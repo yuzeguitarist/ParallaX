@@ -362,6 +362,16 @@ fn oracle_controls_detect_false_accept_false_reject_and_wrong_field() {
         port: 443,
         payload: b"!",
     };
+    let actual = ConnectRequest::decode_ref(good).unwrap();
+    assert_eq!(
+        ConnectView {
+            host: actual.host,
+            port: actual.port,
+            payload: actual.initial_payload,
+        },
+        expected
+    );
+    assert!(ConnectRequest::decode_ref(&bad).is_err());
     assert_eq!(spec_connect(good), Some(expected));
     assert!(spec_connect(&bad).is_none());
     // A decoder that always rejects, always accepts, or misreads the BE port

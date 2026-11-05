@@ -10,9 +10,9 @@ Build jobs have read-only repository access and no OIDC signing permission. They
 
 Separate attestation jobs have no checkout and run no Cargo or downloaded executable. A fixed inline validator rejects unexpected files, symlinks, oversized data, duplicate JSON keys, mismatched metadata, unsafe archive paths/types/modes, and archive bytes that differ from the SBOM-bound binaries. It also enforces bounded, typed component arrays with unique registry references and source checksums; a complete rooted dependency graph with valid references; exact source, target and coverage properties; linked-library inventories for both binaries; and AWS-LC/ring versions and checksums that agree across both SBOMs and the native inventory. It inspects bounded tar data without extracting it. This is an explicit producer contract, not a full CycloneDX schema audit or proof that a compromised builder reports its components truthfully. Only then does the pinned GitHub attestation action create SLSA provenance and a separate SBOM attestation for each executable.
 
-The publisher has no OIDC permission and no source checkout. It waits for every target, verifies every provenance subject and each binary SBOM attestation against the repository, workflow, tag, exact source digest, and hosted-runner requirement, then rechecks the remote tag. It creates a draft release with all assets and publishes after successful upload. Existing releases are never overwritten. A failed upload leaves a draft for maintainer inspection; retries do not clobber it.
+The publisher has no OIDC permission and no source checkout. It waits for every target, verifies every provenance subject and each binary SBOM attestation against the repository, workflow, tag, exact source digest, and hosted-runner requirement, then rechecks the remote tag. It creates a draft release with all assets. Before making it public, it requires an active repository tag ruleset that matches the release tag, prohibits both updates and deletion, and has no bypass actors, then checks the source SHA again. The supported rule includes are the exact tag ref, `refs/tags/v*`, or `~ALL`, with no exclusions. Missing protection or an unreadable ruleset leaves the release in draft; the workflow never changes repository administration. GitHub's enforced protection closes the final tag-check/publication race. Existing releases are never overwritten. A failed upload leaves a draft for maintainer inspection; retries do not clobber it.
 
-This targets the GitHub-hosted signed provenance properties associated with SLSA Build L2. Job separation alone does not establish L3, hermetic builds, reproducibility, a trustworthy maintainer account, or audited dependencies. Tag/branch protection, required independent review, and protected publication administration remain repository-owner responsibilities.
+This targets the GitHub-hosted signed provenance properties associated with SLSA Build L2. Job separation alone does not establish L3, hermetic builds, reproducibility, a trustworthy maintainer account, or audited dependencies. Repository owners must configure the tag protection required by the publisher, branch protection, independent review, and publication administration. An administrator disabling or changing those rules is outside this workflow's trust guarantee.
 
 ## Verify before installing
 
@@ -51,7 +51,9 @@ The Cargo SBOM covers default release features for the native target, including 
 
 The pinned cargo-cyclonedx 0.5.9 installation uses its upstream Cargo.lock, which currently warns about yanked xml-rs 0.8.19. This is a build-tool dependency, not a ParallaX runtime dependency; generated output is JSON and validated before privileged use. The warning is retained rather than hidden by an unlocked resolution. Re-evaluate the tool when upstream publishes a suitable pinned update.
 
-Local dry-run after a locked native release build:
+Local dry-run after a locked native release build requires Python 3.11 or newer
+(`tomllib` is part of the standard library from 3.11). Ensure `python3` selects
+that version, or substitute the path to a suitable interpreter:
 
 ```sh
 cargo install --locked --version 0.5.9 cargo-cyclonedx

@@ -9,7 +9,7 @@ control is satisfied. Evidence is specific to a revision and a completed run.
 | Control references | Project evidence / condition |
 | --- | --- |
 | OSPS-BR-01.01, OSPS-BR-01.04 | Release input validation binds a restricted tag, event ref, event SHA and checked-out commit; subprocesses use explicit argument vectors. Workflow tests exercise hostile and mismatched inputs. |
-| OSPS-BR-01.03 | PR checks have read-only tokens. Native release builds are separated from source-free signing/publishing. Artifact inputs are restricted to the expected files from the same workflow run. |
+| OSPS-BR-01.03 | Build/test PR checks use read-only repository permissions; reporting and review jobs retain their required scoped write permissions, such as `security-events: write` for scan results and PR/comment writes for review automation. Native release builds are separated from source-free signing/publishing. Artifact inputs are restricted to the expected files from the same workflow run. |
 | OSPS-AC-04.01, OSPS-AC-04.02 | New workflows declare minimum permissions; OIDC/attestation rights are confined to the signing job. Repository defaults and other integrations need owner review. |
 | OSPS-BR-02.01, OSPS-BR-02.02 | Release filenames, metadata and checksums carry the release tag and target. Existing assets cannot be silently overwritten. |
 | OSPS-BR-06.01 | Final asset bytes receive GitHub build-provenance attestations; per-binary SBOM evidence is included. Operational evidence requires the first completed release using the new workflow and consumer verification. |
@@ -18,7 +18,7 @@ control is satisfied. Evidence is specific to a revision and a completed run.
 | OSPS-DO-06.01, OSPS-DO-07.01 | [Dependency policy](../../supply-chain/README.md), pinned tools and repository build instructions. Frozen audit imports and an exact missing-audit inventory separate review evidence from inherited debt. |
 | OSPS-QA-06.01, OSPS-QA-06.02 | Existing tests plus bounded Loom/Shuttle, native sanitizer workloads, independent protocol oracles, fault injection and real-listener scenarios. [Commands and limits](README.md) and machine-readable reports describe actual execution. |
 | OSPS-SA-01.01, OSPS-SA-02.01 | Existing SPEC/README describe the protocol; [design record](assurance-design.md) and [threat model](threat-model.md) identify product, experimental, host and release interfaces. |
-| OSPS-SA-03.01, OSPS-SA-03.02 | Threat assessment, design review, separately staffed code review and local attack fixtures. External human penetration testing remains a separate deliverable requiring an assessor, agreed scope and a report. |
+| OSPS-SA-03.01, OSPS-SA-03.02 | Threat assessment, design review, independent AI-agent code review and local attack fixtures. Separately staffed human code review and external human penetration testing remain outstanding deliverables requiring an assessor, agreed scope and a report. |
 | OSPS-VM-05.01, OSPS-VM-05.02, OSPS-VM-05.03 | Dependency policy, cargo-deny and cargo-vet apply to enumerated Cargo workspaces. A vet exemption is not a vulnerability disposition, a source audit or VEX. Review enforcement ultimately depends on branch rules. |
 | OSPS-VM-06.01, OSPS-VM-06.02 | Existing static-analysis workflows remain relevant; this change adds runtime and behavioral evidence. No blanket assertion about complete SAST policy or all historical findings is made. |
 | OSPS-LE-03.01, OSPS-LE-03.02 | Existing LICENSE/NOTICE are retained and bundled with release assets. |

@@ -158,6 +158,12 @@ def policy(root=ROOT, base=None):
                 require(not previous.get("exemptions"), "Base contains exemptions; explicit policy migration required")
                 require(previous.get("imports") == read_toml(root / store / "config.toml").get("imports"),
                         "Import trust changes require separate security policy review")
+                snapshot = subprocess.run(["git", "show", f"{base}:{store}/imports.lock"],
+                                          cwd=root, capture_output=True)
+                require(snapshot.returncode == 0,
+                        f"{workspace}: base audit snapshot missing; explicit policy migration required")
+                require(snapshot.stdout == (root / store / "imports.lock").read_bytes(),
+                        f"{workspace}: base audit snapshot bytes changed; separate security policy review required")
     return protected
 
 

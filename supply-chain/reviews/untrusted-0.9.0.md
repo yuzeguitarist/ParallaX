@@ -1,6 +1,6 @@
 # untrusted 0.9.0: bounded source review
 
-Date: 2026-11-05. Reviewer: OpenAI ChatGPT (AI-assisted source review, not an independent human auditor). Decision: **safe-to-run only** for ordinary Cargo compilation and tests. No safe-to-deploy certification is asserted.
+Date: 2026-11-05. Reviewer: OpenAI ChatGPT (AI-assisted source review, not an independent human auditor). **Informational analysis only:** the initial safe-to-run audit record was withdrawn pending independent human source review. This note grants no cargo-vet criterion or deployment certification.
 
 ## Source identity and scope
 
@@ -19,7 +19,7 @@ Read all four compiled Rust sources, normalized and original Cargo manifests, up
 
 The compiled library wraps borrowed byte slices and a forward cursor. There are no unsafe blocks, filesystem or network capabilities, allocation, subprocesses, global state, or hidden initialization. `read_bytes` checks integer addition and slice bounds before committing its cursor update. `read_byte` increments only after a successful bounds-checked lookup. `read_all` and `read_all_optional` enforce complete consumption after a successful callback. Debug output deliberately omits input bytes and cursor position. The test suite uses deterministic in-memory inputs and formatted strings.
 
-This evidence supports the cargo-vet safe-to-run criterion: ordinary compilation and tests cannot access unrelated files or external endpoints through crate code. It does not establish the security of callers, certificate parsing, constant-time behavior, or native cryptography.
+The reviewed source does not expose unrelated files or external endpoints during ordinary compilation and tests. These observations and the passing tests do not replace independent human source review or authorize a cargo-vet criterion. They also do not establish the security of callers, certificate parsing, constant-time behavior, or native cryptography.
 
 Deployment review is deliberately left open. `read_partial` relies on its callback preserving the reader's identity and monotonic cursor, yet the callback receives `&mut Reader` and can replace it with a new reader. Its final `unwrap` deserves caller-specific review before asserting a broad panic-free deployment guarantee. Caller-provided callbacks may themselves panic. This is a bounded review observation, not a claim of an exploitable ParallaX vulnerability.
 

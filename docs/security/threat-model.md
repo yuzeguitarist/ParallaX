@@ -69,6 +69,15 @@ trust assumption.
 
 ### Replay durability
 
+The replay-cache baseline used by this security-assurance branch treats parent
+directory `sync_all` errors after journal compaction/rename as best effort, even
+on Unix. A successful method return can therefore precede a durable directory
+entry; a crash may lose already-committed entries and reopen marker/0-RTT replays
+across restart. The protocol-hardening change must propagate those Unix sync
+errors before this failure mode can be treated as repaired in the integrated
+revision. Even error propagation and failure-injection tests do not prove
+physical power-loss durability or the behavior of every filesystem/storage stack.
+
 TCP authenticated admission uses the persistent cache before target use. The
 QUIC marker and 0-RTT ticket guards make their decision synchronously in memory
 but defer persistence to a blocking worker. A crash before that write completes

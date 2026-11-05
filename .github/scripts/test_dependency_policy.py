@@ -89,6 +89,36 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "trust is prohibited"):
                 DEP.no_blanket_trust({"audits": {"nested": {key: {"crate": [{"user-id": 1}]}}}})
 
+    def commit_base(self):
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "-c", "user.name=Policy Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "base", "--no-gpg-sign"], cwd=self.root, check=True)
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
+
+    def test_base_snapshot_cannot_change_with_its_current_digest(self):
+        base = self.commit_base()
+        DEP.policy(self.root, base)
+        for workspace, (_, store, _, _) in DEP.WORKSPACES.items():
+            with self.subTest(workspace=workspace):
+                path = self.root / store / "imports.lock"
+                original = path.read_bytes()
+                path.write_bytes(original + b"\n# substituted snapshot\n")
+                # Model a PR updating the script's expected digest together
+                # with the snapshot: only comparison with base can catch it.
+                with patch.dict(DEP.IMPORT_LOCK_SHA256, {workspace: DEP.sha(path)}):
+                    with self.assertRaisesRegex(ValueError, "base audit snapshot bytes changed"):
+                        DEP.policy(self.root, base)
+                path.write_bytes(original)
+
+    def test_base_missing_snapshot_requires_explicit_migration(self):
+        path = self.root / "supply-chain/imports.lock"
+        snapshot = path.read_bytes()
+        path.unlink()
+        base = self.commit_base()
+        path.write_bytes(snapshot)
+        with self.assertRaisesRegex(ValueError, "base audit snapshot missing"):
+            DEP.policy(self.root, base)
+
     def test_local_custom_criterion_cannot_override_builtin(self):
         path = self.root / "supply-chain/audits.toml"
         path.write_text(path.read_text() + '\n[criteria.safe-to-deploy]\ndescription="anything"\n')
