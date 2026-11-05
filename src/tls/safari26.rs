@@ -6411,9 +6411,12 @@ mod tests {
             .await
             .unwrap();
         drop(peer);
+        // The drain polls only ready data at a record boundary. Wait for the
+        // injected header to reach this socket before exercising its rejection.
+        client.readable().await.unwrap();
         assert!(matches!(
             session.drain_post_handshake(&mut client, &mut keys).await,
-            Err(Safari26TlsError::Io(_))
+            Err(Safari26TlsError::Io(ref err)) if err.kind() == std::io::ErrorKind::InvalidData
         ));
     }
 
@@ -6437,9 +6440,13 @@ mod tests {
             .write_all(&[TLS_CONTENT_APPLICATION_DATA, 0x03, 0x03, 0x00, 0x10, 1])
             .await
             .unwrap();
+        // Ensure the ready-only drain consumes the prefix so the outstanding
+        // payload must time out rather than ending at an untouched boundary.
+        client.readable().await.unwrap();
         assert!(matches!(
             session.drain_post_handshake(&mut client, &mut keys).await,
-            Err(Safari26TlsError::Handshake(ref m)) if m.contains("mid-record")
+            Err(Safari26TlsError::Handshake(ref m))
+                if m == "post-handshake drain timed out mid-record"
         ));
     }
 
