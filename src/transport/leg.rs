@@ -499,7 +499,7 @@ mod tests {
         result: Option<&Result<io::Result<T>, tokio::task::JoinError>>,
     ) -> &'static str {
         match result {
-            None => "not-joined",
+            None => "result-unavailable",
             Some(Err(_)) => "task-error",
             Some(Ok(Err(_))) => "io-error",
             Some(Ok(Ok(_))) => "complete",
@@ -508,7 +508,7 @@ mod tests {
 
     fn h3_reader_status<T>(result: Option<&io::Result<T>>) -> &'static str {
         match result {
-            None => "not-completed",
+            None => "result-unavailable",
             Some(Err(_)) => "io-error",
             Some(Ok(_)) => "complete",
         }
