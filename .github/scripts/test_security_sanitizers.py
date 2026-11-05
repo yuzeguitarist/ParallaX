@@ -54,9 +54,13 @@ class SanitizerControls(unittest.TestCase):
                       "patch_commit": sanitizers.TSAN_PATCH}
             for key, path in (("archive", archive), ("dynamic_list", symbols)):
                 report[key] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-            args = sanitizers.runtime_link_arguments(report, directory)
-            self.assertIn(str(archive.resolve()), args)
-            self.assertIn(f"-Wl,--dynamic-list={symbols.resolve()}", args)
+            early, late = sanitizers.runtime_link_arguments(report, directory)
+            args = early + late
+            self.assertIn(str(archive.resolve()), early)
+            self.assertIn(f"-Wl,--dynamic-list={symbols.resolve()}", early)
+            self.assertNotIn(str(archive.resolve()), late)
+            self.assertIn("-lpthread", late)
+            self.assertIn("-lc", late)
             self.assertNotIn("-pthread", args)
             self.assertGreater(args.index("-lpthread"), args.index(str(archive.resolve())))
             self.assertGreater(args.index("-lc"), args.index(str(archive.resolve())))

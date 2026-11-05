@@ -52,7 +52,7 @@ def listed_tests(output: str) -> list[str]:
     return re.findall(r"^([A-Za-z_][A-Za-z0-9_:]*): test$", output, flags=re.MULTILINE)
 
 
-def runtime_link_arguments(report: dict, directory: Path) -> list[str]:
+def runtime_link_arguments(report: dict, directory: Path) -> tuple[list[str], list[str]]:
     """Bind the explicitly linked detector to the pinned, freshly built inputs."""
     if (not isinstance(report, dict)
             or report.get("schema") != 1 or report.get("status") != "passed"
@@ -70,12 +70,17 @@ def runtime_link_arguments(report: dict, directory: Path) -> list[str]:
                 or hashlib.sha256(path.read_bytes()).hexdigest() != item.get("sha256")):
             raise RuntimeError(f"Invalid TSan runtime artifact: {key}")
         paths.append(str(path))
-    return ["-Wl,--whole-archive", paths[0], "-Wl,--no-whole-archive",
-            f"-Wl,--dynamic-list={paths[1]}", "-Wl,--no-as-needed",
+    # Match rustc/Clang's normal sanitizer placement. Loading libc before these
+    # weak interceptor aliases can bind them to versioned libc symbols; another
+    # late -lc does not repair that binding under GNU ld.
+    runtime = ["-Wl,--whole-archive", paths[0], "-Wl,--no-whole-archive",
+               f"-Wl,--dynamic-list={paths[1]}"]
+    dependencies = ["-Wl,--no-as-needed",
             # rustc uses -nodefaultlibs. Clang's -pthread driver option cannot
             # supply the library, and libc must be revisited after this archive
             # for its versioned interceptors and libc_nonshared atfork symbol.
-            "-lpthread", "-lrt", "-lm", "-ldl", "-lresolv", "-lc", "-Wl,--as-needed"]
+                    "-lpthread", "-lrt", "-lm", "-ldl", "-lresolv", "-lc", "-Wl,--as-needed"]
+    return runtime, dependencies
 
 
 def epoll_control_completed(result: subprocess.CompletedProcess[str], mode: str) -> bool:
@@ -138,6 +143,7 @@ class Runner:
         self.build = ROOT / "target/security/sanitizer-build" / kind
         self.output.mkdir(parents=True, exist_ok=True)
         self.env = configured_environment(kind, self.build)
+        self.runtime_pre_link_args: list[str] = []
         self.runtime_link_args: list[str] = []
         self.report = {
             "schema_version": 1, "status": "running", "sanitizer": kind,
@@ -233,11 +239,13 @@ class Runner:
                  timeout=1800)
         runtime_directory = ROOT / "target/security/tsan-runtime"
         runtime = json.loads((runtime_directory / "report.json").read_text(encoding="utf-8"))
-        self.runtime_link_args = runtime_link_arguments(runtime, runtime_directory)
+        self.runtime_pre_link_args, self.runtime_link_args = runtime_link_arguments(
+            runtime, runtime_directory)
         self.report["thread_runtime"] = runtime
         self.build = original_build
         self.env = configured_environment(self.kind, self.build)
         rustflags = shlex.split(self.env["RUSTFLAGS"]) + ["-Zexternal-clangrt"]
+        rustflags += [f"-Zpre-link-arg={value}" for value in self.runtime_pre_link_args]
         rustflags += [f"-Clink-arg={value}" for value in self.runtime_link_args]
         # Cargo's encoded form preserves paths containing spaces exactly.
         self.env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(rustflags)
@@ -258,7 +266,8 @@ class Runner:
                  "verification/sanitizers/Cargo.toml"])
         rust = self.build / TARGET / "debug/parallax-sanitizer-canaries"
         native = self.output / "native-canary"
-        native_link = (["-fno-sanitize-link-runtime"] + self.runtime_link_args
+        native_link = (["-fno-sanitize-link-runtime"]
+                       + self.runtime_pre_link_args + self.runtime_link_args
                        if self.runtime_link_args else [])
         self.run("native-canary-build", ["clang", f"-fsanitize={self.kind}",
                  "-fno-omit-frame-pointer", "-g", "-O1", "-pthread",
