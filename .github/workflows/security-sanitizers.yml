@@ -1,0 +1,75 @@
+name: security-sanitizers
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/security/**'
+      - 'verification/sanitizers/**'
+      - '.github/workflows/security-sanitizers.yml'
+  push:
+    branches: [main, master, 'g2l/security-*']
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/security/**'
+      - 'verification/sanitizers/**'
+      - '.github/workflows/security-sanitizers.yml'
+  schedule:
+    - cron: '23 3 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  sanitizer:
+    name: ${{ matrix.kind }} runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [address, thread, leak]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: nightly-2026-06-17
+          components: rust-src
+      - name: Native compiler and symbolizer
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang llvm
+      - name: Canaries and instrumented ParallaX workloads
+        env:
+          SANITIZER: ${{ matrix.kind }}
+        run: python3 scripts/security/sanitizers.py "$SANITIZER"
+      - name: Retain scope, diagnostics and reproduction evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sanitizer-${{ matrix.kind }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/security/sanitizers/${{ matrix.kind }}/*.log
+            target/security/sanitizers/${{ matrix.kind }}/report.json
+          if-no-files-found: error
+          retention-days: 10
