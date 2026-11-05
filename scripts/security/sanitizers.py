@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -22,6 +23,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 NIGHTLY = "nightly-2026-06-17"
 TARGET = "x86_64-unknown-linux-gnu"
+TSAN_SOURCE = "ec9ab9d68bf7a0e86b2ddf3c0e6e3c4620e02961"
+TSAN_PATCH = "09910aa044808dfbfe1e0f96b5e39260789212fb"
 DIAGNOSTICS = {
     "address": "AddressSanitizer: heap-use-after-free",
     "thread": "ThreadSanitizer: data race",
@@ -47,6 +50,35 @@ def expected_detection(kind: str, returncode: int, output: str) -> bool:
 
 def listed_tests(output: str) -> list[str]:
     return re.findall(r"^([A-Za-z_][A-Za-z0-9_:]*): test$", output, flags=re.MULTILINE)
+
+
+def runtime_link_arguments(report: dict, directory: Path) -> list[str]:
+    """Bind the explicitly linked detector to the pinned, freshly built inputs."""
+    if (not isinstance(report, dict)
+            or report.get("schema") != 1 or report.get("status") != "passed"
+            or report.get("source_commit") != TSAN_SOURCE
+            or report.get("patch_commit") != TSAN_PATCH):
+        raise RuntimeError("Unexpected TSan runtime source or incomplete build")
+    paths = []
+    for key in ("archive", "dynamic_list"):
+        item = report.get(key, {})
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise RuntimeError(f"Invalid TSan runtime artifact record: {key}")
+        path = Path(item["path"]).resolve()
+        if (not path.is_relative_to(directory.resolve()) or not path.is_file()
+                or path.stat().st_size == 0
+                or hashlib.sha256(path.read_bytes()).hexdigest() != item.get("sha256")):
+            raise RuntimeError(f"Invalid TSan runtime artifact: {key}")
+        paths.append(str(path))
+    return ["-Wl,--whole-archive", paths[0], "-Wl,--no-whole-archive",
+            f"-Wl,--dynamic-list={paths[1]}", "-Wl,--no-as-needed",
+            "-pthread", "-lrt", "-lm", "-ldl", "-lresolv", "-Wl,--as-needed"]
+
+
+def epoll_control_completed(result: subprocess.CompletedProcess[str], mode: str) -> bool:
+    return (result.returncode == 0
+            and f"sanitizer-epoll-publication-control-complete: {mode}" in result.stdout
+            and "ThreadSanitizer:" not in result.stdout)
 
 
 def completed_counts(output: str, selected: int, *, allow_ignored: bool = False) -> dict[str, int]:
@@ -103,6 +135,7 @@ class Runner:
         self.build = ROOT / "target/security/sanitizer-build" / kind
         self.output.mkdir(parents=True, exist_ok=True)
         self.env = configured_environment(kind, self.build)
+        self.runtime_link_args: list[str] = []
         self.report = {
             "schema_version": 1, "status": "running", "sanitizer": kind,
             "mode": "canaries-only" if canaries_only else "application-and-canaries",
@@ -149,15 +182,73 @@ class Runner:
         return ["cargo", f"+{self.nightly}", "test", "--locked", "-Zbuild-std",
                 "--target", TARGET]
 
+    def prepare_thread_runtime(self) -> None:
+        """Reproduce the bundled detector defect, then require the fixed control.
+
+        The duplicate-fd program is race-free. Its old-runtime report documents
+        a compatibility defect and never counts as a successful race canary.
+        All application code remains instrumented; no reports are suppressed.
+        """
+        if self.kind != "thread":
+            return
+        if self.nightly != NIGHTLY:
+            raise RuntimeError("The TSan runtime backport requires the pinned nightly")
+        original_build = self.build
+        self.build = original_build.parent / "thread-bundled-control"
+        self.env = configured_environment(self.kind, self.build)
+        build = ["cargo", f"+{self.nightly}", "build", "--locked", "-Zbuild-std",
+                 "--target", TARGET, "--manifest-path", "verification/sanitizers/Cargo.toml",
+                 "--bin", "epoll_publication"]
+        self.run("bundled-epoll-build", build)
+        binary = self.build / TARGET / "debug/epoll_publication"
+        same = self.run("bundled-epoll-same-fd", [str(binary), "same-fd"], timeout=60)
+        if not epoll_control_completed(same, "same-fd"):
+            raise RuntimeError("Bundled TSan failed the same-fd compatibility control")
+        duplicate = self.run("bundled-epoll-duplicate-fd", [str(binary), "duplicate-fd"],
+                             allow_failure=True, timeout=60)
+        if not (duplicate.returncode == 66
+                and DIAGNOSTICS["thread"] in duplicate.stdout
+                and "epoll_publication.rs" in duplicate.stdout):
+            raise RuntimeError("Pinned bundled TSan defect was not reproduced; reassess the backport")
+        self.report["bundled_runtime_compatibility"] = {
+            "same_fd": "passed", "duplicate_fd": "known-detector-defect-reproduced",
+            "upstream_fix": "https://github.com/llvm/llvm-project/pull/221064",
+        }
+        self.save()
+        self.run("tsan-runtime-build", [sys.executable, "scripts/security/tsan_runtime.py"],
+                 timeout=1800)
+        runtime_directory = ROOT / "target/security/tsan-runtime"
+        runtime = json.loads((runtime_directory / "report.json").read_text(encoding="utf-8"))
+        self.runtime_link_args = runtime_link_arguments(runtime, runtime_directory)
+        self.report["thread_runtime"] = runtime
+        self.build = original_build
+        self.env = configured_environment(self.kind, self.build)
+        rustflags = shlex.split(self.env["RUSTFLAGS"]) + ["-Zexternal-clangrt"]
+        rustflags += [f"-Clink-arg={value}" for value in self.runtime_link_args]
+        # Cargo's encoded form preserves paths containing spaces exactly.
+        self.env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(rustflags)
+        self.env["RUSTFLAGS"] = shlex.join(rustflags)
+        self.env["RUSTDOCFLAGS"] = shlex.join(rustflags)
+        self.run("patched-epoll-build", build)
+        binary = self.build / TARGET / "debug/epoll_publication"
+        for mode in ("same-fd", "duplicate-fd"):
+            result = self.run(f"patched-epoll-{mode}", [str(binary), mode], timeout=60)
+            if not epoll_control_completed(result, mode):
+                raise RuntimeError(f"Patched TSan failed the {mode} compatibility control")
+        self.report["patched_runtime_compatibility"] = "same-fd-and-duplicate-fd-passed"
+        self.save()
+
     def canaries(self) -> None:
         self.run("rust-canary-build", ["cargo", f"+{self.nightly}", "build", "--locked",
                  "-Zbuild-std", "--target", TARGET, "--manifest-path",
                  "verification/sanitizers/Cargo.toml"])
         rust = self.build / TARGET / "debug/parallax-sanitizer-canaries"
         native = self.output / "native-canary"
+        native_link = (["-fno-sanitize-link-runtime"] + self.runtime_link_args
+                       if self.runtime_link_args else [])
         self.run("native-canary-build", ["clang", f"-fsanitize={self.kind}",
                  "-fno-omit-frame-pointer", "-g", "-O1", "-pthread",
-                 "verification/sanitizers/native.c", "-o", str(native)])
+                 "verification/sanitizers/native.c", "-o", str(native)] + native_link)
         for name, binary in (("rust", rust), ("native", native)):
             good = self.run(f"{name}-good", [str(binary), "good"], timeout=60)
             if "sanitizer-good-control-complete" not in good.stdout:
@@ -249,6 +340,8 @@ def main() -> int:
     args = parser.parse_args()
     if not re.fullmatch(r"nightly-\d{4}-\d{2}-\d{2}", args.nightly):
         parser.error("use an explicit dated nightly")
+    if args.kind == "thread" and args.nightly != NIGHTLY:
+        parser.error("thread mode requires the nightly paired with its pinned runtime backport")
     if args.plan:
         print(json.dumps({"kind": args.kind, "nightly": args.nightly, "target": TARGET,
                           "suites": SUITES, "canaries_only": args.canaries_only}, indent=2))
@@ -267,10 +360,11 @@ def main() -> int:
         runner.report["rustc"] = runner.run(
             "rustc", ["rustc", f"+{args.nightly}", "-vV"]).stdout.strip()
         runner.report["clang"] = runner.run("clang", ["clang", "--version"]).stdout.strip()
+        runner.prepare_thread_runtime()
         runner.report["build_flags"] = {key: runner.env[key] for key in (
-            "RUSTFLAGS", "CFLAGS_x86_64_unknown_linux_gnu",
+            "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CFLAGS_x86_64_unknown_linux_gnu",
             "CXXFLAGS_x86_64_unknown_linux_gnu", "CARGO_INCREMENTAL",
-            "ASAN_OPTIONS", "TSAN_OPTIONS", "LSAN_OPTIONS")}
+            "ASAN_OPTIONS", "TSAN_OPTIONS", "LSAN_OPTIONS") if key in runner.env}
         runner.canaries()
         if not args.canaries_only:
             runner.application()

@@ -1,5 +1,6 @@
 """Controls against vacuous sanitizer success and environment contamination."""
 import importlib.util
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -15,6 +16,38 @@ SPEC.loader.exec_module(sanitizers)
 
 
 class SanitizerControls(unittest.TestCase):
+    def test_epoll_control_requires_clean_completed_execution(self):
+        marker = "sanitizer-epoll-publication-control-complete: duplicate-fd"
+        for code, output in ((66, marker), (0, ""), (0, marker + " ThreadSanitizer: data race")):
+            self.assertFalse(sanitizers.epoll_control_completed(
+                subprocess.CompletedProcess([], code, output), "duplicate-fd"))
+        self.assertTrue(sanitizers.epoll_control_completed(
+            subprocess.CompletedProcess([], 0, marker), "duplicate-fd"))
+
+    def test_runtime_inputs_and_artifact_hashes_are_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            archive = directory / "runtime with spaces.a"
+            symbols = directory / "runtime with spaces.a.syms"
+            archive.write_bytes(b"archive fixture")
+            symbols.write_bytes(b"symbols fixture")
+            report = {"schema": 1, "status": "passed", "source_commit": sanitizers.TSAN_SOURCE,
+                      "patch_commit": sanitizers.TSAN_PATCH}
+            for key, path in (("archive", archive), ("dynamic_list", symbols)):
+                report[key] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            args = sanitizers.runtime_link_arguments(report, directory)
+            self.assertIn(str(archive.resolve()), args)
+            self.assertIn(f"-Wl,--dynamic-list={symbols.resolve()}", args)
+            for key, value in (("status", "running"), ("source_commit", "main"),
+                               ("patch_commit", "main"), ("schema", 2), ("archive", [])):
+                with self.assertRaises(RuntimeError):
+                    sanitizers.runtime_link_arguments({**report, key: value}, directory)
+            with self.assertRaises(RuntimeError):
+                sanitizers.runtime_link_arguments(report, directory / "different-root")
+            archive.write_bytes(b"changed archive")
+            with self.assertRaises(RuntimeError):
+                sanitizers.runtime_link_arguments(report, directory)
+
     def test_compile_or_loader_failure_does_not_count_as_detection(self):
         for kind, diagnostic in sanitizers.DIAGNOSTICS.items():
             self.assertFalse(sanitizers.expected_detection(kind, 1, "compile error"))

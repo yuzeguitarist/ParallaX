@@ -58,7 +58,7 @@ jobs:
       - name: Native compiler and symbolizer
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y clang llvm
+          sudo apt-get install --no-install-recommends -y clang llvm llvm-dev cmake ninja-build
       - name: Canaries and instrumented ParallaX workloads
         env:
           SANITIZER: ${{ matrix.kind }}
@@ -71,5 +71,7 @@ jobs:
           path: |
             target/security/sanitizers/${{ matrix.kind }}/*.log
             target/security/sanitizers/${{ matrix.kind }}/report.json
+            target/security/tsan-runtime/*.log
+            target/security/tsan-runtime/report.json
           if-no-files-found: error
           retention-days: 10
