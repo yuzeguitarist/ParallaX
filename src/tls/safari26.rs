@@ -2229,7 +2229,7 @@ fn verify_server_certificate(
         .first()
         .ok_or_else(|| Safari26TlsError::Certificate("missing server certificate".to_owned()))?;
     #[cfg(test)]
-    if sni == "example.com" && Sha256::digest(leaf)[..] == LOOPBACK_CAMOUFLAGE_CERT_SHA256 {
+    if is_loopback_test_certificate(sni, &Sha256::digest(leaf)) {
         return Ok(());
     }
 
@@ -2268,6 +2268,14 @@ fn verify_server_certificate(
     )
     .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?;
     Ok(())
+}
+
+/// The certificate pin is a test-only bypass. Keep BOTH conditions independently
+/// testable: a matching name must not waive a wrong certificate, and a matching
+/// digest must not waive a wrong name.
+#[cfg(test)]
+fn is_loopback_test_certificate(sni: &str, digest: &[u8]) -> bool {
+    sni == "example.com" && digest == LOOPBACK_CAMOUFLAGE_CERT_SHA256
 }
 
 fn native_roots() -> Result<&'static [CertificateDer<'static>], Safari26TlsError> {
@@ -5208,6 +5216,23 @@ mod tests {
                 verify_server_certificate(sni, &flight, &transcript),
                 Err(Safari26TlsError::Certificate(_))
             ));
+        }
+    }
+
+    #[test]
+    fn loopback_certificate_exception_requires_exact_domain_and_digest() {
+        let pinned = LOOPBACK_CAMOUFLAGE_CERT_SHA256;
+        let other = [0x42; 32];
+        assert!(is_loopback_test_certificate("example.com", &pinned));
+        for (name, digest) in [
+            ("other.example", pinned),
+            ("example.com", other),
+            ("other.example", other),
+        ] {
+            assert!(
+                !is_loopback_test_certificate(name, &digest),
+                "test-only certificate exception must require both pin and SNI"
+            );
         }
     }
 

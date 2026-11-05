@@ -1409,6 +1409,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authenticated_pruning_does_not_build_a_plaintext_journal_queue() {
+        let mut cache = ReplayCache::new(4);
+        cache.path = Some(PathBuf::from("authenticated-journal.cache"));
+        cache.mac_key = Some(CacheMacKey([0x11; 32]));
+        for (timestamp, byte) in [(100, 1), (1000, 2)] {
+            cache.insert_loaded(ReplayEntry {
+                timestamp,
+                nonce: [byte; 8],
+                transcript_fingerprint: [byte; 32],
+            });
+        }
+        assert!(cache.encoded_entries.is_empty());
+        cache.prune_expired(1000);
+        assert_eq!(cache.order.len(), 1, "the expired entry was pruned");
+        assert_eq!(cache.order[0].timestamp, 1000);
+        assert!(
+            cache.encoded_entries.is_empty(),
+            "authenticated journals must never accumulate plaintext encoded entries"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn fsync_parent_dir_uses_the_real_journal_directory() {
