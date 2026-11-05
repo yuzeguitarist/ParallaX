@@ -1,0 +1,16 @@
+tests/chaos_liveness.rs
+  h_cf34f0def99ee0 55,57,62,80-81,107,124
+tests/splice_equivalence.rs
+  h_cf34f0def99ee0 262,265,268,289-290,361,372
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a8d3724f2837373bac97998cf5b24e557263cdc5",
+  "prompts": {},
+  "humans": {
+    "h_cf34f0def99ee0": {
+      "author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
