@@ -21,7 +21,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -49,6 +49,11 @@ use zeroize::Zeroizing;
 
 const SNI: &str = "example.com";
 const STEP: Duration = Duration::from_secs(12);
+// Production rejection waits up to 60s, then has a 2s graceful-drain budget.
+// Keep observing after the library client's separate 15s establishment timeout.
+const REPLAY_TERMINAL: Duration = Duration::from_secs(75);
+const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+type WireCapture = Arc<Mutex<Vec<u8>>>;
 const REJECTED: &str = "closing on replayed ClientHello after data proof";
 const AT_CAPACITY: &str = "replay cache at capacity with fresh entries";
 const SOURCE_SHED: &str = "per-source connection limit reached; cap-shedding to origin";
@@ -366,6 +371,7 @@ async fn echo_service(tasks: &mut Tasks) -> (SocketAddr, Arc<AtomicUsize>) {
 async fn flush_tls(
     server: &mut rustls::ServerConnection,
     stream: &mut TcpStream,
+    capture: Option<&WireCapture>,
 ) -> io::Result<()> {
     while server.wants_write() {
         let mut wire = Vec::new();
@@ -373,7 +379,34 @@ async fn flush_tls(
         if wire.is_empty() {
             break;
         }
-        stream.write_all(&wire).await?;
+        if let Some(capture) = capture {
+            let mut offset = 0;
+            while offset < wire.len() {
+                stream.writable().await?;
+                // Record only bytes actually written. The lock spans try_write
+                // and append, so an EOF observer cannot see an incomplete trace
+                // while another worker has already delivered those bytes.
+                let written = {
+                    let mut trace = capture.lock().unwrap();
+                    match stream.try_write(&wire[offset..]) {
+                        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(n) => {
+                            assert!(trace.len() + n <= MAX_CAPTURE_BYTES);
+                            trace.extend_from_slice(&wire[offset..offset + n]);
+                            Ok(n)
+                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                match written {
+                    Ok(n) => offset += n,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+        } else {
+            stream.write_all(&wire).await?;
+        }
     }
     Ok(())
 }
@@ -382,6 +415,7 @@ async fn tls_connection(
     mut stream: TcpStream,
     config: Arc<rustls::ServerConfig>,
     echo_probe: bool,
+    capture: Option<WireCapture>,
 ) -> io::Result<()> {
     let mut header = [0; 5];
     stream.read_exact(&mut header).await?;
@@ -396,7 +430,7 @@ async fn tls_connection(
     server.process_new_packets().map_err(io::Error::other)?;
     let mut buffer = [0; 8192];
     while server.is_handshaking() {
-        flush_tls(&mut server, &mut stream).await?;
+        flush_tls(&mut server, &mut stream, capture.as_ref()).await?;
         let n = stream.read(&mut buffer).await?;
         if n == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
@@ -404,7 +438,7 @@ async fn tls_connection(
         server.read_tls(&mut Cursor::new(&buffer[..n]))?;
         server.process_new_packets().map_err(io::Error::other)?;
     }
-    flush_tls(&mut server, &mut stream).await?;
+    flush_tls(&mut server, &mut stream, capture.as_ref()).await?;
     while let Ok(Ok(n)) = timeout(Duration::from_millis(500), stream.read(&mut buffer)).await {
         if n == 0 {
             break;
@@ -417,6 +451,7 @@ async fn tls_service(
     pki: &Pki,
     tasks: &mut Tasks,
     echo_probe: bool,
+    capture: Option<WireCapture>,
 ) -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -430,7 +465,9 @@ async fn tls_service(
                 connection = listener.accept() => {
                     let (stream, _) = connection.unwrap();
                     counter.fetch_add(1, Ordering::SeqCst);
-                    children.spawn(tls_connection(stream, Arc::clone(&config), echo_probe));
+                    children.spawn(tls_connection(
+                        stream, Arc::clone(&config), echo_probe, capture.clone(),
+                    ));
                 }
                 _ = children.join_next(), if !children.is_empty() => {}
             }
@@ -518,7 +555,64 @@ async fn tunnel_roundtrip(app: &mut TcpStream) {
     assert!(trailing.is_empty());
 }
 
-#[derive(Clone, Copy)]
+// This tap deliberately does not propagate client EOF upstream. A timed-out
+// client must not cause the server close which the rejection assertion observes.
+// Download stays active even if the client no longer accepts forwarded bytes.
+async fn observe_server_rejection(captured: TcpStream, upstream: TcpStream) -> io::Result<Vec<u8>> {
+    let (mut client_read, mut client_write) = captured.into_split();
+    let (mut server_read, mut server_write) = upstream.into_split();
+    let result = {
+        let upload = async {
+            let mut buffer = [0; 8192];
+            loop {
+                match client_read.read(&mut buffer).await {
+                    Ok(0) | Err(_) => {
+                        // Keep server_write owned and open until *server* EOF.
+                        return std::future::pending::<io::Result<()>>().await;
+                    }
+                    Ok(n) => server_write.write_all(&buffer[..n]).await?,
+                }
+            }
+        };
+        let download = async {
+            let mut wire = Vec::new();
+            let mut buffer = [0; 8192];
+            let mut client_open = true;
+            loop {
+                let n = server_read.read(&mut buffer).await?;
+                if n == 0 {
+                    return Ok(wire);
+                }
+                if wire.len() + n > MAX_CAPTURE_BYTES {
+                    return Err(io::Error::other("rejected server exceeded capture bound"));
+                }
+                wire.extend_from_slice(&buffer[..n]);
+                if client_open {
+                    client_open = matches!(
+                        timeout(STEP, client_write.write_all(&buffer[..n])).await,
+                        Ok(Ok(()))
+                    );
+                }
+            }
+        };
+        tokio::select! {
+            result = download => result,
+            result = upload => {
+                result?;
+                Err(io::Error::other("tap upload unexpectedly completed"))
+            }
+        }
+    };
+    if result.is_ok() {
+        // Only after genuine upstream read == 0, cooperate with the server's
+        // lingering drain. Reset/read errors and task cancellation are failures.
+        server_write.shutdown().await?;
+        let _ = client_write.shutdown().await;
+    }
+    result
+}
+
+#[derive(Clone, Copy, Debug)]
 enum ReplayCase {
     Fresh,
     Duplicate,
@@ -528,7 +622,9 @@ enum ReplayCase {
 async fn listener_replay_case(pki: &Pki, case: ReplayCase) {
     let keys = Secrets::new();
     let mut tasks = Tasks::default();
-    let (origin, _) = tls_service(pki, &mut tasks, false).await;
+    let origin_wire = Arc::new(Mutex::new(Vec::new()));
+    let (origin, origin_accepts) =
+        tls_service(pki, &mut tasks, false, Some(Arc::clone(&origin_wire))).await;
     let (target, target_accepts) = echo_service(&mut tasks).await;
     let capacity = if matches!(case, ReplayCase::Full) {
         1
@@ -580,10 +676,20 @@ async fn listener_replay_case(pki: &Pki, case: ReplayCase) {
     let mut child = ChildServer::spawn(&mut files);
     child.ready().await;
     let address = files.address;
+    let (closed, terminal) = oneshot::channel();
     tasks.spawn(async move {
-        let mut upstream = TcpStream::connect(address).await.unwrap();
-        upstream.write_all(&hello).await.unwrap();
-        let _ = tokio::io::copy_bidirectional(&mut captured, &mut upstream).await;
+        let result = async {
+            let mut upstream = TcpStream::connect(address).await?;
+            upstream.write_all(&hello).await?;
+            if matches!(case, ReplayCase::Fresh) {
+                tokio::io::copy_bidirectional(&mut captured, &mut upstream).await?;
+                Ok(Vec::new())
+            } else {
+                observe_server_rejection(captured, upstream).await
+            }
+        }
+        .await;
+        let _ = closed.send(result);
     });
     if matches!(case, ReplayCase::Fresh) {
         timeout(STEP, tunnel_roundtrip(&mut app))
@@ -592,8 +698,8 @@ async fn listener_replay_case(pki: &Pki, case: ReplayCase) {
         assert!(timeout(STEP, client_done).await.unwrap().unwrap());
         assert_eq!(target_accepts.load(Ordering::SeqCst), 1);
     } else {
-        // Rejection deliberately includes up to 60s of jitter. Synchronize on
-        // the post-PQ decision, not on a timeout or an early TLS error.
+        // This marker proves the valid client reached the post-PQ decision; it
+        // is not proof of rejection. Continue until independent upstream EOF.
         child.wait_for(REJECTED).await;
         if matches!(case, ReplayCase::Full) {
             assert!(child.log_count(AT_CAPACITY) > 0);
@@ -601,8 +707,27 @@ async fn listener_replay_case(pki: &Pki, case: ReplayCase) {
             assert_eq!(child.log_count(AT_CAPACITY), 0);
         }
         assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
-        sleep(Duration::from_millis(250)).await;
+        let rejected_wire = timeout(REPLAY_TERMINAL, terminal)
+            .await
+            .expect("server did not close within the full replay rejection budget")
+            .expect("independent rejection tap failed")
+            .expect("server rejection was not a clean upstream EOF");
+        assert_eq!(origin_accepts.load(Ordering::SeqCst), 1);
+        assert!(!rejected_wire.is_empty(), "missing TLS positive control");
+        // The rejected connection may forward a prefix of the real origin's
+        // TLS output (including tickets), but must generate no PQ/identity/data
+        // continuation of its own, even after the library client times out.
+        assert!(
+            origin_wire.lock().unwrap().starts_with(&rejected_wire),
+            "{case:?}: rejected server emitted an authenticated continuation",
+        );
         assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
+        // SOCKS success is optimistic (sent before upstream establishment), and
+        // the client has its own 15s timeout. Neither is a rejection oracle.
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "server process exit must not masquerade as connection rejection",
+        );
     }
     drop(app);
     child.stop();
@@ -719,7 +844,7 @@ async fn raw_fallback_roundtrip(address: SocketAddr) {
 async fn source_quota_sheds_then_recovers(pki: &Pki) {
     let keys = Secrets::new();
     let mut tasks = Tasks::default();
-    let (origin, origin_accepts) = tls_service(pki, &mut tasks, true).await;
+    let (origin, origin_accepts) = tls_service(pki, &mut tasks, true, None).await;
     let (target, target_accepts) = echo_service(&mut tasks).await;
     let mut files = ServerFiles::new(&keys, origin, target, 8, 1);
     let mut child = ChildServer::spawn(&mut files);
@@ -778,10 +903,12 @@ fn real_listener_enforces_replay_integrity_capacity_and_source_admission() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        timeout(Duration::from_secs(100), async {
+        timeout(Duration::from_secs(160), async {
             listener_replay_case(&pki, ReplayCase::Fresh).await;
-            listener_replay_case(&pki, ReplayCase::Duplicate).await;
-            listener_replay_case(&pki, ReplayCase::Full).await;
+            tokio::join!(
+                listener_replay_case(&pki, ReplayCase::Duplicate),
+                listener_replay_case(&pki, ReplayCase::Full),
+            );
             corrupted_journal_refuses_startup().await;
             source_quota_sheds_then_recovers(&pki).await;
         })
