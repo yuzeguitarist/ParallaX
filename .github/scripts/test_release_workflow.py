@@ -491,6 +491,15 @@ class PublishTests(unittest.TestCase):
 
 
 class TrustBoundaryTests(unittest.TestCase):
+    def test_builders_checkout_the_immutable_event_commit(self):
+        workflow = WORKFLOW.read_text()
+        for name, following in (("audit", "build"), ("build", "attest")):
+            job = workflow.split(f"\n  {name}:\n", 1)[1].split(f"\n  {following}:\n", 1)[0]
+            self.assertEqual(job.count("actions/checkout@"), 1)
+            self.assertIn("ref: ${{ github.sha }}", job)
+            self.assertNotIn("ref: ${{ needs.", job)
+            self.assertIn("persist-credentials: false", job)
+
     def test_privileged_jobs_never_checkout_or_build(self):
         workflow = WORKFLOW.read_text()
         attest = workflow.split("\n  attest:\n", 1)[1].split("\n  publish:\n", 1)[0]
