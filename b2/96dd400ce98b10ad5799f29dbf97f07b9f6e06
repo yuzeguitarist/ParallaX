@@ -1,0 +1,21 @@
+src/protocol/data.rs
+  s_9ec450b7d718d0::t_4db5c3cf96bb97 6,768-769,807-809,815,818-820,831,864-866,944,1049-1051,1057,1059-1061
+tests/security_fault_injection.rs
+  s_9ec450b7d718d0::t_9abeca09a1f215 1-311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b296dd400ce98b10ad5799f29dbf97f07b9f6e06",
+  "prompts": {},
+  "sessions": {
+    "s_9ec450b7d718d0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a87f-7fe7-7441-860f-12fc066aaa80",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}

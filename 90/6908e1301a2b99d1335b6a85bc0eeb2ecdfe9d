@@ -1,0 +1,21 @@
+src/protocol/data.rs
+  s_27cf9424f2c8dd::t_b20b560eb821f3 832-835
+tests/security_plaintext_allocation.rs
+  s_27cf9424f2c8dd::t_3099498493a0c8 1-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "906908e1301a2b99d1335b6a85bc0eeb2ecdfe9d",
+  "prompts": {},
+  "sessions": {
+    "s_27cf9424f2c8dd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6df-f7ec-7ef2-b5ce-4b4102d93194",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
