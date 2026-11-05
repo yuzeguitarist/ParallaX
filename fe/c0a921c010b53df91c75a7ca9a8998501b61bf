@@ -1,0 +1,16 @@
+docs/security/assurance-design.md
+  h_cf34f0def99ee0 155-159,164-165,172-186
+docs/security/threat-model.md
+  h_cf34f0def99ee0 111-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fec0a921c010b53df91c75a7ca9a8998501b61bf",
+  "prompts": {},
+  "humans": {
+    "h_cf34f0def99ee0": {
+      "author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
