@@ -3,7 +3,7 @@ use std::ops::Range;
 use aws_lc_rs::aead::LessSafeKey;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto::{
@@ -765,7 +765,8 @@ impl DataRecordCodec {
             let record_end = next_record + records_here;
             let lens = record_lens[next_record..record_end].to_vec();
             let span: usize = lens.iter().sum();
-            let group_plaintext = plaintext[byte_offset..byte_offset + span].to_vec();
+            let group_plaintext =
+                Zeroizing::new(plaintext[byte_offset..byte_offset + span].to_vec());
             let group_base_sequence = base_sequence + next_record as u64;
             let seed = rng.gen::<u64>();
             let cipher = SharedCipher::clone(&cipher);
@@ -803,15 +804,20 @@ impl DataRecordCodec {
     /// concatenated plaintext to `out`. Identical validation and AEAD checks
     /// to the per-record `open*` methods; any failure must fail-close the
     /// session, as the sequence counter has already advanced past the records
-    /// opened before the failure.
+    /// opened before the failure. On error, `out` retains only its pre-call
+    /// contents and the in-place input is zeroized: it may already contain
+    /// decrypted records, so callers must not reuse it after a failed batch.
     pub fn open_concat_records(
         &mut self,
         records: &mut [u8],
         out: &mut Vec<u8>,
     ) -> Result<(), DataRecordError> {
-        self.aead.ensure_usable()?;
+        let output_start = out.len();
         let result = self.open_concat_records_inner(records, out);
         if result.is_err() {
+            out[output_start..].zeroize();
+            out.truncate(output_start);
+            records.zeroize();
             self.aead.poison();
         }
         result
@@ -822,6 +828,7 @@ impl DataRecordCodec {
         records: &mut [u8],
         out: &mut Vec<u8>,
     ) -> Result<(), DataRecordError> {
+        self.aead.ensure_usable()?;
         let mut offset = 0;
         while offset < records.len() {
             let header = validate_record_header(records, offset)?;
@@ -854,9 +861,9 @@ impl DataRecordCodec {
     /// Opens a buffer of consecutive sealed TLS records in parallel across
     /// `pool`, appending the concatenated plaintext to `out`. The records must
     /// be exactly those produced for this direction in order; the sequence
-    /// counter advances by the number of records opened. On any AEAD failure
-    /// the counter is left untouched (mirroring the serial `open*` methods, so
-    /// a rejected record cannot silently desynchronize the stream).
+    /// counter advances by the number of records opened. On any failure `out`
+    /// is unchanged, temporary plaintext is zeroized, and the codec is poisoned.
+    /// The caller's immutable ciphertext input is never modified.
     pub fn open_concat_records_parallel(
         &mut self,
         pool: &CryptoPool,
@@ -934,7 +941,7 @@ impl DataRecordCodec {
         for segment in segments {
             plaintexts.push(segment?);
         }
-        out.reserve(plaintexts.iter().map(Vec::len).sum());
+        out.reserve(plaintexts.iter().map(|bytes| bytes.len()).sum());
         for plaintext in &plaintexts {
             out.extend_from_slice(plaintext);
         }
@@ -1039,16 +1046,19 @@ fn seal_records_segment(
 }
 
 /// Opens a contiguous run of records (one worker's share) in place, returning
-/// the concatenated, unpadded plaintext.
+/// the concatenated, unpadded plaintext. Owned inputs and results remain
+/// zeroizing through aggregation, including results discarded after a sibling
+/// worker fails or panics.
 fn open_record_group(
     cipher: &LessSafeKey,
     nonce_base: &[u8; NONCE_LEN],
     aad: &'static [u8],
     base_sequence: u64,
-    mut bytes: Vec<u8>,
+    bytes: Vec<u8>,
     bounds: &[(usize, usize)],
-) -> Result<Vec<u8>, DataRecordError> {
-    let mut out = Vec::with_capacity(bytes.len());
+) -> Result<Zeroizing<Vec<u8>>, DataRecordError> {
+    let mut bytes = Zeroizing::new(bytes);
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
     for (index, &(record_offset, total_len)) in bounds.iter().enumerate() {
         let sequence = base_sequence + index as u64;
         let ciphertext_start = record_offset + record::TLS_HEADER_LEN;
