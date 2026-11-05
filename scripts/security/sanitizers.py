@@ -32,6 +32,7 @@ SUITES = (
     ("linux-fd-lifetimes", ["--lib", "transport::tcp::"], ["--ignored"]),
     ("protocol-oracles", ["--test", "security_protocol_differential"], []),
     ("fault-injection", ["--test", "security_fault_injection"], []),
+    ("plaintext-reallocation", ["--test", "security_plaintext_allocation"], []),
     ("mldsa-oracle", ["--test", "mldsa_differential"], []),
     ("mldsa-vectors", ["--test", "mldsa_acvp"], []),
     ("production-cert-tunnel", ["--test", "e2e_tunnel_roundtrip"], ["--ignored"]),

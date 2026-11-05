@@ -829,6 +829,10 @@ impl DataRecordCodec {
         out: &mut Vec<u8>,
     ) -> Result<(), DataRecordError> {
         self.aead.ensure_usable()?;
+        // Reserve before decrypting: later growth could otherwise free an old
+        // allocation containing this batch's plaintext before rollback can wipe
+        // it. Ciphertext length bounds the total plaintext appended below.
+        out.reserve(records.len());
         let mut offset = 0;
         while offset < records.len() {
             let header = validate_record_header(records, offset)?;

@@ -27,6 +27,7 @@ def selections(kind: str) -> list[tuple[str, list[str], list[str]]]:
     if kind == "protocol":
         return [(name, ["cargo", "test", "--locked", "--test", name], [])
                 for name in ("security_protocol_differential", "security_fault_injection",
+                             "security_plaintext_allocation",
                              "mldsa_differential", "mldsa_acvp")]
     if kind == "listener":
         return [("security_listener", ["cargo", "test", "--locked", "--test",

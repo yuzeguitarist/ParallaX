@@ -132,6 +132,7 @@ jobs:
             --test seccomp_late_install \
             --test security_fault_injection \
             --test security_listener \
+            --test security_plaintext_allocation \
             --test security_protocol_differential \
             --test splice_equivalence
 
