@@ -6135,7 +6135,7 @@ mod tests {
             // Sandboxes legitimately may have no host roots. In that case
             // fail-closed is correct; fabricating Ok(empty) is not.
             Err(Safari26TlsError::Certificate(_)) => {}
-            Err(err) => panic!("unexpected trust-store error: {err:?}"),
+            Err(_) => panic!("unexpected trust-store error variant"),
         }
     }
 
