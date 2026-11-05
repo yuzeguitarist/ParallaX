@@ -5097,7 +5097,23 @@ mod tests {
         client.cancel_stream(cancelled, 0x10c);
         assert_eq!(client.next_stream_to_reset(), None, "control goes first");
         let now = Instant::now();
-        client.poll_transmit(now).expect("control stream packet");
+        // Handshake ACKs can become due before the queued STREAM is selected.
+        // Deliver those packets too, stopping as soon as cancellation is ready.
+        for step in 0..64 {
+            let sent_at = now + Duration::from_millis(step);
+            if let Some(packet) = client.poll_transmit(sent_at) {
+                server.handle_datagram(&packet, sent_at).unwrap();
+            }
+            if client.next_stream_to_reset().is_some() {
+                break;
+            }
+        }
+        assert_eq!(server.read_stream(control), b"control settings");
+        assert_eq!(
+            server.stream_reset(cancelled),
+            None,
+            "control precedes reset"
+        );
         assert_eq!(client.next_stream_to_reset(), Some(cancelled));
     }
 
