@@ -16,6 +16,8 @@ use tokio::{
     time::{timeout_at, Instant},
 };
 
+use super::fd_budget::{ExtraFdBudget, ExtraFdReservation};
+
 const RESERVED_PROCESS_FDS: usize = 64;
 const FDS_PER_RELAY_CONNECTION: usize = 2;
 pub(crate) const MAX_CONCURRENT_CAP_SHED_FALLBACKS: usize = 64;
@@ -40,46 +42,12 @@ static INFLIGHT_EXTRA_CONNECTS: AtomicUsize = AtomicUsize::new(0);
 // optional work stays disabled and connections use their base socket budget.
 static EXTRA_FD_BUDGET: OnceLock<ExtraFdBudget> = OnceLock::new();
 
-struct ExtraFdBudget {
-    limit: usize,
-    used: AtomicUsize,
-}
-
 impl ExtraFdBudget {
     const fn new(limit: usize) -> Self {
         Self {
             limit,
             used: AtomicUsize::new(0),
         }
-    }
-
-    fn try_reserve(&self, count: usize) -> Option<ExtraFdReservation<'_>> {
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            let next = used.checked_add(count).filter(|next| *next <= self.limit)?;
-            match self
-                .used
-                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                Err(actual) => used = actual,
-            }
-        }
-        Some(ExtraFdReservation {
-            budget: self,
-            count,
-        })
-    }
-}
-
-struct ExtraFdReservation<'a> {
-    budget: &'a ExtraFdBudget,
-    count: usize,
-}
-
-impl Drop for ExtraFdReservation<'_> {
-    fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.count, Ordering::AcqRel);
     }
 }
 

@@ -23,9 +23,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv6Addr},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use crate::concurrency::{Arc, Instant, Mutex};
 
 /// Idle entries (no active connections) are evicted this long after going idle.
 const SOURCE_IDLE_GRACE: Duration = Duration::from_secs(120);
