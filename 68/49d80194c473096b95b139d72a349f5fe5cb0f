@@ -1,0 +1,21 @@
+.github/scripts/test_security_sanitizers.py
+  s_917905b5f21d93::t_9331a270fc3ae3 57-63
+scripts/security/sanitizers.py
+  s_917905b5f21d93::t_4ab878eee5deeb 55,73-78,82-83,146,242-243,248,269-270
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6849d80194c473096b95b139d72a349f5fe5cb0f",
+  "prompts": {},
+  "sessions": {
+    "s_917905b5f21d93": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aa16-3a6c-78e1-84bd-0006b2ac3e7f",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
