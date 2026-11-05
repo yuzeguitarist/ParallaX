@@ -36,8 +36,8 @@ Loom uses a pinned nightly for modeled Arc receiver support; Shuttle uses stable
 rustup toolchain install nightly-2026-06-17 --profile minimal --component rust-src
 ```
 
-Sanitizers require native x86_64 Linux, Clang, LLVM tools and nm. Actions supplies
-these on isolated runners. macOS ARM64 can run ordinary production, protocol,
+Sanitizers require native x86_64 Linux, Clang, LLVM development/CMake files,
+CMake, Ninja and nm. Actions supplies these on isolated runners. macOS ARM64 can run ordinary production, protocol,
 listener and model suites, but cannot validate this Linux sanitizer matrix.
 
 The sanitizer runner rebuilds std, supplies target-specific C/C++ flags, inspects
@@ -46,6 +46,20 @@ workloads cover the library, Linux FD/splice lifetimes, differential crypto,
 faulty I/O, certificate-verified tunnel, origin splice and socket cancellation.
 Seccomp/anti-debug are disabled only for instrumented execution; normal CI and
 listener tests retain production hardening.
+
+The pinned TSan runtime predates LLVM's
+[fcntl duplication fix](https://github.com/llvm/llvm-project/pull/221064), which
+matters for Mio/Tokio's cloned epoll registry. The thread runner first exercises
+an independent, std-only epoll publication control with the bundled runtime:
+the same descriptor must work and the duplicated descriptor must reproduce the
+known detector defect. It then builds the exact Rust LLVM source revision with
+only that pinned upstream patch, verifies source/artifact hashes, and links the
+corrected runtime explicitly with `-Zexternal-clangrt`. Both race-free controls
+must pass before the ordinary Rust/C race canaries and application workloads
+run. Rust, std and native application instrumentation remain enabled; there are
+no TSan suppressions. Runtime build provenance is retained under
+`target/security/tsan-runtime/`. A toolchain update must reassess this backport,
+not silently carry it forward.
 
 Unexecuted code, assembly, OS/SDK libraries and reachable global caches are
 outside complete runtime coverage. TSan has fence/assembly synchronization
@@ -74,8 +88,12 @@ TLS/QUIC implementation.
 
 Fault fixtures cover partial reads, Pending, cancellation, EOF, errors,
 authentication failure, poisoning and output rollback. Listener tests spawn the
-production binary with fresh keys and a local trusted origin. Rejection requires
-observing the actual gate and zero target connections; timeout alone is insufficient.
+production binary with fresh keys and a local trusted origin. Replay rejection
+requires the actual gate log, genuine server-side EOF, zero target connections,
+and a complete captured response that is a prefix of the sole origin's recorded
+successful writes. The tap remains alive after client timeout; timeout, reset,
+task exit and optimistic SOCKS success are not rejection evidence. Two delayed
+fallthrough mutations (2 seconds and 17 seconds) exercise this oracle.
 
 ## Actions
 

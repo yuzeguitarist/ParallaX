@@ -76,7 +76,7 @@ Source implementation takes precedence where older descriptive prose differs.
    reassembly policy limits. Derive AEAD nonces independently.
 7. **Root-only dependency review misses nested workspaces.** Include fuzz, lab,
    and model manifests. Vet does not replace vulnerability/license scanning.
-   An exact exemption tuple ratchet is reviewable policy, not an access control;
+   In-repository policy guards are reviewable code, not an access control;
    human review and branch rules remain repository-owner responsibilities.
 8. **Release dispatch could attest the wrong source.** Require event ref, tag,
    event SHA and checked-out commit to agree. Dispatch on a branch while
@@ -111,6 +111,38 @@ partitioned into isolated branches after resolving their design objections.
 A fresh adversarial code-review round follows integration. Each actionable
 finding must be fixed and rechecked, or retained as a clearly scoped external
 limitation. Passing checks are reported for the actual candidate commit.
+
+### Fresh code-review findings and retests
+
+- **Plaintext can survive a Vec reallocation before rollback.** The independent
+  concurrency reviewer found that wiping the final live buffer was insufficient
+  if a prior successfully decrypted record caused its old allocation to be
+  freed during later growth. Reserve the ciphertext-bounded output capacity
+  before decrypting. A separate moving/inspecting allocator regression failed
+  before the fix and passes for AES-GCM and ChaCha20-Poly1305 afterward; the
+  original reviewer rechecked and closed the finding.
+- **A rejection log can precede an incorrect authenticated continuation.** The
+  independent runtime/protocol reviewer demonstrated that a 2-second delayed
+  fallthrough mutation passed the initial listener test. The corrected test
+  awaits real server EOF and compares all server bytes against actual origin
+  writes, even after the client's own timeout. Both 2-second and 17-second
+  fallthrough mutations now fail, and the reviewer checked the final oracle.
+- **Runtime test discovery can silently select nothing.** The sanitizer runner
+  rejected an erroneous `--ignored` filter for Linux FD tests; removing that
+  filter executes the actual selected tests. Dedicated suites also reject any
+  ignored or missing case, and failures remain failures while other suites
+  collect additional evidence.
+- **Old socket fixtures intentionally leaked temporary directories.** Actual
+  ASan/LSan execution found two 15-byte path allocations in splice equivalence
+  and five in socket chaos. Replace `mem::forget` with ownership in the handler
+  future and release after the handler completes. Normal socket retests pass;
+  sanitized retests are required before claiming these lanes pass.
+- **TSan must understand the application's OS synchronization.** The pinned
+  runtime lacked LLVM's fcntl descriptor-duplication interceptor. An independent
+  source investigation traced Mio's duplicated epoll registry and the upstream
+  fix. A narrowly pinned runtime backport, clean duplicated-epoll controls and
+  ordinary true-race canaries are required; suppressing the application report
+  would not establish a valid test environment.
 
 PR work may push its feature branch to execute unprivileged GitHub-hosted
 checks. It must not create a tag, publish a release, change repository access
