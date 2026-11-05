@@ -72,7 +72,10 @@ def runtime_link_arguments(report: dict, directory: Path) -> list[str]:
         paths.append(str(path))
     return ["-Wl,--whole-archive", paths[0], "-Wl,--no-whole-archive",
             f"-Wl,--dynamic-list={paths[1]}", "-Wl,--no-as-needed",
-            "-pthread", "-lrt", "-lm", "-ldl", "-lresolv", "-Wl,--as-needed"]
+            # rustc uses -nodefaultlibs. Clang's -pthread driver option cannot
+            # supply the library, and libc must be revisited after this archive
+            # for its versioned interceptors and libc_nonshared atfork symbol.
+            "-lpthread", "-lrt", "-lm", "-ldl", "-lresolv", "-lc", "-Wl,--as-needed"]
 
 
 def epoll_control_completed(result: subprocess.CompletedProcess[str], mode: str) -> bool:

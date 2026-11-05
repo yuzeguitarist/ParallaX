@@ -57,6 +57,9 @@ class SanitizerControls(unittest.TestCase):
             args = sanitizers.runtime_link_arguments(report, directory)
             self.assertIn(str(archive.resolve()), args)
             self.assertIn(f"-Wl,--dynamic-list={symbols.resolve()}", args)
+            self.assertNotIn("-pthread", args)
+            self.assertGreater(args.index("-lpthread"), args.index(str(archive.resolve())))
+            self.assertGreater(args.index("-lc"), args.index(str(archive.resolve())))
             for key, value in (("status", "running"), ("source_commit", "main"),
                                ("patch_commit", "main"), ("schema", 2), ("archive", [])):
                 with self.assertRaises(RuntimeError):
