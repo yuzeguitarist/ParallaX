@@ -383,7 +383,13 @@ impl LegWriter for H3DataFrameLegWriter {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
 
     use rand::{rngs::StdRng, SeedableRng};
     use tokio::io::AsyncReadExt;
@@ -396,6 +402,144 @@ mod tests {
     };
 
     use super::*;
+
+    // These functional cases transfer several MiB through the real QUIC stack.
+    // Bound both halves together while allowing fully instrumented std/native
+    // code to run. Report actual progress so a slow transfer and a stall remain
+    // distinguishable; production transport deadlines are unchanged.
+    const H3_LARGE_TRANSFER_WATCHDOG: Duration = Duration::from_secs(120);
+    const H3_WRITER_CANCEL_WATCHDOG: Duration = Duration::from_secs(5);
+    const H3_PRIOR_RECEIVE_BUDGET: Duration = Duration::from_secs(15);
+
+    #[derive(Debug, Default)]
+    struct H3TransferProgress {
+        // Count only write_records calls that returned; an in-flight partial
+        // write may already have delivered more bytes to the receiver.
+        write_calls_completed: AtomicUsize,
+        write_bytes_completed: AtomicUsize,
+        received_bytes: AtomicUsize,
+        records_received: AtomicUsize,
+        bytes_completed_by_15s: AtomicUsize,
+        records_completed_by_15s: AtomicUsize,
+        last_read_event_ms: AtomicUsize,
+        max_read_event_gap_ms: AtomicUsize,
+        first_read_event_after_15s_ms: AtomicUsize,
+        writer_completed_ms: AtomicUsize,
+        reader_completed_ms: AtomicUsize,
+        write_shutdown_completed: AtomicBool,
+        eof_observed: AtomicBool,
+    }
+
+    impl H3TransferProgress {
+        fn completed_write(&self, bytes: usize) {
+            self.write_bytes_completed
+                .fetch_add(bytes, Ordering::Relaxed);
+            self.write_calls_completed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn read_event(&self, bytes: usize, records: usize, elapsed: Duration) {
+            let now = elapsed.as_millis() as usize;
+            let previous = self.last_read_event_ms.swap(now, Ordering::Relaxed);
+            self.max_read_event_gap_ms
+                .fetch_max(now.saturating_sub(previous), Ordering::Relaxed);
+            self.received_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.records_received.fetch_add(records, Ordering::Relaxed);
+            if elapsed <= H3_PRIOR_RECEIVE_BUDGET {
+                self.bytes_completed_by_15s
+                    .fetch_add(bytes, Ordering::Relaxed);
+                self.records_completed_by_15s
+                    .fetch_add(records, Ordering::Relaxed);
+            } else {
+                // Zero means no successful read/EOF after the old budget.
+                let _ = self.first_read_event_after_15s_ms.compare_exchange(
+                    0,
+                    now,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+
+        fn observed_eof(&self, elapsed: Duration) {
+            self.read_event(0, 0, elapsed);
+            self.reader_completed_ms
+                .store(elapsed.as_millis() as usize, Ordering::Relaxed);
+            self.eof_observed.store(true, Ordering::Relaxed);
+        }
+
+        fn report(
+            &self,
+            fixture: &str,
+            elapsed: Duration,
+            expected_write_bytes: usize,
+            received_unit: &str,
+            outcomes: (&str, &str, bool),
+        ) {
+            use std::io::Write;
+
+            let (writer_status, reader_status, timed_out) = outcomes;
+            let read_idle_ms = (elapsed.as_millis() as usize)
+                .saturating_sub(self.last_read_event_ms.load(Ordering::Relaxed));
+            // A direct, bounded line remains visible in successful libtest
+            // logs without enabling --nocapture for the entire sanitizer suite.
+            writeln!(
+                std::io::stderr().lock(),
+                "H3 transfer {fixture}: elapsed_ms={} watchdog_ms={} timed_out={timed_out} \
+                 writer_status={writer_status} reader_status={reader_status} \
+                 expected_write_bytes={expected_write_bytes} received_unit={received_unit} \
+                 read_idle_ms={read_idle_ms} {self:?}",
+                elapsed.as_millis(),
+                H3_LARGE_TRANSFER_WATCHDOG.as_millis(),
+            )
+            .expect("write H3 transfer diagnostics");
+        }
+    }
+
+    fn h3_writer_status<T>(
+        result: Option<&Result<io::Result<T>, tokio::task::JoinError>>,
+    ) -> &'static str {
+        match result {
+            None => "not-joined",
+            Some(Err(_)) => "task-error",
+            Some(Ok(Err(_))) => "io-error",
+            Some(Ok(Ok(_))) => "complete",
+        }
+    }
+
+    fn h3_reader_status<T>(result: Option<&io::Result<T>>) -> &'static str {
+        match result {
+            None => "not-completed",
+            Some(Err(_)) => "io-error",
+            Some(Ok(_)) => "complete",
+        }
+    }
+
+    // Preserve read_to_end's buffers, polling and waker. Observe only successful
+    // reads; diagnostics must not add wakeups that could conceal a transport stall.
+    struct H3ObservedReader<R> {
+        inner: R,
+        progress: Arc<H3TransferProgress>,
+        started: Instant,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for H3ObservedReader<R> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+            if matches!(&result, Poll::Ready(Ok(()))) {
+                let n = buf.filled().len() - before;
+                if n != 0 {
+                    this.progress.read_event(n, 0, this.started.elapsed());
+                }
+            }
+            result
+        }
+    }
 
     fn data_codec() -> DataRecordCodec {
         // Matched key+nonce_base on both seal and open sides; zero padding keeps
@@ -423,30 +567,78 @@ mod tests {
             MAX_PAYLOAD_LEN + 1,
             2 * MAX_PAYLOAD_LEN + 37,
         ];
-        let opener = tokio::spawn(async move {
+        let expected_write_bytes = lengths.iter().sum();
+        let progress = Arc::new(H3TransferProgress::default());
+        let write_progress = progress.clone();
+        let started = Instant::now();
+        // Keep the writer's independent task/waker. The owned JoinSet aborts
+        // it on panic, and the timeout path below explicitly aborts and joins.
+        let mut opener = tokio::task::JoinSet::new();
+        opener.spawn(async move {
             let (send, _recv) = client_conn.open_bi();
             let mut writer = H3DataFrameLegWriter(send);
             for len in lengths {
                 let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
                 writer.write_records(&bytes).await?;
+                write_progress.completed_write(bytes.len());
             }
             writer.shutdown().await?;
+            write_progress
+                .writer_completed_ms
+                .store(started.elapsed().as_millis() as usize, Ordering::Relaxed);
+            write_progress
+                .write_shutdown_completed
+                .store(true, Ordering::Relaxed);
             Ok::<_, io::Error>(client_conn)
         });
         let receive = async {
-            let (_send, mut recv) = server_conn.accept_bi().await.unwrap();
+            let (_send, recv) = server_conn.accept_bi().await.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before DATA stream",
+                )
+            })?;
+            let mut recv = H3ObservedReader {
+                inner: recv,
+                progress: progress.clone(),
+                started,
+            };
             let mut wire = Vec::new();
-            recv.read_to_end(&mut wire).await.unwrap();
-            wire
+            recv.read_to_end(&mut wire).await?;
+            progress.observed_eof(started.elapsed());
+            Ok::<_, io::Error>(wire)
         };
-        let (write_result, wire) = tokio::join!(
-            opener,
-            tokio::time::timeout(Duration::from_secs(15), receive)
+        let transfer = tokio::time::timeout(H3_LARGE_TRANSFER_WATCHDOG, async {
+            // join! retains the completed writer's Connection until the reader
+            // finishes, preserving the original stream/connection lifetime.
+            tokio::join!(opener.join_next(), receive)
+        })
+        .await;
+        progress.report(
+            "bounded-DATA-frames",
+            started.elapsed(),
+            expected_write_bytes,
+            "H3-wire-bytes",
+            (
+                h3_writer_status(transfer.as_ref().ok().and_then(|(write, _)| write.as_ref())),
+                h3_reader_status(transfer.as_ref().ok().map(|(_, read)| read)),
+                transfer.is_err(),
+            ),
         );
+        if transfer.is_err() {
+            opener.abort_all();
+            tokio::time::timeout(H3_WRITER_CANCEL_WATCHDOG, async {
+                while opener.join_next().await.is_some() {}
+            })
+            .await
+            .expect("timed-out DATA writer must terminate");
+        }
+        let (write_result, wire) = transfer.expect("bounded DATA frames must arrive");
         let _client_conn = write_result
+            .expect("writer task must remain owned")
             .unwrap()
             .expect("all batch sizes must be writable");
-        let wire = wire.expect("bounded DATA frames must arrive");
+        let wire = wire.expect("DATA frame bytes must be readable");
         let mut remaining = wire.as_slice();
         for len in lengths {
             let mut offset = 0;
@@ -503,34 +695,78 @@ mod tests {
         }));
 
         let (_server_endpoint, _client_endpoint, client_conn, server_conn) = loopback_pair().await;
-        let opener = tokio::spawn(async move {
+        let expected_write_bytes = sealed.len();
+        let progress = Arc::new(H3TransferProgress::default());
+        let write_progress = progress.clone();
+        let started = Instant::now();
+        let mut opener = tokio::task::JoinSet::new();
+        opener.spawn(async move {
             let (send, _recv) = client_conn.open_bi();
             let mut writer = H3DataFrameLegWriter(send);
             writer.write_records(&[]).await?;
+            write_progress.completed_write(0);
             writer.write_records(&sealed).await?;
+            write_progress.completed_write(sealed.len());
             writer.write_records(&[]).await?;
+            write_progress.completed_write(0);
             writer.shutdown().await?;
+            write_progress
+                .writer_completed_ms
+                .store(started.elapsed().as_millis() as usize, Ordering::Relaxed);
+            write_progress
+                .write_shutdown_completed
+                .store(true, Ordering::Relaxed);
             Ok::<_, io::Error>(client_conn)
         });
         let receive = async {
-            let (_send, recv) = server_conn.accept_bi().await.unwrap();
+            let (_send, recv) = server_conn.accept_bi().await.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before DATA stream",
+                )
+            })?;
             let mut reader = H3DataFrameLegReader::buffered(recv);
             let mut record = Vec::new();
             let mut recovered = Vec::new();
             for _ in records {
-                reader.read_record_into(&mut record).await.unwrap();
+                reader.read_record_into(&mut record).await?;
+                progress.read_event(record.len(), 1, started.elapsed());
                 recovered.extend_from_slice(&open.open(&record).unwrap());
             }
             assert_eq!(recovered, plaintext);
             let err = reader.read_record_into(&mut record).await.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
             assert!(reader.is_clean_close(&err));
+            progress.observed_eof(started.elapsed());
+            Ok::<_, io::Error>(())
         };
-        let (write_result, read_result) = tokio::join!(
-            opener,
-            tokio::time::timeout(Duration::from_secs(15), receive)
+        let transfer = tokio::time::timeout(H3_LARGE_TRANSFER_WATCHDOG, async {
+            tokio::join!(opener.join_next(), receive)
+        })
+        .await;
+        progress.report(
+            "heavily-padded-records",
+            started.elapsed(),
+            expected_write_bytes,
+            "completed-TLS-record-bytes",
+            (
+                h3_writer_status(transfer.as_ref().ok().and_then(|(write, _)| write.as_ref())),
+                h3_reader_status(transfer.as_ref().ok().map(|(_, read)| read)),
+                transfer.is_err(),
+            ),
         );
+        if transfer.is_err() {
+            opener.abort_all();
+            tokio::time::timeout(H3_WRITER_CANCEL_WATCHDOG, async {
+                while opener.join_next().await.is_some() {}
+            })
+            .await
+            .expect("timed-out padded-record writer must terminate");
+        }
+        let (write_result, read_result) =
+            transfer.expect("padded records must round-trip across DATA boundaries");
         let _client_conn = write_result
+            .expect("writer task must remain owned")
             .unwrap()
             .expect("legal padding must not fail H3 framing");
         read_result.expect("padded records must round-trip across DATA boundaries");
