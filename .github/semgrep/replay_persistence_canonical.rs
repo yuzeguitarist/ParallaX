@@ -39,6 +39,8 @@ fn fsync_parent_dir(
     };
     let dir_file = open()?;
     #[cfg(test)]
+    LAST_FSYNC_PARENT_DIR.with(|last| *last.borrow_mut() = Some(dir.to_path_buf()));
+    #[cfg(test)]
     if matches!(failure, Some(DirectorySyncFailure::Sync)) {
         return Err(io::Error::other("injected directory-sync failure"));
     }
