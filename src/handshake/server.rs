@@ -1109,17 +1109,37 @@ pub async fn handle_connection(
 }
 
 type ReplayCacheKey = (std::path::PathBuf, usize, [u8; 32]);
+type SharedReplayCacheSlot = Arc<Mutex<Option<Arc<Mutex<ReplayCache>>>>>;
 
-fn shared_replay_cache_table() -> &'static Mutex<HashMap<ReplayCacheKey, Arc<Mutex<ReplayCache>>>> {
-    static TABLE: OnceLock<Mutex<HashMap<ReplayCacheKey, Arc<Mutex<ReplayCache>>>>> =
-        OnceLock::new();
+fn shared_replay_cache_table() -> &'static Mutex<HashMap<ReplayCacheKey, SharedReplayCacheSlot>> {
+    static TABLE: OnceLock<Mutex<HashMap<ReplayCacheKey, SharedReplayCacheSlot>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn initialize_shared_replay_cache(
+    slot: SharedReplayCacheSlot,
+    load: impl FnOnce() -> Result<ReplayCache, ReplayCacheError> + Send + 'static,
+) -> Result<Arc<Mutex<ReplayCache>>, HandshakeServerError> {
+    tokio::task::spawn_blocking(move || {
+        // Loading can compact/upgrade the journal. Keep the single-flight lock
+        // inside the blocking task so cancelling its async waiter cannot let a
+        // second loader rewrite the file while the first is still running.
+        let mut initialized = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cache) = initialized.as_ref() {
+            return Ok(Arc::clone(cache));
+        }
+        let cache = Arc::new(Mutex::new(load()?));
+        *initialized = Some(Arc::clone(&cache));
+        Ok::<_, ReplayCacheError>(cache)
+    })
+    .await?
+    .map_err(Into::into)
 }
 
 /// The replay cache for `config.replay_cache_path`. The first caller loads it
 /// on a blocking thread; every later caller with the same path, capacity, and
-/// PSK receives that `Arc`. A second load that loses the race is dropped
-/// before any insert, so it cannot overwrite the winner's journal.
+/// PSK receives that `Arc`. Publish the initialization slot before any load,
+/// since recovery and legacy-format upgrades can rewrite the journal.
 async fn shared_replay_cache(
     config: &ServerConfig,
     psk: &[u8],
@@ -1131,30 +1151,24 @@ async fn shared_replay_cache(
         config.replay_cache_capacity,
         mac.finalize().into(),
     );
-    {
-        let table = shared_replay_cache_table()
+    let slot = {
+        let mut table = shared_replay_cache_table()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(existing) = table.get(&key) {
-            return Ok(Arc::clone(existing));
-        }
-    }
+        Arc::clone(
+            table
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(None))),
+        )
+    };
     let path = config.replay_cache_path.clone();
     let capacity = config.replay_cache_capacity;
     let psk = Zeroizing::new(psk.to_vec());
     let window = replay_freshness_window_secs();
-    let loaded = tokio::task::spawn_blocking(move || {
+    initialize_shared_replay_cache(slot, move || {
         ReplayCache::load_or_create_authenticated_with_window(&path, capacity, &psk, window)
     })
-    .await??;
-    let cache = Arc::new(Mutex::new(loaded));
-    let mut table = shared_replay_cache_table()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match table.entry(key) {
-        std::collections::hash_map::Entry::Occupied(existing) => Ok(Arc::clone(existing.get())),
-        std::collections::hash_map::Entry::Vacant(slot) => Ok(Arc::clone(slot.insert(cache))),
-    }
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8913,8 +8927,11 @@ mod tests {
             &identity_keys,
             dir.path().join("replay.cache"),
         );
-        let first = shared_replay_cache(&config, PSK).await.unwrap();
-        let second = shared_replay_cache(&config, PSK).await.unwrap();
+        let (first, second) = tokio::join!(
+            shared_replay_cache(&config, PSK),
+            shared_replay_cache(&config, PSK)
+        );
+        let (first, second) = (first.unwrap(), second.unwrap());
         assert!(
             Arc::ptr_eq(&first, &second),
             "two direct callers of one path must commit into the same cache"
@@ -8941,6 +8958,86 @@ mod tests {
                 .unwrap(),
             ReplayInsertOutcome::Replayed
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_replay_cache_waiter_does_not_start_a_second_journal_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.cache");
+        let slot: SharedReplayCacheSlot = Arc::new(Mutex::new(None));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_slot = Arc::clone(&slot);
+        let first_loads = Arc::clone(&loads);
+        let first_path = path.clone();
+        let now = current_unix_timestamp().unwrap();
+        let entry = ReplayEntry {
+            timestamp: now,
+            nonce: [19; 8],
+            transcript_fingerprint: [29; 32],
+        };
+        let first_entry = entry.clone();
+        let first = tokio::spawn(initialize_shared_replay_cache(first_slot, move || {
+            first_loads.fetch_add(1, Ordering::SeqCst);
+            let mut cache = ReplayCache::load_or_create_authenticated(&first_path, 8, PSK)?;
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                cache.insert_new_outcome(first_entry, now)?,
+                ReplayInsertOutcome::Inserted
+            );
+            Ok(cache)
+        }));
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_loads = Arc::clone(&loads);
+        let second_path = path.clone();
+        let mut second = tokio::spawn(initialize_shared_replay_cache(slot, move || {
+            second_loads.fetch_add(1, Ordering::SeqCst);
+            ReplayCache::load_or_create_authenticated(&second_path, 8, PSK)
+        }));
+        // The first blocking loader still owns initialization after its waiter
+        // is cancelled. A competing caller must wait rather than load a stale
+        // snapshot that can later compact over the first loader's durable entry.
+        assert!(timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err());
+        release_tx.send(()).unwrap();
+        let cache = timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cache
+                .lock()
+                .unwrap()
+                .insert_new_outcome(entry.clone(), now)
+                .unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+        let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, PSK).unwrap();
+        assert_eq!(
+            reloaded.insert_new_outcome(entry, now).unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_cache_initialization_failure_can_be_retried() {
+        let slot: SharedReplayCacheSlot = Arc::new(Mutex::new(None));
+        assert!(initialize_shared_replay_cache(Arc::clone(&slot), || {
+            Err(ReplayCacheError::Io(io::Error::other("load failure")))
+        })
+        .await
+        .is_err());
+        initialize_shared_replay_cache(slot, || Ok(ReplayCache::new(8)))
+            .await
+            .unwrap();
     }
 
     #[test]

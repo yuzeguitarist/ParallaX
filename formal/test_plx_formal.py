@@ -171,6 +171,22 @@ class FormalModelTests(unittest.TestCase):
                 plx_formal.correspond(root)
         self.assertIn("verify_server_identity_payload_blocking", str(caught.exception))
 
+    def test_correspondence_rejects_unlocked_replay_cache_initialization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative in plx_formal.CORRESPOND_FILES:
+                source = plx_formal.ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(source.read_text())
+            server = root / "src/handshake/server.rs"
+            source = server.read_text()
+            self.assertIn("slot.lock()", source)
+            server.write_text(source.replace("slot.lock()", "unlocked_slot()", 1))
+            with self.assertRaises(plx_formal.FormalError) as caught:
+                plx_formal.correspond(root)
+        self.assertIn("single-flight lock", str(caught.exception))
+
     def test_extract_fn_does_not_bind_a_longer_name(self):
         src = (
             "fn insert_new_outcome_deferred() {\n"

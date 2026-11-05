@@ -3548,10 +3548,25 @@ def correspond(root: Path = ROOT) -> None:
     _order(
         shared,
         (
+            ".entry(key)",
+            "initialize_shared_replay_cache(slot,",
             "load_or_create_authenticated_with_window(",
-            "Entry::Occupied",
         ),
-        "direct callers share one replay cache per path; a losing load is dropped",
+        "direct callers publish one initialization slot before loading the journal",
+        problems,
+    )
+    initialize = _extract_fn(server, "initialize_shared_replay_cache")
+    _order(
+        initialize,
+        (
+            "tokio::task::spawn_blocking(move ||",
+            "slot.lock()",
+            "initialized.as_ref()",
+            "return Ok(Arc::clone(cache))",
+            "load()?",
+            "*initialized = Some(Arc::clone(&cache))",
+        ),
+        "journal load and publication stay under the blocking task's single-flight lock",
         problems,
     )
     commit_fn = _extract_fn(server, "commit_pending_replay_entry")
