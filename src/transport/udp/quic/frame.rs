@@ -17,9 +17,9 @@
 //! `Connection` for it, so origin frames are forwarded byte-for-byte and are never
 //! decoded here. Several behaviors that would be RFC-noncompliant against a real
 //! peer are SOUND ONLY because of this invariant: unknown / GREASE / DATAGRAM frame
-//! types are a hard decode error rather than the RFC 9000 §19.1 "ignore" (a real H3
-//! origin would send these), and 1-RTT key update is not handled on receive (a real
-//! peer key-updates periodically; see `conn.rs`).
+//! types are a hard decode error (a real H3 origin may use negotiated extensions).
+//! Native 1-RTT key updates are handled by `conn.rs` before frame decoding; they
+//! do not extend this codec's supported frame set.
 //!
 //! If a future change ever points this parser at real-origin frames (e.g. lets a
 //! ParallaX QUIC client terminate a genuine H3 connection), these become hard

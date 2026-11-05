@@ -1,0 +1,176 @@
+rules:
+  - id: parallax-exact-padding-capacity
+    languages: [rust]
+    severity: ERROR
+    message: Exact padding must reject u16, TLS and aggregate arithmetic overflow before sealing.
+    patterns:
+      - pattern: 'fn exact_padded_record_capacity(...) { ... }'
+      - pattern-not: |
+          fn exact_padded_record_capacity(...) {
+            if total_pad > u16::MAX as usize { return Err(record::TlsRecordError::PayloadTooLarge(total_pad).into()); }
+            let tls_len = payload_len.checked_add(total_pad).and_then(|len| len.checked_add(PADDING_LEN_FIELD + AEAD_TAG_LEN)).ok_or(record::TlsRecordError::PayloadTooLarge(usize::MAX))?;
+            if tls_len > OUTER_TLS_RECORD_LIMIT { return Err(record::TlsRecordError::PayloadTooLarge(tls_len).into()); }
+            tls_len.checked_add(record::TLS_HEADER_LEN).ok_or(DataRecordError::InvalidExactPadding)
+          }
+  - id: parallax-exact-padding-whole-window
+    languages: [rust]
+    severity: ERROR
+    message: Validate every length and pad, including the last, and the aggregate capacity before changing output or a nonce.
+    patterns:
+      - pattern: 'fn validate_exact_padded_record_lens(...) { ... }'
+      - pattern-not: |
+          fn validate_exact_padded_record_lens(...) {
+            validate_record_lens(record_lens, plaintext_len)?;
+            if record_lens.len() != pad_lens.len() { return Err(DataRecordError::InvalidExactPadding); }
+            record_lens.iter().zip(pad_lens).try_fold(0usize, |total, (&len, &pad)| {
+              total.checked_add(exact_padded_record_capacity(len, pad)?).ok_or(DataRecordError::InvalidExactPadding)
+            })
+          }
+  - id: parallax-exact-padding-batch-preflight
+    languages: [rust]
+    severity: ERROR
+    message: The serial experiment must preflight the complete window and q budget before any output or AEAD; unexpected sealing failures poison the codec.
+    # Whole reviewed method, without body ellipses: retaining a canonical block
+    # cannot hide an additional early seal, output mutation or budget check.
+    patterns:
+      - pattern: 'fn seal_records_into_exact_padded(...) { ... }'
+      - pattern-not: |
+          fn seal_records_into_exact_padded(...) {
+            let reserve = validate_exact_padded_record_lens(record_lens, pad_lens, plaintext.len())?;
+            self.ensure_seal_budget(record_lens.len())?;
+            out.len().checked_add(reserve).ok_or(DataRecordError::InvalidExactPadding)?;
+            out.reserve(reserve);
+            let start = out.len();
+            let mut offset = 0;
+            for (&len, &pad) in record_lens.iter().zip(pad_lens) {
+              if let Err(err) = self.seal_into_exact_padded(&plaintext[offset..offset + len], pad, rng, out) {
+                self.aead.poison();
+                out[start..].zeroize();
+                out.truncate(start);
+                return Err(err);
+              }
+              offset += len;
+            }
+            Ok(())
+          }
+  - id: parallax-owned-signing-key-copy
+    languages: [rust]
+    severity: ERROR
+    message: Borrow the serialized signing key or use a zeroizing owner; do not return a bare private-key array copy.
+    pattern-either:
+      - pattern: 'fn $F(...) -> Result<[u8; SECRETKEYBYTES], $ERR> { ... }'
+      - pattern: 'fn $F(...) -> [u8; SECRETKEYBYTES] { ... }'
+
+  - id: parallax-by-value-array-wipe
+    languages: [rust]
+    severity: ERROR
+    message: A by-value array wipe clears a Copy argument, not the caller's array; borrow the array mutably or use a zeroizing owner.
+    pattern: 'fn $F(mut $KEY: [u8; $N]) { ... $KEY.zeroize(); ... }'
+
+  - id: parallax-record-seal-guard
+    languages: [rust]
+    severity: ERROR
+    message: Record sealing must enter through a boundary with successful top-level budget and padded-length checks before the AEAD call.
+    patterns:
+      - pattern-inside: 'impl DataRecordCodec { ... }'
+      - pattern: '$AEAD.seal_in_place_detached($PLAINTEXT, $AAD)'
+      - pattern-not-inside: |
+          fn $F(...) {
+            self.ensure_seal_budget(1)?;
+            check_padded_len($PLAINTEXT.len())?;
+            ...
+          }
+
+  - id: parallax-record-seal-direction-binding
+    languages: [rust]
+    severity: ERROR
+    message: The record boundary must use the direction's own codec and the same AAD whose length was budgeted.
+    patterns:
+      - pattern-inside: 'impl DataRecordCodec { ... }'
+      - pattern: '$AEAD.seal_in_place_detached($PLAINTEXT, $AAD)'
+      - pattern-not: 'self.aead.seal_in_place_detached($PLAINTEXT, self.aad)'
+
+  - id: parallax-worker-seal-length-guard
+    languages: [rust]
+    severity: ERROR
+    message: Explicit-sequence record sealing needs a successful top-level padded-length check before the AEAD call.
+    patterns:
+      - pattern: 'session::seal_in_place_detached_with($CIPHER, $NONCE, $SEQ, $PLAINTEXT, $AAD)'
+      - pattern-not-inside: |
+          fn $F(...) {
+            check_padded_len($PLAINTEXT.len())?;
+            ...
+          }
+
+  - id: parallax-raw-worker-seal-boundary
+    languages: [rust]
+    severity: ERROR
+    message: The raw explicit-sequence primitive is reserved for seal_worker_payload; a new free-function caller bypasses the batch reservation chain.
+    patterns:
+      - pattern-either:
+          - pattern: '$MODULE::seal_in_place_detached_with'
+          - pattern: 'seal_in_place_detached_with(...)'
+      - pattern-not-inside: 'fn seal_worker_payload(...) { ... }'
+      - pattern-not-inside: 'impl AeadCodec { ... }'
+
+  - id: parallax-record-allocating-seal-bypass
+    languages: [rust]
+    severity: ERROR
+    message: Use the record-layer sealing boundary; a direct allocating AEAD seal bypasses its budget and padded-length checks.
+    patterns:
+      - pattern-inside: 'impl DataRecordCodec { ... }'
+      - pattern-either:
+          - pattern: '$AEAD.seal(...)'
+          - pattern: 'AeadCodec::seal(...)'
+      - pattern-not: 'self.seal(...)'
+
+  - id: parallax-worker-seal-boundary
+    languages: [rust]
+    severity: ERROR
+    message: The explicit-sequence worker boundary may only be called by the bounded record builder.
+    patterns:
+      - pattern: 'seal_worker_payload(...)'
+      - pattern-not-inside: 'fn seal_one_record_into(...) { ... }'
+
+  - id: parallax-record-worker-boundary
+    languages: [rust]
+    severity: ERROR
+    message: Parallel record building may only be called by the reserved-sequence segment driver.
+    patterns:
+      - pattern: 'seal_one_record_into(...)'
+      - pattern-not-inside: 'fn seal_records_segment(...) { ... }'
+
+  - id: parallax-reserve-before-seal-dispatch
+    languages: [rust]
+    severity: ERROR
+    message: Check the complete batch budget and reserve its nonce range before dispatch; never advance only after worker completion.
+    patterns:
+      - pattern-inside: 'impl DataRecordCodec { ... }'
+      - pattern-inside: 'fn seal_records_into_parallel(...) { ... }'
+      - pattern: 'parallel::dispatch_blocking(...)'
+      - pattern-not-inside: |
+          fn seal_records_into_parallel(...) {
+            validate_record_lens($LENS, $PLAINTEXT.len())?;
+            let $N = $LENS.len();
+            self.ensure_seal_budget($N)?;
+            if $N == 0 { return Ok(()); }
+            let $BASE = self.aead.reserve_sequence($N as u64)?;
+            ...
+          }
+
+  - id: parallax-poison-failed-seal-worker
+    languages: [rust]
+    severity: ERROR
+    message: A failed encryption worker must invalidate the codec before propagating its error.
+    patterns:
+      - pattern-inside: 'impl DataRecordCodec { ... }'
+      - pattern-inside: 'fn seal_records_into_parallel(...) { ... }'
+      - pattern: 'return Err($ERR)'
+      - pattern-not-inside: |
+          match $SEGMENT {
+            Ok($VALUE) => $ACTION,
+            Err($ERR) => {
+              self.aead.poison();
+              return Err($ERR);
+            }
+          }

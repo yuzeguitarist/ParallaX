@@ -90,6 +90,8 @@ pub enum ConfigError {
     CoverIntervalTooSmall { min_ms: u16 },
     #[error("traffic.max_concurrent_streams must be at least 1")]
     InvalidMaxConcurrentStreams,
+    #[error("traffic.tcp_mux_record_profile: {0}")]
+    InvalidTcpMuxRecordProfile(&'static str),
     #[error("udp.probe_timeout_ms must be at least 1")]
     InvalidUdpProbeTimeout,
     #[error(
@@ -542,6 +544,24 @@ pub struct ServerConfig {
     pub tcp_congestion: Option<String>,
 }
 
+/// Explicit experiment for the outer TCP mux data phase. It never selects a
+/// profile from a SOCKS target and does not shape QUIC or setup records.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpMuxRecordProfile {
+    Off,
+    CloudflareDynamic,
+}
+
+// Keep the fail-safe default visible to the blocking Rust AST rule: the pinned
+// Semgrep parser does not retain enum-variant #[default] attributes.
+#[allow(clippy::derivable_impls)]
+impl Default for TcpMuxRecordProfile {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TrafficConfig {
@@ -559,6 +579,11 @@ pub struct TrafficConfig {
     pub cover_max_interval_ms: u16,
     #[serde(default = "default_max_concurrent_streams")]
     pub max_concurrent_streams: u8,
+    /// Experimental server TCP mux profile; requires zero padding, jitter and
+    /// cover. Select explicitly for a suitable outer fallback origin. Default
+    /// off preserves the codec's existing maximum record budget.
+    #[serde(default)]
+    pub tcp_mux_record_profile: TcpMuxRecordProfile,
 }
 
 impl Default for TrafficConfig {
@@ -571,6 +596,7 @@ impl Default for TrafficConfig {
             cover_min_interval_ms: default_cover_min_interval_ms(),
             cover_max_interval_ms: default_cover_max_interval_ms(),
             max_concurrent_streams: default_max_concurrent_streams(),
+            tcp_mux_record_profile: TcpMuxRecordProfile::Off,
         }
     }
 }
@@ -1041,6 +1067,13 @@ impl Config {
     pub fn validate_structure(&self) -> Result<(), ConfigError> {
         self.traffic.validate()?;
         self.udp.validate()?;
+        if self.traffic.tcp_mux_record_profile != TcpMuxRecordProfile::Off
+            && self.mode != Mode::Server
+        {
+            return Err(ConfigError::InvalidTcpMuxRecordProfile(
+                "experimental profiles require server mode",
+            ));
+        }
 
         match self.mode {
             Mode::Client => {
@@ -1344,6 +1377,24 @@ pub(crate) fn read_secret_config_file(path: &Path) -> Result<Zeroizing<String>, 
 
 impl TrafficConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.tcp_mux_record_profile != TcpMuxRecordProfile::Off {
+            if self.max_concurrent_streams <= 1 {
+                return Err(ConfigError::InvalidTcpMuxRecordProfile(
+                    "experimental profiles require max_concurrent_streams greater than one",
+                ));
+            }
+            if self.min_padding != 0
+                || self.max_padding != 0
+                || self.min_delay_ms != 0
+                || self.max_delay_ms != 0
+                || self.cover_min_interval_ms != 0
+                || self.cover_max_interval_ms != 0
+            {
+                return Err(ConfigError::InvalidTcpMuxRecordProfile(
+                    "experimental profiles require zero padding, delay and cover",
+                ));
+            }
+        }
         if self.max_padding < self.min_padding {
             return Err(ConfigError::InvalidPaddingRange);
         }
@@ -1848,6 +1899,96 @@ authorized_sni = ["example.com"]
         assert_eq!(traffic.cover_min_interval_ms, 0);
         assert_eq!(traffic.cover_max_interval_ms, 0);
         assert_eq!(traffic.max_concurrent_streams, 4);
+        assert_eq!(traffic.tcp_mux_record_profile, TcpMuxRecordProfile::Off);
+    }
+
+    #[test]
+    fn tcp_mux_record_profile_is_typed_and_rejects_incompatible_traffic() {
+        let omitted: TrafficConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.tcp_mux_record_profile, TcpMuxRecordProfile::Off);
+        let profile: TrafficConfig =
+            toml::from_str("tcp_mux_record_profile = 'cloudflare_dynamic'").unwrap();
+        assert_eq!(
+            profile.tcp_mux_record_profile,
+            TcpMuxRecordProfile::CloudflareDynamic
+        );
+        profile.validate().unwrap();
+        assert!(toml::from_str::<TrafficConfig>("tcp_mux_record_profile = 'automatic'").is_err());
+        let incompatible = [
+            TrafficConfig {
+                max_concurrent_streams: 1,
+                ..profile
+            },
+            TrafficConfig {
+                min_padding: 1,
+                max_padding: 1,
+                ..profile
+            },
+            TrafficConfig {
+                max_padding: 32,
+                ..profile
+            },
+            TrafficConfig {
+                min_delay_ms: 1,
+                max_delay_ms: 1,
+                ..profile
+            },
+            TrafficConfig {
+                max_delay_ms: 3,
+                ..profile
+            },
+            TrafficConfig {
+                cover_min_interval_ms: 50,
+                ..profile
+            },
+            TrafficConfig {
+                cover_max_interval_ms: 50,
+                ..profile
+            },
+        ];
+        for traffic in incompatible {
+            assert!(matches!(
+                traffic.validate(),
+                Err(ConfigError::InvalidTcpMuxRecordProfile(_))
+            ));
+        }
+        TrafficConfig {
+            min_padding: 7,
+            max_padding: 32,
+            max_delay_ms: 3,
+            ..TrafficConfig::default()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn tcp_mux_record_profile_requires_server_mode_but_allows_udp_coexistence() {
+        let identity_secret_key = STANDARD.encode(vec![0; mldsa::secret_key_bytes()]);
+        let raw = format!(
+            r#"
+mode = "server"
+[crypto]
+psk = "{KEY}"
+[traffic]
+tcp_mux_record_profile = "cloudflare_dynamic"
+[udp]
+enabled = true
+[server]
+listen = "127.0.0.1:8443"
+fallback_addr = "example.com:443"
+private_key = "{KEY}"
+identity_secret_key = "{identity_secret_key}"
+authorized_sni = ["example.com"]
+"#
+        );
+        let mut config: Config = toml::from_str(&raw).unwrap();
+        config.validate_structure().unwrap();
+        config.mode = Mode::Client;
+        assert!(matches!(
+            config.validate_structure(),
+            Err(ConfigError::InvalidTcpMuxRecordProfile(_))
+        ));
     }
 
     #[test]

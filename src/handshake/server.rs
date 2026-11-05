@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
@@ -32,11 +32,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::source_limit::SourceLimiter;
 use super::transcript::transcript_hash;
+use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;
 
 use crate::{
     config::{
         decode_base64_secret, decode_key32_secret, decode_psk, Config, ConfigError, Mode,
-        ServerConfig, TrafficConfig, UdpConfig,
+        ServerConfig, TcpMuxRecordProfile, TrafficConfig, UdpConfig,
     },
     crypto::{
         auth::{
@@ -3146,6 +3147,7 @@ async fn run_authenticated_data_mode(
                                     target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
                                     idle_timeout: fallback_idle_timeout(),
                                 },
+                                traffic.tcp_mux_record_profile,
                             )
                             .await;
                         }
@@ -4276,6 +4278,9 @@ impl ServerMuxDownlink {
     /// Creates `stream_id`'s own download queue and hands it to the writer. The
     /// registration is ordered before any frame the substream sends.
     async fn register(&self, stream_id: u32) -> Result<ServerMuxStreamTx, HandshakeServerError> {
+        // Start before registration can wait on a full control queue. Neither
+        // spawning nor target I/O may grant the receipt a fresh delay window.
+        let receipt_deadline = Instant::now() + MUX_CARRIER_SUSPECT_AFTER / 2;
         let (frames, queue) = mpsc::channel(self.stream_queue_depth);
         self.send_control(DownlinkControl::Register(stream_id, queue))
             .await?;
@@ -4283,6 +4288,8 @@ impl ServerMuxDownlink {
             stream_id,
             frames,
             wake: Arc::clone(&self.wake),
+            first_publication: Arc::new(AtomicBool::new(false)),
+            receipt_deadline,
         })
     }
 
@@ -4316,19 +4323,74 @@ struct ServerMuxStreamTx {
     stream_id: u32,
     frames: mpsc::Sender<MuxFrame>,
     wake: Arc<Notify>,
+    first_publication: Arc<AtomicBool>,
+    receipt_deadline: Instant,
+}
+
+/// Linearization point for the first queued response/receipt. Queue capacity
+/// must already be reserved and publication must follow without another await.
+fn claim_mux_publication(first_publication: &AtomicBool) -> bool {
+    !first_publication.swap(true, Ordering::AcqRel)
+}
+
+#[cfg(kani)]
+mod mux_receipt_proofs {
+    use super::*;
+
+    // The actual atomic claim used after queue reservation. This proves two
+    // sequential claims/monotonicity, not Tokio queue or concurrent scheduling.
+    #[kani::proof]
+    fn first_publication_can_be_claimed_only_once() {
+        let receipt_delay = MUX_CARRIER_SUSPECT_AFTER / 2;
+        assert!(receipt_delay > Duration::ZERO && receipt_delay < MUX_CARRIER_SUSPECT_AFTER);
+        let initial: bool = kani::any();
+        let state = AtomicBool::new(initial);
+        assert_eq!(claim_mux_publication(&state), !initial);
+        assert!(!claim_mux_publication(&state));
+        assert!(state.load(Ordering::Acquire));
+    }
 }
 
 impl ServerMuxStreamTx {
     async fn send(&self, kind: MuxFrameKind, payload: Vec<u8>) -> Result<(), HandshakeServerError> {
-        self.frames
-            .send(MuxFrame {
-                stream_id: self.stream_id,
-                kind,
-                payload,
-            })
+        let permit = self
+            .frames
+            .reserve()
             .await
             .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+        if matches!(
+            kind,
+            MuxFrameKind::Data | MuxFrameKind::Fin | MuxFrameKind::Reset
+        ) {
+            claim_mux_publication(&self.first_publication);
+        }
+        // Ordinary frames are NEVER suppressed by the receipt claim result.
+        permit.send(MuxFrame {
+            stream_id: self.stream_id,
+            kind,
+            payload,
+        });
         self.wake.notify_one();
+        Ok(())
+    }
+
+    async fn send_receipt_if_unanswered(&self) -> Result<(), HandshakeServerError> {
+        if self.first_publication.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let permit = self
+            .frames
+            .reserve()
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+        if claim_mux_publication(&self.first_publication) {
+            permit.send(MuxFrame {
+                stream_id: self.stream_id,
+                kind: MuxFrameKind::Data,
+                payload: Vec::new(),
+            });
+            self.wake.notify_one();
+        }
         Ok(())
     }
 
@@ -4344,6 +4406,25 @@ impl Drop for ServerMuxStreamTx {
     /// and — with the reader gone too — flushes and shuts the client write down.
     fn drop(&mut self) {
         self.wake.notify_one();
+    }
+}
+
+/// Both complete futures stay polled while a receipt waits for queue capacity.
+/// One timer lives in the existing supervisor; cancellation drops both futures.
+async fn with_mux_open_receipt(downlink: &ServerMuxStreamTx, upstream: impl Future<Output = ()>) {
+    let receipt = async {
+        sleep_until(downlink.receipt_deadline).await;
+        downlink.send_receipt_if_unanswered().await
+    };
+    tokio::pin!(upstream, receipt);
+    tokio::select! {
+        biased;
+        _ = &mut upstream => {}
+        result = &mut receipt => {
+            if result.is_ok() {
+                upstream.await;
+            }
+        }
     }
 }
 
@@ -4477,102 +4558,98 @@ async fn server_mux_upstream_task(
     ctx: ServerMuxStreamContext,
     payload_pool: MuxPayloadPool,
 ) {
-    // The decrypted request is already scrub-on-drop before this task is spawned;
-    // copy out the target + initial payload (also scrub-on-drop) so the request
-    // buffer is dropped (scrubbed) before the connect await.
-    let (target_addr, target_source, initial) = match resolve_connect_target(
-        connect_payload.as_mut_slice(),
-        ctx.fixed_data_target.as_deref(),
-    ) {
-        Ok((addr, source, initial)) => (addr, source, Zeroizing::new(initial.to_vec())),
-        Err(_) => {
-            tracing::debug!(
-                cid = ctx.cid,
-                stream_id,
-                "mux connect target resolve failed; resetting stream"
-            );
-            let _ = downlink.reset().await;
-            return;
-        }
-    };
-    drop(connect_payload);
-    crate::process_hardening::exclude_from_core_dump("mux.upstream.initial_payload", &initial);
-
-    // Confirm receipt before any target I/O: a slow DNS/connect/write or a target
-    // that delays its first response says nothing about the carrier's liveness.
-    // Empty Data is already legal and delivers no bytes to the local app.
-    if downlink.send(MuxFrameKind::Data, Vec::new()).await.is_err() {
-        return;
-    }
-
-    let mut target = match connect_outbound_target(&target_addr, target_source).await {
-        Ok(target) => target,
-        Err(_) => {
-            tracing::debug!(
-                cid = ctx.cid,
-                stream_id,
-                "mux outbound connect failed; resetting stream"
-            );
-            let _ = downlink.reset().await;
-            return;
-        }
-    };
-    if tune_tcp_stream(&target).is_err() {
-        tracing::debug!(
-            cid = ctx.cid,
-            stream_id,
-            "mux target tune failed; resetting stream"
-        );
-        let _ = downlink.reset().await;
-        return;
-    }
-    if !initial.is_empty() {
-        match timeout(ctx.target_write_timeout, target.write_all(&initial)).await {
-            Ok(Ok(())) => {}
-            _ => {
+    let upstream = async {
+        // The decrypted request is already scrub-on-drop before this task is spawned;
+        // copy out the target + initial payload (also scrub-on-drop) so the request
+        // buffer is dropped (scrubbed) before the connect await.
+        let (target_addr, target_source, initial) = match resolve_connect_target(
+            connect_payload.as_mut_slice(),
+            ctx.fixed_data_target.as_deref(),
+        ) {
+            Ok((addr, source, initial)) => (addr, source, Zeroizing::new(initial.to_vec())),
+            Err(_) => {
                 tracing::debug!(
                     cid = ctx.cid,
                     stream_id,
-                    "mux target initial-payload write failed/stalled; resetting stream"
+                    "mux connect target resolve failed; resetting stream"
                 );
                 let _ = downlink.reset().await;
                 return;
             }
-        }
-    }
-    drop(initial);
+        };
+        drop(connect_payload);
+        crate::process_hardening::exclude_from_core_dump("mux.upstream.initial_payload", &initial);
 
-    let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
-    let (target_read, target_write) = target.into_split();
-    let reader = server_mux_target_reader_loop(
-        target_read,
-        downlink.clone(),
-        stream_id,
-        ctx.timing,
-        ctx.chunk_size,
-        ctx.cid,
-        payload_pool,
-        activity.clone(),
-    );
-    let writer = server_mux_upload_drain(
-        upload_rx,
-        target_write,
-        stream_id,
-        ctx.cid,
-        ctx.target_write_timeout,
-        &downlink,
-        activity.clone(),
-    );
-    // Run both directions; an error in either drops the other's half of the target
-    // socket. Half-close (client Fin) resolves `writer` Ok while `reader` keeps
-    // streaming the target back until its EOF.
-    tokio::select! {
-        _ = async { tokio::try_join!(reader, writer) } => {}
-        _ = relay_idle_watchdog(activity, ctx.idle_timeout) => {
-            tracing::debug!(cid = ctx.cid, stream_id, "mux target idle backstop reached");
-            let _ = downlink.send(MuxFrameKind::Fin, Vec::new()).await;
+        let mut target = match connect_outbound_target(&target_addr, target_source).await {
+            Ok(target) => target,
+            Err(_) => {
+                tracing::debug!(
+                    cid = ctx.cid,
+                    stream_id,
+                    "mux outbound connect failed; resetting stream"
+                );
+                let _ = downlink.reset().await;
+                return;
+            }
+        };
+        if tune_tcp_stream(&target).is_err() {
+            tracing::debug!(
+                cid = ctx.cid,
+                stream_id,
+                "mux target tune failed; resetting stream"
+            );
+            let _ = downlink.reset().await;
+            return;
         }
-    }
+        if !initial.is_empty() {
+            match timeout(ctx.target_write_timeout, target.write_all(&initial)).await {
+                Ok(Ok(())) => {}
+                _ => {
+                    tracing::debug!(
+                        cid = ctx.cid,
+                        stream_id,
+                        "mux target initial-payload write failed/stalled; resetting stream"
+                    );
+                    let _ = downlink.reset().await;
+                    return;
+                }
+            }
+        }
+        drop(initial);
+
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let (target_read, target_write) = target.into_split();
+        let reader = server_mux_target_reader_loop(
+            target_read,
+            downlink.clone(),
+            stream_id,
+            ctx.timing,
+            ctx.chunk_size,
+            ctx.cid,
+            payload_pool,
+            activity.clone(),
+        );
+        let writer = server_mux_upload_drain(
+            upload_rx,
+            target_write,
+            stream_id,
+            ctx.cid,
+            ctx.target_write_timeout,
+            &downlink,
+            activity.clone(),
+        );
+        // Run both directions; an error in either drops the other's half of the target
+        // socket. Half-close (client Fin) resolves `writer` Ok while `reader` keeps
+        // streaming the target back until its EOF.
+        tokio::select! {
+            _ = async { tokio::try_join!(reader, writer) } => {}
+            _ = relay_idle_watchdog(activity, ctx.idle_timeout) => {
+                tracing::debug!(cid = ctx.cid, stream_id, "mux target idle backstop reached");
+                let _ = downlink.send(MuxFrameKind::Fin, Vec::new()).await;
+            }
+        }
+    };
+    with_mux_open_receipt(&downlink, upstream).await;
 }
 
 /// Drains a substream's client->target upload channel to its target socket, OFF the
@@ -5001,6 +5078,7 @@ async fn run_authenticated_mux_data_mode(
     server_seal: DataRecordCodec,
     first_frames: Vec<MuxFrame>,
     context: ServerMuxContext<'_>,
+    record_profile: TcpMuxRecordProfile,
 ) -> Result<(), HandshakeServerError> {
     tracing::info!(cid = context.cid, "ParallaX mux data mode started");
     let (downlink, scheduler) = server_mux_downlink(context.max_streams);
@@ -5024,6 +5102,7 @@ async fn run_authenticated_mux_data_mode(
         payload_pool,
         context.idle_timeout,
         activity,
+        record_profile,
     );
     let ((), ()) = tokio::try_join!(reader, writer)?;
     Ok(())
@@ -5696,6 +5775,52 @@ async fn shed_server_mux_substream(
     downlink.reset_unregistered(stream_id).await
 }
 
+/// Nominal deadline for retaining an incomplete TCP mux payload. Full payloads
+/// bypass this timer. Timer resolution/scheduling, queue backpressure and
+/// explicitly configured jitter are separate from this intentional hold.
+const SERVER_MUX_TAIL_HOLD: Duration = Duration::from_millis(5);
+
+fn mux_tail_append_len(buffered: usize, available: usize, capacity: usize) -> usize {
+    available.min(capacity - buffered)
+}
+
+async fn flush_server_mux_tail(
+    downlink: &ServerMuxStreamTx,
+    payload_pool: &MuxPayloadPool,
+    tail: &mut Vec<u8>,
+    deadline: &mut Option<Instant>,
+) -> Result<(), HandshakeServerError> {
+    *deadline = None;
+    if !tail.is_empty() {
+        let payload = std::mem::replace(tail, payload_pool.take());
+        downlink.send(MuxFrameKind::Data, payload).await?;
+    }
+    Ok(())
+}
+
+#[cfg(kani)]
+mod mux_tail_proofs {
+    use super::mux_tail_append_len;
+
+    // This is the actual append/slice plan used below, not a proof of Tokio's
+    // scheduling, the deadline, or network delivery latency.
+    #[kani::proof]
+    fn append_plan_bounds_capacity_and_makes_progress() {
+        let capacity: usize = kani::any();
+        kani::assume(capacity > 0);
+        let buffered: usize = kani::any();
+        kani::assume(buffered < capacity);
+        let available: usize = kani::any();
+        let take = mux_tail_append_len(buffered, available, capacity);
+        assert!(take <= available);
+        assert!(buffered + take <= capacity);
+        assert!(available == 0 || take > 0);
+        if available >= capacity - buffered {
+            assert_eq!(buffered + take, capacity);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn server_mux_target_reader_loop(
     mut target_read: OwnedReadHalf,
@@ -5715,10 +5840,31 @@ async fn server_mux_target_reader_loop(
     }
     let mut target_buf = vec![0_u8; relay_read_buffer_len(max_payload_len)];
     let mut rng = StdRng::from_entropy();
+    let mut tail = payload_pool.take();
+    let mut tail_deadline = None;
     loop {
         // The supervisor bounds silence across BOTH target directions. A
         // per-read timeout would truncate a sustained upload-only stream.
-        let n = match target_read.read(&mut target_buf).await {
+        // Only a nonempty tail has a deadline. Check it before polling ready
+        // reads too, so a continuously readable peer cannot postpone the flush.
+        let read = if let Some(deadline) = tail_deadline {
+            if Instant::now() >= deadline {
+                flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline)
+                    .await?;
+                continue;
+            }
+            match timeout_at(deadline, target_read.read(&mut target_buf)).await {
+                Ok(read) => read,
+                Err(_) => {
+                    flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline)
+                        .await?;
+                    continue;
+                }
+            }
+        } else {
+            target_read.read(&mut target_buf).await
+        };
+        let n = match read {
             Ok(n) => n,
             Err(err) => {
                 // Target read failed: tell the client to tear down this substream
@@ -5729,9 +5875,12 @@ async fn server_mux_target_reader_loop(
             }
         };
         if n == 0 {
+            flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline).await?;
             downlink.send(MuxFrameKind::Fin, Vec::new()).await?;
+            payload_pool.put(tail);
             return Ok(());
         }
+        let received_at = Instant::now();
         bump_relay_activity(&activity);
         let n = match drain_ready_tcp_read(&target_read, &mut target_buf, n) {
             Ok(n) => n,
@@ -5746,16 +5895,45 @@ async fn server_mux_target_reader_loop(
         if !delay.is_zero() {
             sleep(delay).await;
         }
-        for chunk in target_buf[..n].chunks(max_payload_len) {
-            downlink
-                .send(MuxFrameKind::Data, payload_pool.take_filled(chunk))
-                .await?;
+        // Explicit jitter retains its original per-read send behavior. The
+        // default zero-timing path coalesces only an incomplete payload, without
+        // delaying full records or adding padding.
+        if timing.is_enabled() {
+            for chunk in target_buf[..n].chunks(max_payload_len) {
+                downlink
+                    .send(MuxFrameKind::Data, payload_pool.take_filled(chunk))
+                    .await?;
+            }
+        } else {
+            let mut input = &target_buf[..n];
+            while !input.is_empty() {
+                if tail.is_empty() && input.len() >= max_payload_len {
+                    downlink
+                        .send(
+                            MuxFrameKind::Data,
+                            payload_pool.take_filled(&input[..max_payload_len]),
+                        )
+                        .await?;
+                    input = &input[max_payload_len..];
+                    continue;
+                }
+                if tail.is_empty() {
+                    tail_deadline = Some(received_at + SERVER_MUX_TAIL_HOLD);
+                }
+                let take = mux_tail_append_len(tail.len(), input.len(), max_payload_len);
+                tail.extend_from_slice(&input[..take]);
+                input = &input[take..];
+                if tail.len() == max_payload_len {
+                    flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline)
+                        .await?;
+                }
+            }
         }
         tracing::trace!(
             cid,
             stream_id,
             bytes = n,
-            "queued server mux download payload"
+            "read server mux download payload"
         );
     }
 }
@@ -5763,8 +5941,8 @@ async fn server_mux_target_reader_loop(
 /// Writes the mux connection's download path: substream frames served
 /// round-robin by `downlink` (see [`ServerMuxDownlink`]), plus cover frames.
 ///
-/// Item #3b: bound every client-facing write. The batched writer does one
-/// `write_records` await per batch; with no bound, an authenticated client that
+/// Item #3b: bound every client-facing write window. One scheduler input batch
+/// may require several windows; with no bound, an authenticated client that
 /// stops reading wedges that write once its kernel receive buffer fills, pinning
 /// this session, every substream queue, and every relayed target fd for the life
 /// of the process (dropping the frame senders never wakes a task already parked
@@ -5784,6 +5962,7 @@ async fn server_mux_writer_loop<W>(
     payload_pool: MuxPayloadPool,
     idle: Duration,
     activity: RelayActivity,
+    record_profile: TcpMuxRecordProfile,
 ) -> Result<(), HandshakeServerError>
 where
     W: LegWriter,
@@ -5792,6 +5971,7 @@ where
     let mut rng = StdRng::from_entropy();
     let mut cover_sleep = Box::pin(sleep(cover.sample_interval(&mut rng)));
     let mut batch = Vec::with_capacity(SERVER_MUX_FRAME_BATCH_LIMIT);
+    let mut record_budget = MuxRecordBudget::new(record_profile);
     // While set and in the future, the client link is the bottleneck: write
     // fair-sized batches (see `SERVER_MUX_FAIR_BATCH_BYTES`).
     let mut link_bound_until: Option<Instant> = None;
@@ -5848,24 +6028,18 @@ where
             continue;
         }
 
-        let waited = match timeout(
-            idle,
-            write_server_mux_frames_batched(
-                &mut client_write,
-                &mut server_seal,
-                &mut batch,
-                &mut rng,
-                &mut seal_scratch,
-                RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
-                &payload_pool,
-            ),
+        let waited = write_server_mux_frames_planned(
+            &mut client_write,
+            &mut server_seal,
+            &mut batch,
+            &mut rng,
+            &mut seal_scratch,
+            RelayWriteLog::new(cid, "server->client", "server-mux-writer"),
+            &payload_pool,
+            &mut record_budget,
+            (idle, Some(&activity)),
         )
-        .await
-        {
-            Ok(res) => res?,
-            Err(_) => return Err(shed_mux_writer_on_stalled_client(cid)),
-        };
-        bump_relay_activity(&activity);
+        .await?;
         if waited >= SERVER_MUX_LINK_BOUND_WAIT {
             link_bound_until = Some(Instant::now() + SERVER_MUX_LINK_BOUND_HOLD);
         }
@@ -5909,11 +6083,351 @@ where
     .await
 }
 
-/// Encodes `frames` (drained, in order) into frame-aligned plaintext records
-/// (one record per `max_plaintext_len` window), then seals the whole batch —
-/// inline for small batches, fanned out across the shared crypto pool for bulk
-/// — and writes the records in order with a single socket write. Returns how
-/// long that write waited for socket space (the link-bottleneck signal).
+/// The experimental profile follows the public Cloudflare dynamic-record patch:
+/// counter >40 / >80 selects the next stage, and idle >1000ms resets it. Starting
+/// from zero therefore emits 41 small records, then 40 medium records. This
+/// counter covers only the mux data phase, never guessed setup records or a
+/// claim about the actual origin's deployed implementation.
+/// https://github.com/cloudflare/sslconfig/blob/master/patches/nginx__dynamic_tls_records.patch
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MuxRecordBudget {
+    profile: TcpMuxRecordProfile,
+    records_sent: u64,
+    last_write: Option<Instant>,
+}
+
+impl MuxRecordBudget {
+    fn new(profile: TcpMuxRecordProfile) -> Self {
+        Self {
+            profile,
+            records_sent: 0,
+            last_write: None,
+        }
+    }
+
+    fn for_write(self, now: Instant) -> Self {
+        let mut next = self;
+        if next.profile == TcpMuxRecordProfile::CloudflareDynamic
+            && next
+                .last_write
+                .is_some_and(|last| now.duration_since(last) > Duration::from_millis(1000))
+        {
+            next.records_sent = 0;
+        }
+        next
+    }
+
+    fn plaintext_limit(self, codec_max: usize) -> usize {
+        // ParallaX adds a two-byte trailer and 16-byte tag, not normal TLS's
+        // one-byte inner type. Budgets are TLS payload lengths, excluding header.
+        const CODEC_OVERHEAD: usize = 18;
+        match self.profile {
+            TcpMuxRecordProfile::Off => codec_max,
+            TcpMuxRecordProfile::CloudflareDynamic if self.records_sent > 80 => codec_max,
+            TcpMuxRecordProfile::CloudflareDynamic if self.records_sent > 40 => {
+                codec_max.min(4246 - CODEC_OVERHEAD)
+            }
+            TcpMuxRecordProfile::CloudflareDynamic => codec_max.min(1386 - CODEC_OVERHEAD),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct MuxFrameCursor {
+    frame: usize,
+    offset: usize,
+}
+
+impl MuxFrameCursor {
+    fn advance(&mut self, payload_len: usize, take: usize) {
+        self.offset += take;
+        if self.offset == payload_len {
+            self.frame += 1;
+            self.offset = 0;
+        }
+    }
+}
+
+/// A generic capacity rule: split an at-most-half-full final tail evenly over
+/// the final two pieces. No producer/packet length or handshake bucket is used.
+fn mux_record_data_piece_len(remaining: usize, capacity: usize) -> usize {
+    if remaining <= capacity {
+        remaining
+    } else if remaining - capacity <= capacity / 2 {
+        remaining.div_ceil(2)
+    } else {
+        capacity
+    }
+}
+
+/// Exact padding is confined to the explicit profile's records containing real
+/// Data. Off still uses its normal codec padding; control-only records are not
+/// inflated. Return both the suffix length and checked TLS wire length.
+fn mux_record_padding_plan(
+    profile: TcpMuxRecordProfile,
+    has_positive_data: bool,
+    plaintext_len: usize,
+    limit: usize,
+) -> Option<(usize, usize)> {
+    if plaintext_len == 0 || plaintext_len > limit {
+        return None;
+    }
+    let pad = if profile == TcpMuxRecordProfile::CloudflareDynamic && has_positive_data {
+        limit.checked_sub(plaintext_len)?
+    } else {
+        0
+    };
+    if pad > u16::MAX as usize {
+        return None;
+    }
+    let tls_len = plaintext_len.checked_add(pad)?.checked_add(18)?;
+    if tls_len > crate::protocol::data::OUTER_TLS_RECORD_LIMIT {
+        return None;
+    }
+    Some((pad, tls_len.checked_add(TLS_HEADER_LEN)?))
+}
+
+fn ready_mux_data_run(
+    frames: &[MuxFrame],
+    cursor: MuxFrameCursor,
+) -> Result<(usize, usize), MuxFrameError> {
+    let stream_id = frames[cursor.frame].stream_id;
+    let mut end = cursor.frame;
+    let mut bytes = 0usize;
+    while let Some(frame) = frames.get(end) {
+        if frame.kind != MuxFrameKind::Data || frame.stream_id != stream_id {
+            break;
+        }
+        let offset = if end == cursor.frame {
+            cursor.offset
+        } else {
+            0
+        };
+        bytes = bytes
+            .checked_add(frame.payload.len() - offset)
+            .ok_or(MuxFrameError::PayloadTooLong)?;
+        end += 1;
+    }
+    Ok((end, bytes))
+}
+
+fn encode_mux_data_piece(
+    out: &mut Vec<u8>,
+    frames: &[MuxFrame],
+    cursor: &mut MuxFrameCursor,
+    mut remaining: usize,
+) -> Result<(), MuxFrameError> {
+    let stream_id = frames[cursor.frame].stream_id;
+    let payload_len = u32::try_from(remaining).map_err(|_| MuxFrameError::PayloadTooLong)?;
+    MuxFrame::encode_borrowed_into(stream_id, MuxFrameKind::Data, &[], out)?;
+    let header_end = out.len();
+    while remaining > 0 {
+        let frame = frames
+            .get(cursor.frame)
+            .ok_or(MuxFrameError::InvalidPayloadLength)?;
+        if frame.kind != MuxFrameKind::Data || frame.stream_id != stream_id {
+            return Err(MuxFrameError::InvalidPayloadLength);
+        }
+        let available = frame.payload.len() - cursor.offset;
+        let take = remaining.min(available);
+        out.extend_from_slice(&frame.payload[cursor.offset..cursor.offset + take]);
+        remaining -= take;
+        cursor.advance(frame.payload.len(), take);
+    }
+    // The final four bytes of the validated mux header carry its payload length.
+    out[header_end - 4..header_end].copy_from_slice(&payload_len.to_be_bytes());
+    crate::process_hardening::exclude_transient_from_core_dump("mux_frame.payload", out.as_slice());
+    Ok(())
+}
+
+fn mux_record_capacity_error(len: usize) -> HandshakeServerError {
+    HandshakeServerError::DataRecord(
+        crate::tls::record::TlsRecordError::PayloadTooLarge(len).into(),
+    )
+}
+
+#[cfg(kani)]
+mod mux_record_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn exact_padding_is_profile_scoped_and_the_record_always_fits() {
+        let profile = if kani::any() {
+            TcpMuxRecordProfile::Off
+        } else {
+            TcpMuxRecordProfile::CloudflareDynamic
+        };
+        let has_data: bool = kani::any();
+        let len: usize = kani::any();
+        let limit: usize = kani::any();
+        let should_pad = profile == TcpMuxRecordProfile::CloudflareDynamic && has_data;
+        let target = if should_pad { limit } else { len };
+        let permitted = len > 0
+            && len <= limit
+            && target as u128 + 18 <= crate::protocol::data::OUTER_TLS_RECORD_LIMIT as u128;
+        let result = mux_record_padding_plan(profile, has_data, len, limit);
+        assert_eq!(result.is_some(), permitted);
+        if let Some((pad, wire_len)) = result {
+            assert!(wire_len <= crate::protocol::data::OUTER_TLS_RECORD_LIMIT + TLS_HEADER_LEN);
+            assert_eq!(
+                len as u128 + pad as u128 + 18 + TLS_HEADER_LEN as u128,
+                wire_len as u128
+            );
+            if should_pad {
+                assert_eq!(len.checked_add(pad), Some(limit));
+            } else {
+                assert_eq!(pad, 0);
+            }
+        }
+    }
+
+    // Actual production arithmetic/state transitions. These do not model Tokio,
+    // AEAD, OS writes or the complete encoder; wire-order tests cover encoding.
+    #[kani::proof]
+    fn data_piece_is_bounded_positive_and_balances_the_final_pair() {
+        let remaining: usize = kani::any();
+        let capacity: usize = kani::any();
+        kani::assume(remaining > 0 && capacity > 0);
+        let take = mux_record_data_piece_len(remaining, capacity);
+        assert!(take > 0 && take <= remaining && take <= capacity);
+        if remaining > capacity && remaining - capacity <= capacity / 2 {
+            assert!(take.abs_diff(remaining - take) <= 1);
+        }
+    }
+
+    #[kani::proof]
+    fn cursor_consumes_exactly_the_selected_prefix_without_skipping_frames() {
+        let frame: usize = kani::any();
+        let offset: usize = kani::any();
+        let payload_len: usize = kani::any();
+        let remaining: usize = kani::any();
+        kani::assume(frame < usize::MAX && offset <= payload_len && remaining > 0);
+        let take = remaining.min(payload_len - offset);
+        let mut cursor = MuxFrameCursor { frame, offset };
+        cursor.advance(payload_len, take);
+        if offset + take == payload_len {
+            assert_eq!(cursor.frame, frame + 1);
+            assert_eq!(cursor.offset, 0);
+        } else {
+            assert_eq!(cursor.frame, frame);
+            assert_eq!(cursor.offset, offset + take);
+            assert!(cursor.offset > offset && cursor.offset < payload_len);
+        }
+    }
+
+    #[kani::proof]
+    fn profile_plaintext_budget_stays_inside_codec_and_outer_record_limits() {
+        let profile = if kani::any() {
+            TcpMuxRecordProfile::Off
+        } else {
+            TcpMuxRecordProfile::CloudflareDynamic
+        };
+        let records_sent: u64 = kani::any();
+        let codec_max: usize = kani::any();
+        kani::assume((14..=max_plaintext_len(0)).contains(&codec_max));
+        let budget = MuxRecordBudget {
+            profile,
+            records_sent,
+            last_write: None,
+        };
+        let limit = budget.plaintext_limit(codec_max);
+        assert!(limit >= 14 && limit <= codec_max);
+        assert!(limit + 18 <= crate::protocol::data::OUTER_TLS_RECORD_LIMIT);
+        if profile == TcpMuxRecordProfile::Off {
+            assert_eq!(limit, codec_max);
+        }
+    }
+}
+
+/// Consume only the scheduler's already-ready batch. Original payloads remain
+/// owned by `frames`; the cursor borrows slices, never allocates a Vec per piece.
+/// At most 64 complete plaintext records are staged before a seal/write.
+fn plan_ready_mux_records(
+    frames: &[MuxFrame],
+    cursor: &mut MuxFrameCursor,
+    scratch: &mut RelaySealScratch,
+    budget: &mut MuxRecordBudget,
+    codec_max: usize,
+) -> Result<(), HandshakeServerError> {
+    scratch.plaintext_buf.clear();
+    scratch.record_lens.clear();
+    scratch.exact_pad_lens.clear();
+    let mut window_wire_bytes = 0usize;
+    let header_len = MuxFrame::encoded_len(0)?;
+    while cursor.frame < frames.len() && scratch.record_lens.len() < SERVER_MUX_FRAME_BATCH_LIMIT {
+        let limit = budget.plaintext_limit(codec_max);
+        if budget.profile == TcpMuxRecordProfile::CloudflareDynamic {
+            // Conservative experiment policy: even fast links use <=64KiB
+            // padded-wire windows. This bounds ONE write, not end-to-end
+            // scheduler fairness. A maximum legal record always fits alone.
+            let (_, maximum_wire_len) = mux_record_padding_plan(budget.profile, true, 1, limit)
+                .ok_or_else(|| mux_record_capacity_error(limit))?;
+            let next_wire_bound = window_wire_bytes
+                .checked_add(maximum_wire_len)
+                .ok_or_else(|| mux_record_capacity_error(usize::MAX))?;
+            if next_wire_bound > SERVER_MUX_FAIR_BATCH_BYTES {
+                break;
+            }
+        }
+        let record_start = scratch.plaintext_buf.len();
+        let mut has_positive_data = false;
+        while cursor.frame < frames.len() {
+            let used = scratch.plaintext_buf.len() - record_start;
+            let room = limit - used;
+            let frame = &frames[cursor.frame];
+            if frame.kind == MuxFrameKind::Data {
+                let (run_end, run_bytes) = ready_mux_data_run(frames, *cursor)?;
+                if run_bytes > 0 {
+                    if room <= header_len {
+                        if used == 0 {
+                            return Err(mux_record_capacity_error(header_len + 1));
+                        }
+                        break;
+                    }
+                    has_positive_data = true;
+                    let take = mux_record_data_piece_len(run_bytes, room - header_len);
+                    encode_mux_data_piece(&mut scratch.plaintext_buf, frames, cursor, take)?;
+                    if take < run_bytes {
+                        break;
+                    }
+                    // Empty Data ACKs adjacent to real data share that Data frame.
+                    cursor.frame = run_end;
+                    cursor.offset = 0;
+                    continue;
+                }
+            }
+            let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
+            if frame_len > limit {
+                return Err(mux_record_capacity_error(frame_len));
+            }
+            if frame_len > room {
+                break;
+            }
+            frame.encode_into(&mut scratch.plaintext_buf)?;
+            cursor.frame += 1;
+        }
+        let len = scratch.plaintext_buf.len() - record_start;
+        if len == 0 || len > limit {
+            return Err(mux_record_capacity_error(len));
+        }
+        let (pad, wire_len) =
+            mux_record_padding_plan(budget.profile, has_positive_data, len, limit)
+                .ok_or_else(|| mux_record_capacity_error(len))?;
+        if budget.profile == TcpMuxRecordProfile::CloudflareDynamic {
+            window_wire_bytes = window_wire_bytes
+                .checked_add(wire_len)
+                .filter(|&bytes| bytes <= SERVER_MUX_FAIR_BATCH_BYTES)
+                .ok_or_else(|| mux_record_capacity_error(usize::MAX))?;
+            scratch.exact_pad_lens.push(pad);
+        }
+        scratch.record_lens.push(len);
+        budget.records_sent = budget.records_sent.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Default/benchmark entry point. Record boundaries depend on ready bytes and
+/// codec capacity, rather than preserving each producer frame boundary.
 pub(crate) async fn write_server_mux_frames_batched<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,
@@ -5927,6 +6441,38 @@ where
     W: LegWriter,
     R: Rng + rand::RngCore + ?Sized,
 {
+    let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::Off);
+    write_server_mux_frames_planned(
+        writer,
+        codec,
+        frames,
+        rng,
+        scratch,
+        log,
+        payload_pool,
+        &mut budget,
+        (fallback_idle_timeout(), None),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_server_mux_frames_planned<W, R>(
+    writer: &mut W,
+    codec: &mut DataRecordCodec,
+    frames: &mut Vec<MuxFrame>,
+    rng: &mut R,
+    scratch: &mut RelaySealScratch,
+    log: RelayWriteLog,
+    payload_pool: &MuxPayloadPool,
+    budget: &mut MuxRecordBudget,
+    write_policy: (Duration, Option<&RelayActivity>),
+) -> Result<Duration, HandshakeServerError>
+where
+    W: LegWriter,
+    R: Rng + rand::RngCore + ?Sized,
+{
+    let (idle, activity) = write_policy;
     let max_plaintext_len = codec.max_plaintext_len();
     if max_plaintext_len == 0 {
         return Err(HandshakeServerError::DataRecord(
@@ -5937,50 +6483,59 @@ where
         return Ok(Duration::ZERO);
     }
 
-    // Phase A: encode the frames into frame-aligned plaintext records, tracking
-    // each record's length so the record boundaries are fixed before sealing.
-    scratch.plaintext_buf.clear();
-    scratch.record_lens.clear();
-    let mut record_plaintext_len = 0;
-    for frame in frames.drain(..) {
-        let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
-        if record_plaintext_len > 0 && record_plaintext_len + frame_len > max_plaintext_len {
-            scratch.record_lens.push(record_plaintext_len);
-            record_plaintext_len = 0;
-        }
-        record_plaintext_len += encode_server_mux_frame(
-            &mut scratch.plaintext_buf,
-            frame,
+    let mut cursor = MuxFrameCursor::default();
+    let mut waited = Duration::ZERO;
+    while cursor.frame < frames.len() {
+        let mut planned_budget = budget.for_write(Instant::now());
+        plan_ready_mux_records(
+            frames,
+            &mut cursor,
+            scratch,
+            &mut planned_budget,
             max_plaintext_len,
-            payload_pool,
         )?;
+        scratch.records_buf.clear();
+        if planned_budget.profile == TcpMuxRecordProfile::CloudflareDynamic {
+            codec.seal_records_into_exact_padded(
+                &scratch.plaintext_buf,
+                &scratch.record_lens,
+                &scratch.exact_pad_lens,
+                rng,
+                &mut scratch.records_buf,
+            )?;
+        } else if should_parallelize_aead(scratch.record_lens.len(), scratch.plaintext_buf.len()) {
+            codec.seal_records_into_parallel(
+                parallel::global(),
+                &scratch.plaintext_buf,
+                &scratch.record_lens,
+                rng,
+                &mut scratch.records_buf,
+            )?;
+        } else {
+            codec.seal_records_into(
+                &scratch.plaintext_buf,
+                &scratch.record_lens,
+                rng,
+                &mut scratch.records_buf,
+            )?;
+        }
+        log_outer_write_batch(log, &scratch.record_lens, &scratch.records_buf);
+        let write_started = Instant::now();
+        match timeout(idle, writer.write_records(scratch.records_buf.as_slice())).await {
+            Ok(result) => result?,
+            Err(_) => return Err(shed_mux_writer_on_stalled_client(log.cid)),
+        }
+        if let Some(activity) = activity {
+            bump_relay_activity(activity);
+        }
+        waited = waited.saturating_add(write_started.elapsed());
+        planned_budget.last_write = Some(Instant::now());
+        *budget = planned_budget;
+        scratch.records_buf.clear();
     }
-    scratch.record_lens.push(record_plaintext_len);
-
-    // Phase B: seal every record with unchanged boundaries and sequence
-    // order; only the bulk path pays the crypto-pool dispatch cost.
-    scratch.records_buf.clear();
-    if should_parallelize_aead(scratch.record_lens.len(), scratch.plaintext_buf.len()) {
-        codec.seal_records_into_parallel(
-            parallel::global(),
-            &scratch.plaintext_buf,
-            &scratch.record_lens,
-            rng,
-            &mut scratch.records_buf,
-        )?;
-    } else {
-        codec.seal_records_into(
-            &scratch.plaintext_buf,
-            &scratch.record_lens,
-            rng,
-            &mut scratch.records_buf,
-        )?;
+    for frame in frames.drain(..) {
+        payload_pool.put(frame.payload);
     }
-    log_outer_write_batch(log, &scratch.record_lens, &scratch.records_buf);
-    let write_started = Instant::now();
-    writer.write_records(scratch.records_buf.as_slice()).await?;
-    let waited = write_started.elapsed();
-    scratch.records_buf.clear();
     Ok(waited)
 }
 
@@ -6004,23 +6559,6 @@ fn log_outer_write_batch(log: RelayWriteLog, record_lens: &[usize], records_buf:
         );
         offset += header.total_len;
     }
-}
-
-fn encode_server_mux_frame(
-    out: &mut Vec<u8>,
-    frame: MuxFrame,
-    max_plaintext_len: usize,
-    payload_pool: &MuxPayloadPool,
-) -> Result<usize, HandshakeServerError> {
-    let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
-    if frame_len > max_plaintext_len {
-        return Err(HandshakeServerError::DataRecord(
-            crate::tls::record::TlsRecordError::PayloadTooLarge(frame_len).into(),
-        ));
-    }
-    frame.encode_into(out)?;
-    payload_pool.put(frame.payload);
-    Ok(frame_len)
 }
 
 /// Validate a speed request against the server's per-phase and aggregate ceilings.
@@ -7061,6 +7599,8 @@ pub(crate) struct RelaySealScratch {
     /// boundaries.
     plaintext_buf: Vec<u8>,
     record_lens: Vec<usize>,
+    /// Allocates only when the explicit CF experiment records its pad plan.
+    exact_pad_lens: Vec<usize>,
 }
 
 impl RelaySealScratch {
@@ -7070,6 +7610,7 @@ impl RelaySealScratch {
             records: Vec::new(),
             plaintext_buf: Vec::with_capacity(capacity),
             record_lens: Vec::new(),
+            exact_pad_lens: Vec::new(),
         }
     }
 }
@@ -7177,6 +7718,908 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+
+    #[derive(Default)]
+    struct MuxRecordTestWriter {
+        writes: Vec<Vec<u8>>,
+        fail_after: Option<usize>,
+        delay: Duration,
+    }
+
+    impl LegWriter for MuxRecordTestWriter {
+        async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if self.fail_after == Some(self.writes.len()) {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            if !self.delay.is_zero() {
+                sleep(self.delay).await;
+            }
+            self.writes.push(bytes.to_vec());
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mux_record_test_codec(padding: (u16, u16)) -> DataRecordCodec {
+        DataRecordCodec::new(
+            AeadCodec::new([0x31; 32], [0x42; 12]),
+            PaddingProfile::new(padding.0, padding.1).unwrap(),
+            SERVER_TO_CLIENT_AAD,
+        )
+    }
+
+    fn mux_data(stream_id: u32, payload: &[u8]) -> MuxFrame {
+        MuxFrame {
+            stream_id,
+            kind: MuxFrameKind::Data,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn decode_mux_record_writes(
+        writes: &[Vec<u8>],
+        opener: &mut DataRecordCodec,
+    ) -> (Vec<MuxFrame>, Vec<usize>) {
+        let mut frames = Vec::new();
+        let mut lengths = Vec::new();
+        for bytes in writes {
+            let mut offset = 0;
+            let mut records = 0;
+            while offset < bytes.len() {
+                let header = parse_header(&bytes[offset..]).unwrap();
+                let plaintext = opener
+                    .open(&bytes[offset..offset + header.total_len])
+                    .unwrap();
+                frames.extend(MuxFrame::decode_all(&plaintext).unwrap());
+                lengths.push(header.payload_len);
+                offset += header.total_len;
+                records += 1;
+            }
+            assert!(records <= SERVER_MUX_FRAME_BATCH_LIMIT);
+            assert!(
+                bytes.len()
+                    <= SERVER_MUX_FRAME_BATCH_LIMIT
+                        * (crate::protocol::data::OUTER_TLS_RECORD_LIMIT + TLS_HEADER_LEN)
+            );
+        }
+        (frames, lengths)
+    }
+
+    async fn write_mux_record_test_batch(
+        frames: &mut Vec<MuxFrame>,
+        writer: &mut MuxRecordTestWriter,
+        codec: &mut DataRecordCodec,
+        budget: &mut MuxRecordBudget,
+    ) -> Result<(), HandshakeServerError> {
+        let max_plaintext = codec.max_plaintext_len();
+        write_server_mux_frames_planned(
+            writer,
+            codec,
+            frames,
+            &mut StdRng::seed_from_u64(13),
+            &mut RelaySealScratch::with_payload_capacity(max_plaintext),
+            RelayWriteLog::new(1, "server->client", "test-mux-records"),
+            &MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(max_plaintext)),
+            budget,
+            (FALLBACK_IDLE_TIMEOUT_FLOOR, None),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mux_record_exact_padding_shapes_positive_data_but_not_controls_and_returns_payloads() {
+        for (sent, target) in [(0, 1386), (41, 4246), (81, 16401)] {
+            let pool = MuxPayloadPool::new(16, 2);
+            let payload = pool.take_filled(b"x");
+            let original_pointer = payload.as_ptr();
+            let mut input = vec![MuxFrame {
+                stream_id: 1,
+                kind: MuxFrameKind::Data,
+                payload,
+            }];
+            let mut scratch = RelaySealScratch::with_payload_capacity(max_plaintext_len(0));
+            let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::CloudflareDynamic);
+            budget.records_sent = sent;
+            let mut writer = MuxRecordTestWriter::default();
+            let mut codec = mux_record_test_codec((0, 0));
+            write_server_mux_frames_planned(
+                &mut writer,
+                &mut codec,
+                &mut input,
+                &mut StdRng::seed_from_u64(141),
+                &mut scratch,
+                RelayWriteLog::new(1, "server->client", "test-exact-padding"),
+                &pool,
+                &mut budget,
+                (FALLBACK_IDLE_TIMEOUT_FLOOR, None),
+            )
+            .await
+            .unwrap();
+            assert!(input.is_empty());
+            let recycled = pool.take();
+            assert_eq!(recycled.as_ptr(), original_pointer);
+            assert!(recycled.is_empty());
+            let mut opener = mux_record_test_codec((0, 0));
+            let (decoded, lengths) = decode_mux_record_writes(&writer.writes, &mut opener);
+            assert_eq!(decoded, vec![mux_data(1, b"x")]);
+            assert_eq!(lengths, vec![target]);
+            // This is the real short-message cost of the opt-in experiment,
+            // not an assertion that padding is free or improves camouflage.
+            assert!(target > MuxFrame::encoded_len(1).unwrap() + 18);
+            writer.writes.clear();
+            let controls = vec![
+                mux_data(3, b""),
+                MuxFrame {
+                    stream_id: 1,
+                    kind: MuxFrameKind::Fin,
+                    payload: Vec::new(),
+                },
+                MuxFrame {
+                    stream_id: 3,
+                    kind: MuxFrameKind::Reset,
+                    payload: Vec::new(),
+                },
+            ];
+            write_server_mux_frames_planned(
+                &mut writer,
+                &mut codec,
+                &mut controls.clone(),
+                &mut StdRng::seed_from_u64(142),
+                &mut scratch,
+                RelayWriteLog::new(1, "server->client", "test-control-padding"),
+                &pool,
+                &mut budget,
+                (FALLBACK_IDLE_TIMEOUT_FLOOR, None),
+            )
+            .await
+            .unwrap();
+            let (decoded, lengths) = decode_mux_record_writes(&writer.writes, &mut opener);
+            assert_eq!(decoded, controls);
+            assert_eq!(lengths, vec![3 * MuxFrame::encoded_len(0).unwrap() + 18]);
+            assert_eq!(scratch.exact_pad_lens, vec![0]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_record_writer_keeps_progressing_windows_alive_and_refreshes_each_activity() {
+        #[derive(Default)]
+        struct Progress {
+            // Activity seen on entry, then the completed window's time/clock.
+            windows: Vec<(u64, Instant, u64, Vec<u8>)>,
+            shutdown: bool,
+        }
+        struct SlowWriter {
+            progress: Arc<Mutex<Progress>>,
+            activity: RelayActivity,
+        }
+        impl LegWriter for SlowWriter {
+            async fn write_records(&mut self, bytes: &[u8]) -> io::Result<()> {
+                let activity_before = self.activity.load(Ordering::Relaxed);
+                sleep(Duration::from_millis(60)).await;
+                self.progress.lock().unwrap().windows.push((
+                    activity_before,
+                    Instant::now(),
+                    relay_now_millis(),
+                    bytes.to_vec(),
+                ));
+                Ok(())
+            }
+            async fn shutdown(&mut self) -> io::Result<()> {
+                self.progress.lock().unwrap().shutdown = true;
+                Ok(())
+            }
+        }
+        let activity = Arc::new(AtomicU64::new(u64::MAX));
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let (downlink, scheduler) = server_mux_downlink(4);
+        let stream = downlink.register(1).await.unwrap();
+        let payload = vec![0x53; 200_000];
+        stream
+            .send(MuxFrameKind::Data, payload.clone())
+            .await
+            .unwrap();
+        stream.send(MuxFrameKind::Fin, Vec::new()).await.unwrap();
+        drop((stream, downlink));
+        let start = Instant::now();
+        let idle = Duration::from_millis(100);
+        let result = server_mux_writer_loop(
+            SlowWriter {
+                progress: progress.clone(),
+                activity: activity.clone(),
+            },
+            mux_record_test_codec((0, 0)),
+            scheduler,
+            CoverTrafficProfile::from_config(TrafficConfig::default()),
+            1,
+            MuxPayloadPool::with_capacity(16370),
+            idle,
+            activity.clone(),
+            TcpMuxRecordProfile::CloudflareDynamic,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "each window progresses before idle, got {result:?}"
+        );
+        let progress = progress.lock().unwrap();
+        assert!(progress.shutdown);
+        assert!(progress.windows.len() >= 3);
+        assert!(
+            start.elapsed() > idle,
+            "the complete input batch exceeds idle"
+        );
+        assert_eq!(progress.windows[0].0, u64::MAX);
+        let mut previous_completion = start;
+        let mut writes = Vec::new();
+        for (index, (activity_before, completed, clock, bytes)) in
+            progress.windows.iter().enumerate()
+        {
+            assert!(*completed - previous_completion < idle);
+            assert!(bytes.len() <= SERVER_MUX_FAIR_BATCH_BYTES);
+            if index > 0 {
+                assert_eq!(
+                    *activity_before,
+                    progress.windows[index - 1].2,
+                    "every completed window refreshes activity before the next write"
+                );
+            }
+            previous_completion = *completed;
+            writes.push(bytes.clone());
+            assert_ne!(*clock, u64::MAX);
+        }
+        assert_eq!(
+            activity.load(Ordering::Relaxed),
+            progress.windows.last().unwrap().2
+        );
+        let (decoded, _) = decode_mux_record_writes(&writes, &mut mux_record_test_codec((0, 0)));
+        assert_eq!(decoded.last().unwrap().kind, MuxFrameKind::Fin);
+        assert_eq!(
+            decoded
+                .into_iter()
+                .flat_map(|frame| frame.payload)
+                .collect::<Vec<_>>(),
+            payload
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_record_write_windows_accumulate_wait_but_a_stalled_window_keeps_uncommitted_state()
+    {
+        for stalled in [false, true] {
+            let idle = Duration::from_millis(100);
+            let delay = if stalled {
+                idle + Duration::from_millis(1)
+            } else {
+                Duration::from_millis(60)
+            };
+            let mut writer = MuxRecordTestWriter {
+                delay,
+                ..Default::default()
+            };
+            let mut input = vec![mux_data(1, &vec![0x61; 200_000])];
+            let mut codec = mux_record_test_codec((0, 0));
+            let mut scratch = RelaySealScratch::with_payload_capacity(codec.max_plaintext_len());
+            let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::CloudflareDynamic);
+            budget.records_sent = 81;
+            budget.last_write = Some(Instant::now());
+            let original_budget = budget;
+            let activity = Arc::new(AtomicU64::new(u64::MAX));
+            let started = Instant::now();
+            let result = write_server_mux_frames_planned(
+                &mut writer,
+                &mut codec,
+                &mut input,
+                &mut StdRng::seed_from_u64(13),
+                &mut scratch,
+                RelayWriteLog::new(1, "server->client", "test-window-backstop"),
+                &MuxPayloadPool::with_capacity(16370),
+                &mut budget,
+                (idle, Some(&activity)),
+            )
+            .await;
+            if stalled {
+                assert!(matches!(result, Err(HandshakeServerError::Timeout)));
+                assert_eq!(started.elapsed(), idle);
+                assert!(writer.writes.is_empty());
+                assert_eq!(budget, original_budget);
+                assert_eq!(activity.load(Ordering::Relaxed), u64::MAX);
+                let mut opener = mux_record_test_codec((0, 0));
+                decode_mux_record_writes(&[scratch.records_buf.clone()], &mut opener);
+                let next = codec
+                    .seal(b"counter probe", &mut StdRng::seed_from_u64(3))
+                    .unwrap();
+                assert_eq!(
+                    opener.open(&next).unwrap(),
+                    b"counter probe",
+                    "a terminal network timeout must not rewind sealed nonces"
+                );
+            } else {
+                let waited = result.unwrap();
+                assert!(writer.writes.len() >= 3);
+                assert_eq!(waited, delay * writer.writes.len() as u32);
+                assert_eq!(waited, started.elapsed());
+                assert!(waited > idle);
+                assert_eq!(activity.load(Ordering::Relaxed), relay_now_millis());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_record_exact_padding_recovers_mixed_streams_and_fin_in_order() {
+        let expected = vec![
+            mux_data(1, b"first"),
+            mux_data(3, b"second"),
+            MuxFrame {
+                stream_id: 1,
+                kind: MuxFrameKind::Fin,
+                payload: Vec::new(),
+            },
+            MuxFrame {
+                stream_id: 3,
+                kind: MuxFrameKind::Fin,
+                payload: Vec::new(),
+            },
+        ];
+        let mut input = expected.clone();
+        let mut writer = MuxRecordTestWriter::default();
+        write_mux_record_test_batch(
+            &mut input,
+            &mut writer,
+            &mut mux_record_test_codec((0, 0)),
+            &mut MuxRecordBudget::new(TcpMuxRecordProfile::CloudflareDynamic),
+        )
+        .await
+        .unwrap();
+        let (decoded, lengths) =
+            decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((0, 0)));
+        assert_eq!(decoded, expected);
+        assert_eq!(lengths, vec![1386]);
+    }
+
+    #[tokio::test]
+    async fn mux_record_exact_padding_off_matches_the_existing_parallel_wire_path_without_metadata_allocation(
+    ) {
+        let capacity = MuxFrame::max_payload_len(max_plaintext_len(0));
+        let mut input: Vec<_> = (0..64)
+            .map(|_| mux_data(1, &vec![0x51; capacity]))
+            .collect();
+        let mut scratch = RelaySealScratch::with_payload_capacity(max_plaintext_len(0));
+        let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::Off);
+        let mut cursor = MuxFrameCursor::default();
+        plan_ready_mux_records(
+            &input,
+            &mut cursor,
+            &mut scratch,
+            &mut budget,
+            max_plaintext_len(0),
+        )
+        .unwrap();
+        assert!(scratch.exact_pad_lens.is_empty());
+        assert_eq!(scratch.exact_pad_lens.capacity(), 0);
+        assert!(should_parallelize_aead(
+            scratch.record_lens.len(),
+            scratch.plaintext_buf.len()
+        ));
+        let mut expected = Vec::new();
+        mux_record_test_codec((0, 0))
+            .seal_records_into_parallel(
+                parallel::global(),
+                &scratch.plaintext_buf,
+                &scratch.record_lens,
+                &mut StdRng::seed_from_u64(13),
+                &mut expected,
+            )
+            .unwrap();
+        let mut writer = MuxRecordTestWriter::default();
+        write_mux_record_test_batch(
+            &mut input,
+            &mut writer,
+            &mut mux_record_test_codec((0, 0)),
+            &mut MuxRecordBudget::new(TcpMuxRecordProfile::Off),
+        )
+        .await
+        .unwrap();
+        assert_eq!(writer.writes.concat(), expected);
+        assert_eq!(writer.writes.len(), 1);
+        assert!(
+            writer.writes[0].len() > SERVER_MUX_FAIR_BATCH_BYTES,
+            "Off retains its existing 64-record fast-link window"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_record_exact_padding_bounds_each_slow_write_by_padded_wire_bytes() {
+        let bytes: Vec<u8> = (0..100_000).map(|index| (index % 251) as u8).collect();
+        let mut input = vec![
+            mux_data(1, &bytes),
+            MuxFrame {
+                stream_id: 1,
+                kind: MuxFrameKind::Fin,
+                payload: Vec::new(),
+            },
+        ];
+        let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::CloudflareDynamic);
+        budget.records_sent = 81;
+        let mut writer = MuxRecordTestWriter {
+            delay: Duration::from_millis(15),
+            ..Default::default()
+        };
+        write_mux_record_test_batch(
+            &mut input,
+            &mut writer,
+            &mut mux_record_test_codec((0, 0)),
+            &mut budget,
+        )
+        .await
+        .unwrap();
+        assert!(writer.writes.len() > 1);
+        assert!(writer
+            .writes
+            .iter()
+            .all(|wire| wire.len() <= SERVER_MUX_FAIR_BATCH_BYTES));
+        let (decoded, _) =
+            decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((0, 0)));
+        assert_eq!(decoded.last().unwrap().kind, MuxFrameKind::Fin);
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|frame| frame.kind == MuxFrameKind::Data)
+                .flat_map(|frame| frame.payload.iter().copied())
+                .collect::<Vec<_>>(),
+            bytes
+        );
+        // This bounds individual writes under a slow writer; it does not prove
+        // the complete scheduler's end-to-end fairness or fast-link throughput.
+    }
+
+    #[tokio::test]
+    async fn mux_record_planning_is_independent_of_producer_data_boundaries() {
+        let bytes: Vec<u8> = (0..40_000).map(|index| (index % 251) as u8).collect();
+        for profile in [
+            TcpMuxRecordProfile::Off,
+            TcpMuxRecordProfile::CloudflareDynamic,
+        ] {
+            let mut expected = None;
+            for chunk in [997, 5000, 16370] {
+                let mut input = bytes
+                    .chunks(chunk)
+                    .map(|chunk| mux_data(1, chunk))
+                    .collect();
+                let mut writer = MuxRecordTestWriter::default();
+                let mut budget = MuxRecordBudget::new(profile);
+                write_mux_record_test_batch(
+                    &mut input,
+                    &mut writer,
+                    &mut mux_record_test_codec((0, 0)),
+                    &mut budget,
+                )
+                .await
+                .unwrap();
+                assert!(input.is_empty());
+                let (decoded, _) =
+                    decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((0, 0)));
+                assert_eq!(
+                    decoded
+                        .iter()
+                        .flat_map(|frame| frame.payload.iter().copied())
+                        .collect::<Vec<_>>(),
+                    bytes
+                );
+                let wire = writer.writes.concat();
+                if let Some(expected) = &expected {
+                    assert_eq!(&wire, expected);
+                } else {
+                    expected = Some(wire);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_record_planning_merges_data_ack_and_preserves_stream_control_barriers() {
+        let control = |stream_id, kind| MuxFrame {
+            stream_id,
+            kind,
+            payload: Vec::new(),
+        };
+        let mut input = vec![
+            mux_data(1, b""),
+            mux_data(1, b"ab"),
+            mux_data(1, b"cd"),
+            mux_data(1, b""),
+            mux_data(3, b"e"),
+            mux_data(1, b"f"),
+            control(1, MuxFrameKind::Fin),
+            mux_data(1, b"g"),
+            control(3, MuxFrameKind::Reset),
+            mux_data(3, b"h"),
+            control(0, MuxFrameKind::Cover),
+        ];
+        let mut writer = MuxRecordTestWriter::default();
+        let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::Off);
+        write_mux_record_test_batch(
+            &mut input,
+            &mut writer,
+            &mut mux_record_test_codec((0, 0)),
+            &mut budget,
+        )
+        .await
+        .unwrap();
+        let (decoded, lengths) =
+            decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((0, 0)));
+        let expected = vec![
+            mux_data(1, b"abcd"),
+            mux_data(3, b"e"),
+            mux_data(1, b"f"),
+            control(1, MuxFrameKind::Fin),
+            mux_data(1, b"g"),
+            control(3, MuxFrameKind::Reset),
+            mux_data(3, b"h"),
+            control(0, MuxFrameKind::Cover),
+        ];
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            lengths.len(),
+            1,
+            "different streams' complete frames can share a record"
+        );
+    }
+
+    #[tokio::test]
+    async fn mux_record_planning_preserves_silent_target_ack_and_balances_one_byte_tail() {
+        let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::CloudflareDynamic);
+        let mut writer = MuxRecordTestWriter::default();
+        let mut codec = mux_record_test_codec((0, 0));
+        write_mux_record_test_batch(
+            &mut vec![mux_data(1, b"")],
+            &mut writer,
+            &mut codec,
+            &mut budget,
+        )
+        .await
+        .unwrap();
+        let (ack, lengths) =
+            decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((0, 0)));
+        assert_eq!(ack, vec![mux_data(1, b"")]);
+        assert_eq!(lengths, vec![31]);
+        for (profile, capacity) in [
+            (TcpMuxRecordProfile::Off, 16370),
+            (TcpMuxRecordProfile::CloudflareDynamic, 1355),
+        ] {
+            let bytes = vec![0x53; capacity + 1];
+            let mut input = vec![
+                mux_data(1, &bytes[..capacity]),
+                mux_data(1, &bytes[capacity..]),
+            ];
+            let mut writer = MuxRecordTestWriter::default();
+            write_mux_record_test_batch(
+                &mut input,
+                &mut writer,
+                &mut mux_record_test_codec((0, 0)),
+                &mut MuxRecordBudget::new(profile),
+            )
+            .await
+            .unwrap();
+            let (decoded, _) =
+                decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((0, 0)));
+            assert_eq!(decoded.len(), 2);
+            assert!(decoded[0].payload.len().abs_diff(decoded[1].payload.len()) <= 1);
+            assert_eq!(
+                decoded
+                    .into_iter()
+                    .flat_map(|frame| frame.payload)
+                    .collect::<Vec<_>>(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_record_planning_warms_by_written_records_and_bounds_expanded_output() {
+        let capacity = MuxFrame::max_payload_len(max_plaintext_len(0));
+        let bytes: Vec<u8> = (0..capacity).map(|index| (index % 251) as u8).collect();
+        let mut input: Vec<_> = (0..64).map(|_| mux_data(1, &bytes)).collect();
+        let mut writer = MuxRecordTestWriter::default();
+        let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::CloudflareDynamic);
+        write_mux_record_test_batch(
+            &mut input,
+            &mut writer,
+            &mut mux_record_test_codec((0, 0)),
+            &mut budget,
+        )
+        .await
+        .unwrap();
+        let (decoded, lengths) =
+            decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((0, 0)));
+        assert_eq!(&lengths[..41], &[1386; 41]);
+        assert_eq!(&lengths[41..81], &[4246; 40]);
+        assert!(lengths[81..].iter().all(|&len| len <= 16401));
+        assert!(
+            writer.writes.len() > 1,
+            "64 input frames may expand past 64 records"
+        );
+        assert_eq!(budget.records_sent as usize, lengths.len());
+        assert_eq!(
+            decoded
+                .into_iter()
+                .flat_map(|frame| frame.payload)
+                .collect::<Vec<_>>(),
+            bytes.repeat(64)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_record_planning_shares_phase_across_streams_and_resets_only_after_real_idle() {
+        let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::CloudflareDynamic);
+        let mut writer = MuxRecordTestWriter::default();
+        let mut codec = mux_record_test_codec((0, 0));
+        let mut opener = mux_record_test_codec((0, 0));
+        let mut input = (0..41).map(|_| mux_data(1, &[0x41; 1355])).collect();
+        write_mux_record_test_batch(&mut input, &mut writer, &mut codec, &mut budget)
+            .await
+            .unwrap();
+        let (_, lengths) = decode_mux_record_writes(&writer.writes, &mut opener);
+        assert_eq!(lengths, vec![1386; 41]);
+        writer.writes.clear();
+        tokio::time::advance(Duration::from_millis(5)).await;
+        write_mux_record_test_batch(
+            &mut vec![mux_data(3, &[0x52; 4215])],
+            &mut writer,
+            &mut codec,
+            &mut budget,
+        )
+        .await
+        .unwrap();
+        let (_, lengths) = decode_mux_record_writes(&writer.writes, &mut opener);
+        assert_eq!(lengths, vec![4246]);
+        let last = budget.last_write.unwrap();
+        assert_eq!(
+            budget
+                .for_write(last + Duration::from_millis(1000))
+                .records_sent,
+            42
+        );
+        assert_eq!(
+            budget
+                .for_write(last + Duration::from_millis(1001))
+                .records_sent,
+            0
+        );
+        writer.writes.clear();
+        tokio::time::advance(Duration::from_millis(1001)).await;
+        write_mux_record_test_batch(
+            &mut vec![mux_data(7, &[0x63; 1355])],
+            &mut writer,
+            &mut codec,
+            &mut budget,
+        )
+        .await
+        .unwrap();
+        let (_, lengths) = decode_mux_record_writes(&writer.writes, &mut opener);
+        assert_eq!(lengths, vec![1386]);
+        assert_eq!(budget.records_sent, 1);
+    }
+
+    #[tokio::test]
+    async fn mux_record_planning_failed_write_does_not_commit_phase_or_rollback_nonce() {
+        let capacity = MuxFrame::max_payload_len(max_plaintext_len(0));
+        for fail_after in [0, 1] {
+            let mut input = (0..64)
+                .map(|_| mux_data(1, &vec![0x51; capacity]))
+                .collect();
+            let mut writer = MuxRecordTestWriter {
+                fail_after: Some(fail_after),
+                ..Default::default()
+            };
+            let mut budget = MuxRecordBudget::new(TcpMuxRecordProfile::CloudflareDynamic);
+            let mut codec = mux_record_test_codec((0, 0));
+            let mut scratch = RelaySealScratch::with_payload_capacity(codec.max_plaintext_len());
+            let activity = Arc::new(AtomicU64::new(u64::MAX));
+            let result = write_server_mux_frames_planned(
+                &mut writer,
+                &mut codec,
+                &mut input,
+                &mut StdRng::seed_from_u64(13),
+                &mut scratch,
+                RelayWriteLog::new(1, "server->client", "test-failed-write"),
+                &MuxPayloadPool::with_capacity(capacity),
+                &mut budget,
+                (FALLBACK_IDLE_TIMEOUT_FLOOR, Some(&activity)),
+            )
+            .await;
+            assert!(matches!(result, Err(HandshakeServerError::Io(_))));
+            let (_, committed_lens) =
+                decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((0, 0)));
+            assert_eq!(budget.records_sent as usize, committed_lens.len());
+            assert_eq!(budget.last_write.is_some(), fail_after != 0);
+            assert_eq!(
+                activity.load(Ordering::Relaxed) != u64::MAX,
+                fail_after != 0
+            );
+            let mut opener = mux_record_test_codec((0, 0));
+            decode_mux_record_writes(&writer.writes, &mut opener);
+            decode_mux_record_writes(&[scratch.records_buf.clone()], &mut opener);
+            // A failed network write is terminal in production. Inspecting the
+            // next seal here proves the already reserved nonces were not undone.
+            let next = codec
+                .seal(b"counter probe", &mut StdRng::seed_from_u64(3))
+                .unwrap();
+            assert_eq!(opener.open(&next).unwrap(), b"counter probe");
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_record_planning_off_retains_existing_padding_support() {
+        let mut codec = mux_record_test_codec((7, 32));
+        let mut input = (0..8).map(|_| mux_data(1, &[0x65; 8000])).collect();
+        let mut writer = MuxRecordTestWriter::default();
+        write_mux_record_test_batch(
+            &mut input,
+            &mut writer,
+            &mut codec,
+            &mut MuxRecordBudget::new(TcpMuxRecordProfile::Off),
+        )
+        .await
+        .unwrap();
+        let (decoded, lengths) =
+            decode_mux_record_writes(&writer.writes, &mut mux_record_test_codec((7, 32)));
+        assert!(lengths
+            .iter()
+            .all(|&len| len <= crate::protocol::data::OUTER_TLS_RECORD_LIMIT));
+        assert_eq!(
+            decoded
+                .into_iter()
+                .flat_map(|frame| frame.payload)
+                .collect::<Vec<_>>(),
+            vec![0x65; 64_000]
+        );
+    }
+
+    async fn mux_record_test_carrier() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+        client.set_nodelay(true).unwrap();
+        server.set_nodelay(true).unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_record_planning_real_tcp_preserves_ack_and_short_stream_during_bulk() {
+        for profile in [
+            TcpMuxRecordProfile::Off,
+            TcpMuxRecordProfile::CloudflareDynamic,
+        ] {
+            let (mut client, server) = mux_record_test_carrier().await;
+            let (_, server_write) = server.into_split();
+            let (downlink, scheduler) = server_mux_downlink(4);
+            let bulk = downlink.register(1).await.unwrap();
+            let small = downlink.register(3).await.unwrap();
+            small.send(MuxFrameKind::Data, Vec::new()).await.unwrap();
+            let writer = tokio::spawn(server_mux_writer_loop(
+                TcpLegWriter(server_write),
+                mux_record_test_codec((0, 0)),
+                scheduler,
+                CoverTrafficProfile::from_config(TrafficConfig::default()),
+                1,
+                MuxPayloadPool::with_capacity(16370),
+                Duration::from_secs(2),
+                Arc::new(AtomicU64::new(relay_now_millis())),
+                profile,
+            ));
+            let mut opener = mux_record_test_codec((0, 0));
+            let wire = timeout(Duration::from_secs(1), read_record(&mut client))
+                .await
+                .unwrap()
+                .unwrap();
+            let ack = MuxFrame::decode_all(&opener.open(&wire).unwrap()).unwrap();
+            assert_eq!(
+                ack,
+                vec![mux_data(3, b"")],
+                "silent targets must receive an immediate ACK"
+            );
+            let capacity = MuxFrame::max_payload_len(max_plaintext_len(0));
+            let producer = tokio::spawn(async move {
+                for index in 0..128 {
+                    bulk.send(MuxFrameKind::Data, vec![(index % 251) as u8; capacity])
+                        .await
+                        .unwrap();
+                }
+                bulk.send(MuxFrameKind::Fin, Vec::new()).await.unwrap();
+            });
+            let short = tokio::spawn(async move {
+                small
+                    .send(MuxFrameKind::Data, b"short stream".to_vec())
+                    .await
+                    .unwrap();
+                small.send(MuxFrameKind::Fin, Vec::new()).await.unwrap();
+            });
+            drop(downlink);
+            let mut received = HashMap::<u32, Vec<u8>>::new();
+            let mut finished = Vec::new();
+            while finished.len() < 2 {
+                let wire = timeout(Duration::from_secs(2), read_record(&mut client))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                for frame in MuxFrame::decode_all(&opener.open(&wire).unwrap()).unwrap() {
+                    match frame.kind {
+                        MuxFrameKind::Data => received
+                            .entry(frame.stream_id)
+                            .or_default()
+                            .extend_from_slice(&frame.payload),
+                        MuxFrameKind::Fin => finished.push(frame.stream_id),
+                        other => panic!("unexpected frame {other:?}"),
+                    }
+                }
+            }
+            producer.await.unwrap();
+            short.await.unwrap();
+            writer.await.unwrap().unwrap();
+            assert_eq!(received[&3], b"short stream");
+            assert_eq!(
+                received[&1],
+                (0..128)
+                    .flat_map(|index| vec![(index % 251) as u8; capacity])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(finished, vec![3, 1]);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_record_planning_real_tcp_nonreader_keeps_write_backstop() {
+        let (client, server) = mux_record_test_carrier().await;
+        socket2::SockRef::from(&client)
+            .set_recv_buffer_size(8192)
+            .unwrap();
+        socket2::SockRef::from(&server)
+            .set_send_buffer_size(8192)
+            .unwrap();
+        let (_, server_write) = server.into_split();
+        let (downlink, scheduler) = server_mux_downlink(4);
+        let bulk = downlink.register(1).await.unwrap();
+        let producer = tokio::spawn(async move {
+            for _ in 0..1024 {
+                if bulk
+                    .send(MuxFrameKind::Data, vec![0x71; 16370])
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        drop(downlink);
+        let result = timeout(
+            Duration::from_secs(5),
+            server_mux_writer_loop(
+                TcpLegWriter(server_write),
+                mux_record_test_codec((0, 0)),
+                scheduler,
+                CoverTrafficProfile::from_config(TrafficConfig::default()),
+                1,
+                MuxPayloadPool::with_capacity(16370),
+                Duration::from_millis(50),
+                Arc::new(AtomicU64::new(relay_now_millis())),
+                TcpMuxRecordProfile::CloudflareDynamic,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(HandshakeServerError::Timeout)));
+        producer.await.unwrap();
+        drop(client);
+    }
 
     #[test]
     fn mux_quic_signal_accepts_only_lone_zero_stream_cover() {
@@ -9122,6 +10565,7 @@ mod tests {
                 payload_pool,
                 idle,
                 activity,
+                TcpMuxRecordProfile::Off,
             ));
             let mut peer_seal = codec();
             tokio::task::yield_now().await;
@@ -9203,11 +10647,12 @@ mod tests {
                 MuxPayloadPool::with_capacity(1024),
             ));
             let (mut target, _) = listener.accept().await.unwrap();
+            tokio::time::pause();
+            tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER / 2 + Duration::from_millis(1)).await;
             let ack = frames.recv().await.unwrap();
             assert_eq!(ack.kind, MuxFrameKind::Data);
             assert!(ack.payload.is_empty());
             tokio::task::yield_now().await;
-            tokio::time::pause();
             for _ in 0..5 {
                 tokio::time::advance(Duration::from_secs(6)).await;
                 // Real socket I/O runs with time resumed, so virtual-time
@@ -9246,8 +10691,434 @@ mod tests {
         }
     }
 
-    /// Receiving an Open proves carrier liveness independently of the target's
-    /// response latency. The empty Data acknowledgement is not application data.
+    async fn mux_receipt_channel(capacity: usize) -> (ServerMuxStreamTx, mpsc::Receiver<MuxFrame>) {
+        let (mut downlink, mut scheduler) = server_mux_downlink(1);
+        downlink.stream_queue_depth = capacity;
+        let stream = downlink.register(1).await.unwrap();
+        scheduler.drain_control();
+        let (_, frames) = scheduler.queues.pop_front().unwrap();
+        (stream, frames)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_receipt_first_data_fin_reset_suppress_fallback_without_dropping_later_frames() {
+        for kind in [MuxFrameKind::Data, MuxFrameKind::Fin, MuxFrameKind::Reset] {
+            let (stream, mut frames) = mux_receipt_channel(8).await;
+            let (done, wait) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                with_mux_open_receipt(&stream, async {
+                    stream
+                        .send(
+                            kind,
+                            if kind == MuxFrameKind::Data {
+                                b"first".to_vec()
+                            } else {
+                                Vec::new()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let _ = wait.await;
+                    if kind == MuxFrameKind::Data {
+                        stream
+                            .send(MuxFrameKind::Data, b"later".to_vec())
+                            .await
+                            .unwrap();
+                    }
+                })
+                .await;
+            });
+            let frame = frames.recv().await.unwrap();
+            assert_eq!(
+                (frame.kind, frame.payload),
+                (
+                    kind,
+                    if kind == MuxFrameKind::Data {
+                        b"first".to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                )
+            );
+            tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER).await;
+            tokio::task::yield_now().await;
+            assert!(
+                frames.try_recv().is_err(),
+                "a response already acknowledges Open"
+            );
+            done.send(()).unwrap();
+            if kind == MuxFrameKind::Data {
+                let later = frames.recv().await.unwrap();
+                assert_eq!(later.payload, b"later");
+            }
+            task.await.unwrap();
+            assert!(frames.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_receipt_silent_operation_gets_one_absolute_deadline_receipt_and_continues() {
+        let (stream, mut frames) = mux_receipt_channel(4).await;
+        let deadline = stream.receipt_deadline;
+        let (done, wait) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            // A pending complete operation also covers DNS/connect and a target
+            // waiting on an empty/partial preface, not just a blocked first read.
+            with_mux_open_receipt(&stream, async {
+                let _ = wait.await;
+            })
+            .await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(deadline - Instant::now() - Duration::from_millis(1)).await;
+        assert!(frames.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let receipt = frames.recv().await.unwrap();
+        assert_eq!(
+            (receipt.kind, receipt.payload),
+            (MuxFrameKind::Data, Vec::new())
+        );
+        assert!(!task.is_finished());
+        tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER * 10).await;
+        tokio::task::yield_now().await;
+        assert!(frames.try_recv().is_err(), "no periodic receipts");
+        done.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_receipt_full_queue_does_not_block_upstream_and_cancelled_reservation_never_claims()
+    {
+        let (stream, mut frames) = mux_receipt_channel(1).await;
+        // Reserve all capacity without publishing a frame/receipt.
+        let occupied = stream.frames.clone().reserve_owned().await.unwrap();
+        let sender = stream.clone();
+        let cancelled_send =
+            tokio::spawn(async move { sender.send(MuxFrameKind::Data, vec![1]).await });
+        tokio::task::yield_now().await;
+        assert!(!stream.first_publication.load(Ordering::Acquire));
+        cancelled_send.abort();
+        assert!(cancelled_send.await.unwrap_err().is_cancelled());
+        assert!(!stream.first_publication.load(Ordering::Acquire));
+        let (progress, progressed) = tokio::sync::oneshot::channel();
+        let made_progress = Arc::new(AtomicBool::new(false));
+        let observed_progress = made_progress.clone();
+        let (done, wait) = tokio::sync::oneshot::channel::<()>();
+        let task_stream = stream.clone();
+        let task = tokio::spawn(async move {
+            with_mux_open_receipt(&task_stream, async {
+                let _ = progressed.await;
+                observed_progress.store(true, Ordering::Release);
+                let _ = wait.await;
+            })
+            .await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER / 2).await;
+        tokio::task::yield_now().await;
+        assert!(!stream.first_publication.load(Ordering::Acquire));
+        progress.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            made_progress.load(Ordering::Acquire),
+            "a receipt waiting on capacity must keep polling upstream"
+        );
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!stream.first_publication.load(Ordering::Acquire));
+        drop(done);
+        drop(occupied);
+        // The cancelled reservation left capacity and the one-bit claim intact.
+        stream.send_receipt_if_unanswered().await.unwrap();
+        assert!(frames.recv().await.unwrap().payload.is_empty());
+        stream.send_receipt_if_unanswered().await.unwrap();
+        assert!(frames.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_receipt_registration_queue_time_counts_and_response_wins_a_ready_deadline() {
+        let (downlink, mut scheduler) = server_mux_downlink(1);
+        let expected = Instant::now() + MUX_CARRIER_SUSPECT_AFTER / 2;
+        while downlink
+            .control
+            .try_send(DownlinkControl::Purge(99))
+            .is_ok()
+        {}
+        let mut register = Box::pin(downlink.register(1));
+        std::future::poll_fn(|cx| {
+            assert!(register.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER).await;
+        scheduler.drain_control();
+        let stream = register.await.unwrap();
+        assert_eq!(
+            stream.receipt_deadline, expected,
+            "queue wait cannot restart the deadline"
+        );
+        scheduler.drain_control();
+        let (_, mut frames) = scheduler.queues.pop_front().unwrap();
+        let now = Instant::now();
+        let task = tokio::spawn(async move {
+            with_mux_open_receipt(&stream, std::future::pending()).await;
+        });
+        assert!(frames.recv().await.unwrap().payload.is_empty());
+        assert_eq!(Instant::now(), now);
+        task.abort();
+        let _ = task.await;
+
+        let (stream, mut frames) = mux_receipt_channel(2).await;
+        let deadline = stream.receipt_deadline;
+        let (done, wait) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            with_mux_open_receipt(&stream, async {
+                sleep_until(deadline).await;
+                stream
+                    .send(MuxFrameKind::Data, b"same tick".to_vec())
+                    .await
+                    .unwrap();
+                let _ = wait.await;
+            })
+            .await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER / 2).await;
+        assert_eq!(frames.recv().await.unwrap().payload, b"same tick");
+        assert!(frames.try_recv().is_err());
+        done.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mux_receipt_empty_server_first_and_partial_preface_keep_both_directions_running() {
+        for server_first in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (stream, mut frames) = mux_receipt_channel(8).await;
+            let traffic = TrafficConfig::default();
+            let initial = if server_first {
+                b"".as_slice()
+            } else {
+                b"partial".as_slice()
+            };
+            let request = ConnectRequest {
+                host: "example.com".into(),
+                port: 22,
+                initial_payload: initial.to_vec(),
+            }
+            .encode()
+            .unwrap();
+            let (upload_tx, upload_rx) = mpsc::channel(4);
+            let task = tokio::spawn(server_mux_upstream_task(
+                1,
+                Zeroizing::new(request),
+                upload_rx,
+                stream,
+                ServerMuxStreamContext {
+                    fixed_data_target: Some(listener.local_addr().unwrap().to_string()),
+                    timing: TimingProfile::from_config(traffic),
+                    chunk_size: max_plaintext_len(0),
+                    cid: 1,
+                    target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
+                    idle_timeout: fallback_idle_timeout(),
+                },
+                MuxPayloadPool::with_capacity(1024),
+            ));
+            let (mut target, _) = listener.accept().await.unwrap();
+            if !server_first {
+                // A partial preface does not elicit a target response. The rest
+                // must arrive through the upload drain before ANY receipt/data.
+                upload_tx
+                    .send(Zeroizing::new(b" remainder".to_vec()))
+                    .await
+                    .unwrap();
+                let mut bytes = [0; 17];
+                timeout(Duration::from_secs(1), target.read_exact(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&bytes, b"partial remainder");
+                assert!(frames.try_recv().is_err());
+            }
+            target.write_all(b"SSH-banner").await.unwrap();
+            target.shutdown().await.unwrap();
+            let frame = timeout(Duration::from_secs(1), frames.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (frame.kind, frame.payload),
+                (MuxFrameKind::Data, b"SSH-banner".to_vec())
+            );
+            assert_eq!(frames.recv().await.unwrap().kind, MuxFrameKind::Fin);
+            drop(upload_tx);
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_receipt_failed_connect_sends_reset_without_a_success_receipt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let (stream, mut frames) = mux_receipt_channel(4).await;
+        let request = ConnectRequest {
+            host: "example.com".into(),
+            port: 443,
+            initial_payload: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let (_, upload_rx) = mpsc::channel(1);
+        server_mux_upstream_task(
+            1,
+            Zeroizing::new(request),
+            upload_rx,
+            stream,
+            ServerMuxStreamContext {
+                fixed_data_target: Some(target),
+                timing: TimingProfile::from_config(TrafficConfig::default()),
+                chunk_size: max_plaintext_len(0),
+                cid: 1,
+                target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
+                idle_timeout: fallback_idle_timeout(),
+            },
+            MuxPayloadPool::with_capacity(1024),
+        )
+        .await;
+        assert_eq!(frames.recv().await.unwrap().kind, MuxFrameKind::Reset);
+        assert!(frames.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_receipt_capacity_recovery_and_both_same_tick_publication_orders() {
+        for response_first in [false, true] {
+            let (stream, mut frames) = mux_receipt_channel(4).await;
+            tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER / 2).await;
+            if response_first {
+                stream
+                    .send(MuxFrameKind::Data, b"data".to_vec())
+                    .await
+                    .unwrap();
+                stream.send_receipt_if_unanswered().await.unwrap();
+                assert_eq!(frames.recv().await.unwrap().payload, b"data");
+                assert!(frames.try_recv().is_err());
+            } else {
+                stream.send_receipt_if_unanswered().await.unwrap();
+                stream
+                    .send(MuxFrameKind::Data, b"data".to_vec())
+                    .await
+                    .unwrap();
+                assert!(frames.recv().await.unwrap().payload.is_empty());
+                assert_eq!(frames.recv().await.unwrap().payload, b"data");
+            }
+        }
+        let (stream, mut frames) = mux_receipt_channel(1).await;
+        let occupied = stream.frames.clone().reserve_owned().await.unwrap();
+        let tx = stream.clone();
+        let pending = tokio::spawn(async move { tx.send_receipt_if_unanswered().await });
+        tokio::task::yield_now().await;
+        assert!(!stream.first_publication.load(Ordering::Acquire));
+        drop(occupied);
+        pending.await.unwrap().unwrap();
+        assert!(frames.recv().await.unwrap().payload.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_receipt_closed_carrier_and_reused_id_do_not_inherit_a_claim() {
+        let (stream, frames) = mux_receipt_channel(1).await;
+        drop(frames);
+        assert!(stream.send_receipt_if_unanswered().await.is_err());
+        assert!(!stream.first_publication.load(Ordering::Acquire));
+        assert!(stream.send(MuxFrameKind::Data, vec![1]).await.is_err());
+        assert!(!stream.first_publication.load(Ordering::Acquire));
+        let dropped = Arc::new(AtomicBool::new(false));
+        struct Cancelled(Arc<AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let guard = Cancelled(dropped.clone());
+        with_mux_open_receipt(&stream, async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(dropped.load(Ordering::Acquire));
+        let (fresh, mut frames) = mux_receipt_channel(1).await;
+        assert_eq!(fresh.stream_id, stream.stream_id);
+        fresh.send_receipt_if_unanswered().await.unwrap();
+        assert!(frames.recv().await.unwrap().payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mux_open_fast_target_data_is_the_receipt_without_a_separate_empty_record() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let traffic = TrafficConfig::default();
+        let (downlink, mut scheduler) = server_mux_downlink(1);
+        let stream = downlink.register(1).await.unwrap();
+        scheduler.drain_control();
+        let (_, mut frames) = scheduler.queues.pop_front().unwrap();
+        let request = ConnectRequest {
+            host: "example.com".into(),
+            port: 443,
+            initial_payload: b"partial request".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        let (upload_tx, upload_rx) = mpsc::channel(4);
+        let upstream = tokio::spawn(server_mux_upstream_task(
+            1,
+            Zeroizing::new(request),
+            upload_rx,
+            stream,
+            ServerMuxStreamContext {
+                fixed_data_target: Some(listener.local_addr().unwrap().to_string()),
+                timing: TimingProfile::from_config(traffic),
+                chunk_size: max_plaintext_len(traffic.max_padding),
+                cid: 1,
+                target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
+                idle_timeout: fallback_idle_timeout(),
+            },
+            MuxPayloadPool::with_capacity(1024),
+        ));
+        let (mut target, _) = listener.accept().await.unwrap();
+        let mut initial = [0; 15];
+        target.read_exact(&mut initial).await.unwrap();
+        assert_eq!(&initial, b"partial request");
+        target.write_all(b"response").await.unwrap();
+        target.shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            while frames.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The frame is already queued: virtual time cannot turn a fast target
+        // into a late response merely because loopback I/O has not been polled.
+        tokio::time::pause();
+        let first = frames.try_recv().unwrap();
+        let wire = mux_record_test_codec((0, 0))
+            .seal(&first.encode().unwrap(), &mut StdRng::seed_from_u64(1))
+            .unwrap();
+        let len = parse_header(&wire).unwrap().payload_len;
+        assert_eq!(first.kind, MuxFrameKind::Data);
+        assert_eq!(
+            first.payload, b"response",
+            "unexpected standalone receipt record: TLS payload={len}"
+        );
+        assert_eq!(frames.recv().await.unwrap().kind, MuxFrameKind::Fin);
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(upload_tx);
+        upstream.await.unwrap();
+    }
+
     #[tokio::test]
     async fn mux_open_is_acknowledged_before_target_response() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9284,10 +11155,12 @@ mod tests {
         let mut request_bytes = [0_u8; 7];
         target.read_exact(&mut request_bytes).await.unwrap();
         assert_eq!(&request_bytes, b"request");
-        let ack = timeout(Duration::from_millis(100), frames.recv())
+        tokio::time::pause();
+        tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER / 2 + Duration::from_millis(1)).await;
+        let ack = frames
+            .recv()
             .await
-            .expect("Open must be acknowledged while the target is still silent")
-            .unwrap();
+            .expect("silent target must receive the bounded receipt");
         assert_eq!(ack.stream_id, 1);
         assert_eq!(ack.kind, MuxFrameKind::Data);
         assert!(ack.payload.is_empty());
@@ -9297,7 +11170,6 @@ mod tests {
             "the acknowledgement must not be written to the target"
         );
 
-        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(30)).await;
         tokio::task::yield_now().await;
         assert!(matches!(
@@ -9599,6 +11471,273 @@ mod tests {
         frames
     }
 
+    async fn mux_tail_test_reader(
+        capacity: usize,
+        timing: TimingProfile,
+    ) -> (
+        TcpStream,
+        mpsc::Receiver<MuxFrame>,
+        tokio::task::JoinHandle<Result<(), HandshakeServerError>>,
+        RelayActivity,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (peer, target) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        let peer = peer.unwrap();
+        peer.set_nodelay(true).unwrap();
+        let (target, _) = target.unwrap();
+        target.set_nodelay(true).unwrap();
+        let (read, _) = target.into_split();
+        let (frames, receiver) = mpsc::channel(16);
+        let downlink = ServerMuxStreamTx {
+            stream_id: 1,
+            frames,
+            wake: Arc::new(Notify::new()),
+            first_publication: Arc::new(AtomicBool::new(false)),
+            receipt_deadline: Instant::now() + MUX_CARRIER_SUSPECT_AFTER / 2,
+        };
+        let activity = Arc::new(AtomicU64::new(u64::MAX));
+        let task = tokio::spawn(server_mux_target_reader_loop(
+            read,
+            downlink,
+            1,
+            timing,
+            MuxFrame::encoded_len(capacity).unwrap(),
+            1,
+            MuxPayloadPool::with_capacity(capacity),
+            activity.clone(),
+        ));
+        (peer, receiver, task, activity)
+    }
+
+    async fn wait_for_mux_target_read(activity: &RelayActivity) {
+        // Keep the paused runtime runnable while the OS reports loopback
+        // readiness; only the test advances the coalescing clock.
+        for _ in 0..100_000 {
+            if activity.load(Ordering::Relaxed) != u64::MAX {
+                tokio::task::yield_now().await;
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("loopback target read was not observed");
+    }
+
+    #[test]
+    fn mux_tail_append_plan_bounds_every_split() {
+        for capacity in [1, 16, 16370] {
+            for buffered in 0..capacity {
+                for available in [0, 1, capacity - buffered, capacity, usize::MAX] {
+                    let take = mux_tail_append_len(buffered, available, capacity);
+                    assert!(take <= available);
+                    assert!(buffered + take <= capacity);
+                    assert!(available == 0 || take > 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_full_payload_sends_without_waiting_for_deadline() {
+        let (mut peer, mut frames, task, activity) =
+            mux_tail_test_reader(16, TimingProfile::from_config(TrafficConfig::default())).await;
+        tokio::time::pause();
+        peer.write_all(b"abcdefgh").await.unwrap();
+        wait_for_mux_target_read(&activity).await;
+        assert!(frames.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(2)).await;
+        activity.store(u64::MAX, Ordering::Relaxed);
+        peer.write_all(b"ijklmnop").await.unwrap();
+        wait_for_mux_target_read(&activity).await;
+        let frame = frames
+            .try_recv()
+            .expect("full payload must not await the timer");
+        assert_eq!(frame.kind, MuxFrameKind::Data);
+        assert_eq!(frame.payload, b"abcdefghijklmnop");
+        assert!(frames.try_recv().is_err());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_deadline_is_not_extended_by_another_read() {
+        let (mut peer, mut frames, task, activity) =
+            mux_tail_test_reader(16, TimingProfile::from_config(TrafficConfig::default())).await;
+        tokio::time::pause();
+        peer.write_all(b"first").await.unwrap();
+        wait_for_mux_target_read(&activity).await;
+        tokio::time::advance(Duration::from_millis(3)).await;
+        activity.store(u64::MAX, Ordering::Relaxed);
+        peer.write_all(b"second").await.unwrap();
+        wait_for_mux_target_read(&activity).await;
+        assert!(frames.try_recv().is_err());
+        // Tokio's timer wheel rounds a deadline up to the next millisecond.
+        // Six milliseconds still precedes a wrongly restarted 3ms + 5ms timer.
+        tokio::time::advance(Duration::from_millis(3)).await;
+        tokio::task::yield_now().await;
+        let frame = frames
+            .try_recv()
+            .expect("oldest byte's deadline must flush");
+        assert_eq!(frame.payload, b"firstsecond");
+        assert_eq!(frame.kind, MuxFrameKind::Data);
+        assert!(frames.try_recv().is_err());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_eof_flushes_data_before_fin_without_waiting() {
+        let (mut peer, mut frames, task, activity) =
+            mux_tail_test_reader(16, TimingProfile::from_config(TrafficConfig::default())).await;
+        tokio::time::pause();
+        peer.write_all(b"short tail").await.unwrap();
+        wait_for_mux_target_read(&activity).await;
+        assert!(frames.try_recv().is_err());
+        let before_eof = Instant::now();
+        peer.shutdown().await.unwrap();
+        for _ in 0..100_000 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "EOF must complete without clock advancement"
+        );
+        let data = frames.try_recv().unwrap();
+        let fin = frames.try_recv().unwrap();
+        assert_eq!(Instant::now(), before_eof, "EOF must bypass the tail timer");
+        assert_eq!(
+            (data.kind, data.payload),
+            (MuxFrameKind::Data, b"short tail".to_vec())
+        );
+        assert_eq!(fin.kind, MuxFrameKind::Fin);
+        assert!(fin.payload.is_empty());
+        task.await.unwrap().unwrap();
+        assert!(frames.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_nonzero_timing_keeps_original_jitter_without_extra_tail_wait() {
+        let traffic = TrafficConfig {
+            min_delay_ms: 7,
+            max_delay_ms: 7,
+            ..TrafficConfig::default()
+        };
+        let (mut peer, mut frames, task, activity) =
+            mux_tail_test_reader(16, TimingProfile::from_config(traffic)).await;
+        tokio::time::pause();
+        peer.write_all(b"jitter").await.unwrap();
+        wait_for_mux_target_read(&activity).await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        assert!(frames.try_recv().is_err());
+        // Allow the timer wheel's one-millisecond rounding, but no additional
+        // five-millisecond tail hold after the configured seven-ms jitter.
+        tokio::time::advance(Duration::from_millis(3)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(frames.try_recv().unwrap().payload, b"jitter");
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_large_transfer_is_byte_exact_and_bounded() {
+        let capacity = MuxFrame::max_payload_len(max_plaintext_len(0));
+        let (mut peer, mut frames, task, _) = mux_tail_test_reader(
+            capacity,
+            TimingProfile::from_config(TrafficConfig::default()),
+        )
+        .await;
+        let expected: Vec<u8> = (0..512 * 1024).map(|index| (index % 251) as u8).collect();
+        let input = expected.clone();
+        let producer = tokio::spawn(async move {
+            for chunk in input.chunks(997) {
+                peer.write_all(chunk).await.unwrap();
+            }
+            peer.shutdown().await.unwrap();
+        });
+        let mut actual = Vec::new();
+        while let Some(frame) = frames.recv().await {
+            match frame.kind {
+                MuxFrameKind::Data => {
+                    assert!(!frame.payload.is_empty() && frame.payload.len() <= capacity);
+                    actual.extend_from_slice(&frame.payload);
+                }
+                MuxFrameKind::Fin => {
+                    assert!(frame.payload.is_empty());
+                    break;
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        producer.await.unwrap();
+        task.await.unwrap().unwrap();
+        assert!(frames.recv().await.is_none());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_blocked_stream_does_not_block_another_stream() {
+        let timing = TimingProfile::from_config(TrafficConfig::default());
+        let (mut slow, slow_frames, slow_task, _) = mux_tail_test_reader(16, timing).await;
+        slow.write_all(&[0x51; 16 * 64]).await.unwrap();
+        let (mut peer, mut frames, task, _) = mux_tail_test_reader(16, timing).await;
+        peer.write_all(b"other stream").await.unwrap();
+        peer.shutdown().await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), frames.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"other stream"
+        );
+        assert_eq!(frames.recv().await.unwrap().kind, MuxFrameKind::Fin);
+        task.await.unwrap().unwrap();
+        assert!(
+            !slow_task.is_finished(),
+            "the full per-stream queue remains blocked"
+        );
+        drop(slow_frames);
+        slow_task.abort();
+        let _ = slow_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_reset_is_an_error_after_preceding_complete_data() {
+        let (mut peer, mut frames, task, _) =
+            mux_tail_test_reader(16, TimingProfile::from_config(TrafficConfig::default())).await;
+        peer.write_all(b"abcdefghijklmnoptail").await.unwrap();
+        assert_eq!(frames.recv().await.unwrap().payload, b"abcdefghijklmnop");
+        socket2::SockRef::from(&peer)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(peer);
+        let mut terminal = frames.recv().await.unwrap();
+        // The tail may have reached its timer while the OS reports the reset.
+        // It can precede Reset, but a reset must never become a clean Fin.
+        if terminal.kind == MuxFrameKind::Data {
+            assert_eq!(terminal.payload, b"tail");
+            terminal = frames.recv().await.unwrap();
+        }
+        assert_eq!(terminal.kind, MuxFrameKind::Reset);
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(HandshakeServerError::Io(_))
+        ));
+        assert!(frames.recv().await.is_none());
+    }
+
     /// The download path must serve substreams round-robin: a small response
     /// that arrives while a bulk substream has a backlog goes out right behind
     /// ONE bulk frame, not behind the whole backlog. The old single FIFO wrote
@@ -9726,6 +11865,7 @@ mod tests {
             payload_pool,
             Duration::from_secs(5),
             Arc::new(AtomicU64::new(relay_now_millis())),
+            TcpMuxRecordProfile::Off,
         ));
         stream
             .send(MuxFrameKind::Data, b"payload".to_vec())
@@ -12334,6 +14474,7 @@ mod tests {
                 payload_pool,
                 idle,
                 Arc::new(AtomicU64::new(relay_now_millis())),
+                TcpMuxRecordProfile::Off,
             ),
         )
         .await

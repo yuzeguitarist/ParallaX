@@ -1,0 +1,143 @@
+rules:
+  - id: observe-mldsa-read-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed reader method.
+    patterns:
+      - pattern-inside: 'impl WipingReader<$R> { ... }'
+      - pattern: 'fn read(...) { ... }'
+  - id: observe-mldsa-read-refill
+    languages: [rust]
+    severity: INFO
+    message: Every core output refill in the reader, including nested scopes.
+    patterns:
+      - pattern-inside: 'impl WipingReader<$R> { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: 'self.core.read_block()'
+  - id: observe-mldsa-read-copy
+    languages: [rust]
+    severity: INFO
+    message: Every output copy site in the reader.
+    patterns:
+      - pattern-inside: 'impl WipingReader<$R> { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: '$DEST.copy_from_slice(...)'
+  - id: observe-mldsa-read-consume-wipe
+    languages: [rust]
+    severity: INFO
+    message: The one consumed-range wipe site.
+    patterns:
+      - pattern-inside: 'impl WipingReader<$R> { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: 'wipe_bytes(...)'
+  - id: observe-mldsa-read-prefix
+    languages: [rust]
+    severity: INFO
+    message: The whole reader delegates each cached window to the shipping proved operation.
+    patterns:
+      - pattern-inside: 'impl WipingReader<$R> { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: 'self.read_cached_prefix(...)'
+  - id: observe-mldsa-read-cursor
+    languages: [rust]
+    severity: INFO
+    message: Refill resets the cursor; prefix advancement belongs to the proved operation.
+    patterns:
+      - pattern-inside: 'impl WipingReader<$R> { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: 'self.offset = ...'
+  - id: observe-mldsa-prefix-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete shipping cached-prefix operation.
+    pattern: 'fn read_cached_prefix(...) { ... }'
+  - id: observe-mldsa-prefix-copy
+    languages: [rust]
+    severity: INFO
+    message: Each output copy in the cached-prefix operation.
+    patterns:
+      - pattern-inside: 'fn read_cached_prefix(...) { ... }'
+      - pattern: '$DEST.copy_from_slice(...)'
+  - id: observe-mldsa-prefix-wipe
+    languages: [rust]
+    severity: INFO
+    message: Each consumed-range wipe in the cached-prefix operation.
+    patterns:
+      - pattern-inside: 'fn read_cached_prefix(...) { ... }'
+      - pattern: 'wipe_bytes(...)'
+  - id: observe-mldsa-prefix-cursor
+    languages: [rust]
+    severity: INFO
+    message: Each cursor write in the cached-prefix operation.
+    patterns:
+      - pattern-inside: 'fn read_cached_prefix(...) { ... }'
+      - pattern: 'self.offset = ...'
+  - id: observe-mldsa-prefix-refill
+    languages: [rust]
+    severity: INFO
+    message: A cached-prefix operation must not refill or advance the sponge.
+    patterns:
+      - pattern-inside: 'fn read_cached_prefix(...) { ... }'
+      - pattern: 'self.core.read_block()'
+  - id: observe-mldsa-prefix-return
+    languages: [rust]
+    severity: INFO
+    message: The cached-prefix operation has only its final count result, including normalized Rust tails.
+    patterns:
+      - pattern-inside: 'fn read_cached_prefix(...) { ... }'
+      - pattern: 'return $VALUE;'
+  - id: observe-mldsa-absorb-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed absorb/finalize function.
+    pattern: 'fn new_reader(...) { ... }'
+  - id: observe-mldsa-absorb-finalize
+    languages: [rust]
+    severity: INFO
+    message: Each core finalization site.
+    patterns:
+      - pattern-inside: 'fn new_reader(...) { ... }'
+      - pattern: '$CORE.finalize_xof_core(...)'
+  - id: observe-mldsa-absorb-feed
+    languages: [rust]
+    severity: INFO
+    message: Each input feed site.
+    patterns:
+      - pattern-inside: 'fn new_reader(...) { ... }'
+      - pattern: '$BUFFER.digest_blocks(...)'
+  - id: observe-mldsa-wipe-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete shipping byte wipe.
+    pattern: 'fn wipe_bytes(...) { ... }'
+  - id: observe-mldsa-wipe-zeroize
+    languages: [rust]
+    severity: INFO
+    message: The helper must call the volatile zeroize operation once.
+    patterns:
+      - pattern-inside: 'fn wipe_bytes(...) { ... }'
+      - pattern: '$BYTES.zeroize()'
+  - id: observe-mldsa-clear-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete absorb-buffer clearing function.
+    pattern: 'fn clear(...) { ... }'
+  - id: observe-mldsa-clear-wipe
+    languages: [rust]
+    severity: INFO
+    message: The absorb buffer must pass one entire block to the shipping wipe.
+    patterns:
+      - pattern-inside: 'fn clear(...) { ... }'
+      - pattern: 'wipe_bytes(...)'
+  - id: observe-mldsa-output-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete output adapter zeroizer.
+    pattern: 'fn zeroize(...) { ... }'
+  - id: observe-mldsa-output-wipe
+    languages: [rust]
+    severity: INFO
+    message: The output adapter must pass one entire block to the shipping wipe.
+    patterns:
+      - pattern-inside: 'fn zeroize(...) { ... }'
+      - pattern: 'wipe_bytes(...)'

@@ -611,6 +611,16 @@ The negotiated AEAD (ChaCha20-Poly1305 or AES-256-GCM) is selected by the server
 and signaled in `SERVER_KEY_EXCHANGE` (§3.3); both peers then use it for all
 records.
 
+The reference sender limits AES-256-GCM to `2^23` encrypted records per key and
+direction, including cover records. Its bounded padded plaintext plus AAD may
+occupy at most `2^12` 16-byte blocks in total, using the conservative
+confidentiality bound in [RFC 9001 Appendix B](https://www.rfc-editor.org/rfc/rfc9001.html#appendix-B).
+The sender rejects a batch before encryption if it would exceed this budget.
+Exhaustion closes the session; subsequent connections use a fresh handshake,
+without replaying partially sent application data. This is an outbound policy:
+the receiver does not impose the same record limit. No on-wire key update is
+introduced, and ChaCha20-Poly1305 retains the nonce-exhaustion limit above.
+
 ### 5.6 Server identity proof (Phase B authentication)
 
 The server proves it holds the long-term ML-DSA-87 identity the client expects.
@@ -621,7 +631,7 @@ It signs, with **ML-DSA-87** under signing context
 signed_message = L_id
               || u64_be(epoch)
               || transcript_hash[32]
-              || server_ephemeral_x25519_public[32]   // = server_x25519_public from PX1K (§6.3)
+              || server_static_x25519_public[32]      // client's configured server_public_key pin
               || pq_rekey_binding[32]
 
   L_id = b"ParallaX v2 server identity proof"
@@ -643,8 +653,10 @@ another. Concretely: both server (signing) and client (verifying) use the
 **initial-handshake `transcript_hash`** (the `CH || origin-SH` value of §5.3,
 which a rekey does NOT change). The client signs/verifies *after* applying the
 rekey (§5.7), so `self.keys.epoch` is already 1 when it verifies. The
-`server_ephemeral_x25519_public` is the `server_x25519_public` from the `PX1K`
-(§6.3) that drove this rekey.
+`server_static_x25519_public` is the server's long-term X25519 public key,
+matching the client's configured `server_public_key`. The fresh server X25519
+public key in `PX1K` (§6.3) is bound through `pq_rekey_binding`, together with
+the complete client request and selected cipher-suite tag.
 
 The proof is encoded as a complete `PX1S` message and transported in `PX1I`
 chunks (§6.4), including the `PX1S` magic and signature-length field. The
@@ -1217,10 +1229,16 @@ Each logical stream is identified by a `u32` `stream_id`.
   plane; the client always initiates.)
 - **OPEN (kind 1).** Carries a complete `CONNECT` (`PX1C`) as its payload,
   telling the server the target for this stream. After OPEN the server dials and
-  the stream is established. Once the request is parsed, the TCP-plane server
-  acknowledges receipt with an empty DATA frame **before** DNS, dial, or target
-  writes. This confirms carrier liveness, not target connection success; setup
-  failures still send RESET.
+  the stream is established. The first DATA, FIN or RESET implicitly acknowledges
+  receipt. Otherwise the TCP-plane server queues one empty DATA receipt by an
+  absolute deadline of half the shared 5 s client suspect budget, measured before
+  Open registration can wait on the writer. DNS, dial, upload and target reads
+  continue concurrently with that deadline. This is a receipt, not target
+  connection success; setup failures still send RESET. The delay consumes existing
+  network/queue margin and does not guarantee peer delivery before 5 s.
+  Implicit confirmation requires a complete authenticated outer record: a large
+  first response stalled mid-record can still reach the unchanged client 5/25 s
+  watchdog limits, whereas an earlier small receipt would have disarmed it.
 - **DATA (kind 2).** Carries stream payload bytes. Multiple DATA frames per
   stream, interleaved with other streams' frames. Empty DATA is legal and
   delivers no bytes to the application, including the OPEN receipt acknowledgement.
@@ -1296,8 +1314,9 @@ shows no proof of life (no record read, and no write that waited for socket spac
 and then drained) for `MUX_CARRIER_SUSPECT_AFTER = 5 s`, the session is
 **suspect** and accepts no new substreams; after `MUX_CARRIER_DEAD_AFTER = 25 s`
 its substreams are reset (so applications retry on a fresh session) and the
-carrier is dropped. The server's empty DATA acknowledgement disarms this wait
-before any target I/O, so a healthy target may delay its response beyond 25 s.
+carrier is dropped. A first DATA/FIN/RESET disarms this wait; otherwise the server
+queues the bounded empty DATA receipt independently of target I/O, so a healthy
+target may delay its response beyond 25 s. Client uploads never wait for a receipt.
 Existing clients already ignore empty DATA payloads. Updated clients wait for
 acknowledgements for **every** OPEN, including an empty initial payload. Deploy
 the updated server before this client behavior: against an older server that
@@ -1349,6 +1368,10 @@ batch map to consecutive sequence numbers `base..base+n` in order, so the
 receiver opens them with the same consecutive sequence numbers. This is purely a
 performance optimization and is wire-transparent — each record is an independent
 AEAD unit with its own sequence-derived nonce (§5.5).
+
+The sender reserves the entire batch's sequence range before dispatching parallel
+encryption. If any worker fails, the codec becomes unusable; reserved sequence
+numbers are never rolled back, and rekeying does not revive a failed codec.
 
 ---
 

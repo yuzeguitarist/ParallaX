@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io,
     net::SocketAddr,
     sync::{
@@ -24,9 +24,10 @@ use tokio::{
         TcpListener, TcpStream,
     },
     sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
-    time::{sleep, timeout, Instant},
+    time::{sleep, timeout, timeout_at, Instant},
 };
 
+use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;
 use crate::{
     client::initial_payload,
     client::socks::{self, SocksError},
@@ -103,11 +104,10 @@ fn client_relay_idle_timeout() -> Duration {
 }
 /// Bound on the local SOCKS5 negotiation. A loopback client that opens the
 /// socket then stalls (or trickles bytes one at a time) would otherwise park the
-/// connection task forever, holding a connection slot — and on the non-mux path
-/// a speculative upstream session. An independent flat 10s bound on the loopback
+/// connection task forever, holding a connection slot. Upstream establishment
+/// starts only after successful validation. An independent flat 10s bound on the loopback
 /// SOCKS side (not the GFW-facing server first-record wait, which is jittered).
 const SOCKS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
-const WARM_SESSION_POOL_TARGET: usize = 4;
 const MUX_FRAME_CHANNEL_PER_STREAM: usize = 8;
 /// Depth of a single stream's download channel: how many decrypted download
 /// frames the reader may queue ahead of a stream's own download task before it
@@ -177,13 +177,11 @@ const MUX_MAX_CONCURRENT_SESSION_BUILDS: usize = 8;
 /// still fails fast against a genuinely down/blocked server.
 const MUX_ACQUIRE_MAX_BUILD_ATTEMPTS: u32 = 3;
 /// Dead-carrier watchdog for a TCP mux session (see [`MuxCarrierWatchdog`]). An
-/// Open, including one with no initial app bytes, draws an empty Data
-/// acknowledgement before server-side target I/O. Target
-/// response latency is therefore independent of this clock. If NOTHING returns
+/// Open, including one with no initial app bytes, draws a bounded receipt unless
+/// Data/Fin/Reset has already answered it. If NOTHING returns
 /// from the carrier for `SUSPECT` the session gets no new substreams; after `DEAD` its
 /// substreams are reset (apps retry on a fresh session) and the carrier is
 /// dropped. Nothing is sent to detect this: no ping, no keepalive.
-const MUX_CARRIER_SUSPECT_AFTER: Duration = Duration::from_secs(5);
 const MUX_CARRIER_DEAD_AFTER: Duration = Duration::from_secs(25);
 /// A client->server mux write that waited at least this long for socket space
 /// and then completed proves the server is ACKing, so an upload that keeps the
@@ -231,9 +229,6 @@ pub enum ClientRuntimeError {
     #[error("blocking crypto task failed: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
 }
-
-type ClientSession = (TcpStream, ClientDataSession, Option<RetainedClientQuic>);
-type ClientSessionTask = tokio::task::JoinHandle<Result<ClientSession, ClientRuntimeError>>;
 
 pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     if config.mode != Mode::Client {
@@ -296,28 +291,6 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     // alongside `udp` so a black-holed UDP path is probed at most once per
     // `UDP_BLACKHOLE_TTL` instead of on every connection.
     let udp_reachability = Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL));
-    let warm_sessions = if config.traffic.max_concurrent_streams == 1 {
-        let warm_sessions = WarmSessionPool::new(
-            Arc::clone(&client),
-            server_addr.clone(),
-            config.traffic,
-            Arc::clone(&udp),
-            Arc::clone(&udp_reachability),
-            Arc::clone(&psk),
-            server_public,
-            Arc::clone(&server_identity_public),
-        );
-        // Pre-warm only when udp is off. With udp on the pool's warm target is 0
-        // (no parked idle retained QUIC), so single-connect sessions are
-        // established on demand "cold"; pre-warming would be a no-op anyway, so we
-        // skip it explicitly.
-        if !udp.enabled {
-            warm_sessions.ensure_started().await;
-        }
-        Some(warm_sessions)
-    } else {
-        None
-    };
     let mux_sessions = if config.traffic.max_concurrent_streams > 1 {
         let mux_sessions = ClientMuxPool::new(
             Arc::clone(&client),
@@ -329,7 +302,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
             server_public,
             Arc::clone(&server_identity_public),
         );
-        mux_sessions.ensure_started();
+        mux_sessions.start_keeper();
         Some(mux_sessions)
     } else {
         None
@@ -385,7 +358,6 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         let udp = Arc::clone(&udp);
         let reachability = Arc::clone(&udp_reachability);
         let server_addr = server_addr.clone();
-        let warm_sessions = warm_sessions.clone();
         let mux_sessions = mux_sessions.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
@@ -406,7 +378,6 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
                 psk: psk.as_ref().as_slice(),
                 server_public: &server_public,
                 server_identity_public,
-                warm_sessions,
             };
             if let Err(err) = handle_local_connection_with_cid(local, context, cid).await {
                 tracing::debug!(cid, %peer, error = %err, "client connection closed");
@@ -437,7 +408,6 @@ pub async fn handle_local_connection(
         psk,
         server_public,
         server_identity_public,
-        warm_sessions: None,
     };
     handle_local_connection_with_cid(local, context, cid).await
 }
@@ -533,196 +503,6 @@ struct ClientConnectionContext<'a> {
     psk: &'a [u8],
     server_public: &'a [u8; 32],
     server_identity_public: Arc<[u8]>,
-    warm_sessions: Option<WarmSessionPool>,
-}
-
-#[derive(Clone)]
-struct WarmSessionPool {
-    inner: Arc<Mutex<VecDeque<ClientSessionTask>>>,
-    config: Arc<ClientConfig>,
-    server_addr: ServerAddrResolver,
-    traffic: TrafficConfig,
-    udp: Arc<UdpConfig>,
-    reachability: Arc<UdpReachability>,
-    psk: Arc<Zeroizing<Vec<u8>>>,
-    server_public: [u8; 32],
-    server_identity_public: Arc<[u8]>,
-    /// Number of pre-established idle sessions the pool keeps warm. This is
-    /// `WARM_SESSION_POOL_TARGET` by default, but 0 when `udp.enabled`: a warm
-    /// single-connect session retains a live QUIC connection (15s keep-alive
-    /// PINGs) and parks a matching server task blocked on the first-command read
-    /// holding its QUIC conn -- an idle footprint (resource + fingerprint) before
-    /// any traffic. With udp on we therefore establish single-connect sessions on
-    /// demand "cold" (no parked idle QUIC), trading away the warm-pool latency
-    /// benefit. With udp off this stays `WARM_SESSION_POOL_TARGET` and the pool is
-    /// byte-identical to before.
-    warm_target: usize,
-}
-
-impl WarmSessionPool {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        config: Arc<ClientConfig>,
-        server_addr: ServerAddrResolver,
-        traffic: TrafficConfig,
-        udp: Arc<UdpConfig>,
-        reachability: Arc<UdpReachability>,
-        psk: Arc<Zeroizing<Vec<u8>>>,
-        server_public: [u8; 32],
-        server_identity_public: Arc<[u8]>,
-    ) -> Self {
-        // With udp on, single-connect sessions are established on demand "cold"
-        // (target 0) so the pool never parks idle retained QUIC connections; with
-        // udp off the pool keeps `WARM_SESSION_POOL_TARGET` warm sessions exactly
-        // as before.
-        let warm_target = if udp.enabled {
-            0
-        } else {
-            WARM_SESSION_POOL_TARGET
-        };
-        Self {
-            inner: Arc::new(Mutex::new(VecDeque::new())),
-            config,
-            server_addr,
-            traffic,
-            udp,
-            reachability,
-            psk,
-            server_public,
-            server_identity_public,
-            warm_target,
-        }
-    }
-
-    async fn ensure_started(&self) {
-        let mut warm = self.inner.lock().await;
-        self.fill_locked(&mut warm);
-    }
-
-    async fn take_or_start(&self) -> ClientSessionTask {
-        let mut warm = self.inner.lock().await;
-        let session = match warm.pop_front() {
-            // A parked warm session may have died (RST / NAT blackhole) or its
-            // handshake may have failed while idle; validate it and transparently
-            // re-dial once if it is not a live, successful session.
-            Some(parked) => self.spawn_validated(parked),
-            None => self.spawn_session(),
-        };
-        self.fill_locked(&mut warm);
-        session
-    }
-
-    fn fill_locked(&self, warm: &mut VecDeque<ClientSessionTask>) {
-        while warm.len() < self.warm_target {
-            warm.push_back(self.spawn_session());
-        }
-    }
-
-    fn spawn_session(&self) -> ClientSessionTask {
-        // The warm-session pool retains up to `self.warm_target` idle sessions,
-        // each of which (on the udp-on retain path) would hold a live QUIC
-        // connection alive (keep-alive footprint / idle resource cost). That is
-        // why `warm_target` is 0 when `udp.enabled`: udp-on single-connect
-        // sessions are established on demand "cold" so no idle retained QUIC is
-        // parked. With udp off the target stays `WARM_SESSION_POOL_TARGET` (4) and
-        // the pre-warm behavior is unchanged.
-        let config = Arc::clone(&self.config);
-        let server_addr = self.server_addr.clone();
-        let traffic = self.traffic;
-        let udp = Arc::clone(&self.udp);
-        let reachability = Arc::clone(&self.reachability);
-        let psk = Arc::clone(&self.psk);
-        let server_public = self.server_public;
-        let server_identity_public = Arc::clone(&self.server_identity_public);
-        tokio::spawn(async move {
-            establish_authenticated_data_session_with_resolver(
-                &server_addr,
-                &config,
-                traffic,
-                &udp,
-                &reachability,
-                psk.as_ref().as_slice(),
-                &server_public,
-                server_identity_public,
-            )
-            .await
-        })
-    }
-
-    /// Wraps a parked warm-session handle so the handle the caller awaits ALWAYS
-    /// resolves to a validated, live session or a genuinely-fresh dial. Fixes a
-    /// stale-cached handshake error (poison/abort -> re-dial) and a dead parked
-    /// socket (RST/blackhole -> re-dial) without changing the call site.
-    fn spawn_validated(&self, parked: ClientSessionTask) -> ClientSessionTask {
-        let config = Arc::clone(&self.config);
-        let server_addr = self.server_addr.clone();
-        let traffic = self.traffic;
-        let udp = Arc::clone(&self.udp);
-        let reachability = Arc::clone(&self.reachability);
-        let psk = Arc::clone(&self.psk);
-        let server_public = self.server_public;
-        let server_identity_public = Arc::clone(&self.server_identity_public);
-        tokio::spawn(async move {
-            // Propagate cancellation to the inner establishment task: if THIS
-            // wrapper is aborted (e.g. the caller's session_abort fires), abort the
-            // parked handshake too. A bare JoinHandle drop only DETACHES the inner
-            // task, leaving the full handshake running uncancelled.
-            let _abort_inner = AbortOnDrop(parked.abort_handle());
-            match parked.await {
-                Ok(Ok(session)) if warm_session_is_live(&session.0) => Ok(session),
-                // Poisoned handshake error, aborted/panicked task, or a dead parked
-                // socket: dial a genuinely fresh session instead of returning stale.
-                _ => {
-                    establish_authenticated_data_session_with_resolver(
-                        &server_addr,
-                        &config,
-                        traffic,
-                        &udp,
-                        &reachability,
-                        psk.as_ref().as_slice(),
-                        &server_public,
-                        server_identity_public,
-                    )
-                    .await
-                }
-            }
-        })
-    }
-}
-
-/// Aborts a tokio task when dropped, so cancelling a wrapper task propagates the
-/// cancellation to the task it is awaiting instead of detaching it.
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Non-destructively probes whether a parked warm TCP session is still alive via
-/// a 1-byte `MSG_PEEK`: a healthy idle session has no pending pre-Connect bytes,
-/// so this never consumes real data. `> 0` => live (bytes peeked); `0` => dead
-/// (clean EOF); `< 0` with `EWOULDBLOCK`/`EAGAIN` => live (idle, the normal warm
-/// case); any other errno (e.g. `ECONNRESET`) => dead.
-#[cfg(unix)]
-fn warm_session_is_live(stream: &TcpStream) -> bool {
-    use rustix::io::Errno;
-    use rustix::net::{recv, RecvFlags};
-
-    let mut byte = [0_u8; 1];
-    // Non-destructive (peek) + non-blocking probe on the borrowed fd. The second
-    // tuple field is recv()'s return: > 0 => live, 0 => clean EOF (dead);
-    // EWOULDBLOCK/EAGAIN => live (idle warm socket, the normal case).
-    match recv(stream, &mut byte, RecvFlags::PEEK | RecvFlags::DONTWAIT) {
-        Ok((_, peeked)) => peeked > 0,
-        Err(err) => err == Errno::WOULDBLOCK || err == Errno::AGAIN,
-    }
-}
-
-#[cfg(not(unix))]
-fn warm_session_is_live(_stream: &TcpStream) -> bool {
-    true
 }
 
 /// Live sessions in the mux pool plus the single-flight build coordinator.
@@ -772,7 +552,8 @@ impl MuxPoolState {
 #[derive(Clone)]
 struct ClientMuxPool {
     inner: Arc<Mutex<MuxPoolState>>,
-    /// Monotonic ms of the last real connection served by `handle()`. The warm-
+    /// Monotonic ms + 1 of the last validated local connection. Zero means the
+    /// client has never served one, including at clock epoch zero. The warm-
     /// keeper consults it to refill a dead tunnel only during active-use windows
     /// (so an idle client never re-handshakes on a 24/7 timer).
     last_activity: Arc<AtomicU64>,
@@ -784,6 +565,34 @@ struct ClientMuxPool {
     psk: Arc<Zeroizing<Vec<u8>>>,
     server_public: [u8; 32],
     server_identity_public: Arc<[u8]>,
+}
+
+fn mux_activity_is_recent(last_activity: u64, now: u64) -> bool {
+    last_activity != 0
+        && now.saturating_sub(last_activity - 1) <= MUX_WARM_KEEPER_ACTIVE_WINDOW.as_millis() as u64
+}
+
+#[cfg(kani)]
+mod activation_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn never_used_mux_cannot_warm() {
+        let now: u64 = kani::any();
+        assert!(!mux_activity_is_recent(0, now));
+    }
+
+    #[kani::proof]
+    fn encoded_activity_matches_elapsed_window() {
+        let activated_at: u64 = kani::any();
+        let now: u64 = kani::any();
+        kani::assume(activated_at < u64::MAX);
+        kani::assume(now >= activated_at);
+        assert_eq!(
+            mux_activity_is_recent(activated_at + 1, now),
+            now - activated_at <= MUX_WARM_KEEPER_ACTIVE_WINDOW.as_millis() as u64
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -1133,7 +942,7 @@ impl ClientMuxPool {
     /// case, wedge the pool).
     async fn acquire(&self) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
         self.last_activity
-            .store(relay_now_millis(), Ordering::Relaxed);
+            .store(relay_now_millis().saturating_add(1), Ordering::Relaxed);
         let mut build_attempts = 0u32;
         loop {
             let mut state = self.inner.lock().await;
@@ -1238,6 +1047,12 @@ impl ClientMuxPool {
     /// cancels it), so its `builds_in_flight` increment/decrement stay paired.
     async fn ensure_warm(&self) -> Result<(), ClientRuntimeError> {
         loop {
+            if !mux_activity_is_recent(
+                self.last_activity.load(Ordering::Relaxed),
+                relay_now_millis(),
+            ) {
+                return Ok(());
+            }
             let mut state = self.inner.lock().await;
             self.reap_sessions(&mut state);
             if !state.sessions.is_empty() {
@@ -1322,13 +1137,9 @@ impl ClientMuxPool {
         });
     }
 
-    fn ensure_started(&self) {
+    fn start_keeper(&self) {
         let pool = self.clone();
         tokio::spawn(async move {
-            // Initial warm at startup.
-            if let Err(err) = pool.ensure_warm().await {
-                tracing::debug!(error = %err, "client mux warm session startup failed");
-            }
             // Warm-keeper: during active-use windows, proactively rebuild a dead
             // shared tunnel so the next local connection finds it warm (resilience
             // to a mid-session RST/blackhole). Outside the active window, let it
@@ -1360,7 +1171,7 @@ impl ClientMuxPool {
                 }
                 let act = pool.last_activity.load(Ordering::Relaxed);
                 let now = relay_now_millis();
-                if now.saturating_sub(act) > MUX_WARM_KEEPER_ACTIVE_WINDOW.as_millis() as u64 {
+                if !mux_activity_is_recent(act, now) {
                     // Idled out cleanly (not an establishment failure): don't rebuild.
                     failures = 0;
                     next_rebuild_at = 0;
@@ -1582,27 +1393,30 @@ async fn supervise_client_mux_session(
     }
 }
 
+async fn accept_local_socks_connect(
+    local: &mut TcpStream,
+) -> Result<socks::SocksRequest, ClientRuntimeError> {
+    match timeout(SOCKS_ACCEPT_TIMEOUT, socks::accept_connect(local)).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_elapsed) => {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "SOCKS handshake timed out").into())
+        }
+    }
+}
+
 async fn handle_local_mux_connection_with_cid(
     mut local: TcpStream,
     mux_pool: ClientMuxPool,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
     tune_tcp_stream(&local)?;
+    let request = accept_local_socks_connect(&mut local).await?;
     tracing::debug!(
         cid,
         task_name = "client-mux-connection",
         "accepted SOCKS connection for mux session"
     );
 
-    let request =
-        match tokio::time::timeout(SOCKS_ACCEPT_TIMEOUT, socks::accept_connect(&mut local)).await {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                return Err(
-                    io::Error::new(io::ErrorKind::TimedOut, "SOCKS handshake timed out").into(),
-                );
-            }
-        };
     // Reserve a substream slot on a session that has one free, opening a new
     // session if every existing session is saturated. The permit is held for the
     // whole connection: it bounds each session to `max_concurrent_streams`
@@ -1697,6 +1511,11 @@ async fn handle_local_mux_connection_with_cid(
         mux.chunk_size,
         cid,
         payload_pool.clone(),
+        if mux_pool.traffic.max_delay_ms == 0 {
+            CLIENT_TCP_MUX_TAIL_HOLD
+        } else {
+            Duration::ZERO
+        },
     );
     let download = client_mux_await_download(outcome_rx, cid);
     // Wait for BOTH halves. A clean server Fin (DownloadOutcome::Fin -> Ok)
@@ -1915,6 +1734,10 @@ async fn handle_local_connection_with_cid(
     context: ClientConnectionContext<'_>,
     cid: u64,
 ) -> Result<(), ClientRuntimeError> {
+    tune_tcp_stream(&local)?;
+    // Cold first use pays establishment latency. A malformed or stalled local
+    // SOCKS client must not cause authenticated TCP/QUIC carrier traffic.
+    let request = accept_local_socks_connect(&mut local).await?;
     let ClientConnectionContext {
         config,
         server_addr,
@@ -1924,27 +1747,22 @@ async fn handle_local_connection_with_cid(
         psk,
         server_public,
         server_identity_public,
-        warm_sessions,
     } = context;
-    tune_tcp_stream(&local)?;
     tracing::debug!(
         cid,
         task_name = "client-connection",
         "accepted SOCKS connection"
     );
-    // Browser SOCKS clients normally send CONNECT immediately after opening the
-    // local TCP socket, so pre-establish the upstream ParallaX session while the
-    // local SOCKS request is still arriving.
-    let server_session_task = if let Some(warm_sessions) = &warm_sessions {
-        warm_sessions.take_or_start().await
-    } else {
+    // Establish exactly the carrier needed by this validated request. Idle
+    // authenticated spares expose additional flows without carrying user data.
+    let server_session_task = {
         let speculative_config = config.clone();
         let speculative_server_addr = server_addr.clone();
         let speculative_udp = udp.clone();
         let speculative_reachability = Arc::clone(&reachability);
         // Wrap the speculative-path PSK copy in Zeroizing so it is wiped when the
-        // spawned task's Arc drops, matching the canonical PSK and the warm/mux
-        // pools (which keep Arc<Zeroizing<Vec<u8>>>); a bare Arc<[u8]> would leave
+        // spawned task drops, matching the canonical PSK and the mux pool
+        // (which keeps Arc<Zeroizing<Vec<u8>>>); a bare Arc<[u8]> would leave
         // a plaintext PSK copy un-wiped on this single-connect path.
         let speculative_psk = Arc::new(Zeroizing::new(psk.to_vec()));
         let speculative_server_public = *server_public;
@@ -1963,25 +1781,9 @@ async fn handle_local_connection_with_cid(
             .await
         })
     };
-    // Abort handle for the speculative/warm session task: if the local SOCKS
-    // request errors out below, we must ABORT the spawned task (not just drop its
-    // JoinHandle, which detaches it and lets it run a full handshake + QUIC connect
-    // to completion, transiently holding a retained QUIC connection when udp is on).
+    // A failed initial-payload read below must abort this establishment task:
+    // dropping its JoinHandle alone would detach a live TCP/QUIC handshake.
     let session_abort = server_session_task.abort_handle();
-    let request =
-        match tokio::time::timeout(SOCKS_ACCEPT_TIMEOUT, socks::accept_connect(&mut local)).await {
-            Ok(Ok(request)) => request,
-            Ok(Err(err)) => {
-                server_session_task.abort();
-                return Err(err.into());
-            }
-            Err(_elapsed) => {
-                server_session_task.abort();
-                return Err(
-                    io::Error::new(io::ErrorKind::TimedOut, "SOCKS handshake timed out").into(),
-                );
-            }
-        };
     let chunk_size = max_plaintext_len(traffic.max_padding);
     let initial_payload_cap = ConnectRequest::max_initial_payload_len(&request.host, chunk_size);
     // Keep the zero-RTT-style initial payload capture, but hide its small wait
@@ -3717,6 +3519,77 @@ where
     }
 }
 
+#[cfg(test)]
+static CLIENT_MUX_UPLOAD_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Nominal producer hold only: Tokio timer resolution and shared-channel/socket
+/// backpressure can extend delivery. Explicit jitter keeps the original path.
+const CLIENT_TCP_MUX_TAIL_HOLD: Duration = Duration::from_millis(1);
+
+struct ClientMuxUploadTail {
+    bytes: Vec<u8>,
+    pool: MuxPayloadPool,
+}
+
+impl Drop for ClientMuxUploadTail {
+    fn drop(&mut self) {
+        // Cancellation never sends asynchronously; recycle only uncommitted
+        // local bytes, including a tail parked behind channel backpressure.
+        self.pool.put(std::mem::take(&mut self.bytes));
+    }
+}
+
+fn client_mux_tail_append_len(buffered: usize, available: usize, capacity: usize) -> usize {
+    available.min(capacity - buffered)
+}
+
+async fn flush_client_mux_upload_tail(
+    frame_tx: &mpsc::Sender<MuxFrame>,
+    stream_id: u32,
+    tail: &mut ClientMuxUploadTail,
+    deadline: &mut Option<Instant>,
+) -> Result<(), ClientRuntimeError> {
+    *deadline = None;
+    if !tail.bytes.is_empty() {
+        // Reserve first so cancellation or receiver closure leaves the bytes
+        // owned by the synchronous pool-return guard, never a pending send.
+        let slot = frame_tx
+            .reserve()
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+        let payload = std::mem::replace(&mut tail.bytes, tail.pool.take());
+        slot.send(MuxFrame {
+            stream_id,
+            kind: MuxFrameKind::Data,
+            payload,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(kani)]
+mod client_mux_tail_proofs {
+    use super::client_mux_tail_append_len;
+
+    // Actual shipping append plan, under the caller's bounded-tail invariant.
+    // This covers arithmetic, not asynchronous scheduling or delivery latency.
+    #[kani::proof]
+    fn append_plan_bounds_one_payload_and_makes_progress() {
+        let capacity = kani::any::<u16>() as usize;
+        kani::assume(capacity > 0);
+        let buffered = kani::any::<u16>() as usize;
+        kani::assume(buffered < capacity);
+        let available = kani::any::<u16>() as usize;
+        let take = client_mux_tail_append_len(buffered, available, capacity);
+        assert!(take <= available);
+        assert!(buffered + take <= capacity);
+        assert!(available == 0 || take > 0);
+        if available >= capacity - buffered {
+            assert_eq!(buffered + take, capacity);
+        }
+    }
+}
+
 async fn client_mux_upload_loop(
     mut local_read: OwnedReadHalf,
     frame_tx: mpsc::Sender<MuxFrame>,
@@ -3724,6 +3597,7 @@ async fn client_mux_upload_loop(
     chunk_size: usize,
     cid: u64,
     payload_pool: MuxPayloadPool,
+    hold: Duration,
 ) -> Result<(), ClientRuntimeError> {
     let mut local_buf = vec![0_u8; relay_read_buffer_len(MuxFrame::max_payload_len(chunk_size))];
     let max_payload_len = MuxFrame::max_payload_len(chunk_size);
@@ -3732,22 +3606,97 @@ async fn client_mux_upload_loop(
             crate::tls::record::TlsRecordError::PayloadTooLarge(0),
         ));
     }
+    let mut tail = ClientMuxUploadTail {
+        bytes: if hold.is_zero() {
+            Vec::new()
+        } else {
+            payload_pool.take()
+        },
+        pool: payload_pool.clone(),
+    };
+    let mut tail_deadline = None;
 
     loop {
-        let n = local_read.read(&mut local_buf).await?;
+        // Check before polling even an always-ready socket. New input must not
+        // postpone the oldest byte, and timeout_at alone polls its I/O first.
+        let read = if let Some(deadline) = tail_deadline {
+            if Instant::now() >= deadline {
+                flush_client_mux_upload_tail(&frame_tx, stream_id, &mut tail, &mut tail_deadline)
+                    .await?;
+                continue;
+            }
+            match timeout_at(deadline, local_read.read(&mut local_buf)).await {
+                Ok(read) => read,
+                Err(_) => {
+                    flush_client_mux_upload_tail(
+                        &frame_tx,
+                        stream_id,
+                        &mut tail,
+                        &mut tail_deadline,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        } else {
+            local_read.read(&mut local_buf).await
+        };
+        let mut n = match read {
+            Ok(n) => n,
+            Err(err) => {
+                flush_client_mux_upload_tail(&frame_tx, stream_id, &mut tail, &mut tail_deadline)
+                    .await?;
+                return Err(err.into());
+            }
+        };
+        #[cfg(test)]
+        CLIENT_MUX_UPLOAD_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         if n == 0 {
+            flush_client_mux_upload_tail(&frame_tx, stream_id, &mut tail, &mut tail_deadline)
+                .await?;
             send_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
             return Ok(());
         }
-        let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
-        for chunk in local_buf[..n].chunks(max_payload_len) {
-            send_mux_frame(
-                &frame_tx,
-                stream_id,
-                MuxFrameKind::Data,
-                payload_pool.take_filled(chunk),
-            )
-            .await?;
+        let received_at = Instant::now();
+        if !hold.is_zero() && tail.bytes.is_empty() {
+            tail_deadline = Some(received_at + hold);
+        }
+        // Held reads are appended before polling again: the drain helper's Err
+        // cannot report a successfully consumed partial prefix. The zero-hold
+        // path keeps its original opportunistic-drain behavior.
+        if hold.is_zero() {
+            n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+            for chunk in local_buf[..n].chunks(max_payload_len) {
+                send_mux_frame(
+                    &frame_tx,
+                    stream_id,
+                    MuxFrameKind::Data,
+                    payload_pool.take_filled(chunk),
+                )
+                .await?;
+            }
+        } else {
+            let mut input = &local_buf[..n];
+            while !input.is_empty() {
+                if tail.bytes.is_empty() {
+                    // Full-frame sends can block; a remaining short suffix
+                    // keeps this read's original receipt time, never a new hold.
+                    tail_deadline = Some(received_at + hold);
+                }
+                let take =
+                    client_mux_tail_append_len(tail.bytes.len(), input.len(), max_payload_len);
+                tail.bytes.extend_from_slice(&input[..take]);
+                input = &input[take..];
+                if tail.bytes.len() == max_payload_len {
+                    flush_client_mux_upload_tail(
+                        &frame_tx,
+                        stream_id,
+                        &mut tail,
+                        &mut tail_deadline,
+                    )
+                    .await?;
+                }
+            }
         }
         tracing::trace!(
             cid,
@@ -4680,6 +4629,425 @@ mod tests {
 
     use super::*;
 
+    async fn client_mux_tail_test_producer(
+        capacity: usize,
+        channel_capacity: usize,
+        hold: Duration,
+    ) -> (
+        TcpStream,
+        mpsc::Receiver<MuxFrame>,
+        tokio::task::JoinHandle<Result<(), ClientRuntimeError>>,
+        MuxPayloadPool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (peer, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        let peer = peer.unwrap();
+        peer.set_nodelay(true).unwrap();
+        let (local, _) = accepted.unwrap();
+        local.set_nodelay(true).unwrap();
+        let (read, _) = local.into_split();
+        let (frames, receiver) = mpsc::channel(channel_capacity);
+        let pool = MuxPayloadPool::new(capacity, 1);
+        CLIENT_MUX_UPLOAD_READ_BYTES.store(0, Ordering::Relaxed);
+        let task = tokio::spawn(client_mux_upload_loop(
+            read,
+            frames,
+            1,
+            MuxFrame::encoded_len(capacity).unwrap(),
+            1,
+            pool.clone(),
+            hold,
+        ));
+        (peer, receiver, task, pool)
+    }
+
+    async fn wait_for_client_mux_upload_bytes(bytes: u64) {
+        // Keep the paused runtime runnable while actual loopback readiness is
+        // delivered. Only this test advances the tail deadline's clock.
+        for _ in 0..100_000 {
+            if CLIENT_MUX_UPLOAD_READ_BYTES.load(Ordering::Relaxed) >= bytes {
+                tokio::task::yield_now().await;
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("client mux upload did not consume the expected local bytes");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_combines_80_and_545_before_the_oldest_deadline() {
+        let (mut peer, mut frames, task, _) =
+            client_mux_tail_test_producer(1024, 16, Duration::from_millis(1)).await;
+        tokio::time::pause();
+        peer.write_all(&[0x18; 80]).await.unwrap();
+        wait_for_client_mux_upload_bytes(80).await;
+        peer.write_all(&[0x29; 545]).await.unwrap();
+        wait_for_client_mux_upload_bytes(625).await;
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        let frame = frames.try_recv().expect("oldest tail deadline must flush");
+        assert_eq!(frame.kind, MuxFrameKind::Data);
+        assert_eq!(frame.payload, [&[0x18; 80][..], &[0x29; 545][..]].concat());
+        assert!(frames.try_recv().is_err());
+        task.abort();
+        let _ = task.await;
+    }
+
+    async fn wait_for_client_mux_tail_task(
+        task: &tokio::task::JoinHandle<Result<(), ClientRuntimeError>>,
+    ) {
+        for _ in 0..100_000 {
+            if task.is_finished() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("client mux tail task did not finish without advancing the clock");
+    }
+
+    #[test]
+    fn client_mux_tail_append_plan_bounds_each_payload() {
+        for capacity in [1, 16, 16370] {
+            for buffered in 0..capacity {
+                for available in [0, 1, capacity - buffered, capacity, usize::MAX] {
+                    let take = client_mux_tail_append_len(buffered, available, capacity);
+                    assert!(take <= available && buffered + take <= capacity);
+                    assert!(available == 0 || take > 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_new_read_does_not_extend_the_oldest_deadline() {
+        // A longer private test argument separates millisecond timer ticks; the
+        // one production call still selects the nominal 1ms constant only.
+        let (mut peer, mut frames, task, _) =
+            client_mux_tail_test_producer(1024, 16, Duration::from_millis(10)).await;
+        tokio::time::pause();
+        peer.write_all(b"first").await.unwrap();
+        wait_for_client_mux_upload_bytes(5).await;
+        tokio::time::advance(Duration::from_millis(7)).await;
+        peer.write_all(b"second").await.unwrap();
+        wait_for_client_mux_upload_bytes(11).await;
+        assert!(frames.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(frames.try_recv().unwrap().payload, b"firstsecond");
+        assert!(frames.try_recv().is_err());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_full_frames_and_backpressured_suffix_keep_original_receipt_time() {
+        let (mut peer, mut frames, task, _) =
+            client_mux_tail_test_producer(16, 1, Duration::from_millis(1)).await;
+        tokio::time::pause();
+        let started = Instant::now();
+        let bytes: Vec<_> = (0..35).collect();
+        peer.write_all(&bytes).await.unwrap();
+        wait_for_client_mux_upload_bytes(35).await;
+        assert_eq!(
+            frames.len(),
+            1,
+            "a complete frame is queued without advancing time"
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        // The second complete frame is held by channel backpressure, while the
+        // same primary read also contains a three-byte short suffix.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert_eq!(frames.try_recv().unwrap().payload, bytes[..16]);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(frames.try_recv().unwrap().payload, bytes[16..32]);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            frames.try_recv().unwrap().payload,
+            bytes[32..],
+            "suffix must use original receipt time, not a fresh hold after blocked sends"
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(10));
+        peer.shutdown().await.unwrap();
+        wait_for_client_mux_tail_task(&task).await;
+        assert_eq!(frames.try_recv().unwrap().kind, MuxFrameKind::Fin);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_eof_flushes_data_then_fin_without_advancing_time() {
+        let (mut peer, mut frames, task, _) =
+            client_mux_tail_test_producer(1024, 16, Duration::from_millis(1)).await;
+        tokio::time::pause();
+        let started = Instant::now();
+        peer.write_all(b"short").await.unwrap();
+        wait_for_client_mux_upload_bytes(5).await;
+        assert!(frames.try_recv().is_err());
+        peer.shutdown().await.unwrap();
+        wait_for_client_mux_tail_task(&task).await;
+        let data = frames.try_recv().unwrap();
+        assert_eq!(
+            (data.kind, data.payload),
+            (MuxFrameKind::Data, b"short".to_vec())
+        );
+        assert_eq!(frames.try_recv().unwrap().kind, MuxFrameKind::Fin);
+        assert!(frames.try_recv().is_err());
+        task.await.unwrap().unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_continuously_ready_input_still_flushes_an_expired_short_tail() {
+        let (mut peer, mut frames, task, _) =
+            client_mux_tail_test_producer(16370, 16, Duration::from_millis(1)).await;
+        tokio::time::pause();
+        peer.write_all(b"oldest").await.unwrap();
+        wait_for_client_mux_upload_bytes(6).await;
+        for index in 0..6 {
+            peer.write_all(&[index]).await.unwrap();
+            wait_for_client_mux_upload_bytes(7 + index as u64).await;
+            tokio::time::advance(Duration::from_micros(500)).await;
+        }
+        let frame = frames
+            .try_recv()
+            .expect("ready reads must not indefinitely starve the deadline");
+        assert_eq!(frame.kind, MuxFrameKind::Data);
+        assert!(frame.payload.starts_with(b"oldest"));
+        assert!(frame.payload.len() < 16370);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_receiver_close_and_cancellation_return_uncommitted_pool_buffer() {
+        for cancel in [false, true] {
+            let pool = MuxPayloadPool::new(1024, 1);
+            let buffer = pool.take();
+            let pointer = buffer.as_ptr();
+            pool.put(buffer);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (peer, accepted) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let mut peer = peer.unwrap();
+            let (local, _) = accepted.unwrap();
+            let (local_read, _) = local.into_split();
+            let (sender, mut frames) = mpsc::channel(1);
+            CLIENT_MUX_UPLOAD_READ_BYTES.store(0, Ordering::Relaxed);
+            let task = tokio::spawn(client_mux_upload_loop(
+                local_read,
+                sender,
+                1,
+                1037,
+                1,
+                pool.clone(),
+                Duration::from_millis(1),
+            ));
+            tokio::time::pause();
+            peer.write_all(b"uncommitted").await.unwrap();
+            wait_for_client_mux_upload_bytes(11).await;
+            assert!(frames.try_recv().is_err());
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                assert!(
+                    frames.recv().await.is_none(),
+                    "Drop must never enqueue data or a terminal frame"
+                );
+            } else {
+                drop(frames);
+                tokio::time::advance(Duration::from_millis(2)).await;
+                wait_for_client_mux_tail_task(&task).await;
+                assert!(
+                    matches!(task.await.unwrap(), Err(ClientRuntimeError::Io(ref err)) if err.kind() == io::ErrorKind::BrokenPipe)
+                );
+            }
+            let recycled = pool.take();
+            assert_eq!(recycled.as_ptr(), pointer);
+            assert!(recycled.is_empty());
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_cancel_while_full_channel_is_pending_never_reenters_send() {
+        let (mut peer, mut frames, task, _) =
+            client_mux_tail_test_producer(16, 1, Duration::from_millis(1)).await;
+        tokio::time::pause();
+        peer.write_all(&[0x61; 35]).await.unwrap();
+        wait_for_client_mux_upload_bytes(35).await;
+        assert_eq!(frames.len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(frames.recv().await.unwrap().payload, vec![0x61; 16]);
+        assert!(
+            frames.recv().await.is_none(),
+            "cancelled reserve must not enqueue or issue Fin"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_zero_hold_preserves_immediate_per_read_sends() {
+        let (mut peer, mut frames, task, _) =
+            client_mux_tail_test_producer(1024, 16, Duration::ZERO).await;
+        tokio::time::pause();
+        peer.write_all(b"first").await.unwrap();
+        wait_for_client_mux_upload_bytes(5).await;
+        assert_eq!(frames.try_recv().unwrap().payload, b"first");
+        peer.write_all(b"second").await.unwrap();
+        wait_for_client_mux_upload_bytes(11).await;
+        assert_eq!(frames.try_recv().unwrap().payload, b"second");
+        task.abort();
+        let _ = task.await;
+    }
+
+    async fn client_mux_tail_test_registered_connection() -> (
+        TcpStream,
+        mpsc::Receiver<MuxFrame>,
+        mpsc::Receiver<ClientStreamControl>,
+        ClientStreamRegistration,
+        tokio::task::JoinHandle<Result<(), ClientRuntimeError>>,
+        MuxPayloadPool,
+    ) {
+        let (handle, mut frames, mut controls) = dummy_mux_handle();
+        let MuxCarrier::Tcp { payload_pool, .. } = &handle.carrier else {
+            unreachable!()
+        };
+        let payload_pool = payload_pool.clone();
+        let pool = ClientMuxPool::new(
+            Arc::new(ClientConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server_addr: "127.0.0.1:9".into(),
+                sni: "example.invalid".into(),
+                server_public_key: String::new(),
+                server_identity_public_key: String::new(),
+                accept_language: None,
+            }),
+            ServerAddrResolver {
+                original: Arc::from("127.0.0.1:9"),
+                cached: Arc::new(Mutex::new(vec!["127.0.0.1:9".parse().unwrap()])),
+                literal: true,
+            },
+            TrafficConfig::default(),
+            Arc::new(UdpConfig::default()),
+            Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL)),
+            Arc::new(Zeroizing::new(Vec::new())),
+            [0; 32],
+            Arc::from([]),
+        );
+        // Reuse an in-memory carrier queue; no handshake, DNS or remote dial.
+        pool.inner.lock().await.sessions.push(handle);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (peer, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut peer = peer.unwrap();
+        peer.set_nodelay(true).unwrap();
+        CLIENT_MUX_UPLOAD_READ_BYTES.store(0, Ordering::Relaxed);
+        let task = tokio::spawn(handle_local_mux_connection_with_cid(
+            accepted.unwrap().0,
+            pool,
+            1,
+        ));
+        peer.write_all(&[
+            5, 1, 0, 5, 1, 0, 3, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o',
+            b'm', 0, 80,
+        ])
+        .await
+        .unwrap();
+        let mut socks_reply = [0; 12];
+        peer.read_exact(&mut socks_reply).await.unwrap();
+        assert_eq!(&socks_reply[..4], &[5, 0, 5, 0]);
+        let open = frames.recv().await.unwrap();
+        assert_eq!(
+            open.kind,
+            MuxFrameKind::Open,
+            "Open stays ahead of all upload bytes"
+        );
+        let ClientStreamControl::Register(registration) = controls.recv().await.unwrap() else {
+            panic!("expected registration before Open")
+        };
+        (peer, frames, controls, registration, task, payload_pool)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_read_reset_flushes_data_before_the_actual_caller_reset_without_fin() {
+        let (mut peer, mut frames, mut controls, registration, task, _) =
+            client_mux_tail_test_registered_connection().await;
+        tokio::time::pause();
+        let start = Instant::now();
+        peer.write_all(b"successfully read tail").await.unwrap();
+        wait_for_client_mux_upload_bytes(22).await;
+        assert!(frames.try_recv().is_err());
+        socket2::SockRef::from(&peer)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(peer);
+        wait_for_client_mux_tail_task(&task).await;
+        assert!(
+            matches!(task.await.unwrap(), Err(ClientRuntimeError::Io(ref err)) if err.kind() == io::ErrorKind::ConnectionReset)
+        );
+        let data = frames.try_recv().unwrap();
+        assert_eq!(
+            (data.kind, data.payload),
+            (MuxFrameKind::Data, b"successfully read tail".to_vec())
+        );
+        assert_eq!(frames.try_recv().unwrap().kind, MuxFrameKind::Reset);
+        assert!(frames.try_recv().is_err(), "no Fin or duplicate Reset");
+        assert!(matches!(
+            controls.recv().await.unwrap(),
+            ClientStreamControl::Deregister(1)
+        ));
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        drop(registration);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets and a serial test-only read counter"]
+    async fn client_mux_tail_remote_reset_cancels_uncommitted_bytes_and_sends_only_caller_reset() {
+        let (mut peer, mut frames, mut controls, registration, task, pool) =
+            client_mux_tail_test_registered_connection().await;
+        tokio::time::pause();
+        peer.write_all(b"cancel me").await.unwrap();
+        wait_for_client_mux_upload_bytes(9).await;
+        assert!(frames.try_recv().is_err());
+        registration
+            .outcome_tx
+            .send(DownloadOutcome::Reset)
+            .unwrap_or_else(|_| panic!("live download outcome"));
+        wait_for_client_mux_tail_task(&task).await;
+        assert!(
+            matches!(task.await.unwrap(), Err(ClientRuntimeError::Io(ref err)) if err.kind() == io::ErrorKind::ConnectionReset)
+        );
+        assert_eq!(frames.try_recv().unwrap().kind, MuxFrameKind::Reset);
+        assert!(
+            frames.try_recv().is_err(),
+            "cancelled tail must not send Data, Fin or another Reset"
+        );
+        assert!(matches!(
+            controls.recv().await.unwrap(),
+            ClientStreamControl::Deregister(1)
+        ));
+        assert!(pool.take().is_empty());
+    }
+
     fn cached_server_addr_resolver(addrs: Vec<SocketAddr>) -> ServerAddrResolver {
         ServerAddrResolver {
             original: Arc::from("server.invalid:443"),
@@ -5527,6 +5895,7 @@ mod tests {
         oneshot::Receiver<DownloadOutcome>,
         DataRecordCodec,
         (TcpStream, OwnedReadHalf),
+        DataRecordCodec,
     ) {
         let (register_tx, register_rx) = mpsc::channel::<ClientStreamControl>(4);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5551,13 +5920,14 @@ mod tests {
             &[7_u8; 32],
         )
         .unwrap();
-        let (open_from_server, _seal) =
-            data_codecs(&session_keys, TrafficConfig::default()).unwrap();
+        let (_, open_from_server) = data_codecs(&session_keys, TrafficConfig::default()).unwrap();
+        let (_, seal_from_server) = data_codecs(&session_keys, TrafficConfig::default()).unwrap();
         (
             register_rx,
             outcome_rx,
             open_from_server,
             (app_side, local_read),
+            seal_from_server,
         )
     }
 
@@ -5565,6 +5935,63 @@ mod tests {
         suspect_after: Duration::from_millis(60),
         dead_after: Duration::from_millis(200),
     };
+
+    /// Implicit receipt requires the WHOLE first authenticated record. A queued
+    /// large response whose transport stalls mid-record cannot disarm the 5/25s
+    /// watchdog. Positive receipt hold consumes existing path/queue margin.
+    #[tokio::test]
+    async fn client_mux_first_data_implicitly_confirms_only_after_the_complete_record() {
+        for complete in [false, true] {
+            let (register_rx, outcome_rx, opener, _sockets, mut sealer) =
+                registered_mux_stream().await;
+            let frame = MuxFrame {
+                stream_id: 1,
+                kind: MuxFrameKind::Data,
+                payload: vec![0x53; 4096],
+            };
+            let wire = sealer.seal(&frame.encode().unwrap(), &mut OsRng).unwrap();
+            let (mut sender, receiver) = duplex(wire.len());
+            let health = Arc::new(MuxCarrierHealth::new());
+            tokio::time::pause();
+            let reader = tokio::spawn(client_mux_reader_loop(
+                TcpLegReader::buffered(receiver),
+                opener,
+                register_rx,
+                1,
+                Duration::from_secs(600),
+                health.clone(),
+                MUX_CARRIER_WATCHDOG,
+            ));
+            sender
+                .write_all(if complete { &wire } else { &wire[..128] })
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(health.is_suspect(), !complete);
+            tokio::time::advance(MUX_CARRIER_DEAD_AFTER).await;
+            tokio::task::yield_now().await;
+            if complete {
+                assert!(
+                    !reader.is_finished(),
+                    "nonempty Data is already a receipt without empty Data"
+                );
+                reader.abort();
+                assert!(reader.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(
+                    reader.is_finished(),
+                    "partial-record traffic cannot extend the existing watchdog"
+                );
+                assert!(
+                    matches!(reader.await.unwrap(), Err(ClientRuntimeError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
+                );
+                assert!(client_mux_await_download(outcome_rx, 1).await.is_err());
+            }
+            tokio::time::resume();
+        }
+    }
 
     /// The server acknowledges an Open with empty Data before waiting on the
     /// target. Its first application bytes may arrive after 25s without resetting
@@ -5700,7 +6127,8 @@ mod tests {
     /// substreams so apps retry on a fresh session.
     #[tokio::test]
     async fn client_mux_watchdog_resets_streams_on_an_unresponsive_carrier() {
-        let (register_rx, outcome_rx, open_from_server, _sockets) = registered_mux_stream().await;
+        let (register_rx, outcome_rx, open_from_server, _sockets, _seal) =
+            registered_mux_stream().await;
         let health = Arc::new(MuxCarrierHealth::new());
 
         let reader = tokio::spawn(client_mux_reader_loop(
@@ -5737,7 +6165,8 @@ mod tests {
     /// until the 10-minute relay idle backstop.
     #[tokio::test]
     async fn client_mux_watchdog_resets_an_empty_open_without_acknowledgement() {
-        let (register_rx, outcome_rx, open_from_server, _sockets) = registered_mux_stream().await;
+        let (register_rx, outcome_rx, open_from_server, _sockets, _seal) =
+            registered_mux_stream().await;
         let health = Arc::new(MuxCarrierHealth::new());
         tokio::time::pause();
         let reader = tokio::spawn(client_mux_reader_loop(
@@ -5776,7 +6205,8 @@ mod tests {
     /// e.g. a large HTTP/1.1 upload — even with an Open still unanswered.
     #[tokio::test]
     async fn client_mux_watchdog_defers_to_proof_of_life() {
-        let (register_rx, _outcome_rx, open_from_server, _sockets) = registered_mux_stream().await;
+        let (register_rx, _outcome_rx, open_from_server, _sockets, _seal) =
+            registered_mux_stream().await;
         let health = Arc::new(MuxCarrierHealth::new());
         let writer_health = Arc::clone(&health);
         let writer = tokio::spawn(async move {
@@ -5813,7 +6243,8 @@ mod tests {
     /// flight — only suspect — and must decide once the write is done.
     #[tokio::test]
     async fn client_mux_watchdog_holds_a_dead_verdict_while_a_write_drains() {
-        let (register_rx, outcome_rx, open_from_server, _sockets) = registered_mux_stream().await;
+        let (register_rx, outcome_rx, open_from_server, _sockets, _seal) =
+            registered_mux_stream().await;
         let health = Arc::new(MuxCarrierHealth::new());
         let writing = WriteInFlight::start(&health);
 
@@ -6467,6 +6898,165 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mux_activity_requires_a_real_request_even_at_clock_epoch_zero() {
+        for now in [0, 1, 5_000, 90_000, u64::MAX] {
+            assert!(!mux_activity_is_recent(0, now));
+        }
+        assert!(mux_activity_is_recent(1, 0));
+        assert!(mux_activity_is_recent(1, 90_000));
+        assert!(!mux_activity_is_recent(1, 90_001));
+    }
+
+    async fn assert_no_client_carrier(
+        upstream: &TcpListener,
+        upstream_udp: &tokio::net::UdpSocket,
+        observation: Duration,
+    ) {
+        let mut packet = [0_u8; 2048];
+        let observed = timeout(observation, async {
+            tokio::select! {
+                result = upstream.accept() => panic!("unsolicited TCP carrier: {result:?}"),
+                result = upstream_udp.recv_from(&mut packet) => panic!("unsolicited UDP carrier: {result:?}"),
+            }
+        })
+        .await;
+        assert!(observed.is_err(), "observation must expire without traffic");
+    }
+
+    async fn client_carriers_wait_for_valid_socks(max_streams: u8, udp_enabled: bool) {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_udp = tokio::net::UdpSocket::bind(upstream_addr).await.unwrap();
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let server_keys = X25519KeyPair::generate();
+        let identity = identity::keypair();
+        let mut config = speed_client_config(
+            upstream_addr,
+            &server_keys,
+            &identity,
+            UdpConfig {
+                enabled: udp_enabled,
+                ..UdpConfig::default()
+            },
+        );
+        config.client.as_mut().unwrap().listen = local_addr;
+        config.traffic.max_concurrent_streams = max_streams;
+        let runtime = tokio::spawn(super::run(config));
+
+        // Cross the keeper's first poll: zero activity must not masquerade as
+        // recent use merely because the process clock just started.
+        assert_no_client_carrier(
+            &upstream,
+            &upstream_udp,
+            MUX_WARM_KEEPER_INTERVAL + Duration::from_millis(200),
+        )
+        .await;
+
+        let mut stalled = TcpStream::connect(local_addr).await.unwrap();
+        assert_no_client_carrier(&upstream, &upstream_udp, Duration::from_millis(100)).await;
+        stalled.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0_u8; 2];
+        stalled.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        assert_no_client_carrier(&upstream, &upstream_udp, Duration::from_millis(100)).await;
+
+        let mut malformed = TcpStream::connect(local_addr).await.unwrap();
+        malformed.write_all(&[4]).await.unwrap();
+        malformed.shutdown().await.unwrap();
+        // A well-formed greeting followed by unsupported BIND is also not a
+        // validated CONNECT and must leave the remote endpoint untouched.
+        stalled
+            .write_all(&[5, 2, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        assert_no_client_carrier(&upstream, &upstream_udp, Duration::from_millis(100)).await;
+
+        let mut bad_reserved = TcpStream::connect(local_addr).await.unwrap();
+        bad_reserved
+            .write_all(&[5, 1, 0, 5, 1, 1, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        assert_no_client_carrier(&upstream, &upstream_udp, Duration::from_millis(100)).await;
+
+        let mut valid = TcpStream::connect(local_addr).await.unwrap();
+        valid
+            .write_all(&[5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        let mut reply = [0_u8; 12];
+        timeout(Duration::from_secs(2), valid.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply[..4], &[5, 0, 5, 0]);
+        let (mut carrier, _) = timeout(Duration::from_secs(2), upstream.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header = [0_u8; 5];
+        timeout(Duration::from_secs(2), carrier.read_exact(&mut header))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            header[0],
+            record::TLS_CONTENT_HANDSHAKE,
+            "valid request must start the real camouflage handshake, not a dead test client"
+        );
+        if max_streams == 1 {
+            // One validated local request needs one carrier. Spare authenticated
+            // sessions are observable even when startup itself stays silent.
+            assert_no_client_carrier(&upstream, &upstream_udp, Duration::from_secs(1)).await;
+            let mut second = TcpStream::connect(local_addr).await.unwrap();
+            second
+                .write_all(&[5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+            let (mut second_carrier, _) = timeout(Duration::from_secs(2), upstream.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            timeout(
+                Duration::from_secs(2),
+                second_carrier.read_exact(&mut header),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(header[0], record::TLS_CONTENT_HANDSHAKE);
+            assert_no_client_carrier(&upstream, &upstream_udp, Duration::from_secs(1)).await;
+        }
+        runtime.abort();
+        let _ = runtime.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn single_tcp_client_is_dormant_until_valid_socks() {
+        client_carriers_wait_for_valid_socks(1, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn mux_tcp_client_is_dormant_until_valid_socks() {
+        client_carriers_wait_for_valid_socks(2, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn single_udp_client_is_dormant_until_valid_socks() {
+        client_carriers_wait_for_valid_socks(1, true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn mux_udp_client_is_dormant_until_valid_socks() {
+        client_carriers_wait_for_valid_socks(2, true).await;
+    }
+
     /// A small speed plan so the loopback e2e runs fast while still exercising every
     /// phase (warmup + one sample, both directions).
     fn tiny_speed_plan() -> crate::speed::SpeedPlan {
@@ -7005,7 +7595,7 @@ mod tests {
     /// per-session slot semaphore. That is the reported "with max_concurrent_streams
     /// > 1, a new tab / new site never loads (while an already-open tab still works,
     /// slowly)" symptom; `=1` worked only because it takes the independent
-    /// per-connection `WarmSessionPool` path instead.
+    /// per-connection establishment path instead.
     ///
     /// The fix makes the pool open an ADDITIONAL session when the existing one is
     /// saturated, so a new connection is served on a fresh session instead of being

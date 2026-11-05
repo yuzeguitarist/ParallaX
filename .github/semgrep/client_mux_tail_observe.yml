@@ -1,0 +1,19 @@
+# AST observations only; the checker asserts cardinality and caller containment.
+rules:
+  - id: observe-client-mux-tail-producer
+    languages: [rust]
+    severity: INFO
+    message: Complete producer declaration.
+    pattern: 'async fn client_mux_upload_loop(...) { ... }'
+  - id: observe-client-mux-tail-owner
+    languages: [rust]
+    severity: INFO
+    message: Complete existing TCP/QUIC dispatcher declaration.
+    pattern: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
+  - id: observe-client-mux-tail-call
+    languages: [rust]
+    severity: INFO
+    message: Every production producer call, including nested duplicate copies.
+    patterns:
+      - pattern: 'client_mux_upload_loop(...)'
+      - pattern-not-inside: 'mod tests { ... }'

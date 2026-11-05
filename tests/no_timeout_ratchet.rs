@@ -316,8 +316,8 @@ fn combined_inbound_read_census_is_pinned() {
         server.iter().filter(|s| s.timed).count() + runtime.iter().filter(|s| s.timed).count();
     let untimed = total - timed;
 
-    // Total inbound-read call sites across both production files today: 25
-    // (server) + 12 (runtime) = 37. This catches a *removed* read site too,
+    // Total inbound-read call sites across both production files today: 26
+    // (server) + 13 (runtime) = 39. This catches a *removed* read site too,
     // which would otherwise slip past the per-file untimed-only assertions.
     // (+2 server vs the mux-over-QUIC baseline of 28: the speed QUIC-run request
     // read and the speed QUIC-run TCP DONE read — both TIMED. +5 for the
@@ -329,11 +329,17 @@ fn combined_inbound_read_census_is_pinned() {
     // (+2 server vs the prior baseline of 35: the FIN-first teardown drain adds two
     // reads — `graceful_fin_then_drain` and `graceful_fin_then_drain_stream` — each
     // a `read()` bounded by `timeout_at(GRACEFUL_FIN_DRAIN_BUDGET)`, so both TIMED.)
-    const EXPECTED_TOTAL_SITES: usize = 37;
-    // Timed sites: 12 (server) + 2 (runtime) = 14. The three existing TCP mux
+    // (+1 server vs 37: a nonempty mux tail reads under its existing absolute
+    // `timeout_at` deadline; the no-tail read still uses the shared idle watchdog.
+    // This adds one TIMED site without adding an untimed read.)
+    // (+1 runtime vs 38: the TCP mux upload producer now reads under the oldest
+    // tail's `timeout_at` deadline when a tail exists. Its empty-tail read retains
+    // the existing shared watchdog. Untimed baselines remain unchanged.)
+    const EXPECTED_TOTAL_SITES: usize = 39;
+    // Timed sites: 13 (server) + 3 (runtime) = 16. The three existing TCP mux
     // reads moved from per-read timeouts to shared idle watchdogs, not new reads;
     // `mux_structural_idle_bounds_are_pinned` guards their enclosing boundaries.
-    const EXPECTED_TIMED_SITES: usize = 14;
+    const EXPECTED_TIMED_SITES: usize = 16;
 
     assert_eq!(
         total, EXPECTED_TOTAL_SITES,
@@ -415,7 +421,21 @@ fn mux_structural_idle_bounds_are_pinned() {
     );
 
     let target = function("src/handshake/server.rs", "server_mux_target_reader_loop");
-    assert!(target.contains("let n = match target_read.read(&mut target_buf).await {"));
+    assert_ordered(
+        &target,
+        &[
+            "let read = if let Some(deadline) = tail_deadline {",
+            "if Instant::now() >= deadline {",
+            "flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline)",
+            "continue;",
+            "match timeout_at(deadline, target_read.read(&mut target_buf)).await {",
+            "Err(_) => {",
+            "flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline)",
+            "continue;",
+            "} else {\n            target_read.read(&mut target_buf).await",
+            "let n = match read {",
+        ],
+    );
     let supervisor = function("src/handshake/server.rs", "server_mux_upstream_task");
     assert_ordered(
         &supervisor,

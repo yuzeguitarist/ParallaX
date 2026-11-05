@@ -15,7 +15,7 @@
 //!
 //! P-values use standard asymptotic approximations (Kolmogorov series; regular
 //! incomplete-gamma for chi-squared). They are accurate enough to drive the
-//! battery's accept/reject gates (`p > 0.05` = indistinguishable) and are
+//! battery's regression gates (failure to reject is not an equivalence proof) and are
 //! cross-checked against synthetic distributions in the unit tests.
 
 /// Result of a two-sample Kolmogorov–Smirnov test.
@@ -29,16 +29,15 @@ pub struct KsResult {
 
 /// Two-sample Kolmogorov–Smirnov test.
 ///
-/// Returns D = 0, p = 1 for degenerate inputs (either sample empty) so the
-/// caller treats "no data" as "indistinguishable" rather than panicking.
+/// Empty or nonfinite inputs fail explicitly: absence of observations cannot
+/// be reported as support for the null hypothesis.
 pub fn two_sample_ks(a: &[f64], b: &[f64]) -> KsResult {
     let (n, m) = (a.len(), b.len());
-    if n == 0 || m == 0 {
-        return KsResult {
-            statistic: 0.0,
-            p_value: 1.0,
-        };
-    }
+    assert!(n > 0 && m > 0, "KS requires two nonempty samples");
+    assert!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "KS requires finite samples"
+    );
     let mut xa = a.to_vec();
     let mut xb = b.to_vec();
     xa.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
@@ -104,10 +103,16 @@ pub struct ChiSquareResult {
 
 /// Pearson chi-squared goodness-of-fit: observed vs expected bin counts.
 ///
-/// `dof = bins - 1`. Bins with `expected <= 0` are skipped (they would divide
-/// by zero); this matches the convention of pooling empty expected bins away.
+/// `dof = bins - 1`. Empty expected bins must be pooled by the caller before
+/// applying this test; missing evidence is not an accepting null result.
 pub fn chi_square_gof(observed: &[f64], expected: &[f64]) -> ChiSquareResult {
     assert_eq!(observed.len(), expected.len(), "bin count mismatch");
+    assert!(
+        observed.len() >= 2
+            && observed.iter().all(|v| v.is_finite() && *v >= 0.0)
+            && expected.iter().all(|v| v.is_finite() && *v > 0.0),
+        "chi-square requires finite observations and at least two positive expected bins"
+    );
     let mut chi = 0.0;
     let mut used = 0usize;
     for (&o, &e) in observed.iter().zip(expected.iter()) {
@@ -229,23 +234,17 @@ pub struct LjungBoxResult {
 /// no autocorrelation. Small p ⇒ the series is autocorrelated.
 pub fn ljung_box(x: &[f64], h: usize) -> LjungBoxResult {
     let n = x.len();
-    if n < 4 || h == 0 {
-        return LjungBoxResult {
-            statistic: 0.0,
-            dof: 0,
-            p_value: 1.0,
-        };
-    }
+    assert!(
+        n >= 4 && h > 0 && x.iter().all(|v| v.is_finite()),
+        "Ljung-Box requires finite observations, a positive lag and at least four samples"
+    );
     let h = h.min(n - 1);
     let mean = x.iter().sum::<f64>() / n as f64;
     let denom: f64 = x.iter().map(|v| (v - mean).powi(2)).sum();
-    if denom == 0.0 {
-        return LjungBoxResult {
-            statistic: 0.0,
-            dof: h,
-            p_value: 1.0,
-        };
-    }
+    assert!(
+        denom > 0.0 && denom.is_finite(),
+        "Ljung-Box requires finite nonzero variance"
+    );
     let mut q = 0.0;
     for k in 1..=h {
         let mut num = 0.0;

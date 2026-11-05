@@ -1,0 +1,119 @@
+# Complete scopes and direct AST sites, including nested blocks and closures.
+# Source-span pins below complement counts; neither proves arbitrary alias/CFG behavior.
+rules:
+  - id: observe-quic-admission-helper-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete shipping predicate.
+    pattern: 'fn frame_permitted(...) { ... }'
+  - id: observe-quic-admission-receive-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete receive scope.
+    pattern: 'fn process_packet(...) { ... }'
+  - id: observe-quic-admission-level-binding
+    languages: [rust]
+    severity: INFO
+    message: Every packet level binding, including nested shadows.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'let pspace = $VALUE;'
+  - id: observe-quic-admission-binding-pattern
+    languages: [rust]
+    severity: INFO
+    message: Complete binding patterns, including destructuring that can shadow the packet level or predicate.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'let $PATTERN = $VALUE;'
+      - focus-metavariable: $PATTERN
+  - id: observe-quic-admission-type-binding
+    languages: [rust]
+    severity: INFO
+    message: Every wire frame type binding.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'let frame_type = $VALUE;'
+  - id: observe-quic-admission-frame-binding
+    languages: [rust]
+    severity: INFO
+    message: Complete decoded-frame binding.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'let frame = $VALUE;'
+  - id: observe-quic-admission-gate
+    languages: [rust]
+    severity: INFO
+    message: Complete admission decision, including both argument expressions.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'if !frame_permitted(...) { ... }'
+  - id: observe-quic-admission-call
+    languages: [rust]
+    severity: INFO
+    message: Every predicate call in receive dispatch.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'frame_permitted(...)'
+  - id: observe-quic-admission-iterate
+    languages: [rust]
+    severity: INFO
+    message: Every frame iteration.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'while let Some(frame) = frames.next() { ... }'
+  - id: observe-quic-admission-iterator
+    languages: [rust]
+    severity: INFO
+    message: Actual parser input.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'Iter::new(...)'
+  - id: observe-quic-admission-crypto
+    languages: [rust]
+    severity: INFO
+    message: Direct CRYPTO dispatch, never duplicated before admission.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.recv_crypto(...)'
+  - id: observe-quic-admission-stream
+    languages: [rust]
+    severity: INFO
+    message: Direct STREAM dispatch.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.recv_stream(...)'
+  - id: observe-quic-admission-reset
+    languages: [rust]
+    severity: INFO
+    message: Direct RESET_STREAM dispatch.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.recv_reset_stream(...)'
+  - id: observe-quic-admission-stop
+    languages: [rust]
+    severity: INFO
+    message: Direct STOP_SENDING dispatch.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.reset_stream(...)'
+  - id: observe-quic-admission-ack
+    languages: [rust]
+    severity: INFO
+    message: Direct ACK dispatch.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.recv_ack(...)'
+  - id: observe-quic-admission-close
+    languages: [rust]
+    severity: INFO
+    message: Terminal admission failure.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.close_transport(...)'
+  - id: observe-quic-admission-closed-write
+    languages: [rust]
+    severity: INFO
+    message: Every direct close-state assignment, including additions to the canonical peer-close dispatch.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.closed = ...'

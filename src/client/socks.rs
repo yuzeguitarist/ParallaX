@@ -21,6 +21,8 @@ pub enum SocksError {
     NoAuthMethodMissing,
     #[error("unsupported SOCKS command: {0}")]
     UnsupportedCommand(u8),
+    #[error("SOCKS reserved byte must be zero")]
+    InvalidReserved,
     #[error("unsupported SOCKS address type: {0}")]
     UnsupportedAddressType(u8),
     #[error("SOCKS domain name is empty")]
@@ -87,7 +89,10 @@ where
         return Err(SocksError::UnsupportedCommand(command));
     }
 
-    let _reserved = stream.read_u8().await?;
+    let reserved = stream.read_u8().await?;
+    if reserved != 0 {
+        return Err(SocksError::InvalidReserved);
+    }
     let address_type = stream.read_u8().await?;
     let host = match address_type {
         1 => {
@@ -164,6 +169,18 @@ mod tests {
                 port: 443
             }
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_every_nonzero_reserved_byte() {
+        for reserved in 1..=u8::MAX {
+            let frame = [5, 1, reserved, 1, 127, 0, 0, 1, 0, 80];
+            let mut input = frame.as_slice();
+            assert!(matches!(
+                read_connect_request(&mut input).await,
+                Err(SocksError::InvalidReserved)
+            ));
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,296 @@
+rules:
+  - id: parallax-peer-ack-early-prevalidation
+    languages: [rust]
+    severity: ERROR
+    message: Validate the current complete CH/EE once before early publication; None is not validated and no active ACK state is committed here.
+    patterns:
+      - pattern: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern-not: |
+          fn prevalidate_peer_transport_params(...) {
+            if self.peer_transport_params_prevalidated { return Ok(()); }
+            let Some(blob) = self.tls.peer_transport_parameters() else { return Ok(()); };
+            if let Err(error) = TransportParameters::read(blob) {
+              self.close_transport(0x08, 0x06, b"invalid peer transport parameters");
+              return Err(transport_error(0x08, 0x06, format!("invalid peer transport parameters: {error:?}")));
+            }
+            self.peer_transport_params_prevalidated = true;
+            Ok(())
+          }
+  - id: parallax-peer-ack-exclusive-prevalidation-commit
+    languages: [rust]
+    severity: ERROR
+    message: Only successful early parsing may mark current peer parameters as prevalidated.
+    patterns:
+      - pattern-not-inside: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.peer_transport_params_prevalidated = ...'
+          - pattern: 'self.peer_transport_params_prevalidated |= ...'
+          - pattern: 'self.peer_transport_params_prevalidated &= ...'
+          - pattern: '&mut self.peer_transport_params_prevalidated'
+  - id: parallax-peer-ack-authenticated-apply
+    languages: [rust]
+    severity: ERROR
+    message: Adopt ACK parameters once, only after this TLS handshake authenticates; malformed parameters fail before any peer state is committed.
+    patterns:
+      - pattern: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+      - pattern-not: |
+          fn apply_authenticated_peer_ack_params(...) {
+            if self.peer_ack_params_applied || self.tls.is_handshaking() { return Ok(()); }
+            let blob = self.tls.peer_transport_parameters().ok_or_else(|| { QuicTlsError::alert(crate::tls::quic::ALERT_MISSING_EXTENSION, $MISSING) })?;
+            let tp = TransportParameters::read(blob).map_err(|error| { transport_error(0x08, 0x06, $REASON) })?;
+            self.peer_ack_delay_exponent = tp.ack_delay_exponent;
+            self.peer_max_ack_delay = Duration::from_millis(tp.max_ack_delay_ms);
+            self.peer_ack_params_applied = true;
+            Ok(())
+          }
+
+  - id: parallax-peer-ack-exclusive-state-commit
+    languages: [rust]
+    severity: ERROR
+    message: Raw handshake input and remembered ticket flow limits cannot write authenticated ACK state.
+    patterns:
+      - pattern-not-inside: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.peer_ack_delay_exponent = ...'
+          - pattern: 'self.peer_max_ack_delay = ...'
+          - pattern: 'self.peer_ack_params_applied = ...'
+
+  - id: parallax-peer-ack-exact-wire-decoding
+    languages: [rust]
+    severity: ERROR
+    message: Decode validated peer ACK delays in u128 and preserve the complete legal Duration without wrapping or clipping.
+    patterns:
+      - pattern: 'fn decoded_ack_delay(...) { ... }'
+      - pattern-not: |
+          fn decoded_ack_delay(...) {
+            let micros = (raw as u128) << exponent;
+            Duration::new((micros / 1_000_000) as u64, ((micros % 1_000_000) * 1_000) as u32)
+          }
+
+  - id: parallax-peer-ack-recovery-delay-policy
+    languages: [rust]
+    severity: ERROR
+    message: Only Application ACK delays affect RTT; clamp to the authenticated peer maximum only after handshake confirmation.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: 'fn cap_decoded_peer_ack_delay(...) { ... }'
+              - pattern-not: |
+                  fn cap_decoded_peer_ack_delay(...) {
+                    if space != SPACE_DATA { return Duration::ZERO; }
+                    if confirmed { delay.min(peer_max) } else { delay }
+                  }
+          - patterns:
+              - pattern: 'fn ack_delay_for_recovery(...) { ... }'
+              - pattern-not: |
+                  fn ack_delay_for_recovery(...) {
+                    cap_decoded_peer_ack_delay(decoded_ack_delay(raw, exponent), space, confirmed, peer_max)
+                  }
+
+  - id: parallax-peer-ack-no-pure-helper-early-return
+    languages: [rust]
+    severity: ERROR
+    message: A retained canonical result cannot excuse an additional early return in a pure numeric/policy helper.
+    patterns:
+      - pattern-either:
+          - pattern-inside: 'fn decoded_ack_delay(...) { ... }'
+          - pattern-inside: 'fn pto_space_eligible(...) { ... }'
+          - pattern-inside: 'fn peer_ack_delay_for_pto(...) { ... }'
+          - pattern-inside: 'fn ack_delay_for_recovery(...) { ... }'
+      - pattern: 'return $VALUE;'
+      - pattern-regex: '\breturn\b'
+
+  - id: parallax-peer-ack-pto-policy
+    languages: [rust]
+    severity: ERROR
+    message: DATA PTO requires confirmation; only confirmed DATA receives the peer's ACK delay allowance.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: 'fn pto_space_eligible(...) { ... }'
+              - pattern-not: 'fn pto_space_eligible(...) { space != SPACE_DATA || confirmed }'
+          - patterns:
+              - pattern: 'fn peer_ack_delay_for_pto(...) { ... }'
+              - pattern-not: |
+                  fn peer_ack_delay_for_pto(...) {
+                    if space == SPACE_DATA && confirmed { peer_max } else { Duration::ZERO }
+                  }
+
+  - id: parallax-peer-ack-recovery-connected
+    languages: [rust]
+    severity: ERROR
+    message: The actual RTT update must consume the authenticated peer exponent/max and current confirmation state.
+    patterns:
+      - pattern: 'fn recv_ack(...) { ... }'
+      - pattern-not: |
+          fn recv_ack(...) {
+            ...
+            let ack_delay = ack_delay_for_recovery(ack.delay, self.peer_ack_delay_exponent, space, self.handshake_confirmed, self.peer_max_ack_delay);
+            self.rtt.update(ack_delay, now.saturating_duration_since(sent_at));
+            ...
+          }
+
+  - id: parallax-peer-ack-pto-drain-connected
+    languages: [rust]
+    severity: ERROR
+    message: PTO and derived drain/key-retention duration use the peer ACK policy while retaining the existing backoff rule.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: 'fn pto_duration(...) { ... }'
+              - pattern-not: |
+                  fn pto_duration(...) {
+                    let extra = peer_ack_delay_for_pto(space, self.handshake_confirmed, self.peer_max_ack_delay);
+                    (self.rtt.pto_base() + extra) * 2u32.pow(self.pto_count.min(MAX_PTO_BACKOFF))
+                  }
+          - patterns:
+              - pattern: 'fn drain_duration(...) { ... }'
+              - pattern-not: |
+                  fn drain_duration(...) {
+                    3 * (self.rtt.pto_base() + peer_ack_delay_for_pto(SPACE_DATA, self.handshake_confirmed, self.peer_max_ack_delay))
+                  }
+
+  - id: parallax-peer-ack-pto-qualification-connected
+    languages: [rust]
+    severity: ERROR
+    message: Timer arming, timer firing and probe selection must all reject preconfirmation DATA PTO.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: 'fn next_timeout(...) { ... }'
+              - pattern-not: |
+                  fn next_timeout(...) {
+                    ...
+                    for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+                      if !pto_space_eligible(space, self.handshake_confirmed) { continue; }
+                      if self.spaces[space].sent.in_flight() > 0 {
+                        if let Some(last) = self.spaces[space].last_ack_eliciting { earliest(last + self.pto_duration(space)); }
+                      }
+                    }
+                    ...
+                  }
+          - patterns:
+              - pattern: 'fn handle_timeout(...) { ... }'
+              - pattern-not: |
+                  fn handle_timeout(...) {
+                    ...
+                    let elapsed = [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA].iter().any(|&space| {
+                      pto_space_eligible(space, self.handshake_confirmed) && self.spaces[space].sent.in_flight() > 0 && self.spaces[space].last_ack_eliciting.is_some_and(|last| now >= last + self.pto_duration(space))
+                    });
+                    ...
+                  }
+          - patterns:
+              - pattern: 'fn queue_probe(...) { ... }'
+              - pattern-not: |
+                  fn queue_probe(...) {
+                    for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+                      if !pto_space_eligible(space, self.handshake_confirmed) || self.spaces[space].sent.in_flight() == 0 { continue; }
+                      ...
+                    }
+                  }
+
+  - id: parallax-peer-ack-handshake-apply-connected
+    languages: [rust]
+    severity: ERROR
+    message: The authenticated parameter check must precede handshake confirmation and completion of each processed packet.
+    patterns:
+      - pattern: 'fn process_packet(...) { ... }'
+      - pattern-not: |
+          fn process_packet(...) {
+            ...
+            self.schedule_ack(space, ack_eliciting, immediate_ack, now);
+            self.prevalidate_peer_transport_params()?;
+            self.pump_write();
+            self.apply_authenticated_peer_ack_params()?;
+            self.maybe_queue_handshake_done();
+            Ok(())
+          }
+
+  - id: parallax-peer-ack-parameter-parser
+    languages: [rust]
+    severity: ERROR
+    message: Both peer ACK parameters require exactly one varint body and RFC 9000 bounds before narrowing or assignment.
+    patterns:
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern-either:
+          - patterns:
+              - pattern: 'tp.ack_delay_exponent = ...'
+              - pattern-not-inside: |
+                  let value = read_varint_body(body)?;
+                  if value > 20 { return Err(Error::Invalid); }
+                  tp.ack_delay_exponent = value as u32;
+          - patterns:
+              - pattern: 'tp.max_ack_delay_ms = ...'
+              - pattern-not-inside: |
+                  let value = read_varint_body(body)?;
+                  if value >= 1 << 14 { return Err(Error::Invalid); }
+                  tp.max_ack_delay_ms = value;
+
+  - id: parallax-peer-ack-defaults
+    languages: [rust]
+    severity: ERROR
+    message: Omitted ACK parameters retain RFC defaults; remembered flow does not initialize authenticated ACK parameters.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: 'const DEFAULT_ACK_DELAY_EXPONENT: u32 = $VALUE;'
+              - pattern-not: 'const DEFAULT_ACK_DELAY_EXPONENT: u32 = 3;'
+          - patterns:
+              - pattern: 'const DEFAULT_MAX_ACK_DELAY_MS: u64 = $VALUE;'
+              - pattern-not: 'const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;'
+
+  - id: parallax-peer-ack-parameter-codepoints
+    languages: [rust]
+    severity: ERROR
+    message: Keep ACK exponent/max codepoints distinct and attached to the correct validated field assignments.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: 'const TP_ACK_DELAY_EXPONENT: u64 = $VALUE;'
+              - pattern-not: 'const TP_ACK_DELAY_EXPONENT: u64 = 0x0a;'
+          - patterns:
+              - pattern: 'const TP_MAX_ACK_DELAY: u64 = $VALUE;'
+              - pattern-not: 'const TP_MAX_ACK_DELAY: u64 = 0x0b;'
+          - patterns:
+              - pattern-inside: 'impl TransportParameters { ... }'
+              - pattern: 'fn read(...) { ... }'
+              - pattern-not: |
+                  fn read(...) {
+                    ...
+                    match id {
+                      TP_INITIAL_MAX_DATA => $DATA,
+                      TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => $BIDI_LOCAL,
+                      TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE => $BIDI_REMOTE,
+                      TP_INITIAL_MAX_STREAM_DATA_UNI => $UNI,
+                      TP_INITIAL_MAX_STREAMS_BIDI => $STREAMS_BIDI,
+                      TP_INITIAL_MAX_STREAMS_UNI => $STREAMS_UNI,
+                      TP_ACK_DELAY_EXPONENT => {
+                        let value = read_varint_body(body)?;
+                        if value > 20 { return Err(Error::Invalid); }
+                        tp.ack_delay_exponent = value as u32;
+                      },
+                      TP_MAX_ACK_DELAY => {
+                        let value = read_varint_body(body)?;
+                        if value >= 1 << 14 { return Err(Error::Invalid); }
+                        tp.max_ack_delay_ms = value;
+                      },
+                      TP_ACTIVE_CONNECTION_ID_LIMIT => $CID,
+                      TP_INITIAL_SOURCE_CONNECTION_ID => $SOURCE_CID,
+                      _ => $UNKNOWN,
+                    }
+                    ...
+                  }
+
+  - id: parallax-peer-ack-fixed-local-wire-contract
+    languages: [rust]
+    severity: ERROR
+    message: Reading peer ACK parameters must not change the existing local Safari/server advertised default ACK contract.
+    patterns:
+      - pattern-either:
+          - pattern-inside: 'fn encode_safari_client_from(...) { ... }'
+          - pattern-inside: 'fn encode_server(...) { ... }'
+      - pattern-either:
+          - pattern: 'put_param($OUT, TP_ACK_DELAY_EXPONENT, ...)'
+          - pattern: 'put_param($OUT, TP_MAX_ACK_DELAY, ...)'
+          - pattern: 'put_param($OUT, 0x0a, ...)'
+          - pattern: 'put_param($OUT, 0x0b, ...)'

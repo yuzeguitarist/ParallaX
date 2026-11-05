@@ -71,6 +71,33 @@ jobs:
       # toolchain rather than spending a separate rounded-up job-minute.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+      - name: Blocking project security rules (AST fixtures and production mutations)
+        run: |
+          python3 -m venv /tmp/parallax-security-rules
+          /tmp/parallax-security-rules/bin/pip install --quiet --require-hashes \
+            -r .github/semgrep-requirements.txt
+          python3 .github/scripts/check_crypto_rules.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_mldsa_buffers.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_client_activation.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_tls_drain.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_quic_packet_guards.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_quic_key_phase.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_quic_ack.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_peer_ack.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_mux_coalescing.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_client_mux_tail.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          python3 .github/scripts/check_mux_record_planning.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
       - name: Maintenance regression tests
         run: |
           command -v git
@@ -79,6 +106,8 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_*.py'
           python3 -m unittest discover -s ops/fuzz-cluster/tests -p 'test_*.py'
           python3 -m unittest discover -s fuzz/ci -p 'test_*.py'
+          python3 -B -m unittest discover -s scripts/traffic_lab -p 'test_*.py'
+          python3 -B -m unittest discover -s ops/traffic-lab -p 'test_*.py'
           python3 scripts/wiki_sync/test_convert.py
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets --locked -- -D warnings

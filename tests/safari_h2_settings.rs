@@ -1,5 +1,5 @@
-//! Real TLS 1.3 handshake with an origin that sends HTTP/2 SETTINGS before the
-//! client's HTTP/2 preface, alongside rustls's post-handshake session tickets.
+//! Real TLS 1.3 origins send tickets and two HTTP/2 SETTINGS either before the
+//! client preface or only after receiving it. Both must be ACKed independently.
 
 use std::{io::Cursor, sync::Arc, time::Duration};
 
@@ -55,11 +55,29 @@ async fn complete_handshake_acks_every_early_settings_frame() {
     )
     .unwrap();
     config.alpn_protocols = vec![b"h2".to_vec()];
+    config.send_tls13_tickets = 2;
+    // Test-only extraction exposes the receive sequence after the response. It
+    // verifies rustls actually accepted a KU response and reset receive keys;
+    // merely ACKing SETTINGS under the old keys cannot satisfy that assertion.
+    config.enable_secret_extraction = true;
+    let config = Arc::new(config);
+    for withhold_post_finished in [false, true] {
+        for key_update in [false, true] {
+            exercise_origin(config.clone(), withhold_post_finished, key_update).await;
+        }
+    }
+}
+
+async fn exercise_origin(
+    config: Arc<rustls::ServerConfig>,
+    withhold_post_finished: bool,
+    key_update: bool,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut server = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        let mut server = rustls::ServerConnection::new(config).unwrap();
         let mut wire = [0; 8192];
         while server.is_handshaking() {
             flush_tls(&mut server, &mut stream).await;
@@ -69,37 +87,53 @@ async fn complete_handshake_acks_every_early_settings_frame() {
             server.process_new_packets().unwrap();
         }
 
-        // Queue two SETTINGS before reading any client application data. They
-        // follow the genuine TLS NewSessionTickets in the same server flight.
+        let mut plaintext = Vec::new();
+        if withhold_post_finished {
+            assert!(server.wants_write(), "the genuine tickets are queued");
+            // Do not flush even rustls's genuine NewSessionTickets until the
+            // opening arrives. A client waiting 180ms for absent tickets fails
+            // this deadline; TLS certificate verification remains production.
+            timeout(Duration::from_millis(100), async {
+                loop {
+                    read_plaintext(&mut server, &mut plaintext);
+                    if plaintext.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") {
+                        break;
+                    }
+                    let n = stream.read(&mut wire).await.unwrap();
+                    assert_ne!(n, 0, "EOF before the client opening flight");
+                    server.read_tls(&mut Cursor::new(&wire[..n])).unwrap();
+                    server.process_new_packets().unwrap();
+                }
+            })
+            .await
+            .expect("client opening must not wait for post-Finished server data");
+        }
+
+        // Two SETTINGS follow genuine NewSessionTickets, including when the
+        // tickets arrive late and must share the H2 phase's receive sequence.
+        if key_update {
+            server.refresh_traffic_keys().unwrap();
+        }
         let settings = Http2Fingerprint::safari26().settings_frame().unwrap();
         std::io::Write::write_all(&mut server.writer(), &settings.repeat(2)).unwrap();
         flush_tls(&mut server, &mut stream).await;
 
-        let mut plaintext = Vec::new();
         let mut saw_preface = false;
         let mut ack_count = 0;
         while ack_count < 2 {
-            let n = timeout(Duration::from_secs(2), stream.read(&mut wire))
-                .await
-                .expect("both early SETTINGS must receive an ACK")
-                .unwrap();
-            assert_ne!(n, 0, "client closed before ACKing both SETTINGS");
-            server.read_tls(&mut Cursor::new(&wire[..n])).unwrap();
-            server.process_new_packets().unwrap();
-            if let Err(err) = std::io::Read::read_to_end(&mut server.reader(), &mut plaintext) {
-                assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
-            }
+            read_plaintext(&mut server, &mut plaintext);
             if !saw_preface {
                 let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-                if plaintext.len() < preface.len() {
-                    continue;
+                if plaintext.len() >= preface.len() {
+                    assert!(plaintext.starts_with(preface));
+                    plaintext.drain(..preface.len());
+                    saw_preface = true;
                 }
-                assert!(plaintext.starts_with(preface));
-                plaintext.drain(..preface.len());
-                saw_preface = true;
             }
             let mut offset = 0;
-            while let Some((header, total)) = Http2FrameHeader::parse_complete(&plaintext[offset..])
+            while let Some((header, total)) = saw_preface
+                .then(|| Http2FrameHeader::parse_complete(&plaintext[offset..]))
+                .flatten()
             {
                 if header.is_settings_ack() {
                     ack_count += 1;
@@ -114,8 +148,24 @@ async fn complete_handshake_acks_every_early_settings_frame() {
             }
             plaintext.drain(..offset);
             flush_tls(&mut server, &mut stream).await;
+            if ack_count < 2 {
+                let n = timeout(Duration::from_secs(2), stream.read(&mut wire))
+                    .await
+                    .expect("both SETTINGS must receive an ACK")
+                    .unwrap();
+                assert_ne!(n, 0, "client closed before ACKing both SETTINGS");
+                server.read_tls(&mut Cursor::new(&wire[..n])).unwrap();
+                server.process_new_packets().unwrap();
+            }
         }
         assert_eq!(ack_count, 2);
+        if key_update {
+            let secrets = server.dangerous_extract_secrets().unwrap();
+            assert_eq!(
+                secrets.rx.0, 2,
+                "KU response reset the receive sequence before both ACKs"
+            );
+        }
     });
 
     let server_keys = X25519KeyPair::generate();
@@ -132,5 +182,14 @@ async fn complete_handshake_acks_every_early_settings_frame() {
         .expect("TLS and HTTP/2 camouflage complete")
         .unwrap();
     assert_eq!(handshake.negotiated_alpn.as_deref(), Some(b"h2".as_slice()));
+    if withhold_post_finished {
+        assert_eq!(handshake.post_handshake_records, 0);
+    }
     origin.await.unwrap();
+}
+
+fn read_plaintext(server: &mut rustls::ServerConnection, plaintext: &mut Vec<u8>) {
+    if let Err(err) = std::io::Read::read_to_end(&mut server.reader(), plaintext) {
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
 }

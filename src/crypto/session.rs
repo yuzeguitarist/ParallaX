@@ -457,6 +457,48 @@ fn write_substream_hkdf_info(
 /// drive several records concurrently as long as each uses a distinct nonce.
 pub type SharedCipher = Arc<LessSafeKey>;
 
+/// Scalar state shared by serial operations and parallel nonce reservations.
+/// Kept independent of the cipher so Kani verifies the production transitions.
+#[derive(Default)]
+struct RecordSequence {
+    next: u64,
+    poisoned: bool,
+}
+
+impl RecordSequence {
+    fn ensure_usable(&self) -> Result<(), SessionError> {
+        if self.poisoned {
+            return Err(SessionError::Aead);
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self, count: u64) -> Result<u64, SessionError> {
+        self.ensure_usable()?;
+        let end = self
+            .next
+            .checked_add(count)
+            .ok_or(SessionError::NonceExhausted)?;
+        let base = self.next;
+        self.next = end;
+        Ok(base)
+    }
+
+    fn advance(&mut self, count: u64) {
+        if self.reserve(count).is_err() {
+            self.poison();
+        }
+    }
+
+    fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    fn reset_for_rekey(&mut self) {
+        self.next = 0;
+    }
+}
+
 pub struct AeadCodec {
     // Boxed so the secret bytes live at a stable heap address: an `AeadCodec` is
     // built then moved into its owner (and returned by value from constructors),
@@ -469,14 +511,9 @@ pub struct AeadCodec {
     // process exit; the leaked budget is bounded by the live working set.
     key: Box<[u8; KEY_LEN]>,
     nonce_base: Box<[u8; NONCE_LEN]>,
-    sequence: u64,
+    records: RecordSequence,
     suite: CipherSuite,
     cipher: SharedCipher,
-    /// Set when a batch open/seal left the sequence counter in an indeterminate
-    /// state. Once poisoned, every seal/open entry point refuses to operate so
-    /// the session can only fail-close, never silently desynchronize its nonce
-    /// stream. Single-record opens never poison the codec.
-    poisoned: bool,
 }
 
 impl Drop for AeadCodec {
@@ -545,7 +582,8 @@ pub(crate) fn record_nonce_from(nonce_base: &[u8; NONCE_LEN], sequence: u64) -> 
 #[cfg(kani)]
 mod kani_proofs {
     use super::{
-        record_nonce_from, write_substream_hkdf_info, HKDF_INFO_STACK_LEN, KEY_LEN, NONCE_LEN,
+        record_nonce_from, write_substream_hkdf_info, RecordSequence, HKDF_INFO_STACK_LEN, KEY_LEN,
+        NONCE_LEN,
     };
 
     /// The catastrophic-failure guard: within one epoch (a fixed `nonce_base`)
@@ -562,6 +600,73 @@ mod kani_proofs {
         if record_nonce_from(&base, s1) == record_nonce_from(&base, s2) {
             assert_eq!(s1, s2, "equal nonces must imply equal sequences (no reuse)");
         }
+    }
+
+    #[kani::proof]
+    fn reservation_rejection_preserves_state_and_success_consumes_range() {
+        let next: u64 = kani::any();
+        let poisoned: bool = kani::any();
+        let count: u64 = kani::any();
+        let mut state = RecordSequence { next, poisoned };
+        match state.reserve(count) {
+            Ok(base) => {
+                assert!(!poisoned);
+                assert_eq!(base, next);
+                assert_eq!(state.next.checked_sub(base), Some(count));
+                assert!(!state.poisoned);
+                let index: u64 = kani::any();
+                if index < count {
+                    let used = base.checked_add(index).unwrap();
+                    assert!(used < state.next);
+                    assert!(used < u64::MAX);
+                }
+            }
+            Err(_) => {
+                assert_eq!(state.next, next);
+                assert_eq!(state.poisoned, poisoned);
+                assert!(poisoned || next.checked_add(count).is_none());
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn consecutive_reservations_never_share_a_nonce() {
+        let mut state = RecordSequence {
+            next: kani::any(),
+            poisoned: false,
+        };
+        let first_count: u64 = kani::any();
+        let second_count: u64 = kani::any();
+        let nonce_base: [u8; NONCE_LEN] = kani::any();
+        if let Ok(first) = state.reserve(first_count) {
+            if let Ok(second) = state.reserve(second_count) {
+                let i: u64 = kani::any();
+                let j: u64 = kani::any();
+                if i < first_count && j < second_count {
+                    let first_seq = first.checked_add(i).unwrap();
+                    let second_seq = second.checked_add(j).unwrap();
+                    assert!(first_seq < second_seq);
+                    assert_ne!(
+                        record_nonce_from(&nonce_base, first_seq),
+                        record_nonce_from(&nonce_base, second_seq)
+                    );
+                }
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn poison_is_permanent_across_rekey_and_reservation() {
+        let mut state = RecordSequence {
+            next: kani::any(),
+            poisoned: kani::any(),
+        };
+        state.poison();
+        state.reset_for_rekey();
+        assert!(state.ensure_usable().is_err());
+        assert!(state.reserve(kani::any()).is_err());
+        assert!(state.poisoned);
+        assert_eq!(state.next, 0);
     }
 
     /// Cross-substream guard: two mux substreams on one session each derive their
@@ -665,10 +770,9 @@ impl AeadCodec {
         let codec = Self {
             key: Box::new(*key),
             nonce_base: Box::new(*nonce_base),
-            sequence: 0,
+            records: RecordSequence::default(),
             suite,
             cipher: make_cipher(suite, &key),
-            poisoned: false,
         };
         codec.protect_secret_memory();
         codec
@@ -699,7 +803,7 @@ impl AeadCodec {
         // stay valid across the rekey (re-`protect` below is then idempotent).
         *self.key = *key;
         *self.nonce_base = *nonce_base;
-        self.sequence = 0;
+        self.records.reset_for_rekey();
         self.suite = suite;
         self.cipher = make_cipher(suite, &key);
         self.protect_secret_memory();
@@ -712,7 +816,11 @@ impl AeadCodec {
 
     /// Current per-direction record sequence number (the next nonce to use).
     pub(crate) fn sequence(&self) -> u64 {
-        self.sequence
+        self.records.next
+    }
+
+    pub(crate) fn suite(&self) -> CipherSuite {
+        self.suite
     }
 
     /// Session nonce base; combine with a sequence number via
@@ -734,10 +842,11 @@ impl AeadCodec {
     /// seal/open fails closed via `ensure_usable` rather than reusing a nonce. The
     /// pre-checks remain the first gate; this is defence in depth on the primitive.
     pub(crate) fn advance_sequence(&mut self, count: u64) {
-        match self.sequence.checked_add(count) {
-            Some(next) => self.sequence = next,
-            None => self.poison(),
-        }
+        self.records.advance(count);
+    }
+
+    pub(crate) fn reserve_sequence(&mut self, count: u64) -> Result<u64, SessionError> {
+        self.records.reserve(count)
     }
 
     /// Permanently marks the codec unusable. Called by the batch open paths
@@ -745,16 +854,13 @@ impl AeadCodec {
     /// the "any failure must fail-close" caller convention into a type-enforced
     /// guarantee.
     pub(crate) fn poison(&mut self) {
-        self.poisoned = true;
+        self.records.poison();
     }
 
     /// Returns an error if the codec has been poisoned by a prior batch
     /// failure. Checked at every seal/open entry point.
     pub(crate) fn ensure_usable(&self) -> Result<(), SessionError> {
-        if self.poisoned {
-            return Err(SessionError::Aead);
-        }
-        Ok(())
+        self.records.ensure_usable()
     }
 
     pub fn protect_secret_memory(&self) {
@@ -782,7 +888,7 @@ impl AeadCodec {
         let tag = seal_in_place_detached_with(
             &self.cipher,
             &self.nonce_base,
-            self.sequence,
+            self.records.next,
             plaintext,
             aad,
         )?;
@@ -825,7 +931,7 @@ impl AeadCodec {
         let plaintext_len = open_in_place_split_with(
             &self.cipher,
             &self.nonce_base,
-            self.sequence,
+            self.records.next,
             ciphertext_with_tag,
             aad,
         )?;

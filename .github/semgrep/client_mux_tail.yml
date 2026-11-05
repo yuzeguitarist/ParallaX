@@ -1,0 +1,187 @@
+rules:
+  - id: parallax-client-mux-tail-window
+    languages: [rust]
+    severity: ERROR
+    message: Keep the reviewed private TCP producer hold at a nominal one millisecond.
+    patterns:
+      - pattern: 'const CLIENT_TCP_MUX_TAIL_HOLD: Duration = $VALUE;'
+      - pattern-not: 'const CLIENT_TCP_MUX_TAIL_HOLD: Duration = Duration::from_millis(1);'
+  - id: parallax-client-mux-tail-private-window
+    languages: [rust]
+    severity: ERROR
+    message: The isolated experiment must not expose a public hold knob.
+    # Semgrep Rust ignores visibility and starts const AST ranges after `pub`.
+    # This visibility-only token ratchet complements the structural rules.
+    pattern-regex: '(?m)^[ \t]*pub(?:\s*\([^)]*\))?\s+const\s+CLIENT_TCP_MUX_TAIL_HOLD\b'
+  - id: parallax-client-mux-tail-capacity
+    languages: [rust]
+    severity: ERROR
+    message: Bound every append by the current payload's remaining space.
+    patterns:
+      - pattern: 'fn client_mux_tail_append_len(...) { ... }'
+      - pattern-not: |
+          fn client_mux_tail_append_len(buffered: usize, available: usize, capacity: usize) -> usize {
+            available.min(capacity - buffered)
+          }
+  - id: parallax-client-mux-tail-flush
+    languages: [rust]
+    severity: ERROR
+    message: Reserve queue capacity before relinquishing the one tail; propagate failure and enqueue exactly one Data frame.
+    patterns:
+      - pattern: 'async fn flush_client_mux_upload_tail(...) { ... }'
+      - pattern-not: |
+          async fn flush_client_mux_upload_tail(...) {
+            *deadline = None;
+            if !tail.bytes.is_empty() {
+              let slot = frame_tx.reserve().await.map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+              let payload = std::mem::replace(&mut tail.bytes, tail.pool.take());
+              slot.send(MuxFrame { stream_id, kind: MuxFrameKind::Data, payload });
+            }
+            Ok(())
+          }
+  - id: parallax-client-mux-tail-cancel-cleanup
+    languages: [rust]
+    severity: ERROR
+    message: Cancellation synchronously recycles uncommitted bytes; Drop must never send or spawn.
+    patterns:
+      - pattern: 'impl Drop for ClientMuxUploadTail { ... }'
+      - pattern-not: |
+          impl Drop for ClientMuxUploadTail {
+            fn drop(&mut self) { self.pool.put(std::mem::take(&mut self.bytes)); }
+          }
+  - id: parallax-client-mux-tail-callsite
+    languages: [rust]
+    severity: ERROR
+    message: Only the TCP mux caller selects the private hold, and explicit jitter selects the old zero-hold path.
+    patterns:
+      - pattern: 'client_mux_upload_loop(...)'
+      - pattern-not-inside: 'mod tests { ... }'
+      - pattern-not: |
+          client_mux_upload_loop(local_read, frame_tx.clone(), stream_id, mux.chunk_size, cid, payload_pool.clone(), if mux_pool.traffic.max_delay_ms == 0 { CLIENT_TCP_MUX_TAIL_HOLD } else { Duration::ZERO })
+  - id: parallax-client-mux-tail-gate-immutable
+    languages: [rust]
+    severity: ERROR
+    message: Preserve the caller's actual traffic policy; canonical gate text does not excuse pool shadows, traffic writes or mutable aliases beside it.
+    patterns:
+      - pattern-inside: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
+      - pattern-either:
+          - patterns:
+              - pattern: 'let $BINDING = $VALUE;'
+              - metavariable-regex:
+                  metavariable: $BINDING
+                  regex: '(?s).*\bmux_pool\b.*'
+          - pattern: 'let mut mux_pool = ...;'
+          - pattern: 'mux_pool = ...'
+          - pattern: 'mux_pool.traffic = ...'
+          - pattern: 'mux_pool.traffic.$FIELD = ...'
+          - pattern: 'mux_pool.traffic.$FIELD += ...'
+          - pattern: 'mux_pool.traffic.$FIELD -= ...'
+          - pattern: 'mux_pool.traffic.$FIELD *= ...'
+          - pattern: 'mux_pool.traffic.$FIELD /= ...'
+          - pattern: 'mux_pool.traffic.$FIELD %= ...'
+          - pattern: 'mux_pool.traffic.$FIELD &= ...'
+          - pattern: 'mux_pool.traffic.$FIELD |= ...'
+          - pattern: 'mux_pool.traffic.$FIELD ^= ...'
+          - pattern: 'mux_pool.traffic.$FIELD <<= ...'
+          - pattern: 'mux_pool.traffic.$FIELD >>= ...'
+          - pattern: '&mut mux_pool'
+          - pattern: '&mut mux_pool.traffic'
+          - pattern: '&mut mux_pool.traffic.$FIELD'
+          # This dispatcher's only reviewed traffic access is the canonical
+          # read below. Extra field access also rejects aliases/raw-pointer
+          # entry points beside that read, without a general alias analysis.
+          - pattern: 'mux_pool.traffic'
+      - pattern-not-inside: |
+          if mux_pool.traffic.max_delay_ms == 0 { CLIENT_TCP_MUX_TAIL_HOLD } else { Duration::ZERO }
+  - id: parallax-client-mux-tail-tcp-boundary
+    languages: [rust]
+    severity: ERROR
+    message: Valid SOCKS and the returning QUIC branch precede the sole TCP mux producer call; Open registration remains ahead of upload.
+    patterns:
+      - pattern: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
+      - pattern-not: |
+          async fn handle_local_mux_connection_with_cid(...) {
+            tune_tcp_stream(&local)?;
+            let request = accept_local_socks_connect(&mut local).await?;
+            ...
+            if let MuxCarrier::Quic { conn, session_keys, traffic, authority, accept_language, .. } = &mux.carrier {
+              return client_mux_quic_substream(local, conn.clone(), session_keys, *traffic, connect_request, authority, accept_language.as_deref(), cid).await;
+            }
+            let MuxCarrier::Tcp { frame_tx, register_tx, payload_pool } = &mux.carrier else { unreachable!("QUIC carrier handled above"); };
+            ...
+            open_slot.send(open_frame);
+            ...
+            let upload = client_mux_upload_loop(...);
+            let download = client_mux_await_download(outcome_rx, cid);
+            ...
+          }
+  - id: parallax-client-mux-tail-producer
+    languages: [rust]
+    severity: ERROR
+    message: Preserve the reviewed one-tail state machine, oldest absolute deadline, bounded full-frame flush, zero-hold drain and EOF/error ordering.
+    # No body ellipses: a retained canonical sequence must not excuse another
+    # append, read, deadline reset, allocation or send beside that sequence.
+    patterns:
+      - pattern: 'async fn client_mux_upload_loop(...) { ... }'
+      - pattern-not: |
+          async fn client_mux_upload_loop(...) {
+            let mut local_buf = vec![0_u8; relay_read_buffer_len(MuxFrame::max_payload_len(chunk_size))];
+            let max_payload_len = MuxFrame::max_payload_len(chunk_size);
+            if max_payload_len == 0 {
+              return Err(ClientRuntimeError::TlsRecord(crate::tls::record::TlsRecordError::PayloadTooLarge(0)));
+            }
+            let mut tail = ClientMuxUploadTail {
+              bytes: if hold.is_zero() { Vec::new() } else { payload_pool.take() },
+              pool: payload_pool.clone(),
+            };
+            let mut tail_deadline = None;
+            loop {
+              let read = if let Some(deadline) = tail_deadline {
+                if Instant::now() >= deadline {
+                  flush_client_mux_upload_tail(&frame_tx, stream_id, &mut tail, &mut tail_deadline).await?;
+                  continue;
+                }
+                match timeout_at(deadline, local_read.read(&mut local_buf)).await {
+                  Ok(read) => read,
+                  Err(_) => {
+                    flush_client_mux_upload_tail(&frame_tx, stream_id, &mut tail, &mut tail_deadline).await?;
+                    continue;
+                  }
+                }
+              } else { local_read.read(&mut local_buf).await };
+              let mut n = match read {
+                Ok(n) => n,
+                Err(err) => {
+                  flush_client_mux_upload_tail(&frame_tx, stream_id, &mut tail, &mut tail_deadline).await?;
+                  return Err(err.into());
+                }
+              };
+              #[cfg(test)]
+              CLIENT_MUX_UPLOAD_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+              if n == 0 {
+                flush_client_mux_upload_tail(&frame_tx, stream_id, &mut tail, &mut tail_deadline).await?;
+                send_mux_frame(&frame_tx, stream_id, MuxFrameKind::Fin, Vec::new()).await?;
+                return Ok(());
+              }
+              let received_at = Instant::now();
+              if !hold.is_zero() && tail.bytes.is_empty() { tail_deadline = Some(received_at + hold); }
+              if hold.is_zero() {
+                n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+                for chunk in local_buf[..n].chunks(max_payload_len) {
+                  send_mux_frame(&frame_tx, stream_id, MuxFrameKind::Data, payload_pool.take_filled(chunk)).await?;
+                }
+              } else {
+                let mut input = &local_buf[..n];
+                while !input.is_empty() {
+                  if tail.bytes.is_empty() { tail_deadline = Some(received_at + hold); }
+                  let take = client_mux_tail_append_len(tail.bytes.len(), input.len(), max_payload_len);
+                  tail.bytes.extend_from_slice(&input[..take]);
+                  input = &input[take..];
+                  if tail.bytes.len() == max_payload_len {
+                    flush_client_mux_upload_tail(&frame_tx, stream_id, &mut tail, &mut tail_deadline).await?;
+                  }
+                }
+              }
+              tracing::trace!(cid, stream_id, bytes = n, "queued client mux upload payload");
+            }
+          }

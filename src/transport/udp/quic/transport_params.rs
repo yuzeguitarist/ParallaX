@@ -24,6 +24,8 @@ const TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
 const TP_INITIAL_MAX_STREAM_DATA_UNI: u64 = 0x07;
 const TP_INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
 const TP_INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
+const TP_ACK_DELAY_EXPONENT: u64 = 0x0a;
+const TP_MAX_ACK_DELAY: u64 = 0x0b;
 const TP_ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
 const TP_INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
 
@@ -61,6 +63,8 @@ const SAFARI_ACTIVE_CID_LIMIT: u64 = 64;
 /// RFC 9000 §18.2 default for `active_connection_id_limit` when the parameter is
 /// absent from a received blob.
 const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
+const DEFAULT_ACK_DELAY_EXPONENT: u32 = 3;
+const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
 
 /// RFC 9000 §18.2: the minimum legal `active_connection_id_limit`.
 const MIN_ACTIVE_CONNECTION_ID_LIMIT: u64 = 2;
@@ -97,6 +101,10 @@ pub struct TransportParameters {
     pub initial_max_stream_data_uni: u64,
     pub initial_max_streams_bidi: u64,
     pub initial_max_streams_uni: u64,
+    /// Peer ACK Delay scale, constrained to 0..=20 by RFC 9000 §18.2.
+    pub ack_delay_exponent: u32,
+    /// Peer ACK delay bound in milliseconds, strictly below 2^14.
+    pub max_ack_delay_ms: u64,
     pub active_connection_id_limit: u64,
     /// `initial_source_connection_id` (0x0f). Zero-length for the Safari client.
     /// RFC 9000 §7.3 defines it to equal the Initial packet-header SCID; the relay
@@ -120,6 +128,8 @@ impl TransportParameters {
             initial_max_stream_data_uni: SAFARI_INITIAL_MAX_STREAM_DATA,
             initial_max_streams_bidi: 0,
             initial_max_streams_uni: SAFARI_MAX_STREAMS_UNI,
+            ack_delay_exponent: DEFAULT_ACK_DELAY_EXPONENT,
+            max_ack_delay_ms: DEFAULT_MAX_ACK_DELAY_MS,
             active_connection_id_limit: SAFARI_ACTIVE_CID_LIMIT,
             initial_src_cid: scid.to_vec(),
         }
@@ -171,6 +181,8 @@ impl TransportParameters {
             initial_max_stream_data_uni: SAFARI_INITIAL_MAX_STREAM_DATA,
             initial_max_streams_bidi: 2,
             initial_max_streams_uni: SAFARI_MAX_STREAMS_UNI,
+            ack_delay_exponent: DEFAULT_ACK_DELAY_EXPONENT,
+            max_ack_delay_ms: DEFAULT_MAX_ACK_DELAY_MS,
             active_connection_id_limit: MIN_ACTIVE_CONNECTION_ID_LIMIT,
             initial_src_cid: scid.to_vec(),
         }
@@ -231,6 +243,8 @@ impl TransportParameters {
             initial_max_stream_data_uni: 0,
             initial_max_streams_bidi: 0,
             initial_max_streams_uni: 0,
+            ack_delay_exponent: DEFAULT_ACK_DELAY_EXPONENT,
+            max_ack_delay_ms: DEFAULT_MAX_ACK_DELAY_MS,
             active_connection_id_limit: DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
             initial_src_cid: Vec::new(),
         };
@@ -276,6 +290,20 @@ impl TransportParameters {
                 }
                 TP_INITIAL_MAX_STREAMS_UNI => {
                     tp.initial_max_streams_uni = read_max_streams(body)?;
+                }
+                TP_ACK_DELAY_EXPONENT => {
+                    let value = read_varint_body(body)?;
+                    if value > 20 {
+                        return Err(Error::Invalid);
+                    }
+                    tp.ack_delay_exponent = value as u32;
+                }
+                TP_MAX_ACK_DELAY => {
+                    let value = read_varint_body(body)?;
+                    if value >= 1 << 14 {
+                        return Err(Error::Invalid);
+                    }
+                    tp.max_ack_delay_ms = value;
                 }
                 TP_ACTIVE_CONNECTION_ID_LIMIT => {
                     // RFC 9000 §18.2: a value below 2 is a TRANSPORT_PARAMETER_ERROR.
@@ -356,6 +384,120 @@ fn read_max_streams(body: &[u8]) -> Result<u64, Error> {
         return Err(Error::Invalid);
     }
     Ok(value)
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn assert_canonical_ack_parameter(blob: &[u8], exponent: bool, value: u64) {
+        let parsed = TransportParameters::read(blob);
+        if (exponent && value > 20) || (!exponent && value >= 1 << 14) {
+            assert_eq!(parsed, Err(Error::Invalid));
+        } else {
+            let tp = parsed.unwrap();
+            assert_eq!(
+                tp.ack_delay_exponent as u64,
+                if exponent { value } else { 3 }
+            );
+            assert_eq!(tp.max_ack_delay_ms, if exponent { 25 } else { value });
+        }
+    }
+
+    macro_rules! peer_ack_parameter_case {
+        ($name:ident, $id:literal, $width:literal, $wire_len:literal, $tag:literal, $minimum:expr, $maximum:expr) => {
+            #[kani::proof]
+            // One parameter; the reference copy and each varint decode touch at
+            // most eight value bytes. Unwinding assertions remain enabled.
+            #[kani::unwind(12)]
+            fn $name() {
+                let value: u64 = kani::any();
+                kani::assume(value >= $minimum && value <= $maximum);
+                let mut blob = [0_u8; $wire_len];
+                blob[0] = $id;
+                blob[1] = $width;
+                blob[2..].copy_from_slice(&value.to_be_bytes()[8 - $width..]);
+                blob[2] = (blob[2] & 0x3f) | $tag;
+                assert_canonical_ack_parameter(&blob, $id == 0x0a, value);
+            }
+        };
+    }
+
+    // Parse reference canonical wire directly, rather than round-tripping the
+    // production put_param builder. For each ID these four disjoint intervals
+    // exhaust 0..=2^62-1, including every out-of-range ACK parameter value.
+    peer_ack_parameter_case!(
+        peer_ack_parameter_exponent_width_1,
+        0x0a,
+        1,
+        3,
+        0x00,
+        0,
+        (1_u64 << 6) - 1
+    );
+    peer_ack_parameter_case!(
+        peer_ack_parameter_exponent_width_2,
+        0x0a,
+        2,
+        4,
+        0x40,
+        1_u64 << 6,
+        (1_u64 << 14) - 1
+    );
+    peer_ack_parameter_case!(
+        peer_ack_parameter_exponent_width_4,
+        0x0a,
+        4,
+        6,
+        0x80,
+        1_u64 << 14,
+        (1_u64 << 30) - 1
+    );
+    peer_ack_parameter_case!(
+        peer_ack_parameter_exponent_width_8,
+        0x0a,
+        8,
+        10,
+        0xc0,
+        1_u64 << 30,
+        (1_u64 << 62) - 1
+    );
+    peer_ack_parameter_case!(
+        peer_ack_parameter_max_delay_width_1,
+        0x0b,
+        1,
+        3,
+        0x00,
+        0,
+        (1_u64 << 6) - 1
+    );
+    peer_ack_parameter_case!(
+        peer_ack_parameter_max_delay_width_2,
+        0x0b,
+        2,
+        4,
+        0x40,
+        1_u64 << 6,
+        (1_u64 << 14) - 1
+    );
+    peer_ack_parameter_case!(
+        peer_ack_parameter_max_delay_width_4,
+        0x0b,
+        4,
+        6,
+        0x80,
+        1_u64 << 14,
+        (1_u64 << 30) - 1
+    );
+    peer_ack_parameter_case!(
+        peer_ack_parameter_max_delay_width_8,
+        0x0b,
+        8,
+        10,
+        0xc0,
+        1_u64 << 30,
+        (1_u64 << 62) - 1
+    );
 }
 
 #[cfg(test)]
@@ -502,6 +644,69 @@ mod tests {
             tp.active_connection_id_limit,
             DEFAULT_ACTIVE_CONNECTION_ID_LIMIT
         );
+    }
+
+    #[test]
+    fn read_rejects_ack_delay_exponent_above_20() {
+        let mut blob = Vec::new();
+        put_param(&mut blob, 0x0a, 21);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn read_rejects_max_ack_delay_at_2_pow_14() {
+        let mut blob = Vec::new();
+        put_param(&mut blob, 0x0b, 1 << 14);
+        assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn read_ack_parameters_require_exact_varint_bodies() {
+        for id in [0x0a, 0x0b] {
+            for body in [&[][..], &[0x40][..]] {
+                let mut truncated = Vec::new();
+                put_param_bytes(&mut truncated, id, body);
+                assert_eq!(TransportParameters::read(&truncated), Err(Error::Truncated));
+            }
+            let mut trailing = Vec::new();
+            put_param_bytes(&mut trailing, id, &[0x01, 0x01]);
+            assert_eq!(TransportParameters::read(&trailing), Err(Error::Malformed));
+            let mut duplicate = Vec::new();
+            put_param(&mut duplicate, id, 1);
+            put_param(&mut duplicate, id, 2);
+            assert_eq!(TransportParameters::read(&duplicate), Err(Error::Duplicate));
+        }
+    }
+
+    #[test]
+    fn read_ack_parameter_defaults_and_boundaries() {
+        for tp in [
+            TransportParameters::read(&[]).unwrap(),
+            TransportParameters::safari_client(&[]),
+            TransportParameters::server(&[]),
+        ] {
+            assert_eq!(tp.ack_delay_exponent, 3);
+            assert_eq!(tp.max_ack_delay_ms, 25);
+        }
+        for exponent in [0, 20] {
+            for max_delay in [0, (1 << 14) - 1] {
+                let mut blob = Vec::new();
+                put_param(&mut blob, 0x0a, exponent);
+                put_param(&mut blob, 0x0b, max_delay);
+                let tp = TransportParameters::read(&blob).unwrap();
+                assert_eq!(tp.ack_delay_exponent, exponent as u32);
+                assert_eq!(tp.max_ack_delay_ms, max_delay);
+            }
+        }
+        for id in [0x0a, 0x0b] {
+            let mut blob = Vec::new();
+            put_param(&mut blob, id, varint::MAX);
+            assert_eq!(TransportParameters::read(&blob), Err(Error::Invalid));
+        }
+        let server = TransportParameters::server(&[]).encode_server();
+        assert!(decode_pairs(&server)
+            .iter()
+            .all(|(id, _)| ![0x0a, 0x0b].contains(id)));
     }
 
     #[test]

@@ -34,6 +34,27 @@ pub struct PacketNumberSpace {
 }
 
 impl PacketNumberSpace {
+    #[cfg(test)]
+    pub(crate) fn exhausted_for_test() -> Self {
+        Self {
+            next: MAX_PACKET_NUMBER + 1,
+        }
+    }
+
+    /// Dispatchers check this before building, so exhaustion retires the
+    /// connection without allocating a packet number or sealing another packet.
+    pub fn can_allocate(&self) -> bool {
+        self.next <= MAX_PACKET_NUMBER
+    }
+
+    /// Reserve a PN only while both the key budget and PN space permit sealing.
+    pub fn allocate_protected(&mut self, sealed: u64, limit: u64) -> Option<u64> {
+        if sealed >= limit || !self.can_allocate() {
+            return None;
+        }
+        Some(self.allocate())
+    }
+
     #[allow(dead_code)] // redundant with the derived Default; used by the spaces tests
     pub fn new() -> Self {
         Self { next: 0 }
@@ -163,6 +184,59 @@ impl ReceivedPackets {
             ranges,
             ecn: None,
         })
+    }
+}
+
+#[cfg(kani)]
+mod replay_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn protected_allocation_rejects_without_advancing_or_wrapping() {
+        let pn: u64 = kani::any();
+        let sealed: u64 = kani::any();
+        let limit: u64 = kani::any();
+        let mut space = PacketNumberSpace { next: pn };
+        let allocated = space.allocate_protected(sealed, limit);
+        if sealed >= limit || pn > MAX_PACKET_NUMBER {
+            assert!(allocated.is_none());
+            assert_eq!(space.peek(), pn);
+        } else {
+            assert_eq!(allocated, Some(pn));
+            assert_eq!(space.peek(), pn + 1);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn low_water_replay_leaves_receive_state_unchanged() {
+        let low_water: u64 = kani::any();
+        let pn: u64 = kani::any();
+        kani::assume(pn <= low_water);
+        let mut received = ReceivedPackets {
+            ranges: Vec::new(),
+            low_water: Some(low_water),
+        };
+        assert!(!received.insert(pn));
+        assert!(received.ranges.is_empty());
+        assert_eq!(received.low_water, Some(low_water));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(20)] // One retained interval; includes the 16-byte tuple comparison.
+    fn retained_range_replay_leaves_receive_state_unchanged() {
+        let lo: u64 = kani::any();
+        let hi: u64 = kani::any();
+        let pn: u64 = kani::any();
+        kani::assume(lo <= pn && pn <= hi && hi <= MAX_PACKET_NUMBER);
+        let mut received = ReceivedPackets {
+            ranges: vec![(lo, hi)],
+            low_water: None,
+        };
+        assert!(!received.insert(pn));
+        assert_eq!(received.ranges.len(), 1);
+        assert_eq!(received.ranges[0], (lo, hi));
+        assert_eq!(received.low_water, None);
     }
 }
 

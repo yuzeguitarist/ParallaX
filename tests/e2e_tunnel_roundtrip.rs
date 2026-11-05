@@ -36,11 +36,26 @@
 //!       reads in both directions; and
 //!   (d) teardown is a clean FIN, not a RST: after the app half-closes, its read
 //!       side observes a graceful EOF (`read_to_end` returns `Ok`), which a RST
-//!       would surface as a `ConnectionReset` error instead.
+//!       would surface as a `ConnectionReset` error instead; and
+//!   (e) a transparent TCP forwarder records the real TLS record sizes,
+//!       directions, and completion times throughout the authenticated session.
+//!       This userspace stream tap changes packetization and includes loopback
+//!       scheduling noise; it does not establish field indistinguishability.
+//!
+//! Set `PARALLAX_TCP_TRACE_PATH` to write an optional metadata-only TSV artifact.
+//! The capture contains no payload or keys and refuses to overwrite a file.
+//! Set `PARALLAX_TCP_CAPTURE_PORT` to a u16 port for a packet-capture filter;
+//! the forwarder always binds 127.0.0.1 and otherwise uses an ephemeral port.
 //!
 //! Live-socket test: `#[ignore]`d and run serially, matching the repo's loopback
 //! convention (`requires loopback TCP sockets`). Run with:
 //!   cargo test --test e2e_tunnel_roundtrip -- --ignored --test-threads=1
+
+#[path = "distinguisher/tcp_capture.rs"]
+mod tcp_capture;
+#[allow(dead_code)]
+#[path = "distinguisher/trace.rs"]
+mod trace;
 
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -404,8 +419,19 @@ async fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
         replay_cache_path,
     );
     let (parallax_addr, server_task) = spawn_parallax_server(config).await;
+    let capture_port = std::env::var_os("PARALLAX_TCP_CAPTURE_PORT")
+        .map(|port| {
+            port.to_str()
+                .expect("PARALLAX_TCP_CAPTURE_PORT must be Unicode")
+                .parse::<u16>()
+                .expect("PARALLAX_TCP_CAPTURE_PORT must be a u16 port")
+        })
+        .unwrap_or(0);
+    let forwarder = tcp_capture::RecordingForwarder::spawn(parallax_addr, capture_port)
+        .await
+        .expect("start TCP record capture");
     let (local_addr, client_task) =
-        spawn_local_client(parallax_addr, &server_keys, &server_identity_keys).await;
+        spawn_local_client(forwarder.front_addr, &server_keys, &server_identity_keys).await;
 
     // Drive a SOCKS5 app through the tunnel to the echo target. Reaching an
     // accepted SOCKS CONNECT already proves the full authenticated handshake
@@ -458,6 +484,43 @@ async fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
     wait_for_task("server", server_task).await;
     wait_for_task("target", target_task).await;
     origin_task.abort();
+
+    let capture = timeout(Duration::from_secs(10), forwarder.finish())
+        .await
+        .expect("TCP record capture timed out")
+        .expect("TCP record capture failed");
+    let trace = capture.application_data();
+    let c2s = trace.dir(trace::Dir::C2S).len();
+    let s2c = trace.dir(trace::Dir::S2C).len();
+    assert!(
+        c2s >= 64 && s2c >= 64,
+        "incomplete bidirectional capture: {c2s}/{s2c}"
+    );
+    for dir in [trace::Dir::C2S, trace::Dir::S2C] {
+        assert!(
+            capture
+                .records
+                .iter()
+                .any(|r| r.dir == dir && r.content_type == 22),
+            "capture missed a direction of the camouflage handshake"
+        );
+    }
+    let span = capture.records.last().unwrap().t_micros;
+    assert!(span > 0, "capture must retain elapsed socket time");
+    eprintln!(
+        "[authenticated-tcp-record-capture] records={} appdata_c2s={c2s} appdata_s2c={s2c} \
+         span_us={span}; loopback measurement only",
+        capture.records.len(),
+    );
+    if let Some(path) = std::env::var_os("PARALLAX_TCP_TRACE_PATH") {
+        capture
+            .write_tsv(&path)
+            .expect("write TCP capture metadata");
+        eprintln!(
+            "TCP record metadata: {}",
+            std::path::Path::new(&path).display()
+        );
+    }
 }
 
 async fn wait_for_task(name: &str, task: JoinHandle<()>) {

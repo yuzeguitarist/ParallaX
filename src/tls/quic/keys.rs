@@ -17,7 +17,7 @@ use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use cipher::generic_array::GenericArray;
 use cipher::{BlockEncrypt, KeyIvInit, StreamCipher, StreamCipherSeek};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::suite::CipherSuite;
 use super::QuicTlsError;
@@ -79,7 +79,7 @@ impl PacketKey {
     pub(crate) fn from_secret(suite: CipherSuite, secret: &[u8]) -> Result<Self, QuicTlsError> {
         let key =
             Zeroizing::new(suite.hkdf_expand_label(secret, "quic key", &[], suite.key_len())?);
-        let iv_vec = suite.hkdf_expand_label(secret, "quic iv", &[], IV_LEN)?;
+        let iv_vec = Zeroizing::new(suite.hkdf_expand_label(secret, "quic iv", &[], IV_LEN)?);
         let mut iv = [0_u8; IV_LEN];
         iv.copy_from_slice(&iv_vec);
         Ok(Self { suite, key, iv })
@@ -191,6 +191,12 @@ impl PacketKey {
             }
         }
         Ok(&buf[..pt_len])
+    }
+}
+
+impl Drop for PacketKey {
+    fn drop(&mut self) {
+        self.iv.zeroize();
     }
 }
 

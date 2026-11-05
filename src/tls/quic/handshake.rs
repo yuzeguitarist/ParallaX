@@ -26,7 +26,7 @@ use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, ML_KEM_768};
 use flate2::read::ZlibDecoder;
 use rand::{rngs::OsRng, RngCore};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::session::{x25519_shared_secret, X25519KeyPair};
 use crate::tls::safari_shape::{GreaseSet, GROUP_X25519, GROUP_X25519_MLKEM768, X25519_KEY_LEN};
@@ -396,9 +396,6 @@ impl ClientHandshake {
         }
         if let Some(finished) = self.pending_client_finished.take() {
             out.extend_from_slice(&finished);
-            // Keep the transcript through the client Finished so a later
-            // `resumption_master_secret` matches the server (RFC 8446 §7.1).
-            self.transcript.extend_from_slice(&finished);
             let keys = self
                 .pending_1rtt_keys
                 .take()
@@ -410,8 +407,11 @@ impl ClientHandshake {
     }
 
     /// Return the next 1-RTT packet-key generation for a key update (RFC 9001 §6).
-    pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
-        self.schedule.as_mut()?.next_1rtt_packet_keys().ok()
+    pub fn next_1rtt_keys(&mut self) -> Result<KeyPair<PacketKey>, QuicTlsError> {
+        self.schedule
+            .as_mut()
+            .ok_or_else(|| QuicTlsError::Crypto("key update before key schedule".into()))?
+            .next_1rtt_packet_keys()
     }
 
     /// RFC 5705 exporter; available once the handshake completes.
@@ -429,18 +429,19 @@ impl ClientHandshake {
 
     /// `resumption_master_secret` over the transcript through the client Finished
     /// (RFC 8446 §7.1). Available only after [`Self::write_handshake`] has emitted
-    /// the client Finished (which appends it to the transcript). The per-ticket PSK
+    /// the client Finished (already included in the cached transcript). The per-ticket PSK
     /// the client stores is [`super::schedule::resumption_psk`] of this secret.
     pub fn resumption_master_secret(&self) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
-        let suite = self
-            .suite
-            .ok_or_else(|| QuicTlsError::Crypto("resumption master before handshake".into()))?;
+        if !self.handshake_complete {
+            return Err(QuicTlsError::Crypto(
+                "resumption master before client Finished".into(),
+            ));
+        }
         let schedule = self
             .schedule
             .as_ref()
             .ok_or_else(|| QuicTlsError::Crypto("resumption master before schedule".into()))?;
-        let transcript_hash = suite.digest(&self.transcript);
-        schedule.resumption_master_secret(&transcript_hash)
+        schedule.resumption_master_secret()
     }
 
     /// Parse a post-handshake NewSessionTicket and store a [`ClientTicket`] for a
@@ -620,6 +621,9 @@ impl ClientHandshake {
         };
         let (schedule, keys) =
             KeySchedule::after_server_hello(suite, psk, &shared_secret, &transcript_hash)?;
+        self.x25519.private.zeroize();
+        self.mlkem_secret.zeroize();
+        self.resumption_psk = None;
         self.schedule = Some(schedule);
         self.pending_handshake_keys = Some(keys);
         Ok(())
@@ -786,6 +790,10 @@ impl ClientHandshake {
         finished.push(len as u8);
         finished.extend_from_slice(&client_verify_data);
 
+        // Cache resumption material over client Finished before retiring the
+        // handshake/master ancestors. The pending Finished is emitted next.
+        self.transcript.extend_from_slice(&finished);
+        schedule.finish_handshake(&suite.digest(&self.transcript))?;
         self.pending_client_finished = Some(finished);
         self.pending_1rtt_keys = Some(onertt);
         Ok(())
@@ -1362,6 +1370,38 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn successful_server_hello_retires_client_kex_inputs() {
+        use aws_lc_rs::{
+            rand::SystemRandom,
+            signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
+        };
+        let mut client = handshake();
+        let signing =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let mut server = super::super::ServerHandshake::new(
+            Arc::new(vec![vec![0x30, 3, 2, 1, 0]]),
+            signing.as_ref(),
+            vec![b"h3".to_vec()],
+            vec![0x0f, 0],
+            None,
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_handshake(&mut hello);
+        assert!(client.x25519.private.iter().any(|byte| *byte != 0));
+        assert!(!client.mlkem_secret.is_empty());
+        server.read_handshake(&hello).unwrap();
+        let mut server_hello = Vec::new();
+        server.write_handshake(&mut server_hello);
+        client.read_handshake(&server_hello).unwrap();
+        assert!(client.x25519.private.iter().all(|byte| *byte == 0));
+        assert!(client.mlkem_secret.is_empty());
+        assert!(client.resumption_psk.is_none());
+        assert!(client.resumption_master_secret().is_err());
+    }
+
     /// Extract the client's X25519 key_share (group 0x001d) from a ClientHello
     /// handshake message — used by the marker test to recompute the server-side ECDH.
     fn x25519_key_share(ch: &[u8]) -> [u8; 32] {
@@ -1518,6 +1558,9 @@ mod tests {
             let (mut schedule, _) =
                 KeySchedule::after_server_hello(suite, None, &[0x11; 32], &[0x22; 32]).unwrap();
             schedule.derive_application(&[0x33; 32]).unwrap();
+            schedule
+                .finish_handshake(&suite.digest(&hs.transcript))
+                .unwrap();
             hs.suite = Some(suite);
             hs.schedule = Some(schedule);
             hs.alpn = Some(b"h3".to_vec());

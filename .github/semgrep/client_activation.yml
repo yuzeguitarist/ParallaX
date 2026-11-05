@@ -1,0 +1,173 @@
+rules:
+  - id: parallax-no-startup-carrier
+    languages: [rust]
+    severity: ERROR
+    message: Client startup may construct pools and start a passive keeper, but may not acquire or establish authenticated carriers.
+    patterns:
+      - pattern-inside: 'async fn run(...) { ... }'
+      - pattern-either:
+          - pattern: '$POOL.ensure_started(...)'
+          - pattern: '$POOL.ensure_warm(...)'
+          - pattern: '$POOL.take_or_start(...)'
+          - pattern: '$POOL.acquire(...)'
+          - pattern: '$POOL.spawn_session(...)'
+          - pattern: '$POOL.start_session(...)'
+          - pattern: 'establish_authenticated_data_session_with_resolver(...)'
+          - pattern: 'establish_authenticated_data_session(...)'
+
+  - id: parallax-validate-socks-before-carrier
+    languages: [rust]
+    severity: ERROR
+    message: Both local handlers must propagate successful SOCKS validation before carrier acquisition or establishment.
+    patterns:
+      - pattern-inside: 'async fn $HANDLER(...) { ... }'
+      - metavariable-regex:
+          metavariable: $HANDLER
+          regex: '^handle_local_(mux_)?connection_with_cid$'
+      - pattern-either:
+          - pattern: '$POOL.take_or_start(...)'
+          - pattern: '$POOL.acquire(...)'
+          - pattern: 'establish_authenticated_data_session_with_resolver(...)'
+      - pattern-not-inside: |
+          async fn $HANDLER(...) {
+            tune_tcp_stream(&$LOCAL)?;
+            let $REQUEST = accept_local_socks_connect(&mut $LOCAL).await?;
+            ...
+          }
+
+  - id: parallax-validated-socks-boundary
+    languages: [rust]
+    severity: ERROR
+    message: The activation boundary must use the bounded production SOCKS parser and propagate parser errors.
+    patterns:
+      - pattern: 'async fn accept_local_socks_connect(...) { ... }'
+      - pattern-not: |
+          async fn accept_local_socks_connect($LOCAL: &mut TcpStream) {
+            match timeout(SOCKS_ACCEPT_TIMEOUT, socks::accept_connect($LOCAL)).await {
+              Ok($RESULT) => $RESULT.map_err(Into::into),
+              Err($ELAPSED) => { Err(...) }
+            }
+          }
+
+  - id: parallax-single-demand-carrier
+    languages: [rust]
+    severity: ERROR
+    message: Single-stream establishment must use exactly its one reviewed on-demand task; no spare pool fills or extra dials.
+    patterns:
+      - pattern-inside: 'async fn handle_local_connection_with_cid(...) { ... }'
+      - pattern-either:
+          - pattern: 'establish_authenticated_data_session_with_resolver(...)'
+          - pattern: 'establish_authenticated_data_session(...)'
+          - pattern: '$POOL.take_or_start(...)'
+          - pattern: '$POOL.fill_locked(...)'
+          - pattern: '$POOL.spawn_session(...)'
+          - pattern: '$POOL.ensure_warm(...)'
+      - pattern-not-inside: |
+          let server_session_task = {
+            let speculative_config = config.clone();
+            let speculative_server_addr = server_addr.clone();
+            let speculative_udp = udp.clone();
+            let speculative_reachability = Arc::clone(&reachability);
+            let speculative_psk = Arc::new(Zeroizing::new(psk.to_vec()));
+            let speculative_server_public = *server_public;
+            let speculative_server_identity_public = server_identity_public.clone();
+            tokio::spawn(async move {
+              establish_authenticated_data_session_with_resolver(
+                &speculative_server_addr, &speculative_config, traffic,
+                &speculative_udp, &speculative_reachability,
+                speculative_psk.as_slice(), &speculative_server_public,
+                speculative_server_identity_public,
+              ).await
+            })
+          };
+
+  - id: parallax-single-demand-carrier-once
+    languages: [rust]
+    severity: ERROR
+    message: Do not duplicate the on-demand establishment declaration or place it inside a loop.
+    patterns:
+      - pattern-inside: 'async fn handle_local_connection_with_cid(...) { ... }'
+      - pattern-either:
+          - pattern: |
+              let server_session_task = $FIRST;
+              ...
+              let server_session_task = $SECOND;
+          - pattern: 'loop { ... let server_session_task = $TASK; ... }'
+          - pattern: 'while $COND { ... let server_session_task = $TASK; ... }'
+          - pattern: 'for $ITEM in $ITER { ... let server_session_task = $TASK; ... }'
+
+  - id: parallax-mux-warm-activation-guard
+    languages: [rust]
+    severity: ERROR
+    message: Proactive mux builds must reject never-active and expired activity before entering the pool/build loop.
+    patterns:
+      - pattern-inside: 'impl ClientMuxPool { ... }'
+      - pattern-inside: 'async fn ensure_warm(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.spawn_build(...)'
+          - pattern: 'self.start_session(...)'
+          - pattern: 'establish_authenticated_data_session_with_resolver(...)'
+      - pattern-not-inside: |
+          async fn ensure_warm(...) {
+            loop {
+              if !mux_activity_is_recent(self.last_activity.load(Ordering::Relaxed), relay_now_millis()) {
+                return Ok(());
+              }
+              ...
+            }
+          }
+
+  - id: parallax-no-eager-keeper-build
+    languages: [rust]
+    severity: ERROR
+    message: The passive keeper must not perform an initial carrier warm before its activity-gated polling loop.
+    patterns:
+      - pattern-inside: 'fn start_keeper(...) { ... }'
+      - pattern: '$POOL.ensure_warm(...)'
+      - pattern-not-inside: 'loop { ... }'
+
+  - id: parallax-mux-activity-stamp
+    languages: [rust]
+    severity: ERROR
+    message: Reserve zero for never-active clients; publish real activity as monotonic time plus one.
+    patterns:
+      - pattern-inside: 'impl ClientMuxPool { ... }'
+      - pattern: 'self.last_activity.store($VALUE, $ORDERING)'
+      - pattern-not: 'self.last_activity.store(relay_now_millis().saturating_add(1), Ordering::Relaxed)'
+
+  - id: parallax-mux-starts-inactive
+    languages: [rust]
+    severity: ERROR
+    message: A new mux pool must reserve zero for the never-used state.
+    patterns:
+      - pattern-inside: 'impl ClientMuxPool { ... }'
+      - pattern-inside: 'fn new(...) { ... }'
+      - pattern: 'Arc::new(AtomicU64::new($VALUE))'
+      - pattern-not: 'Arc::new(AtomicU64::new(0))'
+
+  - id: parallax-mux-activity-sentinel
+    languages: [rust]
+    severity: ERROR
+    message: The activity predicate must explicitly reject zero and decode the time-plus-one stamp consistently.
+    patterns:
+      - pattern: 'fn mux_activity_is_recent(...) { ... }'
+      - pattern-not: |
+          fn mux_activity_is_recent($ACTIVITY: u64, $NOW: u64) -> bool {
+            $ACTIVITY != 0 && $NOW.saturating_sub($ACTIVITY - 1) <= MUX_WARM_KEEPER_ACTIVE_WINDOW.as_millis() as u64
+          }
+
+  - id: parallax-socks-reserved-byte
+    languages: [rust]
+    severity: ERROR
+    message: A validated SOCKS CONNECT must reject a nonzero reserved byte before accepting the target.
+    patterns:
+      - pattern: 'async fn read_connect_request(...) { ... }'
+      - pattern-not: |
+          async fn read_connect_request(...) {
+            read_socks5_version($STREAM).await?;
+            let $COMMAND = $STREAM.read_u8().await?;
+            if $COMMAND != 1 { return Err(SocksError::UnsupportedCommand($COMMAND)); }
+            let $RESERVED = $STREAM.read_u8().await?;
+            if $RESERVED != 0 { return Err(SocksError::InvalidReserved); }
+            ...
+          }

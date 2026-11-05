@@ -1,7 +1,6 @@
 //! Statistical distinguisher battery — test-support library.
 //!
-//! Turns "I believe ParallaX looks like Safari" into "I have numbers that prove
-//! it does (or does not)". The battery compares two corpora — the real Safari-26
+//! Measures selected differences between traffic traces. The battery compares the real Safari-26
 //! capture (ground truth) and ParallaX's own output, in the same units — with
 //! three independent two-sample distinguishers:
 //!
@@ -9,11 +8,12 @@
 //! * Pearson chi-squared on categorical features (direction runs, buckets),
 //! * Ljung–Box on serial autocorrelation,
 //!
-//! plus a cross-validated logistic-regression classifier whose held-out ROC AUC
-//! is the headline indistinguishability metric.
+//! plus a logistic-regression classifier. Its legacy window folds test machinery
+//! and known perturbations; windows from one flow are not independent captures.
 //!
-//! Acceptance (indistinguishable): two-sample `KS p > 0.05` AND classifier
-//! `AUC ∈ [0.45, 0.55]`. Discriminability self-proof: injecting a known
+//! Same-source self-check: two-sample `KS p > 0.05` AND classifier
+//! `AUC ∈ [0.45, 0.55]`. Neither is a universal indistinguishability claim.
+//! Discriminability self-check: injecting a known
 //! perturbation (e.g. the 1:1-ACK pathology) must drive `KS p → 0` and
 //! `AUC → 1`, demonstrating the battery actually fires.
 //!

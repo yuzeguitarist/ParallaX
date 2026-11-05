@@ -1,0 +1,207 @@
+rules:
+  - id: parallax-tls-ready-drain
+    languages: [rust]
+    severity: ERROR
+    message: Before the H2 opening, poll ready records and return at an empty boundary; only the same partially consumed reader may wait, and partial timeout/EOF must fail.
+    patterns:
+      - pattern: 'async fn drain_post_handshake(...) { ... }'
+      - pattern-not: |
+          async fn drain_post_handshake(...) {
+            ...
+              let read = match $READER.try_read_record_into(&mut $RECORD).await {
+                Some(result) => result,
+                None if $READER.at_record_boundary() => return Ok($OBSERVED),
+                None => match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, $READER.read_record_into(&mut $RECORD)).await {
+                  Ok(result) => result,
+                  Err(_) => {
+                    return Err(Safari26TlsError::Handshake(...))
+                  }
+                },
+              };
+              match read {
+                Ok(()) => {},
+                Err(err) if is_clean_close(&err) && $READER.at_record_boundary() => {
+                  return Ok($OBSERVED)
+                }
+                Err(err) => return Err(err.into()),
+              }
+            ...
+          }
+  - id: parallax-tls-post-handshake-processing
+    languages: [rust]
+    severity: ERROR
+    message: Both pre-opening drain and H2 receive paths must process framed handshake records with the shared state before accepting another inner record type.
+    patterns:
+      - pattern-inside: 'async fn $PHASE(...) { ... }'
+      - metavariable-regex:
+          metavariable: $PHASE
+          regex: '^(drain_post_handshake|await_http2_settings_ack)$'
+      - pattern: 'keys.server_application.decrypt_record(...)'
+      - pattern-not-inside: |
+          {
+            ...
+            let decrypted = keys.server_application.decrypt_record(...)?;
+            if decrypted.content_type == TLS_RECORD_HANDSHAKE {
+              self.process_post_handshake_record(reader.get_mut(), keys, &decrypted.plaintext).await?;
+              continue;
+            }
+            self.ensure_post_handshake_boundary()?;
+            ...
+          }
+      - pattern-not-inside: |
+          {
+            ...
+            let chunk = keys.server_application.decrypt_record(...)?;
+            if chunk.content_type == TLS_RECORD_HANDSHAKE {
+              self.process_post_handshake_record(reader.get_mut(), keys, &chunk.plaintext).await?;
+              continue;
+            }
+            self.ensure_post_handshake_boundary()?;
+            ...
+          }
+
+  - id: parallax-tls-key-update-framing
+    languages: [rust]
+    severity: ERROR
+    message: Post-handshake parser must bound declared lengths, frame tickets exactly, and require a one-byte valid KeyUpdate ending the record.
+    patterns:
+      - pattern: 'fn parse_post_handshake_message(...) { ... }'
+      - pattern-not: |
+          fn parse_post_handshake_message(...) {
+            if bytes.len() < 4 { return Ok(None); }
+            let len = ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | bytes[3] as usize;
+            if len > MAX_POST_HANDSHAKE_MESSAGE { return Err(...); }
+            let total = 4 + len;
+            match bytes[0] {
+              HANDSHAKE_NEW_SESSION_TICKET => {
+                Ok((bytes.len() >= total).then_some(PostHandshakeMessage::NewSessionTicket(total)))
+              }
+              HANDSHAKE_KEY_UPDATE => {
+                if len != 1 { return Err(...); }
+                if bytes.len() < total { return Ok(None); }
+                if bytes.len() != total { return Err(...); }
+                match bytes[4] {
+                  0 => Ok(Some(PostHandshakeMessage::KeyUpdate { request_update: false })),
+                  1 => Ok(Some(PostHandshakeMessage::KeyUpdate { request_update: true })),
+                  _ => Err(...),
+                }
+              }
+              _ => Err(...),
+            }
+          }
+
+  - id: parallax-tls-key-update-response-order
+    languages: [rust]
+    severity: ERROR
+    message: Receive keys update on KeyUpdate; a requested response0 must be encrypted/written with old send keys before replacing send keys, propagating write failure.
+    patterns:
+      - pattern: 'async fn process_post_handshake_record(...) { ... }'
+      - pattern-not: |
+          async fn process_post_handshake_record(...) {
+            ...
+            while let Some(message) = $PARSE {
+              match message {
+                PostHandshakeMessage::NewSessionTicket(total) => { ... }
+                PostHandshakeMessage::KeyUpdate { request_update } => {
+                  keys.update_server_application_keys()?;
+                  if request_update {
+                    let response = keys.client_application.encrypt_record(TLS_RECORD_HANDSHAKE, &[HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0])?;
+                    self.tap_records(RecordDirection::Outbound, &response);
+                    stream.write_all(&response).await?;
+                    keys.update_client_application_keys()?;
+                  }
+                  consumed = self.pending_post_handshake.len();
+                }
+              }
+            }
+            ...
+          }
+
+  - id: parallax-tls-key-update-derivation
+    languages: [rust]
+    severity: ERROR
+    message: Replace the Zeroizing traffic secret and cipher with HKDF traffic upd and a freshly initialized sequence-zero RecordCipher.
+    patterns:
+      - pattern: 'fn update_application_traffic_keys(...) { ... }'
+      - pattern-not: |
+          fn update_application_traffic_keys(...) {
+            let next = Zeroizing::new(suite.hkdf_expand_label(secret, "traffic upd", &[], suite.hash_len())?);
+            let next_cipher = RecordCipher::new(suite, &next)?;
+            *secret = next;
+            *cipher = next_cipher;
+            Ok(())
+          }
+
+  - id: parallax-tls-post-handshake-buffer
+    languages: [rust]
+    severity: ERROR
+    message: Retain only a bounded shared handshake buffer across phases and discard only exactly parsed prefixes.
+    patterns:
+      - pattern: 'async fn process_post_handshake_record(...) { ... }'
+      - pattern-not: |
+          async fn process_post_handshake_record(...) {
+            if plaintext.is_empty() || self.pending_post_handshake.len().saturating_add(plaintext.len()) > POST_HANDSHAKE_BUFFER_LIMIT {
+              return Err(...);
+            }
+            self.pending_post_handshake.extend_from_slice(plaintext);
+            let mut consumed = 0;
+            while let Some(message) = parse_post_handshake_message(&self.pending_post_handshake[consumed..]).map_err(|message| Safari26TlsError::Handshake(message.to_owned()))? {
+              ...
+            }
+            self.pending_post_handshake.drain(..consumed);
+            Ok(())
+          }
+
+  - id: parallax-tls-post-handshake-handoff
+    languages: [rust]
+    severity: ERROR
+    message: Completing camouflage must reject any remaining post-handshake message fragment before handing the transport to ParallaX.
+    patterns:
+      - pattern-either:
+          - pattern: 'async fn complete(...) { ... }'
+          - pattern: 'fn ensure_post_handshake_boundary(...) { ... }'
+      - pattern-not: |
+          async fn complete(...) {
+            ...
+            self.open_http2_connection(stream, &mut keys).await?;
+            self.ensure_post_handshake_boundary()?;
+            ...
+          }
+      - pattern-not: |
+          fn ensure_post_handshake_boundary(...) {
+            if !self.pending_post_handshake.is_empty() { return Err(...); }
+            Ok(())
+          }
+
+  - id: parallax-tls-application-secrets-zeroizing
+    languages: [rust]
+    severity: ERROR
+    message: Both application traffic secrets must be retained in Zeroizing storage for direction-specific KeyUpdates.
+    patterns:
+      - pattern: 'struct Tls13Keys { ... }'
+      - pattern-not: |
+          struct Tls13Keys {
+            ...,
+            client_application_secret: Zeroizing<Vec<u8>>,
+            server_application_secret: Zeroizing<Vec<u8>>,
+            ...
+          }
+  - id: parallax-tls-no-extra-blocking-drain
+    languages: [rust]
+    severity: ERROR
+    message: Blocking pre-opening reads are allowed only in the ready poll's guarded partial-record continuation.
+    patterns:
+      - pattern-inside: 'async fn drain_post_handshake(...) { ... }'
+      - pattern-either:
+          - pattern: '$READER.read_record_into(...)'
+          - pattern: '$READER.read_record(...)'
+          - pattern: 'read_record(...)'
+      - pattern-not-inside: |
+          match $READER.try_read_record_into(...).await {
+            Some(result) => result,
+            None if $READER.at_record_boundary() => return Ok($OBSERVED),
+            None => match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, $READER.read_record_into(...)).await {
+              Ok(result) => result,
+              Err(_) => { return Err(Safari26TlsError::Handshake(...)) }
+            },
+          }

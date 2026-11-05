@@ -1560,6 +1560,7 @@ where
         }
         Ok(_) => anyhow::bail!("blocking bench wrapper requires a multi-thread tokio runtime"),
         Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()?
             .block_on(fut),
     }
