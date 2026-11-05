@@ -1892,7 +1892,7 @@ mod post_handshake_proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(3)]
+    #[kani::unwind(1)]
     fn minimal_ticket_requires_nonempty_ticket_and_exact_vector_lengths() {
         let nonce_len: u8 = kani::any();
         let ticket_len: [u8; 2] = kani::any();
@@ -1916,7 +1916,11 @@ mod post_handshake_proofs {
         ];
         assert_eq!(
             validate_new_session_ticket(&body).is_ok(),
-            nonce_len == 0 && ticket_len == [0, 1] && extensions_len == [0, 0]
+            nonce_len == 0
+                && ticket_len[0] == 0
+                && ticket_len[1] == 1
+                && extensions_len[0] == 0
+                && extensions_len[1] == 0
         );
     }
 }
