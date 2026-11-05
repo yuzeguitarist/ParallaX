@@ -1,0 +1,19 @@
+src/crypto/replay.rs
+  s_47b16dbf3646cd::t_fee0a949e24d13 1389-1472
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fc60f9a324abe405b49f5e866966963aa8112d5d",
+  "prompts": {},
+  "sessions": {
+    "s_47b16dbf3646cd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a9eb-f865-7752-8502-4b712655feb3",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
