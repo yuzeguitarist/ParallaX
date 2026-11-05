@@ -29,6 +29,9 @@ mutants.out.old/
 __pycache__/
 *.pyc
 
+# TLA+ tools jar downloaded by .github/workflows/formal.yml or a local TLC run.
+tla2tools.jar
+
 # Default report output of the gfw-lab trafficgen bin when run by hand from the
 # crate dir (run-lab.sh writes to an explicit temp path). Local artifact only.
 ci/gfw-lab/trafficgen-report.json

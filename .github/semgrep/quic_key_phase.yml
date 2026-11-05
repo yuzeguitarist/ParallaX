@@ -1,0 +1,407 @@
+rules:
+  - id: parallax-quic-phase-commit-after-admission
+    languages: [rust]
+    severity: ERROR
+    message: Key generations and frontiers may commit only after authenticated global PN admission.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.commit_data_generation(...)'
+          - pattern: 'self.key_phase.$FIELD = ...'
+          - pattern: 'self.key_phase.commit_receive(...)'
+          - pattern: 'self.install_send_key(...)'
+          - pattern: 'self.next_packet_keys = ...'
+          - pattern: 'self.previous_read_key = ...'
+      - pattern-not-inside: |
+          if !self.spaces[space].recv.insert(header.packet_number()) { return Ok(()); }
+          ...
+
+  - id: parallax-quic-phase-receive-gates
+    languages: [rust]
+    severity: ERROR
+    message: The receive path must check phase/PN ordering after AEAD and before global dedup, then commit once.
+    patterns:
+      - pattern: 'fn process_packet(...) { ... }'
+      - pattern-not: |
+          fn process_packet(...) {
+            ...
+            let (header, range) = match opened { Ok(v) => v, Err(_) => { ... } };
+            if let Some(generation) = read_generation {
+              if !self.key_phase.valid_receive(generation, header.packet_number()) { return Err(...); }
+            }
+            if !self.spaces[space].recv.insert(header.packet_number()) { return Ok(()); }
+            let receive_generation = if let Some(generation) = read_generation {
+              self.commit_data_generation(generation, header.packet_number(), now)?;
+              ...
+            } else { None };
+            ...
+          }
+
+  - id: parallax-quic-phase-single-header-and-aead
+    languages: [rust]
+    severity: ERROR
+    message: Select once after fixed HP removal; never retry a mutating packet opener or derive keys on an apparent phase.
+    patterns:
+      - pattern-inside: 'fn open_data_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'open_packet(...)'
+          - pattern: 'self.tls.next_1rtt_keys(...)'
+          - pattern: 'self.cache_next_packet_keys(...)'
+          - pattern: |
+              let $A = unprotect_packet_header(...)?;
+              ...
+              let $B = unprotect_packet_header(...)?;
+          - pattern: |
+              let $A = open_packet_payload(...)?;
+              ...
+              let $B = open_packet_payload(...)?;
+
+  - id: parallax-quic-phase-selected-open-required
+    languages: [rust]
+    severity: ERROR
+    message: The data opener must keep one fixed HP operation and one selected payload operation.
+    patterns:
+      - pattern: 'fn open_data_packet(...) { ... }'
+      - pattern-not: |
+          fn open_data_packet(...) {
+            ...
+            let opened = unprotect_packet_header(&keys.remote.header, pkt, local_cid_len, largest)?;
+            ...
+            let range = open_packet_payload(selected.unwrap_or(&keys.remote.packet), pkt, &opened)?;
+            Ok((opened.header, range, generation))
+          }
+
+  - id: parallax-quic-phase-cumulative-integrity
+    languages: [rust]
+    severity: ERROR
+    message: Integrity failures are connection cumulative and cannot reset at key update.
+    patterns:
+      - pattern-inside: 'impl Connection { ... }'
+      - pattern: 'self.data_packets_open_failed = $VALUE'
+      - pattern-not: 'self.data_packets_open_failed = self.data_packets_open_failed.saturating_add(1)'
+
+  - id: parallax-quic-phase-confidentiality-reset-after-key
+    languages: [rust]
+    severity: ERROR
+    message: Only installation of a fresh sending key resets the confidentiality budget.
+    patterns:
+      - pattern-inside: 'impl Connection { ... }'
+      - pattern: 'self.data_packets_sealed = 0'
+      - pattern-not-inside: |
+          self.spaces[SPACE_DATA].keys.as_mut().unwrap().local.packet = key;
+          self.key_phase.tx = generation;
+          self.key_phase.tx_first = None;
+          self.key_phase.tx_last = None;
+          self.key_phase.tx_acked = false;
+          self.data_packets_sealed = 0;
+
+  - id: parallax-quic-phase-no-direct-receive-mutation
+    languages: [rust]
+    severity: ERROR
+    message: Receive generation/key changes must go through the single admitted commit helper, including after a canonical commit block.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.key_phase.$FIELD = ...'
+          - pattern: 'self.key_phase.commit_receive(...)'
+          - pattern: 'self.install_send_key(...)'
+          - pattern: 'self.next_packet_keys = ...'
+          - pattern: 'self.previous_read_key = ...'
+
+  - id: parallax-quic-phase-single-commit
+    languages: [rust]
+    severity: ERROR
+    message: There is exactly one canonical generation commit per admitted packet.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.commit_data_generation(...)'
+      - pattern-not-inside: |
+          self.commit_data_generation(generation, header.packet_number(), now)?;
+          Some(if generation == ReadGeneration::Previous { self.key_phase.rx - 1 } else { self.key_phase.rx })
+
+  - id: parallax-quic-phase-global-pn-and-replay
+    languages: [rust]
+    severity: ERROR
+    message: Application PN and replay admission must survive every generation.
+    patterns:
+      - pattern-inside: 'impl Connection { ... }'
+      - pattern-either:
+          - pattern: 'self.spaces[SPACE_DATA].send = ...'
+          - pattern: 'self.spaces[SPACE_DATA].recv = ...'
+          - pattern: 'self.spaces[SPACE_DATA] = ...'
+          - pattern: 'self.discard_space(SPACE_DATA)'
+
+  - id: parallax-quic-phase-fixed-retirement
+    languages: [rust]
+    severity: ERROR
+    message: The previous read key gets one retirement deadline on authenticated promotion, never an extension on old traffic.
+    patterns:
+      - pattern-inside: 'impl Connection { ... }'
+      - pattern-either:
+          - pattern: 'self.previous_read_key.$FIELD = ...'
+          - pattern: 'self.previous_read_key.as_mut().unwrap().retire_at = ...'
+          - pattern: 'previous.retire_at = ...'
+
+  - id: parallax-quic-phase-update-ack-gate
+    languages: [rust]
+    severity: ERROR
+    message: Active updates require a confirmed handshake, current-generation ACK, checked generation, and interval gate.
+    patterns:
+      - pattern: 'fn initiate_key_update(...) { ... }'
+      - pattern-not: |
+          fn initiate_key_update(...) {
+            if self.closed.is_some() || self.next_update_at.is_some_and(|at| now < at) { return Ok(false); }
+            let Some(generation) = self.key_phase.active_successor(self.handshake_confirmed) else { return Ok(false); };
+            self.install_send_key(generation)?;
+            Ok(true)
+          }
+
+  - id: parallax-quic-phase-commit-auth-gate
+    languages: [rust]
+    severity: ERROR
+    message: The production state helper must reject unauthenticated, replayed, or unordered commits before mutation.
+    patterns:
+      - pattern: 'fn commit_receive(...) { ... }'
+      - pattern-not: |
+          fn commit_receive(...) {
+            if !authenticated || !fresh || !self.valid_receive(generation, pn) { return false; }
+            ...
+            true
+          }
+
+  - id: parallax-quic-phase-protected-allocation
+    languages: [rust]
+    severity: ERROR
+    message: Every production builder must reserve a PN with the matching protection budget.
+    patterns:
+      - pattern-inside: 'impl Connection { ... }'
+      - pattern: 'self.spaces[$SPACE].send.allocate()'
+
+  - id: parallax-quic-phase-no-hp-rotation
+    languages: [rust]
+    severity: ERROR
+    message: A sending key update replaces only PacketKey; header protection is fixed for the connection.
+    patterns:
+      - pattern-inside: 'fn install_send_key(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.spaces[$S].keys.as_mut().unwrap().local.header = ...'
+          - pattern: 'self.spaces[$S].keys.as_mut().unwrap().local = ...'
+
+  - id: parallax-quic-phase-active-successor
+    languages: [rust]
+    severity: ERROR
+    message: Active successor arithmetic must retain confirmation, same-generation ACK, and checked increment.
+    patterns:
+      - pattern: 'fn active_successor(...) { ... }'
+      - pattern-not: |
+          fn active_successor(...) {
+            (confirmed && self.tx == self.rx && self.tx_acked).then(|| self.tx.checked_add(1)).flatten()
+          }
+
+  - id: parallax-quic-phase-ack-confirmation
+    languages: [rust]
+    severity: ERROR
+    message: Confirmation must bind the authenticated receive generation and actual current-generation sent interval.
+    patterns:
+      - pattern-inside: 'impl KeyPhaseState { ... }'
+      - pattern: 'fn confirm(...) { ... }'
+      - pattern-not: |
+          fn confirm(...) {
+            let covered = self.tx_first.zip(self.tx_last).is_some_and(|(first, last)| low <= high && low <= last && high >= first);
+            if receive_generation < self.tx || !covered { return false; }
+            self.tx_acked = true;
+            true
+          }
+
+  - id: parallax-quic-hkdf-extract-prk-wipe
+    languages: [rust]
+    severity: ERROR
+    message: Copying an extracted PRK into owned secret storage must explicitly wipe the source GenericArray.
+    patterns:
+      - pattern-inside: 'impl CipherSuite { ... }'
+      - pattern-inside: 'fn hkdf_extract(...) { ... }'
+      - pattern: '$PRK.to_vec()'
+      - pattern-not-inside: |
+          let result = $PRK.to_vec();
+          $PRK.as_mut_slice().zeroize();
+          result
+
+  - id: parallax-quic-phase-handshake-receive-boundary
+    languages: [rust]
+    severity: ERROR
+    message: Both roles must reject 1-RTT before TLS completion, before key lookup, authentication or trusted state changes.
+    patterns:
+      - pattern: 'fn process_packet(...) { ... }'
+      - pattern-not: |
+          fn process_packet(...) {
+            let pspace = match packet::first_packet_space(pkt) { Some(s) => s, None => return Ok(()) };
+            if self.side == Side::Client && pspace == PacketSpace::ZeroRtt { return Ok(()); }
+            if self.closed.is_some() { return Ok(()); }
+            if pspace == PacketSpace::OneRtt && self.tls.is_handshaking() { return Ok(()); }
+            let space = space_index(pspace);
+            ...
+          }
+
+  - id: parallax-quic-phase-handshake-close-batch
+    languages: [rust]
+    severity: ERROR
+    message: Close batches must retain Handshake reachability until confirmation, preflight all PN spaces, and bound the complete datagram before sealing.
+    patterns:
+      - pattern: 'fn build_close_packet(...) { ... }'
+      - pattern-not: |
+          fn build_close_packet(...) {
+                  self.enforce_aead_confidentiality_limit();
+                  self.enforce_aead_integrity_limit();
+                  let (code, frame_type, reason) = self.close_pending.clone()?;
+                  let available =
+                      |space: usize| !self.spaces[space].discarded && self.spaces[space].keys.is_some();
+                  let mut spaces = if !self.handshake_confirmed {
+                      let mut spaces = Vec::new();
+                      if self.side == Side::Server && available(SPACE_INITIAL) {
+                          spaces.push(SPACE_INITIAL);
+                      }
+                      if available(SPACE_HANDSHAKE) {
+                          spaces.push(SPACE_HANDSHAKE);
+                      }
+                      spaces
+                  } else {
+                      Vec::new()
+                  };
+                  let mandatory = spaces.len().max(1);
+                  if available(SPACE_DATA) {
+                      spaces.push(SPACE_DATA);
+                  } else if spaces.is_empty() && !self.handshake_confirmed && available(SPACE_INITIAL) {
+                      spaces.push(SPACE_INITIAL);
+                  }
+                  if spaces.is_empty() {
+                      return None;
+                  }
+                  // Preflight the entire batch before any PN advances or AEAD seals. A
+                  // lower-level close must not bypass an exhausted Application key.
+                  if spaces
+                      .iter()
+                      .any(|&space| !self.spaces[space].send.can_allocate())
+                  {
+                      self.close_pending = None;
+                      return None;
+                  }
+                  let mtu = self.pmtud.current_mtu();
+                  let batch_size = |spaces: &[usize], reason: &[u8]| {
+                      spaces.iter().try_fold(0usize, |total, &space| {
+                          total.checked_add(self.close_packet_size(space, code, frame_type, reason))
+                      })
+                  };
+                  let mut size = batch_size(&spaces, &reason)?;
+                  if size > mtu && spaces.len() > mandatory {
+                      spaces.truncate(mandatory);
+                      size = batch_size(&spaces, &reason)?;
+                  }
+                  // Optional Data is already removed. Shorten only the wire reason when
+                  // necessary to retain BOTH mandatory server levels; keep the local
+                  // CloseReason unchanged. The final sealer reads this same pending tuple.
+                  let shorten_reason = size > mtu
+                      && frame_type.is_some()
+                      && spaces.as_slice() == [SPACE_INITIAL, SPACE_HANDSHAKE];
+                  if shorten_reason {
+                      size = batch_size(&spaces, &[])?;
+                  }
+                  if size > mtu {
+                      self.close_pending = None;
+                      return None;
+                  }
+                  if !self.peer_addr_validated
+                      && self.anti_amp_sent.saturating_add(size as u64) > self.anti_amp_recv.saturating_mul(3)
+                  {
+                      return None;
+                  }
+                  if shorten_reason {
+                      self.close_pending.as_mut()?.2.clear();
+                  }
+                  let mut datagram = Vec::new();
+                  for space in spaces {
+                      datagram.extend(self.build_close_packet_in_space(space, now)?);
+                  }
+                  self.close_sent = true;
+                  Some(datagram)
+              }
+
+  - id: parallax-quic-phase-explicit-close-space-budget
+    languages: [rust]
+    severity: ERROR
+    message: A direct explicit-space close call must enforce both AEAD limits and prohibit lower levels after handshake confirmation.
+    patterns:
+      - pattern: 'fn build_close_packet_in_space(...) { ... }'
+      - pattern-not: |
+          fn build_close_packet_in_space(...) {
+                  self.enforce_aead_confidentiality_limit();
+                  self.enforce_aead_integrity_limit();
+                  let (code, frame_type, reason) = self.close_pending.clone()?;
+                  if self.spaces[space].discarded
+                      || self.spaces[space].keys.is_none()
+                      || (self.handshake_confirmed && space != SPACE_DATA)
+                      || !self.spaces[space].send.can_allocate()
+                      || self.close_packet_size(space, code, frame_type, &reason) > self.pmtud.current_mtu()
+                  {
+                      self.close_pending = None;
+                      return None;
+                  }
+                  let pn = self.allocate_packet_number(space);
+                  let (_, pn_len) = packet::encode_packet_number(pn, None);
+                  let header = self.make_header(space, pn, pn_len);
+                  let close = Self::close_frame(space, code, frame_type, &reason);
+                  let datagram = {
+                      let keys = self.spaces[space].keys.as_ref().unwrap();
+                      seal_packet(
+                          &keys.local,
+                          header,
+                          &[Frame::Close(close), Frame::Padding(3)],
+                      )
+                  };
+                  // CONNECTION_CLOSE is not ack-eliciting (RFC 9002 §2).
+                  self.record_sent(
+                      space,
+                      pn,
+                      datagram.len(),
+                      false,
+                      SentContent::default(),
+                      now,
+                  );
+                  Some(datagram)
+              }
+
+  - id: parallax-quic-phase-expected-response-gate
+    languages: [rust]
+    severity: ERROR
+    message: A pending ACK must not reject the response to our own next sending generation; unsolicited consecutive updates remain gated.
+    patterns:
+      - pattern: 'fn valid_receive(...) { ... }'
+      - pattern-not: |
+          fn valid_receive(...) {
+            match generation {
+              ReadGeneration::Current => self.previous_max.map_or(true, |max| pn > max),
+              ReadGeneration::Previous => self.rx > 0 && self.rx_min.is_some_and(|min| pn < min),
+              ReadGeneration::Next => {
+                self.rx.checked_add(1).is_some()
+                  && (!self.update_ack_pending || self.rx.checked_add(1) == Some(self.tx))
+                  && self.rx_max.map_or(true, |max| pn > max)
+              }
+              ReadGeneration::Unavailable => false,
+            }
+          }
+
+  - id: parallax-quic-phase-close-frame-level
+    languages: [rust]
+    severity: ERROR
+    message: Transport close codes survive lower-level transmission; application closes downgrade to APPLICATION_ERROR with no application reason in Handshake/Initial.
+    patterns:
+      - pattern: 'fn close_frame(...) { ... }'
+      - pattern-not: |
+          fn close_frame(...) {
+            if let Some(frame_type) = frame_type {
+              super::frame::Close { application: false, error_code: code, frame_type, reason }
+            } else if space == SPACE_DATA {
+              super::frame::Close { application: true, error_code: code, frame_type: 0, reason }
+            } else {
+              super::frame::Close { application: false, error_code: APPLICATION_ERROR, frame_type: 0, reason: &[] }
+            }
+          }

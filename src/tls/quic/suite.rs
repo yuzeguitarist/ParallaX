@@ -10,6 +10,7 @@
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384};
+use zeroize::Zeroize;
 
 use super::QuicTlsError;
 
@@ -103,12 +104,16 @@ impl CipherSuite {
     pub(crate) fn hkdf_extract(self, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
         match self {
             Self::Aes256GcmSha384 => {
-                let (prk, _) = Hkdf::<Sha384>::extract(Some(salt), ikm);
-                prk.to_vec()
+                let (mut prk, _) = Hkdf::<Sha384>::extract(Some(salt), ikm);
+                let result = prk.to_vec();
+                prk.as_mut_slice().zeroize();
+                result
             }
             Self::Aes128GcmSha256 | Self::ChaCha20Poly1305Sha256 => {
-                let (prk, _) = Hkdf::<Sha256>::extract(Some(salt), ikm);
-                prk.to_vec()
+                let (mut prk, _) = Hkdf::<Sha256>::extract(Some(salt), ikm);
+                let result = prk.to_vec();
+                prk.as_mut_slice().zeroize();
+                result
             }
         }
     }

@@ -1,0 +1,116 @@
+rules:
+  - id: parallax-mux-tail-capacity
+    languages: [rust]
+    severity: ERROR
+    message: Appends must be limited by the remaining mux payload capacity.
+    patterns:
+      - pattern: 'fn mux_tail_append_len(...) { ... }'
+      - pattern-not: |
+          fn mux_tail_append_len(buffered: usize, available: usize, capacity: usize) -> usize {
+            available.min(capacity - buffered)
+          }
+  - id: parallax-mux-tail-window
+    languages: [rust]
+    severity: ERROR
+    message: The reviewed additional tail hold is five milliseconds, not an unbounded wait.
+    patterns:
+      - pattern: 'const SERVER_MUX_TAIL_HOLD: Duration = $VALUE;'
+      - pattern-not: 'const SERVER_MUX_TAIL_HOLD: Duration = Duration::from_millis(5);'
+  - id: parallax-mux-tail-oldest-deadline
+    languages: [rust]
+    severity: ERROR
+    message: Only an empty tail starts a deadline; additional reads must not extend it.
+    patterns:
+      - pattern-inside: 'async fn server_mux_target_reader_loop(...) { ... }'
+      - pattern: 'tail_deadline = Some(...);'
+      - pattern-not-inside: |
+          if tail.is_empty() {
+            tail_deadline = Some(received_at + SERVER_MUX_TAIL_HOLD);
+          }
+  - id: parallax-mux-tail-ready-deadline
+    languages: [rust]
+    severity: ERROR
+    message: Expired tails must flush before polling ready reads, and waiting reads must use the same absolute deadline.
+    patterns:
+      - pattern: 'async fn server_mux_target_reader_loop(...) { ... }'
+      - pattern-not: |
+          async fn server_mux_target_reader_loop(...) {
+            ...
+            let read = if let Some(deadline) = tail_deadline {
+              if Instant::now() >= deadline {
+                flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline).await?;
+                continue;
+              }
+              match timeout_at(deadline, target_read.read(&mut target_buf)).await {
+                Ok(read) => read,
+                Err(_) => {
+                  flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline).await?;
+                  continue;
+                }
+              }
+            } else {
+              target_read.read(&mut target_buf).await
+            };
+            ...
+          }
+  - id: parallax-mux-tail-eof-order
+    languages: [rust]
+    severity: ERROR
+    message: A clean target EOF must flush pending data successfully before emitting Fin.
+    patterns:
+      - pattern-inside: 'async fn server_mux_target_reader_loop(...) { ... }'
+      - pattern: 'downlink.send(MuxFrameKind::Fin, Vec::new()).await'
+      - pattern-not-inside: |
+          if n == 0 {
+            flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline).await?;
+            downlink.send(MuxFrameKind::Fin, Vec::new()).await?;
+            ...
+          }
+  - id: parallax-mux-tail-bounded-append
+    languages: [rust]
+    severity: ERROR
+    message: Copy only the bounded prefix, advance input by that prefix, and flush a newly full payload.
+    patterns:
+      - pattern-inside: 'async fn server_mux_target_reader_loop(...) { ... }'
+      - pattern: 'tail.extend_from_slice(...)'
+      # Restrict the exemption to the exact append statement sequence. A
+      # containing block (or surrounding ellipses) would also exempt extra,
+      # unbounded appends before/after the canonical sequence or in a branch.
+      - pattern-not-inside: |
+          let take = mux_tail_append_len(tail.len(), input.len(), max_payload_len);
+          tail.extend_from_slice(&input[..take]);
+          input = &input[take..];
+          if tail.len() == max_payload_len {
+            flush_server_mux_tail(&downlink, &payload_pool, &mut tail, &mut tail_deadline).await?;
+          }
+  - id: parallax-mux-tail-full-fast-path
+    languages: [rust]
+    severity: ERROR
+    message: Full payloads with no pending tail must send immediately without a timer or padding.
+    patterns:
+      - pattern: 'async fn server_mux_target_reader_loop(...) { ... }'
+      - pattern-not: |
+          async fn server_mux_target_reader_loop(...) {
+            ...
+            if tail.is_empty() && input.len() >= max_payload_len {
+              downlink.send(MuxFrameKind::Data, payload_pool.take_filled(&input[..max_payload_len])).await?;
+              input = &input[max_payload_len..];
+              continue;
+            }
+            ...
+          }
+  - id: parallax-mux-tail-flush
+    languages: [rust]
+    severity: ERROR
+    message: Flush exactly one nonempty owned payload, reset its deadline, and propagate queue failure.
+    patterns:
+      - pattern: 'async fn flush_server_mux_tail(...) { ... }'
+      - pattern-not: |
+          async fn flush_server_mux_tail(...) {
+            *deadline = None;
+            if !tail.is_empty() {
+              let payload = std::mem::replace(tail, payload_pool.take());
+              downlink.send(MuxFrameKind::Data, payload).await?;
+            }
+            Ok(())
+          }

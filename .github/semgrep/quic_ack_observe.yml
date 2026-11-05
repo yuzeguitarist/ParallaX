@@ -1,0 +1,52 @@
+rules:
+  - id: observe-ack-receive-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete receive function.
+    pattern: 'fn process_packet(...) { ... }'
+  - id: observe-ack-receive-schedule
+    languages: [rust]
+    severity: INFO
+    message: Every scheduler call, including nested branches, loops and closures.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.schedule_ack(...)'
+  - id: observe-ack-builder-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete ACK builder.
+    pattern: 'fn build_ack_packet(...) { ... }'
+  - id: observe-ack-builder-reserve
+    languages: [rust]
+    severity: INFO
+    message: Each protected PN reservation in the ACK builder.
+    patterns:
+      - pattern-inside: 'fn build_ack_packet(...) { ... }'
+      - pattern: 'self.allocate_packet_number(...)'
+  - id: observe-ack-builder-record
+    languages: [rust]
+    severity: INFO
+    message: Each sent-packet accounting call in the ACK builder.
+    patterns:
+      - pattern-inside: 'fn build_ack_packet(...) { ... }'
+      - pattern: 'self.record_sent(...)'
+  - id: observe-ack-ready-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete ACK readiness helper.
+    pattern: 'fn ack_ready_for_space(...) { ... }'
+  - id: observe-ack-ready-due
+    languages: [rust]
+    severity: INFO
+    message: Exactly one shipping count/deadline predicate call site.
+    patterns:
+      - pattern-inside: 'fn ack_ready_for_space(...) { ... }'
+      - pattern: 'ack_count_due(...)'
+  - id: observe-ack-ready-return
+    languages: [rust]
+    severity: INFO
+    message: Result paths including Rust tails and nested early returns, excluding the canonical deadline-closure tail; require one final result site.
+    patterns:
+      - pattern-inside: 'fn ack_ready_for_space(...) { ... }'
+      - pattern: 'return $VALUE;'
+      - pattern-not-inside: 'sp.ack_deadline.is_some_and(|deadline| now >= deadline)'

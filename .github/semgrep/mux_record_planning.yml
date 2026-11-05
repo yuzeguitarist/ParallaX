@@ -1,0 +1,404 @@
+rules:
+  - id: parallax-mux-benchmark-timer-driver
+    languages: [rust]
+    severity: ERROR
+    message: Standalone mux benchmark fixtures use the production write timeout and need the Tokio time driver.
+    patterns:
+      - pattern-inside: 'fn block_on_current_or_fresh(...) { ... }'
+      - pattern: 'tokio::runtime::Builder::new_current_thread()'
+      - pattern-not-inside: 'tokio::runtime::Builder::new_current_thread().enable_time().build()'
+
+  - id: parallax-mux-record-window-constants
+    languages: [rust]
+    severity: ERROR
+    message: Preserve the reviewed 64-record and 64KiB single-write bounds.
+    patterns:
+      - pattern-either:
+          - pattern: 'const SERVER_MUX_FRAME_BATCH_LIMIT: usize = $VALUE;'
+          - pattern: 'const SERVER_MUX_FAIR_BATCH_BYTES: usize = $VALUE;'
+      - pattern-not: 'const SERVER_MUX_FRAME_BATCH_LIMIT: usize = 64;'
+      - pattern-not: 'const SERVER_MUX_FAIR_BATCH_BYTES: usize = 64 * 1024;'
+  - id: parallax-mux-profile-default-off
+    languages: [rust]
+    severity: ERROR
+    message: The experimental profile must remain explicitly selected, with both serde and TrafficConfig defaults off.
+    patterns:
+      - pattern-either:
+          - pattern: 'impl Default for TcpMuxRecordProfile { ... }'
+          - patterns:
+              - pattern-inside: 'impl Default for TrafficConfig { ... }'
+              - pattern: 'TcpMuxRecordProfile::CloudflareDynamic'
+      - pattern-not: |
+          impl Default for TcpMuxRecordProfile {
+            fn default() -> Self { Self::Off }
+          }
+  - id: parallax-mux-profile-server-mode
+    languages: [rust]
+    severity: ERROR
+    message: Client configurations cannot silently accept the server-only record experiment.
+    patterns:
+      - pattern: 'fn validate_structure(...) { ... }'
+      - pattern-not: |
+          fn validate_structure(...) {
+            self.traffic.validate()?;
+            self.udp.validate()?;
+            if self.traffic.tcp_mux_record_profile != TcpMuxRecordProfile::Off && self.mode != Mode::Server {
+              return Err(ConfigError::InvalidTcpMuxRecordProfile(...));
+            }
+            ...
+          }
+  - id: parallax-mux-profile-traffic-compatibility
+    languages: [rust]
+    severity: ERROR
+    message: The experimental profile requires mux plus zero padding, delay and cover; off keeps existing configurations.
+    patterns:
+      - pattern-inside: 'impl TrafficConfig { ... }'
+      - pattern: 'fn validate(...) { ... }'
+      - pattern-not: |
+          fn validate(...) {
+            if self.tcp_mux_record_profile != TcpMuxRecordProfile::Off {
+              if self.max_concurrent_streams <= 1 { return Err(ConfigError::InvalidTcpMuxRecordProfile(...)); }
+              if self.min_padding != 0 || self.max_padding != 0 || self.min_delay_ms != 0 || self.max_delay_ms != 0 || self.cover_min_interval_ms != 0 || self.cover_max_interval_ms != 0 {
+                return Err(ConfigError::InvalidTcpMuxRecordProfile(...));
+              }
+            }
+            ...
+          }
+  - id: parallax-mux-record-profile-budgets
+    languages: [rust]
+    severity: ERROR
+    message: Sealed budgets use the codec's 18-byte overhead and the reviewed public >40/>80 thresholds, always capped by codec capacity.
+    patterns:
+      - pattern-inside: 'impl MuxRecordBudget { ... }'
+      - pattern: 'fn plaintext_limit(...) { ... }'
+      - pattern-not: |
+          fn plaintext_limit(self, codec_max: usize) -> usize {
+            const CODEC_OVERHEAD: usize = 18;
+            match self.profile {
+              TcpMuxRecordProfile::Off => codec_max,
+              TcpMuxRecordProfile::CloudflareDynamic if self.records_sent > 80 => codec_max,
+              TcpMuxRecordProfile::CloudflareDynamic if self.records_sent > 40 => { codec_max.min(4246 - CODEC_OVERHEAD) }
+              TcpMuxRecordProfile::CloudflareDynamic => codec_max.min(1386 - CODEC_OVERHEAD),
+            }
+          }
+  - id: parallax-mux-record-idle-reset
+    languages: [rust]
+    severity: ERROR
+    message: Reset the experimental mux counter only for a gap strictly greater than 1000ms since the successful write.
+    patterns:
+      - pattern-inside: 'impl MuxRecordBudget { ... }'
+      - pattern: 'fn for_write(...) { ... }'
+      - pattern-not: |
+          fn for_write(self, now: Instant) -> Self {
+            let mut next = self;
+            if next.profile == TcpMuxRecordProfile::CloudflareDynamic && next.last_write.is_some_and(|last| now.duration_since(last) > Duration::from_millis(1000)) {
+              next.records_sent = 0;
+            }
+            next
+          }
+  - id: parallax-mux-record-piece-capacity
+    languages: [rust]
+    severity: ERROR
+    message: Use the bounded generic split rule; a short final pair is balanced without producer-length constants.
+    patterns:
+      - pattern: 'fn mux_record_data_piece_len(...) { ... }'
+      - pattern-not: |
+          fn mux_record_data_piece_len(remaining: usize, capacity: usize) -> usize {
+            if remaining <= capacity { remaining }
+            else if remaining - capacity <= capacity / 2 { remaining.div_ceil(2) }
+            else { capacity }
+          }
+  - id: parallax-mux-record-cursor-progress
+    languages: [rust]
+    severity: ERROR
+    message: A copy advances only its selected prefix and moves to exactly the next frame on completion.
+    patterns:
+      - pattern-inside: 'impl MuxFrameCursor { ... }'
+      - pattern: 'fn advance(...) { ... }'
+      - pattern-not: |
+          fn advance(&mut self, payload_len: usize, take: usize) {
+            self.offset += take;
+            if self.offset == payload_len { self.frame += 1; self.offset = 0; }
+          }
+  - id: parallax-mux-record-exact-padding-scope
+    languages: [rust]
+    severity: ERROR
+    message: Only explicit CF positive Data fills the current budget; control and Off get zero exact padding, with checked TLS/wire bounds.
+    patterns:
+      - pattern: 'fn mux_record_padding_plan(...) { ... }'
+      - pattern-not: |
+          fn mux_record_padding_plan(...) {
+            if plaintext_len == 0 || plaintext_len > limit { return None; }
+            let pad = if profile == TcpMuxRecordProfile::CloudflareDynamic && has_positive_data { limit.checked_sub(plaintext_len)? } else { 0 };
+            if pad > u16::MAX as usize { return None; }
+            let tls_len = plaintext_len.checked_add(pad)?.checked_add(18)?;
+            if tls_len > crate::protocol::data::OUTER_TLS_RECORD_LIMIT { return None; }
+            Some((pad, tls_len.checked_add(TLS_HEADER_LEN)?))
+          }
+  - id: parallax-mux-record-padded-wire-window
+    languages: [rust]
+    severity: ERROR
+    message: CF windows must conservatively check the next maximum padded TLS record against 64KiB before consuming its frames; Off retains the existing window.
+    patterns:
+      - pattern: 'fn plan_ready_mux_records(...) { ... }'
+      - pattern-not: |
+          fn plan_ready_mux_records(...) {
+            scratch.plaintext_buf.clear();
+            scratch.record_lens.clear();
+            scratch.exact_pad_lens.clear();
+            let mut window_wire_bytes = 0usize;
+            let header_len = MuxFrame::encoded_len(0)?;
+            while cursor.frame < frames.len() && scratch.record_lens.len() < SERVER_MUX_FRAME_BATCH_LIMIT {
+              let limit = budget.plaintext_limit(codec_max);
+              if budget.profile == TcpMuxRecordProfile::CloudflareDynamic {
+                let (_, maximum_wire_len) = mux_record_padding_plan(budget.profile, true, 1, limit).ok_or_else(|| mux_record_capacity_error(limit))?;
+                let next_wire_bound = window_wire_bytes.checked_add(maximum_wire_len).ok_or_else(|| mux_record_capacity_error(usize::MAX))?;
+                if next_wire_bound > SERVER_MUX_FAIR_BATCH_BYTES { break; }
+              }
+              ...
+            }
+            Ok(())
+          }
+  - id: parallax-mux-record-run-barriers
+    languages: [rust]
+    severity: ERROR
+    message: A ready Data run ends at any other stream or control frame, with checked byte accumulation.
+    patterns:
+      - pattern: 'fn ready_mux_data_run(...) { ... }'
+      - pattern-not: |
+          fn ready_mux_data_run(...) {
+            let stream_id = frames[cursor.frame].stream_id;
+            let mut end = cursor.frame;
+            let mut bytes = 0usize;
+            while let Some(frame) = frames.get(end) {
+              if frame.kind != MuxFrameKind::Data || frame.stream_id != stream_id { break; }
+              let offset = if end == cursor.frame { cursor.offset } else { 0 };
+              bytes = bytes.checked_add(frame.payload.len() - offset).ok_or(MuxFrameError::PayloadTooLong)?;
+              end += 1;
+            }
+            Ok((end, bytes))
+          }
+  - id: parallax-mux-record-output-window
+    languages: [rust]
+    severity: ERROR
+    message: Bound the number of planned output records independently of the number of input frames.
+    patterns:
+      - pattern: 'fn plan_ready_mux_records(...) { ... }'
+      - pattern-not: |
+          fn plan_ready_mux_records(...) {
+            ...
+            while cursor.frame < frames.len() && scratch.record_lens.len() < SERVER_MUX_FRAME_BATCH_LIMIT { ... }
+            ...
+          }
+  - id: parallax-mux-record-planner-effects
+    languages: [rust]
+    severity: ERROR
+    message: Encoding and record-count effects must be in their exact validated statement sequences; a later correct sequence does not excuse an extra append.
+    patterns:
+      - pattern-inside: 'fn plan_ready_mux_records(...) { ... }'
+      - pattern-either:
+          - pattern: 'encode_mux_data_piece(...)'
+          - pattern: '$FRAME.encode_into(&mut scratch.plaintext_buf)'
+          - pattern: 'MuxFrame::encode_borrowed_into($SID, $KIND, $PAYLOAD, &mut scratch.plaintext_buf)'
+          - pattern: 'scratch.plaintext_buf.extend_from_slice(...)'
+          - pattern: 'scratch.plaintext_buf.extend(...)'
+          - pattern: 'scratch.plaintext_buf.push(...)'
+          - pattern: 'scratch.plaintext_buf.append(...)'
+          - pattern: 'scratch.record_lens.push(...)'
+          - pattern: 'scratch.record_lens.append(...)'
+          - pattern: 'scratch.record_lens.extend(...)'
+          - pattern: 'scratch.record_lens.extend_from_slice(...)'
+          - pattern: 'scratch.record_lens.resize(...)'
+          - pattern: 'scratch.record_lens.insert(...)'
+          - pattern: 'scratch.exact_pad_lens.push(...)'
+          - pattern: 'scratch.exact_pad_lens.append(...)'
+          - pattern: 'scratch.exact_pad_lens.extend(...)'
+          - pattern: 'scratch.exact_pad_lens.extend_from_slice(...)'
+          - pattern: 'scratch.exact_pad_lens.resize(...)'
+          - pattern: 'scratch.exact_pad_lens.insert(...)'
+          - pattern: 'window_wire_bytes = ...'
+          - pattern: 'window_wire_bytes += ...'
+          - pattern: 'has_positive_data = ...'
+          - pattern: 'budget.records_sent = ...'
+          - pattern: 'budget.records_sent += ...'
+          - pattern: 'budget.records_sent -= ...'
+          - pattern: 'budget.last_write = ...'
+          - pattern: 'budget.profile = ...'
+      # Exact ranges, never a containing block with surrounding ellipses.
+      - pattern-not-inside: |
+          let take = mux_record_data_piece_len(run_bytes, room - header_len);
+          encode_mux_data_piece(&mut scratch.plaintext_buf, frames, cursor, take)?;
+          if take < run_bytes { break; }
+      - pattern-not-inside: |
+          let frame_len = MuxFrame::encoded_len(frame.payload.len())?;
+          if frame_len > limit { return Err(mux_record_capacity_error(frame_len)); }
+          if frame_len > room { break; }
+          frame.encode_into(&mut scratch.plaintext_buf)?;
+          cursor.frame += 1;
+      - pattern-not-inside: |
+          if room <= header_len {
+            if used == 0 { return Err(mux_record_capacity_error(header_len + 1)); }
+            break;
+          }
+          has_positive_data = true;
+          let take = mux_record_data_piece_len(run_bytes, room - header_len);
+      - pattern-not-inside: |
+          let len = scratch.plaintext_buf.len() - record_start;
+          if len == 0 || len > limit { return Err(mux_record_capacity_error(len)); }
+          let (pad, wire_len) = mux_record_padding_plan(budget.profile, has_positive_data, len, limit).ok_or_else(|| mux_record_capacity_error(len))?;
+          if budget.profile == TcpMuxRecordProfile::CloudflareDynamic {
+            window_wire_bytes = window_wire_bytes.checked_add(wire_len).filter(|&bytes| bytes <= SERVER_MUX_FAIR_BATCH_BYTES).ok_or_else(|| mux_record_capacity_error(usize::MAX))?;
+            scratch.exact_pad_lens.push(pad);
+          }
+          scratch.record_lens.push(len);
+          budget.records_sent = budget.records_sent.saturating_add(1);
+  - id: parallax-mux-record-exact-sealer-branch
+    languages: [rust]
+    severity: ERROR
+    message: Only CF uses the checked serial exact-padding batch; Off keeps the original parallel/serial calls, with the per-record pad vector.
+    patterns:
+      - pattern-inside: 'async fn write_server_mux_frames_planned(...) { ... }'
+      - pattern-either:
+          - pattern: 'codec.seal_records_into_exact_padded(...)'
+          - pattern: 'codec.seal_records_into_parallel(...)'
+          - pattern: 'codec.seal_records_into(...)'
+      - pattern-not-inside: |
+          if planned_budget.profile == TcpMuxRecordProfile::CloudflareDynamic {
+            codec.seal_records_into_exact_padded(&scratch.plaintext_buf, &scratch.record_lens, &scratch.exact_pad_lens, rng, &mut scratch.records_buf)?;
+          } else if should_parallelize_aead(scratch.record_lens.len(), scratch.plaintext_buf.len()) {
+            codec.seal_records_into_parallel(parallel::global(), &scratch.plaintext_buf, &scratch.record_lens, rng, &mut scratch.records_buf)?;
+          } else {
+            codec.seal_records_into(&scratch.plaintext_buf, &scratch.record_lens, rng, &mut scratch.records_buf)?;
+          }
+  - id: parallax-mux-record-encoder-prefix
+    languages: [rust]
+    severity: ERROR
+    message: Encode only an empty mux header and copy the exact bounded payload prefix; reject additional encoding or copies beside a correct sequence.
+    patterns:
+      - pattern-inside: 'fn encode_mux_data_piece(...) { ... }'
+      - pattern-either:
+          - pattern: 'out.extend_from_slice(...)'
+          - pattern: 'out.extend(...)'
+          - pattern: 'out.push(...)'
+          - pattern: 'out.append(...)'
+          - pattern: 'cursor.advance(...)'
+          - pattern: 'MuxFrame::encode_borrowed_into($SID, $KIND, $PAYLOAD, out)'
+      - pattern-not-inside: |
+          let payload_len = u32::try_from(remaining).map_err(|_| MuxFrameError::PayloadTooLong)?;
+          MuxFrame::encode_borrowed_into(stream_id, MuxFrameKind::Data, &[], out)?;
+          let header_end = out.len();
+      - pattern-not-inside: |
+          let available = frame.payload.len() - cursor.offset;
+          let take = remaining.min(available);
+          out.extend_from_slice(&frame.payload[cursor.offset..cursor.offset + take]);
+          remaining -= take;
+          cursor.advance(frame.payload.len(), take);
+  - id: parallax-mux-record-one-header-per-piece
+    languages: [rust]
+    severity: ERROR
+    message: A data piece has one mux header encoding site, even when a complete canonical header sequence is copied.
+    # Same-statement-list ratchet. The checker's separate AST observations
+    # enforce cardinality across branches, loops and closures as well.
+    patterns:
+      - pattern-inside: 'fn encode_mux_data_piece(...) { ... }'
+      - pattern: |
+          MuxFrame::encode_borrowed_into($SID1, $KIND1, $PAYLOAD1, out)?;
+          ...
+          MuxFrame::encode_borrowed_into($SID2, $KIND2, $PAYLOAD2, out)?;
+  - id: parallax-mux-record-one-control-encode
+    languages: [rust]
+    severity: ERROR
+    message: The planner has one control/empty-Data encoding site; copying its complete validated sequence would duplicate a frame and skip the next input.
+    # Cross-scope duplicates are checked by the observation/cardinality pass.
+    patterns:
+      - pattern-inside: 'fn plan_ready_mux_records(...) { ... }'
+      - pattern: |
+          $FIRST.encode_into(&mut scratch.plaintext_buf)?;
+          ...
+          $SECOND.encode_into(&mut scratch.plaintext_buf)?;
+  - id: parallax-mux-record-successful-write-commit
+    languages: [rust]
+    severity: ERROR
+    message: Each write window has its own idle bound; successful completion refreshes activity and then commits profile state.
+    patterns:
+      - pattern-inside: 'async fn write_server_mux_frames_planned(...) { ... }'
+      - pattern-either:
+          - pattern: '*budget = ...'
+          - pattern: 'budget.records_sent = ...'
+          - pattern: 'budget.records_sent += ...'
+          - pattern: 'budget.records_sent -= ...'
+          - pattern: 'budget.last_write = ...'
+          - pattern: 'budget.profile = ...'
+          - pattern: '$WRITER.write_records(...)'
+          - pattern: 'bump_relay_activity(...)'
+      - pattern-not-inside: |
+          let write_started = Instant::now();
+          match timeout(idle, writer.write_records(scratch.records_buf.as_slice())).await {
+            Ok(result) => result?,
+            Err(_) => return Err(shed_mux_writer_on_stalled_client(log.cid)),
+          }
+          if let Some(activity) = activity { bump_relay_activity(activity); }
+          waited = waited.saturating_add(write_started.elapsed());
+          planned_budget.last_write = Some(Instant::now());
+          *budget = planned_budget;
+          scratch.records_buf.clear();
+  - id: parallax-mux-record-no-whole-batch-timeout
+    languages: [rust]
+    severity: ERROR
+    message: Do not impose one fixed deadline across all progressing mux windows; pass the real idle/activity policy into the per-write helper.
+    patterns:
+      - pattern-inside: 'async fn server_mux_writer_loop(...) { ... }'
+      - pattern: 'write_server_mux_frames_planned(...)'
+      - pattern-not-inside: |
+          let waited = write_server_mux_frames_planned(&mut client_write, &mut server_seal, &mut batch, &mut rng, &mut seal_scratch, RelayWriteLog::new(cid, "server->client", "server-mux-writer"), &payload_pool, &mut record_budget, (idle, Some(&activity))).await?;
+  - id: parallax-mux-record-writer-loop-timeout-boundary
+    languages: [rust]
+    severity: ERROR
+    message: The production loop may time out its single cover write, but never wrap an async block containing the progressing batch call.
+    patterns:
+      - pattern-inside: 'async fn server_mux_writer_loop(...) { ... }'
+      - pattern-either:
+          - pattern: 'timeout(...)'
+          - pattern: 'timeout_at(...)'
+      - pattern-not: 'timeout(idle, write_server_mux_frame(...))'
+  - id: parallax-mux-record-write-policy-binding
+    languages: [rust]
+    severity: ERROR
+    message: Do not shadow or overwrite the real idle/activity policy beside the canonical guarded write block.
+    patterns:
+      - pattern-inside: 'async fn write_server_mux_frames_planned(...) { ... }'
+      - pattern-either:
+          - pattern: 'let activity = ...;'
+          - pattern: 'let mut activity = ...;'
+          - pattern: 'let idle = ...;'
+          - pattern: 'let mut idle = ...;'
+          - pattern: 'let write_policy = ...;'
+          - pattern: 'activity = ...'
+          - pattern: 'idle = ...'
+          - pattern: 'write_policy = ...'
+          - pattern: 'let (idle, activity) = ...;'
+      - pattern-not: 'let (idle, activity) = write_policy;'
+  - id: parallax-mux-record-one-write-per-plan
+    languages: [rust]
+    severity: ERROR
+    message: Do not write the same planned ciphertext twice beside a later correct commit sequence.
+    patterns:
+      - pattern-inside: 'async fn write_server_mux_frames_planned(...) { ... }'
+      - pattern: |
+          $WRITER.write_records(...).await?;
+          ...
+          $WRITER.write_records(...).await?;
+  - id: parallax-mux-record-no-piece-allocation
+    languages: [rust]
+    severity: ERROR
+    message: Keep original owned frame payloads and borrowed offsets; do not allocate a Vec per planned piece.
+    patterns:
+      - pattern-inside: 'fn $FUNC(...) { ... }'
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: '^(ready_mux_data_run|encode_mux_data_piece|plan_ready_mux_records)$'
+      - pattern-either:
+          - pattern: '$DATA.to_vec()'
+          - pattern: 'Vec::new()'
+          - pattern: 'Vec::with_capacity(...)'
+          - pattern: 'Vec::from(...)'

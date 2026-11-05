@@ -37,14 +37,29 @@
 //!       reads in both directions; and
 //!   (d) teardown is a clean FIN, not a RST: after the app half-closes, its read
 //!       side observes a graceful EOF (`read_to_end` returns `Ok`), which a RST
-//!       would surface as a `ConnectionReset` error instead.
-//! Both the direct path and a first-byte-gated path retain these assertions.
+//!       would surface as a `ConnectionReset` error instead; and
+//!   (e) on the direct path, a transparent TCP forwarder records TLS record sizes,
+//!       directions, and completion times throughout the authenticated session.
+//!       This userspace stream tap changes packetization and includes loopback
+//!       scheduling noise; it does not establish field indistinguishability.
+//! Both the direct path and a first-byte-gated path retain assertions (a)-(d).
 //! The gate waits for an observed speculative origin pre-dial before releasing
 //! ClientHello bytes, so this also covers slow/instrumented client preparation.
+//!
+//! Set `PARALLAX_TCP_TRACE_PATH` to write direct-path metadata as a TSV artifact.
+//! The capture contains no payload or keys and refuses to overwrite a file.
+//! Set `PARALLAX_TCP_CAPTURE_PORT` to a u16 port for a packet-capture filter;
+//! the forwarder always binds 127.0.0.1 and otherwise uses an ephemeral port.
 //!
 //! Live-socket test: `#[ignore]`d and run serially, matching the repo's loopback
 //! convention (`requires loopback TCP sockets`). Run with:
 //!   cargo test --locked --test e2e_tunnel_roundtrip -- --ignored --test-threads=1
+
+#[path = "distinguisher/tcp_capture.rs"]
+mod tcp_capture;
+#[allow(dead_code)]
+#[path = "distinguisher/trace.rs"]
+mod trace;
 
 use std::io::{self, Cursor};
 use std::net::SocketAddr;
@@ -531,11 +546,25 @@ async fn run_roundtrip(pki: &CamouflagePki, force_predial: bool, tasks: &mut Fix
         replay_cache_path,
     );
     let parallax_addr = spawn_parallax_server(config, tasks).await;
-    let upstream = if force_predial {
-        spawn_first_byte_gate(parallax_addr, origin_accepted, tasks).await
+    let (upstream, forwarder) = if force_predial {
+        (
+            spawn_first_byte_gate(parallax_addr, origin_accepted, tasks).await,
+            None,
+        )
     } else {
         drop(origin_accepted);
-        parallax_addr
+        let capture_port = std::env::var_os("PARALLAX_TCP_CAPTURE_PORT")
+            .map(|port| {
+                port.to_str()
+                    .expect("PARALLAX_TCP_CAPTURE_PORT must be Unicode")
+                    .parse::<u16>()
+                    .expect("PARALLAX_TCP_CAPTURE_PORT must be a u16 port")
+            })
+            .unwrap_or(0);
+        let forwarder = tcp_capture::RecordingForwarder::spawn(parallax_addr, capture_port)
+            .await
+            .expect("start TCP record capture");
+        (forwarder.front_addr, Some(forwarder))
     };
     let local_addr = spawn_local_client(upstream, &server_keys, &server_identity_keys, tasks).await;
 
@@ -604,6 +633,44 @@ async fn run_roundtrip(pki: &CamouflagePki, force_predial: bool, tasks: &mut Fix
         report.empty_predials,
         report.tls_handshakes,
     );
+    if let Some(forwarder) = forwarder {
+        let capture = timeout(Duration::from_secs(10), forwarder.finish())
+            .await
+            .expect("TCP record capture timed out")
+            .expect("TCP record capture failed");
+        let trace = capture.application_data();
+        let c2s = trace.dir(trace::Dir::C2S).len();
+        let s2c = trace.dir(trace::Dir::S2C).len();
+        assert!(
+            c2s >= 64 && s2c >= 64,
+            "incomplete bidirectional capture: {c2s}/{s2c}"
+        );
+        for dir in [trace::Dir::C2S, trace::Dir::S2C] {
+            assert!(
+                capture
+                    .records
+                    .iter()
+                    .any(|r| r.dir == dir && r.content_type == 22),
+                "capture missed a direction of the camouflage handshake"
+            );
+        }
+        let span = capture.records.last().unwrap().t_micros;
+        assert!(span > 0, "capture must retain elapsed socket time");
+        eprintln!(
+            "[authenticated-tcp-record-capture] records={} appdata_c2s={c2s} appdata_s2c={s2c} \
+         span_us={span}; loopback measurement only",
+            capture.records.len(),
+        );
+        if let Some(path) = std::env::var_os("PARALLAX_TCP_TRACE_PATH") {
+            capture
+                .write_tsv(&path)
+                .expect("write TCP capture metadata");
+            eprintln!(
+                "TCP record metadata: {}",
+                std::path::Path::new(&path).display()
+            );
+        }
+    }
 }
 
 async fn wait_for_tasks(tasks: &mut FixtureTasks, has_proxy: bool) {

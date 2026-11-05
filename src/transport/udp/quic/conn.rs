@@ -26,9 +26,9 @@ use super::recovery::{RttEstimator, SentPacket, SentPackets};
 use super::spaces::{PacketNumberSpace, ReceivedPackets};
 use super::transport_params::TransportParameters;
 use crate::tls::quic::{
-    initial_keys, ClientConfig, ClientHandshake, ClientTicket, DirectionalKeys, KeyChange, KeyPair,
-    Keys, PacketKey, QuicTlsError, ServerHandshake, Side, TlsSession, ZeroRttGuard,
-    QUIC_VERSION_V1,
+    initial_keys, ClientConfig, ClientHandshake, ClientTicket, DirectionalKeys,
+    HeaderProtectionKey, KeyChange, KeyPair, Keys, PacketKey, QuicTlsError, ServerHandshake, Side,
+    TlsSession, ZeroRttGuard, QUIC_VERSION_V1,
 };
 use zeroize::Zeroizing;
 
@@ -46,6 +46,226 @@ pub enum CloseReason {
     PeerTransport(u64, u64, Vec<u8>),
     /// The idle timeout fired (RFC 9000 §10.1).
     IdleTimeout,
+}
+
+/// Admission for decoded frame codepoints, before that frame has any effect.
+/// Keep the original packet level: 0-RTT shares a PN space with 1-RTT, but not
+/// its permitted frames. RFC 9000 §§12.4–12.5 and verified erratum 7365.
+fn frame_permitted(space: PacketSpace, side: Side, frame_type: u64) -> bool {
+    if side == Side::Server && matches!(frame_type, 0x07 | 0x1e) {
+        return false;
+    }
+    match space {
+        PacketSpace::Initial | PacketSpace::Handshake => {
+            matches!(frame_type, 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x1c)
+        }
+        PacketSpace::ZeroRtt => {
+            !matches!(frame_type, 0x02 | 0x03 | 0x06 | 0x07 | 0x19 | 0x1b | 0x1e)
+        }
+        PacketSpace::OneRtt => true,
+    }
+}
+
+/// Exhausting a protection key ends the connection without another encrypted
+/// close packet. Preserve an existing close reason, but cancel even a close that
+/// was queued before the budget was spent. Used by both transmit entry points.
+fn close_on_exhausted_data_key(
+    sealed: u64,
+    limit: u64,
+    closed: &mut Option<CloseReason>,
+    close_pending: &mut Option<(u64, Option<u64>, Vec<u8>)>,
+) {
+    if sealed < limit {
+        return;
+    }
+    if closed.is_none() {
+        *closed = Some(CloseReason::LocalApp(
+            0,
+            b"AEAD confidentiality limit reached".to_vec(),
+        ));
+    }
+    *close_pending = None;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadGeneration {
+    Previous,
+    Current,
+    Next,
+    Unavailable,
+}
+
+/// Non-secret key-update metadata. Packet numbers remain in the existing global
+/// Application space; these frontiers only bind an authenticated PN to its key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct KeyPhaseState {
+    tx: u64,
+    rx: u64,
+    tx_first: Option<u64>,
+    tx_last: Option<u64>,
+    tx_acked: bool,
+    rx_min: Option<u64>,
+    rx_max: Option<u64>,
+    previous_max: Option<u64>,
+    update_ack_pending: bool,
+}
+
+impl KeyPhaseState {
+    fn select(&self, phase: bool, pn: u64) -> ReadGeneration {
+        if phase == (self.rx & 1 != 0) {
+            ReadGeneration::Current
+        } else if self.rx_min.is_some_and(|min| pn < min) {
+            ReadGeneration::Previous
+        } else if self.rx_max.map_or(true, |max| pn > max) {
+            ReadGeneration::Next
+        } else {
+            ReadGeneration::Unavailable
+        }
+    }
+
+    fn valid_receive(&self, generation: ReadGeneration, pn: u64) -> bool {
+        match generation {
+            ReadGeneration::Current => self.previous_max.map_or(true, |max| pn > max),
+            ReadGeneration::Previous => self.rx > 0 && self.rx_min.is_some_and(|min| pn < min),
+            ReadGeneration::Next => {
+                self.rx.checked_add(1).is_some()
+                    && (!self.update_ack_pending || self.rx.checked_add(1) == Some(self.tx))
+                    && self.rx_max.map_or(true, |max| pn > max)
+            }
+            ReadGeneration::Unavailable => false,
+        }
+    }
+
+    /// Authentication, ordering and global dedup are independent prerequisites.
+    fn commit_receive(
+        &mut self,
+        generation: ReadGeneration,
+        pn: u64,
+        authenticated: bool,
+        fresh: bool,
+    ) -> bool {
+        if !authenticated || !fresh || !self.valid_receive(generation, pn) {
+            return false;
+        }
+        match generation {
+            ReadGeneration::Next => {
+                self.rx = self.rx.checked_add(1).expect("validated generation");
+                self.previous_max = self.rx_max;
+                self.rx_min = Some(pn);
+                self.rx_max = Some(pn);
+                self.update_ack_pending = true;
+            }
+            ReadGeneration::Current => {
+                self.rx_min = Some(self.rx_min.map_or(pn, |min| min.min(pn)));
+                self.rx_max = Some(self.rx_max.map_or(pn, |max| max.max(pn)));
+            }
+            ReadGeneration::Previous => {
+                self.previous_max = Some(self.previous_max.map_or(pn, |max| max.max(pn)));
+            }
+            ReadGeneration::Unavailable => unreachable!(),
+        }
+        true
+    }
+
+    fn active_successor(&self, confirmed: bool) -> Option<u64> {
+        (confirmed && self.tx == self.rx && self.tx_acked)
+            .then(|| self.tx.checked_add(1))
+            .flatten()
+    }
+
+    fn confirm(&mut self, receive_generation: u64, low: u64, high: u64) -> bool {
+        let covered = self
+            .tx_first
+            .zip(self.tx_last)
+            .is_some_and(|(first, last)| low <= high && low <= last && high >= first);
+        if receive_generation < self.tx || !covered {
+            return false;
+        }
+        self.tx_acked = true;
+        true
+    }
+}
+
+/// Each direction consumes its own half once. An initiating sender may be one
+/// generation ahead of its receiver until the peer responds.
+struct NextPacketKeys {
+    generation: u64,
+    local: Option<PacketKey>,
+    remote: Option<PacketKey>,
+}
+
+struct PreviousReadKey {
+    key: PacketKey,
+    retire_at: Instant,
+}
+
+/// Only fresh, authenticated ack-eliciting packets contribute to this count.
+/// Two is also the immediate-feedback state; no ACK frame or key is retained.
+fn ack_count_after_packet(count: u8, ack_eliciting: bool, immediate: bool) -> u8 {
+    if !ack_eliciting {
+        return count;
+    }
+    if immediate {
+        2
+    } else {
+        count.saturating_add(1).min(2)
+    }
+}
+
+fn ack_count_due(count: u8, expired: bool) -> bool {
+    count >= 2 || (count != 0 && expired)
+}
+
+fn encoded_ack_delay(elapsed: Duration) -> u64 {
+    ((elapsed.as_micros() >> ACK_DELAY_EXPONENT).min((1u128 << 62) - 1)) as u64
+}
+
+fn decoded_ack_delay(raw: u64, exponent: u32) -> Duration {
+    // Both inputs are wire-validated: raw <= 2^62-1 and exponent <= 20.
+    // The complete scaled value fits u128; its seconds fit u64.
+    let micros = (raw as u128) << exponent;
+    Duration::new(
+        (micros / 1_000_000) as u64,
+        ((micros % 1_000_000) * 1_000) as u32,
+    )
+}
+
+fn ack_delay_for_recovery(
+    raw: u64,
+    exponent: u32,
+    space: usize,
+    confirmed: bool,
+    peer_max: Duration,
+) -> Duration {
+    cap_decoded_peer_ack_delay(decoded_ack_delay(raw, exponent), space, confirmed, peer_max)
+}
+
+fn cap_decoded_peer_ack_delay(
+    delay: Duration,
+    space: usize,
+    confirmed: bool,
+    peer_max: Duration,
+) -> Duration {
+    if space != SPACE_DATA {
+        return Duration::ZERO;
+    }
+    if confirmed {
+        delay.min(peer_max)
+    } else {
+        delay
+    }
+}
+
+fn pto_space_eligible(space: usize, confirmed: bool) -> bool {
+    space != SPACE_DATA || confirmed
+}
+
+fn peer_ack_delay_for_pto(space: usize, confirmed: bool, peer_max: Duration) -> Duration {
+    if space == SPACE_DATA && confirmed {
+        peer_max
+    } else {
+        Duration::ZERO
+    }
 }
 
 fn transport_error(error_code: u64, frame_type: u64, reason: impl Into<String>) -> QuicTlsError {
@@ -131,9 +351,27 @@ pub fn open_packet(
     local_cid_len: usize,
     largest_pn: Option<u64>,
 ) -> Result<(Header, std::ops::Range<usize>), OpenError> {
+    let opened = unprotect_packet_header(&keys.header, datagram, local_cid_len, largest_pn)?;
+    let payload = open_packet_payload(&keys.packet, datagram, &opened)?;
+    Ok((opened.header, payload))
+}
+
+struct UnprotectedHeader {
+    header: Header,
+    aad_len: usize,
+    body_end: usize,
+}
+
+/// Remove HP once. A 1-RTT receiver can select one generation's AEAD key from
+/// the unprotected phase/PN; neither is trusted before payload authentication.
+fn unprotect_packet_header(
+    key: &HeaderProtectionKey,
+    datagram: &mut [u8],
+    local_cid_len: usize,
+    largest_pn: Option<u64>,
+) -> Result<UnprotectedHeader, OpenError> {
     let pn_offset = packet::locate_pn_offset(datagram, local_cid_len)?;
-    keys.header
-        .decrypt_header(pn_offset, datagram)
+    key.decrypt_header(pn_offset, datagram)
         .map_err(|_| OpenError::Crypto)?;
     // `Header::decode` reconstructs the full packet number internally from
     // `largest_pn` (the largest PN already processed in this space; 0 before the
@@ -141,7 +379,6 @@ pub fn open_packet(
     // packet numbers — equivalent to taking the truncated value verbatim).
     let (header, aad_len) = Header::decode(datagram, local_cid_len, largest_pn.unwrap_or(0))?;
     let pn_len = header.pn_len();
-    let full_pn = header.packet_number();
 
     // The protected region: long headers carry an explicit Length; short headers
     // run to the end of the datagram.
@@ -158,13 +395,28 @@ pub fn open_packet(
         return Err(OpenError::Malformed);
     }
 
-    let aad = datagram[..aad_len].to_vec();
-    let pt = keys
-        .packet
-        .decrypt_in_place(full_pn, &aad, &mut datagram[aad_len..body_end])
+    Ok(UnprotectedHeader {
+        header,
+        aad_len,
+        body_end,
+    })
+}
+
+fn open_packet_payload(
+    key: &PacketKey,
+    datagram: &mut [u8],
+    opened: &UnprotectedHeader,
+) -> Result<std::ops::Range<usize>, OpenError> {
+    let (aad, body) = datagram.split_at_mut(opened.aad_len);
+    let pt = key
+        .decrypt_in_place(
+            opened.header.packet_number(),
+            aad,
+            &mut body[..opened.body_end - opened.aad_len],
+        )
         .map_err(|_| OpenError::Crypto)?;
     let pt_len = pt.len();
-    Ok((header, aad_len..aad_len + pt_len))
+    Ok(opened.aad_len..opened.aad_len + pt_len)
 }
 
 /// RFC 9000 §14.1: a client MUST pad every datagram carrying an Initial packet to
@@ -405,6 +657,8 @@ struct Space {
     recv_ecn: EcnCounts,
     /// An ack-eliciting packet has been received and not yet acknowledged.
     ack_pending: bool,
+    ack_eliciting_count: u8,
+    ack_deadline: Option<Instant>,
     /// When the LARGEST-numbered packet covered by the current (not-yet-sent) ACK was
     /// received, for the `ack_delay` field (RFC 9000 §13.2.5: ack_delay is measured from
     /// the receipt of the largest ACKNOWLEDGED packet, NOT the first one in the batch —
@@ -413,7 +667,7 @@ struct Space {
     /// may be a NON-ack-eliciting packet (e.g. a pure ACK whose PN exceeds a later,
     /// reordered ack-eliciting packet), so this is updated whenever ANY newly-received
     /// packet becomes the new largest — NOT gated on ack-eliciting (gating it there left
-    /// a stale, too-old stamp in that interleaving). Cleared when the ACK is sent. A real
+    /// a stale, too-old stamp in that interleaving). Retained while ranges retain the largest PN. A real
     /// QUIC stack reports this; hard-coding 0 was a passive tell.
     largest_recv_time: Option<Instant>,
     /// CRYPTO byte ranges to RESEND (lost packets) before any fresh CRYPTO.
@@ -648,10 +902,18 @@ pub struct Connection {
     /// Number of probe packets allowed to bypass the congestion window (RFC 9002
     /// §6.2.4): a PTO sets this so a retransmit goes out even when cwnd is full.
     probe_pending: u8,
-    /// Count of 1-RTT (Data-space) packets sealed with the current key, to enforce
-    /// the AEAD confidentiality limit (RFC 9001 §6.6). Without 1-RTT key update we
-    /// force-close before exceeding it rather than overrun the AEAD safety margin.
+    /// Count of 1-RTT packets sealed with the current sending key (RFC 9001 §6.6).
     data_packets_sealed: u64,
+    zero_rtt_packets_sealed: u64,
+    key_phase: KeyPhaseState,
+    next_packet_keys: Option<NextPacketKeys>,
+    previous_read_key: Option<PreviousReadKey>,
+    /// Respect the recommended three-PTO interval after confirming a key update.
+    next_update_at: Option<Instant>,
+    #[cfg(test)]
+    key_update_soft_limit: Option<u64>,
+    #[cfg(test)]
+    sealed_packets: Vec<(Side, u64, u64)>,
     /// Count of 1-RTT (Data-space) packets that FAILED to AEAD-open, to enforce the
     /// AEAD integrity limit (RFC 9001 §6.6). Without 1-RTT key update we force-close
     /// once forged-packet attempts reach the AEAD's forgery margin, mirroring the
@@ -663,6 +925,13 @@ pub struct Connection {
     /// The handshake is confirmed (RFC 9001 §4.1.2): the server when it sends
     /// HANDSHAKE_DONE, the client when it receives it.
     handshake_confirmed: bool,
+    /// The current handshake's authenticated peer ACK parameters, never ticket state.
+    peer_ack_delay_exponent: u32,
+    peer_max_ack_delay: Duration,
+    peer_ack_params_applied: bool,
+    /// Current complete CH/EE parameters passed syntax/range validation. This
+    /// never substitutes for the authenticated reparse or activates ACK policy.
+    peer_transport_params_prevalidated: bool,
     /// A client saw a Handshake packet while it still owed an Initial ACK: it
     /// discards the Initial space right after sending that ACK instead of at once.
     discard_initial_after_ack: bool,
@@ -823,9 +1092,22 @@ impl Connection {
             pto_count: 0,
             probe_pending: 0,
             data_packets_sealed: 0,
+            zero_rtt_packets_sealed: 0,
+            key_phase: KeyPhaseState::default(),
+            next_packet_keys: None,
+            previous_read_key: None,
+            next_update_at: None,
+            #[cfg(test)]
+            key_update_soft_limit: None,
+            #[cfg(test)]
+            sealed_packets: Vec::new(),
             data_packets_open_failed: 0,
             handshake_done_pending: false,
             handshake_confirmed: false,
+            peer_ack_delay_exponent: ACK_DELAY_EXPONENT,
+            peer_max_ack_delay: MAX_ACK_DELAY,
+            peer_ack_params_applied: false,
+            peer_transport_params_prevalidated: false,
             discard_initial_after_ack: false,
             peer_addr_validated: side == Side::Client,
             anti_amp_recv: 0,
@@ -1027,6 +1309,7 @@ impl Connection {
         }
         self.closed = Some(CloseReason::LocalApp(error_code, reason.to_vec()));
         self.close_pending = Some((error_code, None, reason.to_vec()));
+        self.clear_ack_schedules();
     }
 
     /// Close with a transport error, preserving its code and triggering frame.
@@ -1040,6 +1323,7 @@ impl Connection {
             reason.to_vec(),
         ));
         self.close_pending = Some((error_code, Some(frame_type), reason.to_vec()));
+        self.clear_ack_schedules();
     }
 
     /// Why the connection closed, if it has (local close, peer close, or idle).
@@ -1099,13 +1383,6 @@ impl Connection {
     /// exchanged them (the relay parses it with [`TransportParameters::read`]).
     pub fn peer_transport_parameters(&self) -> Option<&[u8]> {
         self.tls.peer_transport_parameters()
-    }
-
-    /// The next 1-RTT packet-key generation for a key update (RFC 9001 §6). MUST
-    /// be `Some` once the connection has 1-RTT keys (the Data-space-entry contract).
-    #[allow(dead_code)] // key-update keys: implemented + tested; the relay closes at the AEAD limit, not rotates
-    pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
-        self.tls.next_1rtt_keys()
     }
 
     /// Open a new outgoing bidirectional stream, returning its id (RFC 9000 §2.1).
@@ -1392,6 +1669,56 @@ impl Connection {
         }
     }
 
+    /// Reject malformed complete CH/EE parameters before the next coalesced
+    /// packet can publish early data. Missing input is not cached as validated;
+    /// ACK policy remains at its defaults until the authenticated reparse below.
+    fn prevalidate_peer_transport_params(&mut self) -> Result<(), QuicTlsError> {
+        if self.peer_transport_params_prevalidated {
+            return Ok(());
+        }
+        let Some(blob) = self.tls.peer_transport_parameters() else {
+            return Ok(());
+        };
+        if let Err(error) = TransportParameters::read(blob) {
+            // The endpoint may ignore a handshaking error. Make rejection
+            // terminal before returning so later datagrams cannot publish data.
+            self.close_transport(0x08, 0x06, b"invalid peer transport parameters");
+            return Err(transport_error(
+                0x08,
+                0x06,
+                format!("invalid peer transport parameters: {error:?}"),
+            ));
+        }
+        self.peer_transport_params_prevalidated = true;
+        Ok(())
+    }
+
+    /// ACK recovery settings come only from this completed, authenticated TLS
+    /// handshake. Raw CH/EE parameters and remembered 0-RTT flow limits do not
+    /// establish this boundary. Parse before committing any peer ACK state.
+    fn apply_authenticated_peer_ack_params(&mut self) -> Result<(), QuicTlsError> {
+        if self.peer_ack_params_applied || self.tls.is_handshaking() {
+            return Ok(());
+        }
+        let blob = self.tls.peer_transport_parameters().ok_or_else(|| {
+            QuicTlsError::alert(
+                crate::tls::quic::ALERT_MISSING_EXTENSION,
+                "missing authenticated peer transport parameters",
+            )
+        })?;
+        let tp = TransportParameters::read(blob).map_err(|error| {
+            transport_error(
+                0x08,
+                0x06,
+                format!("invalid peer transport parameters: {error:?}"),
+            )
+        })?;
+        self.peer_ack_delay_exponent = tp.ack_delay_exponent;
+        self.peer_max_ack_delay = Duration::from_millis(tp.max_ack_delay_ms);
+        self.peer_ack_params_applied = true;
+        Ok(())
+    }
+
     /// The peer's initial MAX_STREAM_DATA for a stream, by kind (RFC 9000 §18.2):
     /// a uni stream, a bidi stream we opened (the peer's "remote" limit), or a bidi
     /// stream the peer opened (its "local" limit). Zero until the peer TP arrives.
@@ -1429,6 +1756,13 @@ impl Connection {
                 Some(KeyChange::OneRtt { keys }) => {
                     self.spaces[SPACE_DATA].keys = Some(keys);
                     self.write_level = SPACE_DATA;
+                    if self.side == Side::Client {
+                        self.zero_rtt_keys = None;
+                    }
+                    if self.cache_next_packet_keys().is_err() {
+                        self.retire_data_connection(b"key update derivation failed");
+                        return;
+                    }
                 }
                 None => {
                     if buf.is_empty() {
@@ -1437,6 +1771,169 @@ impl Connection {
                 }
             }
         }
+    }
+
+    fn retire_data_connection(&mut self, reason: &[u8]) {
+        if self.closed.is_none() {
+            self.closed = Some(CloseReason::LocalApp(0, reason.to_vec()));
+        }
+        self.close_pending = None;
+        self.clear_ack_schedules();
+    }
+
+    fn cache_next_packet_keys(&mut self) -> Result<(), QuicTlsError> {
+        if self
+            .next_packet_keys
+            .as_ref()
+            .is_some_and(|keys| keys.local.is_some() || keys.remote.is_some())
+        {
+            return Ok(());
+        }
+        let generation = self
+            .key_phase
+            .tx
+            .max(self.key_phase.rx)
+            .checked_add(1)
+            .ok_or_else(|| QuicTlsError::Crypto("key generation exhausted".into()))?;
+        let KeyPair { local, remote } = self.tls.next_1rtt_keys()?;
+        self.next_packet_keys = Some(NextPacketKeys {
+            generation,
+            local: Some(local),
+            remote: Some(remote),
+        });
+        Ok(())
+    }
+
+    fn install_send_key(&mut self, generation: u64) -> Result<(), QuicTlsError> {
+        let next = self
+            .next_packet_keys
+            .as_mut()
+            .filter(|next| next.generation == generation)
+            .ok_or_else(|| QuicTlsError::Crypto("missing next sending generation".into()))?;
+        let key = next
+            .local
+            .take()
+            .ok_or_else(|| QuicTlsError::Crypto("sending generation already consumed".into()))?;
+        self.spaces[SPACE_DATA].keys.as_mut().unwrap().local.packet = key;
+        self.key_phase.tx = generation;
+        self.key_phase.tx_first = None;
+        self.key_phase.tx_last = None;
+        self.key_phase.tx_acked = false;
+        self.data_packets_sealed = 0;
+        self.next_update_at = None;
+        Ok(())
+    }
+
+    fn initiate_key_update(&mut self, now: Instant) -> Result<bool, QuicTlsError> {
+        if self.closed.is_some() || self.next_update_at.is_some_and(|at| now < at) {
+            return Ok(false);
+        }
+        let Some(generation) = self.key_phase.active_successor(self.handshake_confirmed) else {
+            return Ok(false);
+        };
+        self.install_send_key(generation)?;
+        Ok(true)
+    }
+
+    fn maybe_update_send_key(&mut self, now: Instant) {
+        let Some(keys) = self.spaces[SPACE_DATA].keys.as_ref() else {
+            return;
+        };
+        // Leave half the confidentiality budget for loss, ACKs, and the three-PTO
+        // update interval. A peer that never confirms still hits the hard stop.
+        let soft_limit = keys.local.packet.confidentiality_limit() / 2;
+        #[cfg(test)]
+        let soft_limit = self.key_update_soft_limit.unwrap_or(soft_limit);
+        if self.data_packets_sealed < keys.local.packet.confidentiality_limit()
+            && self.data_packets_sealed >= soft_limit
+            && self.initiate_key_update(now).is_err()
+        {
+            self.retire_data_connection(b"key update derivation failed");
+        }
+    }
+
+    fn retire_previous_read_key(&mut self, now: Instant) {
+        if self
+            .previous_read_key
+            .as_ref()
+            .is_some_and(|previous| now >= previous.retire_at)
+        {
+            self.previous_read_key = None;
+        }
+    }
+
+    /// The fixed HP key is applied once, followed by exactly one selected AEAD
+    /// attempt. Missing/retired candidates use the current key as a dummy; they
+    /// are never admitted, even if that attempt happens to authenticate.
+    fn open_data_packet(
+        &self,
+        pkt: &mut [u8],
+        local_cid_len: usize,
+        largest: Option<u64>,
+        now: Instant,
+    ) -> Result<(Header, std::ops::Range<usize>, ReadGeneration), OpenError> {
+        let keys = self.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .ok_or(OpenError::Crypto)?;
+        let opened = unprotect_packet_header(&keys.remote.header, pkt, local_cid_len, largest)?;
+        let Header::Short { key_phase, .. } = &opened.header else {
+            return Err(OpenError::Malformed);
+        };
+        let mut generation = self
+            .key_phase
+            .select(*key_phase, opened.header.packet_number());
+        let selected = match generation {
+            ReadGeneration::Current => Some(&keys.remote.packet),
+            ReadGeneration::Previous => self
+                .previous_read_key
+                .as_ref()
+                .filter(|previous| now < previous.retire_at)
+                .map(|previous| &previous.key),
+            ReadGeneration::Next => self
+                .next_packet_keys
+                .as_ref()
+                .filter(|next| self.key_phase.rx.checked_add(1) == Some(next.generation))
+                .and_then(|next| next.remote.as_ref()),
+            ReadGeneration::Unavailable => None,
+        };
+        if selected.is_none() {
+            generation = ReadGeneration::Unavailable;
+        }
+        let range = open_packet_payload(selected.unwrap_or(&keys.remote.packet), pkt, &opened)?;
+        Ok((opened.header, range, generation))
+    }
+
+    fn commit_data_generation(
+        &mut self,
+        generation: ReadGeneration,
+        pn: u64,
+        now: Instant,
+    ) -> Result<(), QuicTlsError> {
+        assert!(self.key_phase.commit_receive(generation, pn, true, true));
+        if generation == ReadGeneration::Next {
+            let next = self.next_packet_keys.as_mut().unwrap();
+            let read_key = next.remote.take().expect("authenticated cached next key");
+            let keys = self.spaces[SPACE_DATA].keys.as_mut().unwrap();
+            let old_key = std::mem::replace(&mut keys.remote.packet, read_key);
+            self.previous_read_key = Some(PreviousReadKey {
+                key: old_key,
+                retire_at: now + self.drain_duration(),
+            });
+            // A locally initiated update already consumed this same local half.
+            // Otherwise respond before any ACK can acknowledge the new phase.
+            if self.key_phase.tx < self.key_phase.rx {
+                if let Err(error) = self.install_send_key(self.key_phase.rx) {
+                    self.retire_data_connection(b"key update installation failed");
+                    return Err(error);
+                }
+            }
+            if let Err(error) = self.cache_next_packet_keys() {
+                self.retire_data_connection(b"key update derivation failed");
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Discard a packet-number space's keys and all associated state (RFC 9001 §4.9,
@@ -1453,44 +1950,105 @@ impl Connection {
         };
     }
 
+    fn clear_ack_schedules(&mut self) {
+        for space in &mut self.spaces {
+            space.ack_pending = false;
+            space.ack_eliciting_count = 0;
+            space.ack_deadline = None;
+        }
+    }
+
+    fn schedule_ack(&mut self, space: usize, ack_eliciting: bool, immediate: bool, now: Instant) {
+        if self.closed.is_some() {
+            self.clear_ack_schedules();
+            return;
+        }
+        if !ack_eliciting {
+            return;
+        }
+        let sp = &mut self.spaces[space];
+        sp.ack_pending = true;
+        sp.ack_eliciting_count =
+            ack_count_after_packet(sp.ack_eliciting_count, ack_eliciting, immediate);
+        let deadline = if sp.ack_eliciting_count >= 2 {
+            now
+        } else {
+            now + MAX_ACK_DELAY
+        };
+        sp.ack_deadline = Some(sp.ack_deadline.map_or(deadline, |old| old.min(deadline)));
+    }
+
+    fn ack_ready_for_space(&self, space: usize, now: Instant) -> bool {
+        let sp = &self.spaces[space];
+        sp.ack_pending
+            && (space != SPACE_DATA
+                || !self.handshake_confirmed
+                || ack_count_due(
+                    sp.ack_eliciting_count,
+                    sp.ack_deadline.is_some_and(|deadline| now >= deadline),
+                ))
+    }
+
+    /// Only arm a new ACK timer where poll_transmit can actually send it. The
+    /// Initial client's existing ServerHello/Initial-ACK exception is unchanged.
+    fn pending_data_ack_deadline(&self) -> Option<Instant> {
+        let sp = &self.spaces[SPACE_DATA];
+        if self.closed.is_some()
+            || !sp.ack_pending
+            || sp.keys.is_none()
+            || sp.discarded
+            || (!self.peer_addr_validated
+                && self.anti_amp_sent.saturating_add(MAX_DATAGRAM as u64)
+                    > self.anti_amp_recv.saturating_mul(3))
+        {
+            return None;
+        }
+        sp.ack_deadline
+    }
+
     /// Force a local close once the 1-RTT AEAD confidentiality limit is reached
-    /// (RFC 9001 §6.6). The relay does not perform 1-RTT key update, so closing is
-    /// the spec-permitted alternative to rotating the key before the limit. (A
+    /// (RFC 9001 §6.6). If an update was not possible before the hard stop, no
+    /// encrypted CONNECTION_CLOSE can be sent after the budget is spent. (A
     /// ChaCha20-Poly1305 key has an effectively unbounded limit, so this never
     /// fires for it; AES-GCM caps at 2^23 packets.)
     fn enforce_aead_confidentiality_limit(&mut self) {
-        if self.closed.is_some() {
-            return;
+        if self.spaces[SPACE_DATA].keys.is_none() {
+            if let Some(keys) = &self.zero_rtt_keys {
+                close_on_exhausted_data_key(
+                    self.zero_rtt_packets_sealed,
+                    keys.local.packet.confidentiality_limit(),
+                    &mut self.closed,
+                    &mut self.close_pending,
+                );
+            }
         }
         let limit = self.spaces[SPACE_DATA]
             .keys
             .as_ref()
             .map(|k| k.local.packet.confidentiality_limit());
         if let Some(limit) = limit {
-            if self.data_packets_sealed >= limit {
-                self.close(0, b"AEAD confidentiality limit reached");
-            }
+            close_on_exhausted_data_key(
+                self.data_packets_sealed,
+                limit,
+                &mut self.closed,
+                &mut self.close_pending,
+            );
         }
     }
 
     /// Enforce the AEAD integrity limit (RFC 9001 §6.6): once the number of 1-RTT
     /// packets that failed to AEAD-open reaches the cipher's integrity limit, the
-    /// key's forgery-resistance margin is spent. With no 1-RTT key update the only
-    /// spec-permitted action is to close — mirroring `enforce_aead_confidentiality_limit`
-    /// (same close shape, same NO_ERROR code) so this adds no externally distinct
-    /// behavior. The limit (2^36 for ChaCha20-Poly1305, 2^52 for AES-GCM) is never
-    /// reached in normal operation.
+    /// connection's forgery-resistance margin is spent, across all generations.
+    /// Retire without further encrypted output. The limit is unreachable in
+    /// normal operation (2^36 for ChaCha20-Poly1305, 2^52 for AES-GCM).
     fn enforce_aead_integrity_limit(&mut self) {
-        if self.closed.is_some() {
-            return;
-        }
         let limit = self.spaces[SPACE_DATA]
             .keys
             .as_ref()
             .map(|k| k.remote.packet.integrity_limit());
         if let Some(limit) = limit {
             if self.data_packets_open_failed >= limit {
-                self.close(0, b"AEAD integrity limit reached");
+                self.retire_data_connection(b"AEAD integrity limit reached");
             }
         }
     }
@@ -1513,16 +2071,25 @@ impl Connection {
     }
 
     fn poll_transmit_inner(&mut self, now: Instant) -> Option<Vec<u8>> {
-        // Enforce the AEAD confidentiality limit (RFC 9001 §6.6): with no 1-RTT key
-        // update, once we have sealed the cipher's safe number of 1-RTT packets we
-        // MUST stop using the key — force-close rather than overrun the AEAD margin.
+        // Rotate while budget remains; closing never rotates just to send close.
+        if self.closed.is_none() {
+            self.maybe_update_send_key(now);
+        }
         self.enforce_aead_confidentiality_limit();
         self.enforce_aead_integrity_limit();
+        if self
+            .spaces
+            .iter()
+            .any(|space| !space.discarded && !space.send.can_allocate())
+        {
+            self.retire_data_connection(b"packet-number space exhausted");
+        }
         // Once closed (locally, by the peer, or on idle) the connection enters the
         // closing/draining state (RFC 9000 §10.2): it sends at most a single
         // CONNECTION_CLOSE (for a local close) and is otherwise silent — no ACKs,
         // data, probes, or keep-alives. This also starts the drain countdown.
         if self.closed.is_some() {
+            self.clear_ack_schedules();
             if self.close_time.is_none() {
                 self.close_time = Some(now);
             }
@@ -1553,7 +2120,7 @@ impl Connection {
         // Pure ACKs first so acknowledgements are not held behind data, and are
         // never blocked by the congestion window (they are not ack-eliciting).
         for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
-            if self.spaces[space].keys.is_some() && self.spaces[space].ack_pending {
+            if self.spaces[space].keys.is_some() && self.ack_ready_for_space(space, now) {
                 // A client holds its Initial ACK until the ServerHello is complete
                 // (Handshake keys installed), so a ServerHello split across several
                 // Initial datagrams draws ONE padded ACK, as Safari sends — not one
@@ -1670,21 +2237,23 @@ impl Connection {
     }
 
     /// Current PTO duration with exponential backoff (RFC 9002 §6.2.1). `max_ack_delay`
-    /// is added only for the Application (1-RTT) space; Initial/Handshake peers must
-    /// ACK immediately, so adding it there arms handshake probes too late.
+    /// is the peer's value and is added only for confirmed Application data;
+    /// Initial/Handshake peers must ACK immediately.
     fn pto_duration(&self, space: usize) -> Duration {
-        let extra = if space == SPACE_DATA {
-            MAX_ACK_DELAY
-        } else {
-            Duration::ZERO
-        };
+        let extra =
+            peer_ack_delay_for_pto(space, self.handshake_confirmed, self.peer_max_ack_delay);
         (self.rtt.pto_base() + extra) * 2u32.pow(self.pto_count.min(MAX_PTO_BACKOFF))
     }
 
     /// How long to remain in the closing/draining state before the connection is
     /// considered drained and reapable (RFC 9000 §10.2: at least 3×PTO).
     fn drain_duration(&self) -> Duration {
-        3 * (self.rtt.pto_base() + MAX_ACK_DELAY)
+        3 * (self.rtt.pto_base()
+            + peer_ack_delay_for_pto(
+                SPACE_DATA,
+                self.handshake_confirmed,
+                self.peer_max_ack_delay,
+            ))
     }
 
     /// The earliest loss-detection / PTO deadline, for the async layer to arm a
@@ -1696,10 +2265,21 @@ impl Connection {
             if self.drained {
                 return None;
             }
-            return self.close_time.map(|t| t + self.drain_duration());
+            let drain = self.close_time.map(|t| t + self.drain_duration());
+            return match (drain, &self.previous_read_key) {
+                (Some(drain), Some(previous)) => Some(drain.min(previous.retire_at)),
+                (None, Some(previous)) => Some(previous.retire_at),
+                (deadline, _) => deadline,
+            };
         }
         let mut deadline: Option<Instant> = None;
         let mut earliest = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        if let Some(previous) = &self.previous_read_key {
+            earliest(previous.retire_at);
+        }
+        if let Some(ack) = self.pending_data_ack_deadline() {
+            earliest(ack);
+        }
         for sp in &self.spaces {
             if let Some(lt) = sp.loss_time {
                 earliest(lt);
@@ -1709,6 +2289,9 @@ impl Connection {
         // space's timer is armed from its own last ack-eliciting send; the earliest
         // across spaces is when handle_timeout must probe.
         for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+            if !pto_space_eligible(space, self.handshake_confirmed) {
+                continue;
+            }
             if self.spaces[space].sent.in_flight() > 0 {
                 if let Some(last) = self.spaces[space].last_ack_eliciting {
                     earliest(last + self.pto_duration(space));
@@ -1751,6 +2334,7 @@ impl Connection {
     /// calls this when [`Self::next_timeout`] elapses; `poll_transmit` then sends
     /// any retransmits / probes that were queued.
     pub fn handle_timeout(&mut self, now: Instant) {
+        self.retire_previous_read_key(now);
         // Closing/draining (RFC 9000 §10.2): count down to drained, nothing else.
         if self.closed.is_some() {
             if self.close_time.is_none() {
@@ -1772,6 +2356,7 @@ impl Connection {
             && now >= self.last_recv_time.unwrap_or(self.created_at) + IDLE_TIMEOUT
         {
             self.closed = Some(CloseReason::IdleTimeout);
+            self.clear_ack_schedules();
             self.close_time = Some(now);
             return;
         }
@@ -1799,7 +2384,8 @@ impl Connection {
             let elapsed = [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA]
                 .iter()
                 .any(|&space| {
-                    self.spaces[space].sent.in_flight() > 0
+                    pto_space_eligible(space, self.handshake_confirmed)
+                        && self.spaces[space].sent.in_flight() > 0
                         && self.spaces[space]
                             .last_ack_eliciting
                             .is_some_and(|last| now >= last + self.pto_duration(space))
@@ -1829,7 +2415,9 @@ impl Connection {
     /// (lowest space first, so handshake progress is not blocked behind 1-RTT).
     fn queue_probe(&mut self) {
         for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
-            if self.spaces[space].sent.in_flight() == 0 {
+            if !pto_space_eligible(space, self.handshake_confirmed)
+                || self.spaces[space].sent.in_flight() == 0
+            {
                 continue;
             }
             let oldest = self.spaces[space].sent_content.keys().next().copied();
@@ -1914,12 +2502,36 @@ impl Connection {
             }
             _ => Header::Short {
                 spin: false,
-                key_phase: false,
+                key_phase: self.key_phase.tx & 1 != 0,
                 dcid: self.dcid,
                 packet_number: pn,
                 pn_len,
             },
         }
+    }
+
+    fn allocate_packet_number(&mut self, space: usize) -> u64 {
+        let (sealed, limit) = if space == SPACE_DATA {
+            if let Some(keys) = &self.spaces[SPACE_DATA].keys {
+                (
+                    self.data_packets_sealed,
+                    keys.local.packet.confidentiality_limit(),
+                )
+            } else if let Some(keys) = &self.zero_rtt_keys {
+                (
+                    self.zero_rtt_packets_sealed,
+                    keys.local.packet.confidentiality_limit(),
+                )
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, u64::MAX)
+        };
+        self.spaces[space]
+            .send
+            .allocate_protected(sealed, limit)
+            .expect("transmit dispatcher admitted key budget and PN")
     }
 
     /// Record an outgoing packet for loss detection. Only ack-eliciting packets
@@ -1965,9 +2577,15 @@ impl Connection {
             self.spaces[space].last_ack_eliciting = Some(now);
         }
         if space == SPACE_DATA {
-            // Every 1-RTT packet is sealed with the Data key; count it toward the
-            // AEAD confidentiality limit (RFC 9001 §6.6).
-            self.data_packets_sealed = self.data_packets_sealed.saturating_add(1);
+            if self.spaces[SPACE_DATA].keys.is_some() {
+                self.data_packets_sealed = self.data_packets_sealed.saturating_add(1);
+                self.key_phase.tx_first.get_or_insert(pn);
+                self.key_phase.tx_last = Some(pn);
+                #[cfg(test)]
+                self.sealed_packets.push((self.side, self.key_phase.tx, pn));
+            } else {
+                self.zero_rtt_packets_sealed = self.zero_rtt_packets_sealed.saturating_add(1);
+            }
         }
         self.last_send_time = Some(now);
     }
@@ -1975,26 +2593,22 @@ impl Connection {
     /// Build a packet carrying only an ACK frame for `space` (non-ack-eliciting),
     /// clearing the space's pending-ACK flag.
     fn build_ack_packet(&mut self, space: usize, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[space].send.allocate();
+        let pn = self.allocate_packet_number(space);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         // ack_delay (RFC 9000 §19.3): how long the ACK was held since the LARGEST
-        // acknowledged packet was received (§13.2.5), capped at max_ack_delay (25ms) and
+        // acknowledged packet was received (§13.2.5) and
         // encoded as the raw value (microseconds >> ack_delay_exponent). The peer
         // multiplies it back by 2^exponent. A real QUIC stack reports this; the old
         // hard-coded 0 is a passive distinguisher (an ACK that always claims zero
-        // delay). NOTE:
-        // ACK *coalescing* (~2:1) is a separate, deferred change (PAR-22) pending a
-        // sustained-flow Safari QUIC capture to validate the exact ratio.
+        // delay). The wire value reports actual elapsed time, including scheduling
+        // delay; the local delayed-ACK timer is bounded separately at 25ms.
         // Only the Application (1-RTT) space reports a real ack_delay: Initial and
         // Handshake ACKs are sent immediately (the peer must not apply max_ack_delay
         // there, RFC 9000 §13.2.1 / §17.2.5), so they keep delay 0.
         let ack_delay_raw = if space == SPACE_DATA {
             self.spaces[space]
                 .largest_recv_time
-                .map(|recv| {
-                    let held = now.saturating_duration_since(recv).min(MAX_ACK_DELAY);
-                    (held.as_micros() as u64) >> ACK_DELAY_EXPONENT
-                })
+                .map(|recv| encoded_ack_delay(now.saturating_duration_since(recv)))
                 .unwrap_or(0)
         } else {
             0
@@ -2034,7 +2648,11 @@ impl Connection {
             }
         };
         self.spaces[space].ack_pending = false;
-        self.spaces[space].largest_recv_time = None;
+        self.spaces[space].ack_eliciting_count = 0;
+        self.spaces[space].ack_deadline = None;
+        if space == SPACE_DATA {
+            self.key_phase.update_ack_pending = false;
+        }
         self.record_sent(
             space,
             pn,
@@ -2046,33 +2664,104 @@ impl Connection {
         datagram
     }
 
-    /// Build a packet carrying the queued CONNECTION_CLOSE (RFC 9000
-    /// §19.19) in the highest space with keys. `None` if no keys exist yet.
+    /// Coalesce readable closes for the possible peer handshake states (§10.2.3).
+    /// Before confirmation a server must cover both a peer awaiting ServerHello
+    /// (Initial) and one awaiting Finished (Handshake). Data is optional then.
     fn build_close_packet(&mut self, now: Instant) -> Option<Vec<u8>> {
+        self.enforce_aead_confidentiality_limit();
+        self.enforce_aead_integrity_limit();
         let (code, frame_type, reason) = self.close_pending.clone()?;
-        let space = [SPACE_DATA, SPACE_HANDSHAKE, SPACE_INITIAL]
-            .into_iter()
-            .find(|&s| self.spaces[s].keys.is_some())?;
-        let pn = self.spaces[space].send.allocate();
-        let (_, pn_len) = packet::encode_packet_number(pn, None);
-        let header = self.make_header(space, pn, pn_len);
-        // An application CONNECTION_CLOSE (0x1d) is prohibited in Initial/Handshake
-        // packets (RFC 9000 §12.5). If 1-RTT keys are not yet installed, close with
-        // a transport CONNECTION_CLOSE (0x1c) carrying APPLICATION_ERROR and no
-        // application-specific code/reason (RFC 9000 §10.2.3).
-        let close = if let Some(frame_type) = frame_type {
+        let available =
+            |space: usize| !self.spaces[space].discarded && self.spaces[space].keys.is_some();
+        let mut spaces = if !self.handshake_confirmed {
+            let mut spaces = Vec::new();
+            if self.side == Side::Server && available(SPACE_INITIAL) {
+                spaces.push(SPACE_INITIAL);
+            }
+            if available(SPACE_HANDSHAKE) {
+                spaces.push(SPACE_HANDSHAKE);
+            }
+            spaces
+        } else {
+            Vec::new()
+        };
+        let mandatory = spaces.len().max(1);
+        if available(SPACE_DATA) {
+            spaces.push(SPACE_DATA);
+        } else if spaces.is_empty() && !self.handshake_confirmed && available(SPACE_INITIAL) {
+            spaces.push(SPACE_INITIAL);
+        }
+        if spaces.is_empty() {
+            return None;
+        }
+        // Preflight the entire batch before any PN advances or AEAD seals. A
+        // lower-level close must not bypass an exhausted Application key.
+        if spaces
+            .iter()
+            .any(|&space| !self.spaces[space].send.can_allocate())
+        {
+            self.close_pending = None;
+            return None;
+        }
+        let mtu = self.pmtud.current_mtu();
+        let batch_size = |spaces: &[usize], reason: &[u8]| {
+            spaces.iter().try_fold(0usize, |total, &space| {
+                total.checked_add(self.close_packet_size(space, code, frame_type, reason))
+            })
+        };
+        let mut size = batch_size(&spaces, &reason)?;
+        if size > mtu && spaces.len() > mandatory {
+            spaces.truncate(mandatory);
+            size = batch_size(&spaces, &reason)?;
+        }
+        // Optional Data is already removed. Shorten only the wire reason when
+        // necessary to retain BOTH mandatory server levels; keep the local
+        // CloseReason unchanged. The final sealer reads this same pending tuple.
+        let shorten_reason = size > mtu
+            && frame_type.is_some()
+            && spaces.as_slice() == [SPACE_INITIAL, SPACE_HANDSHAKE];
+        if shorten_reason {
+            size = batch_size(&spaces, &[])?;
+        }
+        if size > mtu {
+            self.close_pending = None;
+            return None;
+        }
+        if !self.peer_addr_validated
+            && self.anti_amp_sent.saturating_add(size as u64) > self.anti_amp_recv.saturating_mul(3)
+        {
+            return None;
+        }
+        if shorten_reason {
+            self.close_pending.as_mut()?.2.clear();
+        }
+        let mut datagram = Vec::new();
+        for space in spaces {
+            datagram.extend(self.build_close_packet_in_space(space, now)?);
+        }
+        self.close_sent = true;
+        Some(datagram)
+    }
+
+    fn close_frame(
+        space: usize,
+        code: u64,
+        frame_type: Option<u64>,
+        reason: &[u8],
+    ) -> super::frame::Close<'_> {
+        if let Some(frame_type) = frame_type {
             super::frame::Close {
                 application: false,
                 error_code: code,
                 frame_type,
-                reason: &reason,
+                reason,
             }
         } else if space == SPACE_DATA {
             super::frame::Close {
                 application: true,
                 error_code: code,
                 frame_type: 0,
-                reason: &reason,
+                reason,
             }
         } else {
             super::frame::Close {
@@ -2081,7 +2770,62 @@ impl Connection {
                 frame_type: 0,
                 reason: &[],
             }
-        };
+        }
+    }
+
+    fn close_packet_size(
+        &self,
+        space: usize,
+        code: u64,
+        frame_type: Option<u64>,
+        reason: &[u8],
+    ) -> usize {
+        let pn = self.spaces[space].send.peek();
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(space, pn, pn_len);
+        let close = Self::close_frame(space, code, frame_type, reason);
+        if close.reason.len() > self.pmtud.current_mtu() {
+            return self.pmtud.current_mtu().saturating_add(1);
+        }
+        let mut encoded = Vec::new();
+        header.encode(&mut encoded);
+        Frame::Close(close).encode(&mut encoded);
+        encoded
+            .len()
+            .checked_add(3)
+            .and_then(|size| {
+                size.checked_add(
+                    self.spaces[space]
+                        .keys
+                        .as_ref()
+                        .unwrap()
+                        .local
+                        .packet
+                        .tag_len(),
+                )
+            })
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Seal a close at one explicit encryption level. The orchestrator preflights
+    /// the whole batch; this entry point independently guards direct callers.
+    fn build_close_packet_in_space(&mut self, space: usize, now: Instant) -> Option<Vec<u8>> {
+        self.enforce_aead_confidentiality_limit();
+        self.enforce_aead_integrity_limit();
+        let (code, frame_type, reason) = self.close_pending.clone()?;
+        if self.spaces[space].discarded
+            || self.spaces[space].keys.is_none()
+            || (self.handshake_confirmed && space != SPACE_DATA)
+            || !self.spaces[space].send.can_allocate()
+            || self.close_packet_size(space, code, frame_type, &reason) > self.pmtud.current_mtu()
+        {
+            self.close_pending = None;
+            return None;
+        }
+        let pn = self.allocate_packet_number(space);
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(space, pn, pn_len);
+        let close = Self::close_frame(space, code, frame_type, &reason);
         let datagram = {
             let keys = self.spaces[space].keys.as_ref().unwrap();
             seal_packet(
@@ -2090,7 +2834,6 @@ impl Connection {
                 &[Frame::Close(close), Frame::Padding(3)],
             )
         };
-        self.close_sent = true;
         // CONNECTION_CLOSE is not ack-eliciting (RFC 9002 §2).
         self.record_sent(
             space,
@@ -2115,7 +2858,7 @@ impl Connection {
         content: SentContent,
         now: Instant,
     ) -> Vec<u8> {
-        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let pn = self.allocate_packet_number(SPACE_DATA);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let header = self.make_header(SPACE_DATA, pn, pn_len);
         let datagram = {
@@ -2175,7 +2918,7 @@ impl Connection {
     /// The probe carries NO retransmittable content: a fresh probe is issued by the
     /// state machine if this one is lost, so there is nothing to requeue.
     fn build_mtu_probe_packet(&mut self, probe_size: usize, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let pn = self.allocate_packet_number(SPACE_DATA);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let header = self.make_header(SPACE_DATA, pn, pn_len);
         let mut hdr_buf = Vec::new();
@@ -2223,7 +2966,7 @@ impl Connection {
     /// Build pending MAX_DATA, MAX_STREAM_DATA, and MAX_STREAMS updates, recording
     /// them so lost grants are re-armed (RFC 9000 §19.9–19.11).
     fn build_flow_update_packet(&mut self, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let pn = self.allocate_packet_number(SPACE_DATA);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let header = self.make_header(SPACE_DATA, pn, pn_len);
 
@@ -2287,7 +3030,7 @@ impl Connection {
     }
 
     fn build_crypto_packet(&mut self, space: usize, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[space].send.allocate();
+        let pn = self.allocate_packet_number(space);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let tag_len = self.spaces[space]
             .keys
@@ -2404,7 +3147,7 @@ impl Connection {
     /// Build a 1-RTT packet carrying RESET_STREAM for `id` (RFC 9000 §19.4),
     /// recording it for loss re-arm.
     fn build_reset_packet(&mut self, id: u64, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let pn = self.allocate_packet_number(SPACE_DATA);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let header = self.make_header(SPACE_DATA, pn, pn_len);
         let s = &self.streams[&id];
@@ -2442,7 +3185,7 @@ impl Connection {
     /// `id` — either a resend of a lost range or the next fresh slice (with the FIN
     /// bit when the final byte is reached).
     fn build_stream_packet(&mut self, id: u64, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let pn = self.allocate_packet_number(SPACE_DATA);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let tag_len = self.spaces[SPACE_DATA]
             .keys
@@ -2540,7 +3283,7 @@ impl Connection {
     /// Application Data space (RFC 9000 §12.3). A lost 0-RTT packet's bytes stay
     /// buffered in the stream and are retransmitted in 1-RTT.
     fn build_zero_rtt_stream_packet(&mut self, id: u64, now: Instant) -> Vec<u8> {
-        let pn = self.spaces[SPACE_DATA].send.allocate();
+        let pn = self.allocate_packet_number(SPACE_DATA);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let tag_len = self
             .zero_rtt_keys
@@ -2675,6 +3418,19 @@ impl Connection {
             Some(s) => s,
             None => return Ok(()), // unsupported type / clear fixed bit: drop
         };
+        // RFC 9001 §5.6: servers never send 0-RTT. Drop reflected client early
+        // data before decryption or any packet-derived state can be committed.
+        if self.side == Side::Client && pspace == PacketSpace::ZeroRtt {
+            return Ok(());
+        }
+        if self.closed.is_some() {
+            return Ok(());
+        }
+        // RFC 9001 section 5.7 applies to both roles, including close and ACK.
+        // A coalesced earlier Handshake packet can complete TLS before this call.
+        if pspace == PacketSpace::OneRtt && self.tls.is_handshaking() {
+            return Ok(());
+        }
         let space = space_index(pspace);
         if self.spaces[space].discarded {
             return Ok(());
@@ -2710,7 +3466,15 @@ impl Connection {
 
         let local_cid_len = self.scid.len();
         let largest = self.spaces[space].recv.largest();
-        let opened = {
+        let mut read_generation = None;
+        let opened = if pspace == PacketSpace::OneRtt {
+            self.open_data_packet(pkt, local_cid_len, largest, now).map(
+                |(header, range, generation)| {
+                    read_generation = Some(generation);
+                    (header, range)
+                },
+            )
+        } else {
             let keys = if pspace == PacketSpace::ZeroRtt {
                 // 0-RTT opens with the early-data keys. If they are not installed
                 // (PSK not accepted, or the ClientHello not yet processed) the packet
@@ -2747,10 +3511,40 @@ impl Connection {
             }
         };
 
-        // The packet authenticated — only NOW is it safe to commit state derived
-        // from this (now-trusted) datagram.
-        // Refresh the idle timer only here, after authentication (RFC 9000 §10.1):
-        // a forged/garbage datagram that never AEAD-opens must not reset it.
+        if let Some(generation) = read_generation {
+            if !self
+                .key_phase
+                .valid_receive(generation, header.packet_number())
+            {
+                return Err(transport_error(
+                    0x0e,
+                    0,
+                    "invalid key phase packet-number ordering",
+                ));
+            }
+        }
+        // Only a new authenticated packet may commit trusted state. This also
+        // rejects evicted low-water PNs, not just explicitly retained replays.
+        if !self.spaces[space].recv.insert(header.packet_number()) {
+            return Ok(());
+        }
+        let receive_generation = if let Some(generation) = read_generation {
+            self.commit_data_generation(generation, header.packet_number(), now)?;
+            Some(if generation == ReadGeneration::Previous {
+                self.key_phase.rx - 1
+            } else {
+                self.key_phase.rx
+            })
+        } else {
+            None
+        };
+        let immediate_ack = pspace != PacketSpace::OneRtt
+            || !self.handshake_confirmed
+            || read_generation == Some(ReadGeneration::Next)
+            || largest.is_some_and(|largest| header.packet_number() != largest + 1)
+            || ecn == EcnCodepoint::Ce;
+        // Refresh idle only after authentication AND deduplication (RFC 9000
+        // §10.1), so a recorded valid packet cannot keep a silent peer alive.
         self.last_recv_time = Some(now);
         if let Some((dcid, keys)) = pending_initial {
             self.initial_dcid = dcid;
@@ -2761,11 +3555,6 @@ impl Connection {
                 self.dcid = scid;
                 self.peer_cid_adopted = true;
             }
-        }
-
-        // Drop a duplicate (replayed) packet without reprocessing it.
-        if !self.spaces[space].recv.insert(header.packet_number()) {
-            return Ok(());
         }
 
         // Fold this authenticated, non-duplicate packet's ECN codepoint into the
@@ -2809,8 +3598,8 @@ impl Connection {
         // a TERMINATED ParallaX<->ParallaX tunnel (we are a `Connection`), never a
         // spliced real-origin flow (those are forwarded verbatim as a `SpliceFlow`
         // and never decoded). This is what makes the parser's deliberate omissions
-        // sound — unknown/GREASE/DATAGRAM frames as a hard decode error and no 1-RTT
-        // key-update handling would be fingerprints/interop breaks against a real
+        // sound — unknown/GREASE/DATAGRAM frames as a hard decode error would be
+        // fingerprints/interop breaks against a real
         // origin, but a ParallaX peer never sends them. See frame.rs's invariant note
         // before pointing this path at any non-ParallaX peer.
         let mut frames = Iter::new(&payload);
@@ -2819,25 +3608,13 @@ impl Connection {
             let frame = frame.map_err(|e| {
                 transport_error(0x07, frame_type, format!("frame decode failed: {e:?}"))
             })?;
-            // RFC 9000 §12.4/§12.5: Initial and Handshake packets may carry only
-            // PADDING, PING, ACK, CRYPTO, and a transport CONNECTION_CLOSE (0x1c).
-            // Any other frame is a PROTOCOL_VIOLATION. This matters because Initial
-            // keys are publicly derivable (RFC 9001 §5.2), so an on-path attacker
-            // can forge an Initial that AEAD-opens; without this gate it could inject
-            // STREAM / MAX_DATA / RESET_STREAM etc. straight into the connection's
-            // data plane. The packet is dropped (Err) rather than acted on.
-            if matches!(space, SPACE_INITIAL | SPACE_HANDSHAKE)
-                && !matches!(
-                    frame,
-                    Frame::Padding(_) | Frame::Ping | Frame::Ack(_) | Frame::Crypto { .. }
-                )
-                && !matches!(frame, Frame::Close(ref c) if !c.application)
-            {
-                return Err(transport_error(
-                    0x0a,
-                    frame_type,
-                    "frame type not permitted in Initial/Handshake space",
-                ));
+            // A driver may ignore a handshake processing error. Make rejection
+            // terminal before returning; neither this frame nor later frames
+            // (including in another datagram) may then mutate the connection.
+            // Earlier legal frames and authenticated packet metadata stay committed.
+            if !frame_permitted(pspace, self.side, frame_type) {
+                self.close_transport(0x0a, frame_type, b"frame not permitted");
+                return Err(transport_error(0x0a, frame_type, "frame not permitted"));
             }
             match frame {
                 Frame::Crypto { offset, data } => {
@@ -2912,7 +3689,7 @@ impl Connection {
                     self.send_max_streams[kind] = self.send_max_streams[kind].max(max);
                 }
                 Frame::Ack(ack) => self
-                    .recv_ack(space, &ack, now)
+                    .recv_ack(space, &ack, receive_generation, now)
                     .map_err(|error| with_frame_type(error, frame_type))?,
                 Frame::HandshakeDone => {
                     ack_eliciting = true;
@@ -2956,10 +3733,10 @@ impl Connection {
         if self.spaces[space].recv.largest() == Some(header.packet_number()) {
             self.spaces[space].largest_recv_time = Some(now);
         }
-        if ack_eliciting {
-            self.spaces[space].ack_pending = true;
-        }
+        self.schedule_ack(space, ack_eliciting, immediate_ack, now);
+        self.prevalidate_peer_transport_params()?;
         self.pump_write();
+        self.apply_authenticated_peer_ack_params()?;
         self.maybe_queue_handshake_done();
         Ok(())
     }
@@ -2985,7 +3762,13 @@ impl Connection {
     /// packets, fold one RTT sample (largest newly acked + an ack-eliciting packet),
     /// feed the congestion controller, then run loss detection and queue any lost
     /// CRYPTO/STREAM bytes for resend.
-    fn recv_ack(&mut self, space: usize, ack: &Ack, now: Instant) -> Result<(), QuicTlsError> {
+    fn recv_ack(
+        &mut self,
+        space: usize,
+        ack: &Ack,
+        receive_generation: Option<u64>,
+        now: Instant,
+    ) -> Result<(), QuicTlsError> {
         // RFC 9000 §13.1: a peer must never acknowledge a packet number we never
         // sent. Reject such an ACK (PROTOCOL_VIOLATION) before on_ack runs — it would
         // otherwise advance largest_acked past anything sent, and the next loss
@@ -2995,6 +3778,21 @@ impl Connection {
             return Err(QuicTlsError::Protocol(
                 "ACK acknowledges a packet number that was never sent".into(),
             ));
+        }
+        if let Some(generation) = receive_generation {
+            let was_acked = self.key_phase.tx_acked;
+            for &(low, high) in &ack.ranges {
+                // Old-key ACKs cannot confirm a packet sent with newer keys.
+                if generation < self.key_phase.tx
+                    && self.key_phase.tx_first.is_some_and(|first| high >= first)
+                {
+                    return Err(transport_error(0x0e, 0, "old-key ACK for updated packet"));
+                }
+                self.key_phase.confirm(generation, low, high);
+            }
+            if !was_acked && self.key_phase.tx_acked && self.key_phase.tx > 0 {
+                self.next_update_at = Some(now + self.drain_duration());
+            }
         }
         let newly = self.spaces[space].sent.on_ack(ack.largest, &ack.ranges);
         if newly.is_empty() {
@@ -3062,16 +3860,16 @@ impl Connection {
             self.pmtud.on_full_size_acked();
         }
         if let (Some(sent_at), true) = (largest_time, any_ack_eliciting) {
-            // ACK delay applies only to the Application space (RFC 9002 §5.3); the
-            // peer MUST send 0 for Initial/Handshake. Clamp to max_ack_delay so a
-            // peer cannot report a huge ack_delay to deflate our smoothed RTT (and
-            // thus trigger premature PTO/loss). RFC 9002 §5.3.
-            let ack_delay = if space == SPACE_DATA {
-                Duration::from_micros(ack.delay.saturating_mul(1 << ACK_DELAY_EXPONENT))
-                    .min(MAX_ACK_DELAY)
-            } else {
-                Duration::ZERO
-            };
+            // The peer controls the incoming exponent/bound. Before confirmation
+            // RFC 9002 §5.3 does not clamp to max_ack_delay; min_rtt still bounds
+            // adjustment in RttEstimator. Our outgoing ACK contract stays 3/25ms.
+            let ack_delay = ack_delay_for_recovery(
+                ack.delay,
+                self.peer_ack_delay_exponent,
+                space,
+                self.handshake_confirmed,
+                self.peer_max_ack_delay,
+            );
             self.rtt
                 .update(ack_delay, now.saturating_duration_since(sent_at));
         }
@@ -3660,6 +4458,295 @@ impl Connection {
     }
 }
 
+#[cfg(kani)]
+mod packet_guard_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn decoded_frame_admission_matrix() {
+        let level: u8 = kani::any();
+        let server: bool = kani::any();
+        let frame_type: u8 = kani::any();
+        kani::assume(level < 4 && frame_type <= 0x1e);
+        let space = match level {
+            0 => PacketSpace::Initial,
+            1 => PacketSpace::Handshake,
+            2 => PacketSpace::ZeroRtt,
+            _ => PacketSpace::OneRtt,
+        };
+        let side = if server { Side::Server } else { Side::Client };
+        // Independent finite table of decoded codepoints. Unknown frame errors
+        // and client stateless 0-RTT rejection precede this shipping predicate.
+        let allowed: u32 = match level {
+            0 | 1 => 0x1000_004f,
+            2 => 0x35ff_ff33,
+            _ if server => 0x3fff_ff7f,
+            _ => 0x7fff_ffff,
+        };
+        assert_eq!(
+            frame_permitted(space, side, frame_type as u64),
+            allowed & (1 << frame_type) != 0
+        );
+    }
+
+    fn assert_peer_ack_decoding_for_exponent(exponent: u32) {
+        let raw: u64 = kani::any();
+        kani::assume(raw <= super::super::varint::MAX);
+        let decoded = decoded_ack_delay(raw, exponent);
+        let micros = (raw as u128) * (1u128 << exponent);
+        assert_eq!(decoded.as_secs() as u128, micros / 1_000_000);
+        assert_eq!(decoded.subsec_micros() as u128, micros % 1_000_000);
+        assert_eq!(decoded.subsec_nanos() % 1_000, 0);
+    }
+
+    macro_rules! peer_ack_decoder_case {
+        ($name:ident, $exponent:literal) => {
+            #[kani::proof]
+            #[kani::solver(z3)]
+            fn $name() {
+                assert_peer_ack_decoding_for_exponent($exponent);
+            }
+        };
+    }
+
+    // These independent proof cases exhaust the finite exponent domain. Every
+    // case retains the complete 62-bit raw domain and the real decoder/checks.
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_00, 0);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_01, 1);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_02, 2);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_03, 3);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_04, 4);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_05, 5);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_06, 6);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_07, 7);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_08, 8);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_09, 9);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_10, 10);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_11, 11);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_12, 12);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_13, 13);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_14, 14);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_15, 15);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_16, 16);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_17, 17);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_18, 18);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_19, 19);
+    peer_ack_decoder_case!(peer_ack_decoding_exponent_20, 20);
+
+    #[kani::proof]
+    fn peer_ack_recovery_caps_only_confirmed_data() {
+        // Policy accepts any canonical Duration; decoding is a separate proof.
+        let seconds: u64 = kani::any();
+        let nanos: u32 = kani::any();
+        let space: usize = kani::any();
+        let confirmed: bool = kani::any();
+        let max_ms: u16 = kani::any();
+        kani::assume(nanos < 1_000_000_000);
+        kani::assume(space <= SPACE_DATA && max_ms < (1 << 14));
+        let peer_max = Duration::from_millis(max_ms as u64);
+        let decoded = Duration::new(seconds, nanos);
+        let actual = cap_decoded_peer_ack_delay(decoded, space, confirmed, peer_max);
+        if space != SPACE_DATA {
+            assert_eq!(actual, Duration::ZERO);
+        } else if confirmed {
+            assert_eq!(actual, decoded.min(peer_max));
+        } else {
+            assert_eq!(actual, decoded);
+        }
+    }
+
+    #[kani::proof]
+    fn peer_ack_pto_scope_requires_confirmation_only_for_data() {
+        let space: usize = kani::any();
+        let confirmed: bool = kani::any();
+        let max_ms: u16 = kani::any();
+        kani::assume(space <= SPACE_DATA && max_ms < (1 << 14));
+        let peer_max = Duration::from_millis(max_ms as u64);
+        assert_eq!(
+            pto_space_eligible(space, confirmed),
+            space != SPACE_DATA || confirmed
+        );
+        let extra = peer_ack_delay_for_pto(space, confirmed, peer_max);
+        if space == SPACE_DATA && confirmed {
+            assert_eq!(extra, peer_max);
+        } else {
+            assert_eq!(extra, Duration::ZERO);
+        }
+    }
+
+    #[kani::proof]
+    fn ack_count_accepts_first_second_and_immediate_packets_without_ack_of_ack() {
+        let count: u8 = kani::any();
+        kani::assume(count <= 2);
+        let immediate: bool = kani::any();
+        assert_eq!(ack_count_after_packet(count, false, immediate), count);
+        assert!(ack_count_after_packet(count, true, immediate) <= 2);
+        assert_eq!(ack_count_after_packet(0, true, false), 1);
+        assert!(!ack_count_due(1, false));
+        assert!(ack_count_due(1, true));
+        assert!(ack_count_due(ack_count_after_packet(1, true, false), false));
+        assert!(ack_count_due(ack_count_after_packet(0, true, true), false));
+        assert!(!ack_count_due(0, true));
+    }
+
+    #[kani::proof]
+    fn ack_delay_encoding_is_varint_bounded_and_does_not_clip_max_ack_delay() {
+        let seconds: u64 = kani::any();
+        let nanos: u32 = kani::any();
+        kani::assume(nanos < 1_000_000_000);
+        let elapsed = Duration::new(seconds, nanos);
+        let encoded = encoded_ack_delay(elapsed);
+        assert!(encoded < (1u64 << 62));
+        assert_eq!(encoded_ack_delay(Duration::from_millis(40)), 5_000);
+        assert_eq!(encoded_ack_delay(Duration::ZERO), 0);
+    }
+
+    fn arbitrary_phase() -> KeyPhaseState {
+        KeyPhaseState {
+            tx: kani::any(),
+            rx: kani::any(),
+            tx_first: kani::any(),
+            tx_last: kani::any(),
+            tx_acked: kani::any(),
+            rx_min: kani::any(),
+            rx_max: kani::any(),
+            previous_max: kani::any(),
+            update_ack_pending: kani::any(),
+        }
+    }
+
+    #[kani::proof]
+    fn key_phase_commit_requires_authenticated_fresh_ordered_packet() {
+        let mut state = arbitrary_phase();
+        let before = state;
+        let pn: u64 = kani::any();
+        let authenticated: bool = kani::any();
+        let fresh: bool = kani::any();
+        let kind: u8 = kani::any();
+        let generation = match kind {
+            0 => ReadGeneration::Previous,
+            1 => ReadGeneration::Current,
+            2 => ReadGeneration::Next,
+            _ => ReadGeneration::Unavailable,
+        };
+        let valid = state.valid_receive(generation, pn);
+        let committed = state.commit_receive(generation, pn, authenticated, fresh);
+        assert_eq!(committed, authenticated && fresh && valid);
+        if !committed {
+            assert_eq!(state, before);
+        } else {
+            assert_eq!(state.tx, before.tx);
+            assert_eq!(state.tx_acked, before.tx_acked);
+            if generation == ReadGeneration::Next {
+                assert!(before.rx < u64::MAX);
+                assert_eq!(state.rx, before.rx + 1);
+                assert_eq!(state.rx_min, Some(pn));
+                assert_eq!(state.rx_max, Some(pn));
+                assert!(state.update_ack_pending);
+            } else {
+                assert_eq!(state.rx, before.rx);
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn key_phase_expected_response_is_accepted_but_unsolicited_second_update_is_not() {
+        let rx: u64 = kani::any();
+        let frontier: u64 = kani::any();
+        let pn: u64 = kani::any();
+        kani::assume(rx < u64::MAX && frontier < pn);
+        let mut state = KeyPhaseState {
+            tx: rx + 1,
+            rx,
+            rx_min: Some(frontier),
+            rx_max: Some(frontier),
+            update_ack_pending: true,
+            ..KeyPhaseState::default()
+        };
+        assert!(state.commit_receive(ReadGeneration::Next, pn, true, true));
+        assert_eq!(state.rx, rx + 1);
+        assert_eq!(state.tx, state.rx);
+        assert_eq!(state.rx_min, Some(pn));
+        assert!(state.update_ack_pending);
+        let before = state;
+        // No local initiation and no ACK of this peer generation: even a
+        // correctly ordered, authenticated second update must remain rejected.
+        if let Some(next_pn) = pn.checked_add(1) {
+            assert!(!state.commit_receive(ReadGeneration::Next, next_pn, true, true));
+            assert_eq!(state, before);
+        }
+    }
+
+    #[kani::proof]
+    fn key_phase_active_update_requires_confirmation_ack_and_checked_generation() {
+        let state = arbitrary_phase();
+        let confirmed: bool = kani::any();
+        let next = state.active_successor(confirmed);
+        if let Some(next) = next {
+            assert!(confirmed && state.tx_acked && state.tx == state.rx);
+            assert!(state.tx < u64::MAX);
+            assert_eq!(next, state.tx + 1);
+        } else {
+            assert!(!confirmed || !state.tx_acked || state.tx != state.rx || state.tx == u64::MAX);
+        }
+    }
+
+    #[kani::proof]
+    fn key_phase_ack_must_cover_actual_current_generation_and_use_new_keys() {
+        let mut state = arbitrary_phase();
+        let before = state;
+        let receive_generation: u64 = kani::any();
+        let low: u64 = kani::any();
+        let high: u64 = kani::any();
+        let accepted = state.confirm(receive_generation, low, high);
+        if accepted {
+            assert!(receive_generation >= state.tx);
+            assert!(low <= high);
+            assert!(before.tx_first.is_some() && before.tx_last.is_some());
+            assert!(low <= before.tx_last.unwrap() && high >= before.tx_first.unwrap());
+            assert!(state.tx_acked);
+        } else {
+            assert_eq!(state, before);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(40)] // Covers the fixed 34-byte exhaustion reason, with unwinding assertions.
+    fn exhausted_key_cancels_protected_close_and_preserves_existing_reason() {
+        let sealed: u64 = kani::any();
+        let limit: u64 = kani::any();
+        let code: u64 = kani::any();
+        let frame_type: u64 = kani::any();
+        let kind: u8 = kani::any();
+        let mut closed = match kind {
+            0 => None,
+            1 => Some(CloseReason::LocalApp(code, Vec::new())),
+            2 => Some(CloseReason::LocalTransport(code, frame_type, Vec::new())),
+            3 => Some(CloseReason::PeerApp(code, Vec::new())),
+            4 => Some(CloseReason::PeerTransport(code, frame_type, Vec::new())),
+            _ => Some(CloseReason::IdleTimeout),
+        };
+        let mut pending = if kani::any() {
+            Some((code, Some(frame_type), Vec::new()))
+        } else {
+            None
+        };
+        let closed_before = closed.clone();
+        let pending_before = pending.clone();
+        close_on_exhausted_data_key(sealed, limit, &mut closed, &mut pending);
+        if sealed >= limit {
+            assert!(closed.is_some());
+            assert!(pending.is_none());
+            if closed_before.is_some() {
+                assert_eq!(closed, closed_before);
+            }
+        } else {
+            assert_eq!(closed, closed_before);
+            assert_eq!(pending, pending_before);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3731,6 +4818,47 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(frames_back, frames);
+    }
+
+    #[test]
+    fn selected_packet_key_opens_without_removing_header_protection_twice() {
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let keys = DirectionalKeys {
+                packet: PacketKey::from_secret(suite, &vec![0x22; suite.hash_len()]).unwrap(),
+                header: HeaderProtectionKey::from_secret(suite, &vec![0x11; suite.hash_len()])
+                    .unwrap(),
+            };
+            let header = Header::Short {
+                spin: false,
+                key_phase: true,
+                dcid: ConnectionId::new(&[]),
+                packet_number: 17,
+                pn_len: 1,
+            };
+            let frames = [Frame::Ping, Frame::Padding(20)];
+            let mut packet = seal_packet(&keys, header, &frames);
+            let opened = unprotect_packet_header(&keys.header, &mut packet, 0, None).unwrap();
+            assert!(matches!(
+                opened.header,
+                Header::Short {
+                    key_phase: true,
+                    ..
+                }
+            ));
+            let unprotected_header = packet[..opened.aad_len].to_vec();
+            let range = open_packet_payload(&keys.packet, &mut packet, &opened).unwrap();
+            assert_eq!(&packet[..opened.aad_len], &unprotected_header);
+            assert_eq!(
+                Iter::new(&packet[range])
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                frames
+            );
+        }
     }
 
     #[test]
@@ -3969,7 +5097,23 @@ mod tests {
         client.cancel_stream(cancelled, 0x10c);
         assert_eq!(client.next_stream_to_reset(), None, "control goes first");
         let now = Instant::now();
-        client.poll_transmit(now).expect("control stream packet");
+        // Handshake ACKs can become due before the queued STREAM is selected.
+        // Deliver those packets too, stopping as soon as cancellation is ready.
+        for step in 0..64 {
+            let sent_at = now + Duration::from_millis(step);
+            if let Some(packet) = client.poll_transmit(sent_at) {
+                server.handle_datagram(&packet, sent_at).unwrap();
+            }
+            if client.next_stream_to_reset().is_some() {
+                break;
+            }
+        }
+        assert_eq!(server.read_stream(control), b"control settings");
+        assert_eq!(
+            server.stream_reset(cancelled),
+            None,
+            "control precedes reset"
+        );
         assert_eq!(client.next_stream_to_reset(), Some(cancelled));
     }
 
@@ -4128,11 +5272,17 @@ mod tests {
         );
         // The next 1-RTT keys MUST be ready once the handshake completes.
         assert!(
-            client.next_1rtt_keys().is_some(),
+            client
+                .next_packet_keys
+                .as_ref()
+                .is_some_and(|next| next.local.is_some() && next.remote.is_some()),
             "client 1-RTT key update ready"
         );
         assert!(
-            server.next_1rtt_keys().is_some(),
+            server
+                .next_packet_keys
+                .as_ref()
+                .is_some_and(|next| next.local.is_some() && next.remote.is_some()),
             "server 1-RTT key update ready"
         );
     }
@@ -4175,7 +5325,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_rtt_early_data_flows_to_the_server() {
+    fn quic_guard_regression_zero_rtt_reflection_and_server_delivery() {
         let stek = Zeroizing::new([0x44u8; 32]);
         let cover = || Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
 
@@ -4230,6 +5380,36 @@ mod tests {
         while let Some(dg) = rclient.poll_transmit(now) {
             if dg[0] & 0x80 != 0 && dg[0] & 0x30 == 0x10 {
                 saw_zero_rtt = true;
+                assert_eq!(
+                    rclient.data_packets_sealed, 0,
+                    "early data has a separate key budget"
+                );
+                assert!(rclient.zero_rtt_packets_sealed > 0);
+                let last_recv = rclient.last_recv_time;
+                let received = rclient.spaces[SPACE_DATA].recv.to_ack(0);
+                let largest = rclient.spaces[SPACE_DATA].recv.largest();
+                let ack_pending = rclient.spaces[SPACE_DATA].ack_pending;
+                let largest_time = rclient.spaces[SPACE_DATA].largest_recv_time;
+                let ecn = rclient.spaces[SPACE_DATA].recv_ecn;
+                // Reflect the actual emitted early-data ciphertext unchanged,
+                // before delivering it to the intended server.
+                rclient
+                    .handle_datagram_ecn(&dg, EcnCodepoint::Ce, now + Duration::from_secs(1))
+                    .unwrap();
+                assert!(
+                    rclient.read_stream(RELAY_STREAM_ID).is_empty(),
+                    "a client must never read its own reflected 0-RTT bytes"
+                );
+                assert_eq!(rclient.last_recv_time, last_recv);
+                assert_eq!(rclient.spaces[SPACE_DATA].recv.to_ack(0), received);
+                assert_eq!(rclient.spaces[SPACE_DATA].recv.largest(), largest);
+                assert_eq!(rclient.spaces[SPACE_DATA].ack_pending, ack_pending);
+                assert_eq!(rclient.spaces[SPACE_DATA].largest_recv_time, largest_time);
+                let after = rclient.spaces[SPACE_DATA].recv_ecn;
+                assert_eq!(
+                    (after.ect0, after.ect1, after.ce),
+                    (ecn.ect0, ecn.ect1, ecn.ce)
+                );
             }
             rserver.handle_datagram(&dg, now).unwrap();
         }
@@ -4483,6 +5663,2379 @@ mod tests {
             }
             if !moved {
                 break;
+            }
+        }
+    }
+
+    /// Explicitly advance a caller-owned monotonic clock while ACK debt remains.
+    /// A lack of output at a fixed instant is not treated as quiescence.
+    fn drive_acked_at(a: &mut Connection, b: &mut Connection, now: &mut Instant) {
+        for _ in 0..32 {
+            drive_at(a, b, *now);
+            let next = [a.pending_data_ack_deadline(), b.pending_data_ack_deadline()]
+                .into_iter()
+                .flatten()
+                .min();
+            let Some(next) = next else {
+                return;
+            };
+            *now = (*now).max(next);
+            a.handle_timeout(*now);
+            b.handle_timeout(*now);
+        }
+        panic!("ACK debt must settle in bounded timer steps");
+    }
+
+    fn connected_pair() -> (Connection, Connection) {
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x62; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let mut server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x63; 4]),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(client.handshake_confirmed && server.handshake_confirmed);
+        (client, server)
+    }
+
+    fn handshake_start(suite: CipherSuite) -> (Connection, Connection) {
+        let client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x71; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let mut tls = ServerHandshake::new(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            None,
+        )
+        .unwrap();
+        tls.set_test_suite(suite);
+        let mut server = Connection::new_inner(
+            Side::Server,
+            Box::new(tls),
+            ConnectionId::new(&[]),
+            ConnectionId::new(&[]),
+            ConnectionId::new(&[0x72; 4]),
+            1,
+            3,
+        );
+        server.recv_max_streams_sent = [MAX_PEER_STREAMS as u64; 2];
+        (client, server)
+    }
+
+    fn handshake_start_with_transport_params(
+        client_tp: Vec<u8>,
+        server_tp: Vec<u8>,
+    ) -> (Connection, Connection) {
+        let dcid = ConnectionId::new(&[0x73; 8]);
+        let tls = ClientHandshake::new(
+            client_config(),
+            QUIC_VERSION_V1,
+            "example.com",
+            client_tp,
+            dcid.as_slice(),
+        )
+        .unwrap();
+        let mut client = Connection::new_inner(
+            Side::Client,
+            Box::new(tls),
+            dcid,
+            dcid,
+            ConnectionId::new(&[]),
+            0,
+            2,
+        );
+        client.spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
+        client.pump_write();
+        let server = Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp,
+            ConnectionId::new(&[0x74; 4]),
+        )
+        .unwrap();
+        (client, server)
+    }
+
+    fn with_ack_transport_params(mut blob: Vec<u8>, exponent: u64, max_delay: u64) -> Vec<u8> {
+        for (id, value) in [(0x0a, exponent), (0x0b, max_delay)] {
+            super::super::varint::encode(id, &mut blob);
+            super::super::varint::encode(super::super::varint::size(value) as u64, &mut blob);
+            super::super::varint::encode(value, &mut blob);
+        }
+        blob
+    }
+
+    #[test]
+    fn peer_ack_parameters_are_applied_by_both_authenticated_handshakes_without_streams() {
+        let client_tp = with_ack_transport_params(
+            TransportParameters::safari_client(&[]).encode_safari_client(),
+            6,
+            7,
+        );
+        let server_tp = with_ack_transport_params(server_tp(), 10, 100);
+        let (mut client, mut server) = handshake_start_with_transport_params(client_tp, server_tp);
+        drive(&mut client, &mut server);
+        assert!(client.handshake_confirmed && server.handshake_confirmed);
+        assert!(client.streams.is_empty() && server.streams.is_empty());
+        assert_eq!(client.peer_ack_delay_exponent, 10);
+        assert_eq!(client.peer_max_ack_delay, Duration::from_millis(100));
+        assert_eq!(server.peer_ack_delay_exponent, 6);
+        assert_eq!(server.peer_max_ack_delay, Duration::from_millis(7));
+        assert!(client.peer_ack_params_applied && server.peer_ack_params_applied);
+        for (connection, peer_max) in [(&client, 100), (&server, 7)] {
+            for space in [SPACE_INITIAL, SPACE_HANDSHAKE] {
+                assert_eq!(connection.pto_duration(space), connection.rtt.pto_base());
+            }
+            assert_eq!(
+                connection.pto_duration(SPACE_DATA),
+                connection.rtt.pto_base() + Duration::from_millis(peer_max)
+            );
+            assert_eq!(
+                connection.drain_duration(),
+                3 * connection.pto_duration(SPACE_DATA)
+            );
+        }
+    }
+
+    fn assert_encrypted_ack_rtt(
+        sender: &mut Connection,
+        peer: &mut Connection,
+        now: Instant,
+        raw_delay: u64,
+        expected_delay: Duration,
+    ) {
+        sender.rtt = RttEstimator::new();
+        sender.rtt.update(Duration::ZERO, Duration::from_millis(10));
+        let mut expected = sender.rtt.clone();
+        expected.update(expected_delay, Duration::from_millis(50));
+        let pn = sender.spaces[SPACE_DATA].send.peek();
+        let packet = sender.seal_data_packet(
+            &[Frame::Ping, Frame::Padding(3)],
+            true,
+            SentContent::default(),
+            now,
+        );
+        peer.handle_datagram(&packet, now + Duration::from_millis(5))
+            .unwrap();
+        let now = now + Duration::from_millis(50);
+        let ack = peer.seal_data_packet(
+            &[
+                Frame::Ack(Ack {
+                    largest: pn,
+                    delay: raw_delay,
+                    ranges: vec![(pn, pn)],
+                    ecn: None,
+                }),
+                Frame::Padding(3),
+            ],
+            false,
+            SentContent::default(),
+            now,
+        );
+        sender.handle_datagram(&ack, now).unwrap();
+        assert_eq!(sender.rtt.smoothed(), expected.smoothed());
+        assert_eq!(sender.rtt.rttvar(), expected.rttvar());
+    }
+
+    #[test]
+    fn peer_ack_parameters_decode_real_encrypted_acks_for_both_roles() {
+        let client_tp = with_ack_transport_params(
+            TransportParameters::safari_client(&[]).encode_safari_client(),
+            6,
+            7,
+        );
+        let server_tp = with_ack_transport_params(server_tp(), 10, 100);
+        let (mut client, mut server) = handshake_start_with_transport_params(client_tp, server_tp);
+        let mut now = Instant::now();
+        drive_acked_at(&mut client, &mut server, &mut now);
+        assert_encrypted_ack_rtt(
+            &mut client,
+            &mut server,
+            now,
+            20,
+            Duration::from_micros(20_480),
+        );
+        now += Duration::from_millis(100);
+        assert_encrypted_ack_rtt(&mut server, &mut client, now, 320, Duration::from_millis(7));
+    }
+
+    #[test]
+    fn peer_max_ack_delay_caps_rtt_only_after_confirmation() {
+        let client_tp = TransportParameters::safari_client(&[]).encode_safari_client();
+        let server_tp = with_ack_transport_params(server_tp(), 3, 5);
+        let (mut client, mut server) = handshake_start_with_transport_params(client_tp, server_tp);
+        let mut now = Instant::now();
+        while let Some(packet) = client.poll_transmit(now) {
+            server.handle_datagram(&packet, now).unwrap();
+        }
+        while let Some(packet) = server.poll_transmit(now) {
+            client.handle_datagram(&packet, now).unwrap();
+        }
+        while let Some(packet) = client.poll_transmit(now) {
+            server.handle_datagram(&packet, now).unwrap();
+        }
+        assert!(server.handshake_confirmed && !client.handshake_confirmed);
+        assert_eq!(client.peer_max_ack_delay, Duration::from_millis(5));
+        assert_encrypted_ack_rtt(
+            &mut client,
+            &mut server,
+            now,
+            5_000,
+            Duration::from_millis(40),
+        );
+        assert!(!client.handshake_confirmed);
+        now += Duration::from_millis(100);
+        drive_acked_at(&mut client, &mut server, &mut now);
+        assert!(client.handshake_confirmed);
+        assert_encrypted_ack_rtt(
+            &mut client,
+            &mut server,
+            now,
+            5_000,
+            Duration::from_millis(5),
+        );
+    }
+
+    #[test]
+    fn invalid_peer_ack_parameters_fail_atomically_before_coalesced_one_rtt_data() {
+        let client_base = TransportParameters::safari_client(&[]).encode_safari_client();
+        let server_base = server_tp();
+        let invalid_parameters = [
+            with_ack_transport_params(Vec::new(), 21, 25),
+            with_ack_transport_params(Vec::new(), 3, 1 << 14),
+            vec![0x0a, 0x00],
+            vec![0x0b, 0x02, 0x01, 0x01],
+            vec![0x0a, 0x01, 0x03, 0x0a, 0x01, 0x03],
+        ];
+        for receiver_is_client in [false, true] {
+            for invalid in &invalid_parameters {
+                let mut client_tp = client_base.clone();
+                let mut server_tp = server_base.clone();
+                if receiver_is_client {
+                    server_tp.extend(invalid);
+                } else {
+                    client_tp.extend(invalid);
+                }
+                let (mut client, mut server) =
+                    handshake_start_with_transport_params(client_tp, server_tp);
+                let now = Instant::now();
+                let mut initial_error = None;
+                while let Some(packet) = client.poll_transmit(now) {
+                    if let Err(error) = server.handle_datagram(&packet, now) {
+                        initial_error = Some(error);
+                        break;
+                    }
+                }
+                if !receiver_is_client {
+                    // Invalid CH parameters now fail on the complete Initial
+                    // CRYPTO input. Do not keep driving a rejected handshake
+                    // merely to manufacture later authenticated STREAM keys.
+                    assert_transport_error(initial_error.expect("invalid CH rejected early"), 0x08);
+                    assert!(server.is_handshaking());
+                    assert!(!server.peer_transport_params_prevalidated);
+                    assert!(!server.peer_ack_params_applied);
+                    assert_eq!(server.peer_ack_delay_exponent, ACK_DELAY_EXPONENT);
+                    assert_eq!(server.peer_max_ack_delay, MAX_ACK_DELAY);
+                    assert!(server.accept_uni().is_none());
+                    assert!(server.read_stream(2).is_empty());
+                    assert!(server.spaces[SPACE_DATA].recv.largest().is_none());
+                    assert!(server.spaces[SPACE_INITIAL].keys.is_some());
+                    assert!(server.spaces[SPACE_HANDSHAKE].keys.is_none());
+                    assert!(server.spaces[SPACE_DATA].keys.is_none());
+                    assert_invalid_parameter_close(
+                        &mut client,
+                        &mut server,
+                        PacketSpace::Initial,
+                        now,
+                    );
+                    continue;
+                }
+                assert!(initial_error.is_none());
+                assert!(!server.peer_ack_params_applied);
+                assert_eq!(server.peer_ack_delay_exponent, ACK_DELAY_EXPONENT);
+                assert_eq!(server.peer_max_ack_delay, MAX_ACK_DELAY);
+                let (sender, receiver, stream) = if receiver_is_client {
+                    (&mut server, &mut client, 3)
+                } else {
+                    while let Some(packet) = server.poll_transmit(now) {
+                        client.handle_datagram(&packet, now).unwrap();
+                    }
+                    (&mut client, &mut server, 2)
+                };
+                let mut flight = Vec::new();
+                while let Some(packet) = sender.poll_transmit(now) {
+                    // A short-header packet must be last in a valid coalesced
+                    // datagram. Hold control-only 1-RTT output; append one STREAM
+                    // packet after the complete long-header handshake flight.
+                    if packet::first_packet_space(&packet) != Some(PacketSpace::OneRtt) {
+                        flight.extend(packet);
+                    }
+                }
+                let data = sender.seal_data_packet(
+                    &[Frame::Stream {
+                        id: stream,
+                        offset: 0,
+                        fin: false,
+                        data: b"must not publish",
+                    }],
+                    true,
+                    SentContent::default(),
+                    now,
+                );
+                flight.extend(data);
+                let result = receiver.handle_datagram(&flight, now);
+                assert!(
+                    matches!(
+                        &result,
+                        Err(QuicTlsError::Transport {
+                            error_code: 0x08,
+                            ..
+                        })
+                    ),
+                    "client={receiver_is_client}, invalid={invalid:?}, result={result:?}"
+                );
+                // Complete invalid EE input may now fail before Finished is
+                // consumed. Neither early validation nor authenticated adoption
+                // is allowed to commit state on that failure.
+                assert!(!receiver.peer_transport_params_prevalidated);
+                assert!(!receiver.peer_ack_params_applied);
+                assert_eq!(receiver.peer_ack_delay_exponent, ACK_DELAY_EXPONENT);
+                assert_eq!(receiver.peer_max_ack_delay, MAX_ACK_DELAY);
+                assert!(receiver.accept_uni().is_none());
+                assert!(receiver.read_stream(stream).is_empty());
+                assert!(receiver.spaces[SPACE_DATA].recv.largest().is_none());
+                assert_invalid_parameter_close(sender, receiver, PacketSpace::Handshake, now);
+            }
+        }
+    }
+
+    #[test]
+    fn remembered_ack_parameters_are_not_applied_before_the_new_authenticated_handshake() {
+        let stek = Zeroizing::new([0x49; 32]);
+        let cover = || Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x75; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let mut server = Connection::new_server_with_stek(
+            cover(),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            with_ack_transport_params(server_tp(), 10, 100),
+            ConnectionId::new(&[0x76; 4]),
+            Some(stek.clone()),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        let ticket = client.take_session_ticket(1_000_000).unwrap();
+        assert_eq!(
+            TransportParameters::read(&ticket.peer_transport_params)
+                .unwrap()
+                .ack_delay_exponent,
+            10
+        );
+        let mut resumed = Connection::new_client_resumption(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x77; 8]),
+            ConnectionId::new(&[]),
+            &ticket,
+            1_001_000,
+        )
+        .unwrap();
+        assert!(!resumed.peer_ack_params_applied);
+        assert_eq!(resumed.peer_ack_delay_exponent, 3);
+        assert_eq!(resumed.peer_max_ack_delay, Duration::from_millis(25));
+        assert!(
+            resumed.send_max_data > 0,
+            "remembered flow credit remains usable"
+        );
+        let mut peer = Connection::new_server_with_stek(
+            cover(),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            with_ack_transport_params(server_tp(), 6, 7),
+            ConnectionId::new(&[0x78; 4]),
+            Some(stek),
+        )
+        .unwrap();
+        resumed.send_stream(RELAY_STREAM_ID, b"permitted early data");
+        let now = Instant::now();
+        while let Some(packet) = resumed.poll_transmit(now) {
+            peer.handle_datagram(&packet, now).unwrap();
+        }
+        assert!(peer.is_handshaking() && peer.zero_rtt_keys_installed());
+        assert!(!peer.peer_ack_params_applied);
+        assert_eq!(peer.read_stream(RELAY_STREAM_ID), b"permitted early data");
+        drive_at(&mut resumed, &mut peer, now);
+        assert!(resumed.peer_ack_params_applied);
+        assert_eq!(resumed.peer_ack_delay_exponent, 6);
+        assert_eq!(resumed.peer_max_ack_delay, Duration::from_millis(7));
+    }
+
+    fn ack_parameter_resumption_ticket() -> (ClientTicket, Zeroizing<[u8; 32]>) {
+        let stek = Zeroizing::new([0x4a; 32]);
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x79; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        let mut server = Connection::new_server_with_stek(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            with_ack_transport_params(server_tp(), 10, 100),
+            ConnectionId::new(&[0x7a; 4]),
+            Some(stek.clone()),
+        )
+        .unwrap();
+        drive(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        let ticket = client.take_session_ticket(1_000_000).unwrap();
+        assert_eq!(ticket.alpn, b"h3");
+        assert!(!ticket.ticket.is_empty());
+        (ticket, stek)
+    }
+
+    const ACK_PARAMETER_EARLY_DATA: &[u8] = b"early STREAM under the new ClientHello";
+
+    fn assert_invalid_parameter_close(
+        peer: &mut Connection,
+        rejected: &mut Connection,
+        expected_space: PacketSpace,
+        now: Instant,
+    ) {
+        let mut packet = rejected
+            .poll_transmit(now)
+            .expect("transport close is reachable");
+        assert_eq!(packet::first_packet_space(&packet), Some(expected_space));
+        assert_eq!(packet::long_packet_len(&packet), Some(packet.len()));
+        let original = packet.clone();
+        let space = space_index(expected_space);
+        let (_, range) = open_packet(
+            &peer.spaces[space]
+                .keys
+                .as_ref()
+                .expect("peer can read close space")
+                .remote,
+            &mut packet,
+            peer.scid.len(),
+            peer.spaces[space].recv.largest(),
+        )
+        .unwrap();
+        let frames: Vec<_> = Iter::new(&packet[range]).collect::<Result<_, _>>().unwrap();
+        let mut close_count = 0;
+        for frame in frames {
+            match frame {
+                Frame::Padding(_) => {}
+                Frame::Close(close) => {
+                    close_count += 1;
+                    assert!(!close.application);
+                    assert_eq!((close.error_code, close.frame_type), (0x08, 0x06));
+                    assert_eq!(close.reason, b"invalid peer transport parameters");
+                }
+                frame => panic!("invalid CH/EE must not flush queued CRYPTO or STREAM: {frame:?}"),
+            }
+        }
+        assert_eq!(close_count, 1);
+        peer.handle_datagram(&original, now).unwrap();
+        assert!(matches!(
+            peer.close_reason(),
+            Some(CloseReason::PeerTransport(0x08, 0x06, _))
+        ));
+        assert!(
+            rejected.poll_transmit(now).is_none(),
+            "only the terminal close is sent"
+        );
+    }
+
+    fn resumption_first_flight_with_client_transport_params(
+        ticket: &ClientTicket,
+        stek: Zeroizing<[u8; 32]>,
+        client_tp: Vec<u8>,
+        dcid_byte: u8,
+    ) -> (Connection, Connection, Vec<u8>) {
+        let dcid = ConnectionId::new(&[dcid_byte; 8]);
+        let scid = ConnectionId::new(&[]);
+        let local_tp = TransportParameters::safari_client(scid.as_slice());
+        // Rebuild the actual ClientHello with this raw TP vector. The real TLS
+        // constructor recomputes its PSK binder and 0-RTT traffic keys over that
+        // exact ClientHello; this never edits an already-authenticated flight.
+        let tls = ClientHandshake::new_resumption(
+            client_config(),
+            QUIC_VERSION_V1,
+            "example.com",
+            client_tp,
+            dcid.as_slice(),
+            ticket,
+            1_001_000,
+        )
+        .unwrap();
+        // Mirror new_client_inner, changing only the raw ClientHello TP input.
+        let mut client = Connection::new_inner(Side::Client, Box::new(tls), dcid, dcid, scid, 0, 2);
+        client.recv_max_streams_sent = [
+            local_tp.initial_max_streams_bidi,
+            local_tp.initial_max_streams_uni,
+        ];
+        client.spaces[SPACE_INITIAL].keys = Some(initial_keys(dcid.as_slice(), Side::Client));
+        client.apply_remembered_transport_params(&ticket.peer_transport_params);
+        client.pump_write();
+        assert!(client.is_handshaking() && client.zero_rtt_keys_installed());
+        assert!(client.spaces[SPACE_DATA].keys.is_none());
+        assert!(!client.peer_ack_params_applied);
+        assert_eq!(client.peer_ack_delay_exponent, ACK_DELAY_EXPONENT);
+        assert_eq!(client.peer_max_ack_delay, MAX_ACK_DELAY);
+        client.send_stream(RELAY_STREAM_ID, ACK_PARAMETER_EARLY_DATA);
+        let peer = Connection::new_server_with_stek(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            with_ack_transport_params(server_tp(), 10, 100),
+            ConnectionId::new(&[dcid_byte; 4]),
+            Some(stek),
+        )
+        .unwrap();
+        let mut flight = Vec::new();
+        let mut initial_count = 0;
+        let mut early_count = 0;
+        let now = Instant::now();
+        while let Some(datagram) = client.poll_transmit(now) {
+            match packet::first_packet_space(&datagram) {
+                Some(PacketSpace::Initial) => {
+                    assert_eq!(early_count, 0, "all Initial CRYPTO precedes 0-RTT");
+                    initial_count += 1;
+                }
+                Some(PacketSpace::ZeroRtt) => early_count += 1,
+                space => panic!("unexpected first-flight packet space: {space:?}"),
+            }
+            flight.extend(datagram);
+        }
+        assert!(initial_count > 0 && early_count > 0);
+        assert!(
+            client.is_handshaking(),
+            "no server flight or Finished was exchanged"
+        );
+        (client, peer, flight)
+    }
+
+    #[test]
+    fn invalid_new_client_ack_parameters_reject_resumption_before_coalesced_zero_rtt_stream() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let base = TransportParameters::safari_client(&[]).encode_safari_client();
+        let invalid = [
+            ("exponent21", with_ack_transport_params(Vec::new(), 21, 25)),
+            (
+                "max_delay16384",
+                with_ack_transport_params(Vec::new(), 3, 1 << 14),
+            ),
+            ("empty_exponent", vec![0x0a, 0x00]),
+            ("trailing_max_delay", vec![0x0b, 0x02, 0x01, 0x01]),
+            (
+                "duplicate_exponent",
+                vec![0x0a, 0x01, 0x03, 0x0a, 0x01, 0x03],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (index, (case, invalid_tp)) in invalid.into_iter().enumerate() {
+            let mut client_tp = base.clone();
+            client_tp.extend(invalid_tp);
+            let (mut client, mut peer, flight) =
+                resumption_first_flight_with_client_transport_params(
+                    &ticket,
+                    stek.clone(),
+                    client_tp,
+                    0x80 + index as u8,
+                );
+            // Deliver the actual Initial(s) and then 0-RTT in ONE datagram, so
+            // packet ordering cannot hide validation behind another driver turn.
+            let result = peer.handle_datagram(&flight, Instant::now());
+            let published = peer.read_stream(RELAY_STREAM_ID);
+            let accepted = peer.accept_bi();
+            let rejected = matches!(
+                &result,
+                Err(QuicTlsError::Transport {
+                    error_code: 0x08,
+                    ..
+                })
+            );
+            let default_ack = !peer.peer_ack_params_applied
+                && !peer.peer_transport_params_prevalidated
+                && peer.peer_ack_delay_exponent == ACK_DELAY_EXPONENT
+                && peer.peer_max_ack_delay == MAX_ACK_DELAY;
+            if !rejected || !published.is_empty() || accepted.is_some() || !default_ack {
+                failures.push(format!(
+                    "{case}: result={result:?}, published={published:?}, accepted={accepted:?}, \
+                     ack_applied={}, exponent={}, max_delay={:?}",
+                    peer.peer_ack_params_applied,
+                    peer.peer_ack_delay_exponent,
+                    peer.peer_max_ack_delay,
+                ));
+            }
+            if rejected {
+                assert!(peer.spaces[SPACE_INITIAL].keys.is_some());
+                assert!(peer.spaces[SPACE_HANDSHAKE].keys.is_none());
+                assert!(peer.spaces[SPACE_DATA].keys.is_none());
+                assert!(!peer.zero_rtt_keys_installed());
+                assert_invalid_parameter_close(
+                    &mut client,
+                    &mut peer,
+                    PacketSpace::Initial,
+                    Instant::now(),
+                );
+            }
+        }
+        // A valid ticket holder is already permitted to send early data. This
+        // pins the chosen invalid-TP rejection boundary, not an auth-bypass or
+        // a claim that the RFC requires all early bytes to await Finished.
+        assert!(
+            failures.is_empty(),
+            "invalid resumption TP outcomes: {failures:#?}"
+        );
+    }
+
+    fn frame_admission_resumption_pair(
+        ticket: &ClientTicket,
+        stek: Zeroizing<[u8; 32]>,
+        now: Instant,
+    ) -> (Connection, Connection) {
+        let (client, mut server, flight) = resumption_first_flight_with_client_transport_params(
+            ticket,
+            stek,
+            TransportParameters::safari_client(&[]).encode_safari_client(),
+            0x91,
+        );
+        let mut remaining = flight.as_slice();
+        while !remaining.is_empty() {
+            let length = packet::long_packet_len(remaining).unwrap();
+            let (packet, rest) = remaining.split_at(length);
+            if packet::first_packet_space(packet) == Some(PacketSpace::Initial) {
+                server.handle_datagram(packet, now).unwrap();
+            }
+            // Withhold the fixture's early STREAM. Each test seals fresh frames
+            // with the actual resumed ClientHello's installed traffic keys.
+            remaining = rest;
+        }
+        assert!(server.zero_rtt_keys_installed() && server.is_handshaking());
+        assert!(server.peer_transport_params_prevalidated);
+        assert!(server.spaces[SPACE_HANDSHAKE].keys.is_some());
+        assert!(server.spaces[SPACE_DATA].keys.is_some());
+        (client, server)
+    }
+
+    fn seal_early_frames(client: &mut Connection, frames: &[Frame], now: Instant) -> Vec<u8> {
+        assert!(client.is_handshaking() && client.zero_rtt_keys_installed());
+        let pn = client.allocate_packet_number(SPACE_DATA);
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = client.make_zero_rtt_header(pn, pn_len);
+        let packet = seal_packet(
+            &client.zero_rtt_keys.as_ref().unwrap().local,
+            header,
+            frames,
+        );
+        client.record_sent(
+            SPACE_DATA,
+            pn,
+            packet.len(),
+            true,
+            SentContent::default(),
+            now,
+        );
+        packet
+    }
+
+    #[test]
+    fn frame_admission_rejects_forbidden_zero_rtt_before_effects_and_remains_terminal() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let now = Instant::now();
+        let mut failures = Vec::new();
+        for frame_type in [0x02, 0x03, 0x06, 0x07, 0x19, 0x1b, 0x1e] {
+            let (mut client, mut server) =
+                frame_admission_resumption_pair(&ticket, stek.clone(), now);
+            // ACK a genuinely emitted server Application packet, not an unsent
+            // PN that the independent ACK-range guard would already reject.
+            server.send_stream(1, b"actual server Application packet");
+            let mut data_sent = false;
+            while let Some(packet) = server.poll_transmit(now) {
+                data_sent |= packet::first_packet_space(&packet) == Some(PacketSpace::OneRtt);
+                // Never deliver the server flight: the client must retain its
+                // actual 0-RTT keys and still be waiting for ServerHello.
+            }
+            assert!(data_sent);
+            let sent_pn = server.spaces[SPACE_DATA].send.peek() - 1;
+            let forbidden = match frame_type {
+                0x02 | 0x03 => Frame::Ack(Ack {
+                    largest: sent_pn,
+                    delay: 0,
+                    ranges: vec![(sent_pn, sent_pn)],
+                    ecn: (frame_type == 0x03).then_some(super::super::frame::EcnCounts {
+                        ect0: 0,
+                        ect1: 0,
+                        ce: 0,
+                    }),
+                }),
+                0x06 => Frame::Crypto {
+                    offset: 1,
+                    data: b"future CRYPTO",
+                },
+                0x07 => Frame::NewToken { token: b"token" },
+                0x19 => Frame::RetireConnectionId(0),
+                0x1b => Frame::PathResponse(7),
+                0x1e => Frame::HandshakeDone,
+                _ => unreachable!(),
+            };
+            let marker = Frame::Stream {
+                id: 0,
+                offset: 0,
+                fin: false,
+                data: b"must not publish",
+            };
+            let packet =
+                seal_early_frames(&mut client, &[forbidden, marker, Frame::Padding(3)], now);
+            let in_flight = server.spaces[SPACE_DATA].sent.in_flight();
+            let result = server.handle_datagram(&packet, now);
+            // Deliberately ignore the first error, as the handshake driver can.
+            let next = seal_early_frames(
+                &mut client,
+                &[Frame::Stream {
+                    id: 4,
+                    offset: 0,
+                    fin: false,
+                    data: b"later datagram",
+                }],
+                now,
+            );
+            let followup = server.handle_datagram(&next, now);
+            let first = server.read_stream(0);
+            let later = server.read_stream(4);
+            let pending = server.spaces[SPACE_DATA].crypto_pending.len();
+            let rejected = matches!(&result, Err(QuicTlsError::Transport {
+                error_code: 0x0a, frame_type: actual, ..
+            }) if *actual == frame_type);
+            if !rejected
+                || followup.is_err()
+                || !first.is_empty()
+                || !later.is_empty()
+                || pending != 0
+                || server.spaces[SPACE_DATA].sent.in_flight() != in_flight
+                || !matches!(server.close_reason(), Some(CloseReason::LocalTransport(0x0a, actual, _)) if *actual == frame_type)
+            {
+                failures.push(format!("type={frame_type:#x}, result={result:?}, followup={followup:?}, first={first:?}, later={later:?}, crypto_pending={pending}, sent_in_flight={in_flight}->{}, close={:?}", server.spaces[SPACE_DATA].sent.in_flight(), server.close_reason()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "frame admission outcomes: {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn frame_admission_server_rejects_client_only_one_rtt_frames() {
+        let now = Instant::now();
+        let mut failures = Vec::new();
+        for (frame_type, frame) in [
+            (0x07, Frame::NewToken { token: b"token" }),
+            (0x1e, Frame::HandshakeDone),
+        ] {
+            let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+            let packet = client.test_data_packet(&[
+                frame,
+                Frame::Stream {
+                    id: 0,
+                    offset: 0,
+                    fin: false,
+                    data: b"must not publish",
+                },
+            ]);
+            let result = server.handle_datagram(&packet, now);
+            let followup = client.test_data_packet(&[Frame::Stream {
+                id: 4,
+                offset: 0,
+                fin: false,
+                data: b"later datagram",
+            }]);
+            server.handle_datagram(&followup, now).unwrap();
+            let first = server.read_stream(0);
+            let later = server.read_stream(4);
+            if !matches!(&result, Err(QuicTlsError::Transport { error_code: 0x0a, frame_type: actual, .. }) if *actual == frame_type)
+                || !first.is_empty()
+                || !later.is_empty()
+                || !matches!(server.close_reason(), Some(CloseReason::LocalTransport(0x0a, actual, _)) if *actual == frame_type)
+            {
+                failures.push(format!("type={frame_type:#x}, result={result:?}, first={first:?}, later={later:?}, close={:?}", server.close_reason()));
+            }
+        }
+        assert!(failures.is_empty(), "wrong-role outcomes: {failures:#?}");
+    }
+
+    #[test]
+    fn frame_admission_close_reaches_client_before_and_after_server_flight() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let now = Instant::now();
+        for received_server_flight in [false, true] {
+            let (mut client, mut server) =
+                frame_admission_resumption_pair(&ticket, stek.clone(), now);
+            // Seal while genuine early keys exist, then optionally delay this
+            // datagram until the client has read the server's handshake flight.
+            let illegal = seal_early_frames(
+                &mut client,
+                &[
+                    Frame::Crypto {
+                        offset: 1,
+                        data: b"future CRYPTO",
+                    },
+                    Frame::Padding(3),
+                ],
+                now,
+            );
+            if received_server_flight {
+                while let Some(packet) = server.poll_transmit(now) {
+                    client.handle_datagram(&packet, now).unwrap();
+                }
+                // Poll the client's Initial ACK/Finished, but withhold all of
+                // them. This discards its Initial keys without confirming server.
+                while client.poll_transmit(now).is_some() {}
+                assert!(client.spaces[SPACE_INITIAL].discarded);
+                assert!(client.spaces[SPACE_HANDSHAKE].keys.is_some());
+            } else {
+                assert!(client.is_handshaking());
+                assert!(client.spaces[SPACE_HANDSHAKE].keys.is_none());
+            }
+            assert!(server.is_handshaking() && !server.handshake_confirmed);
+            assert!(server.spaces[SPACE_INITIAL].keys.is_some());
+            assert!(matches!(
+                server.handle_datagram(&illegal, now),
+                Err(QuicTlsError::Transport {
+                    error_code: 0x0a,
+                    frame_type: 0x06,
+                    ..
+                })
+            ));
+            let close = server.poll_transmit(now).expect("readable terminal close");
+            assert!(close.len() <= server.pmtud.current_mtu());
+            client.handle_datagram(&close, now).unwrap();
+            assert!(
+                matches!(
+                    client.close_reason(),
+                    Some(CloseReason::PeerTransport(0x0a, 0x06, _))
+                ),
+                "received_server_flight={received_server_flight}, close={:?}",
+                client.close_reason()
+            );
+        }
+    }
+
+    #[test]
+    fn frame_admission_preserves_legal_zero_rtt_frames() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let now = Instant::now();
+        let legal = [
+            Frame::Padding(1),
+            Frame::Ping,
+            Frame::ResetStream {
+                id: 4,
+                error_code: 0,
+                final_size: 0,
+            },
+            Frame::StopSending {
+                id: 1,
+                error_code: 0,
+            },
+            Frame::MaxData(1 << 20),
+            Frame::MaxStreamData {
+                id: 1,
+                max: 1 << 20,
+            },
+            Frame::MaxStreams {
+                dir: Dir::Bidi,
+                max: 10,
+            },
+            Frame::MaxStreams {
+                dir: Dir::Uni,
+                max: 10,
+            },
+            Frame::DataBlocked(0),
+            Frame::StreamDataBlocked { id: 0, limit: 0 },
+            Frame::StreamsBlocked {
+                dir: Dir::Bidi,
+                limit: 0,
+            },
+            Frame::StreamsBlocked {
+                dir: Dir::Uni,
+                limit: 0,
+            },
+            Frame::NewConnectionId {
+                seq: 1,
+                retire_prior_to: 0,
+                cid: b"new cid",
+                reset_token: &[0; 16],
+            },
+            Frame::PathChallenge(7),
+        ];
+        for frame in legal {
+            let (mut client, mut server) =
+                frame_admission_resumption_pair(&ticket, stek.clone(), now);
+            server.send_stream(1, b"opened local stream");
+            let packet = seal_early_frames(
+                &mut client,
+                &[
+                    frame.clone(),
+                    Frame::Stream {
+                        id: 0,
+                        offset: 0,
+                        fin: true,
+                        data: b"legal early data",
+                    },
+                ],
+                now,
+            );
+            server
+                .handle_datagram(&packet, now)
+                .unwrap_or_else(|error| panic!("{frame:?}: {error:?}"));
+            assert_eq!(server.read_stream(0), b"legal early data", "{frame:?}");
+            assert!(server.close_reason().is_none());
+            assert!(server.is_handshaking());
+        }
+        for application in [false, true] {
+            let (mut client, mut server) =
+                frame_admission_resumption_pair(&ticket, stek.clone(), now);
+            let packet = seal_early_frames(
+                &mut client,
+                &[
+                    Frame::Close(super::super::frame::Close {
+                        application,
+                        error_code: 23,
+                        frame_type: 0,
+                        reason: b"legal close",
+                    }),
+                    Frame::Padding(3),
+                ],
+                now,
+            );
+            server.handle_datagram(&packet, now).unwrap();
+            assert_eq!(
+                server.close_reason(),
+                Some(&if application {
+                    CloseReason::PeerApp(23, b"legal close".to_vec())
+                } else {
+                    CloseReason::PeerTransport(23, 0, b"legal close".to_vec())
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn frame_admission_server_close_preflights_all_candidates_and_preserves_mandatory_levels() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let now = Instant::now();
+        for failure in 0..5 {
+            let (_, mut server) = frame_admission_resumption_pair(&ticket, stek.clone(), now);
+            server.close_transport(0x0a, 0x06, b"local reason");
+            match failure {
+                0..=2 => server.spaces[failure].send = PacketNumberSpace::exhausted_for_test(),
+                3 => {
+                    server.data_packets_sealed = server.spaces[SPACE_DATA]
+                        .keys
+                        .as_ref()
+                        .unwrap()
+                        .local
+                        .packet
+                        .confidentiality_limit()
+                }
+                4 => {
+                    server.anti_amp_recv = 0;
+                    server.anti_amp_sent = 0;
+                }
+                _ => unreachable!(),
+            }
+            let before = std::array::from_fn::<_, 3, _>(|space| server.spaces[space].send.peek());
+            let seals = server.sealed_packets.len();
+            let local_reason = server.closed.clone();
+            assert!(
+                server.build_close_packet(now).is_none(),
+                "failure={failure}"
+            );
+            assert_eq!(
+                std::array::from_fn::<_, 3, _>(|space| server.spaces[space].send.peek()),
+                before
+            );
+            assert_eq!(server.sealed_packets.len(), seals);
+            assert_eq!(server.closed, local_reason);
+        }
+        for reason_len in [400, 900, 10_000] {
+            let (client, mut server) = frame_admission_resumption_pair(&ticket, stek.clone(), now);
+            let reason = vec![b'r'; reason_len];
+            server.close_transport(0x0a, 0x06, &reason);
+            let data_pn = server.spaces[SPACE_DATA].send.peek();
+            let mut packet = server.build_close_packet(now).unwrap();
+            assert!(packet.len() <= server.pmtud.current_mtu());
+            let initial_len = packet::long_packet_len(&packet).unwrap();
+            assert_eq!(
+                packet::first_packet_space(&packet),
+                Some(PacketSpace::Initial)
+            );
+            assert_eq!(
+                packet::first_packet_space(&packet[initial_len..]),
+                Some(PacketSpace::Handshake)
+            );
+            let handshake_len = packet::long_packet_len(&packet[initial_len..]).unwrap();
+            assert_eq!(
+                initial_len + handshake_len,
+                packet.len(),
+                "optional Data omitted first"
+            );
+            assert_eq!(server.spaces[SPACE_DATA].send.peek(), data_pn);
+            let (_, body) = open_packet(
+                &client.spaces[SPACE_INITIAL].keys.as_ref().unwrap().remote,
+                &mut packet[..initial_len],
+                client.scid.len(),
+                None,
+            )
+            .unwrap();
+            let Frame::Close(close) = Iter::new(&packet[body]).next().unwrap().unwrap() else {
+                panic!("close")
+            };
+            assert_eq!(
+                close.reason,
+                if reason_len == 400 {
+                    reason.as_slice()
+                } else {
+                    &[]
+                }
+            );
+            assert_eq!(
+                server.closed,
+                Some(CloseReason::LocalTransport(0x0a, 0x06, reason))
+            );
+        }
+        // A spent Data key must not be bypassed even when that optional packet
+        // would have been removed from a large-reason batch for MTU.
+        let (_, mut server) = frame_admission_resumption_pair(&ticket, stek, now);
+        server.close_transport(0x0a, 0x06, &vec![1; 900]);
+        server.data_packets_sealed = server.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .unwrap()
+            .local
+            .packet
+            .confidentiality_limit();
+        let before = std::array::from_fn::<_, 3, _>(|space| server.spaces[space].send.peek());
+        assert!(server.build_close_packet(now).is_none());
+        assert_eq!(
+            std::array::from_fn::<_, 3, _>(|space| server.spaces[space].send.peek()),
+            before
+        );
+    }
+
+    #[test]
+    fn legal_new_client_ack_parameters_allow_zero_rtt_without_committing_ack_before_finished() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let client_tp = with_ack_transport_params(
+            TransportParameters::safari_client(&[]).encode_safari_client(),
+            6,
+            7,
+        );
+        let (mut client, mut peer, flight) =
+            resumption_first_flight_with_client_transport_params(&ticket, stek, client_tp, 0x85);
+        let now = Instant::now();
+        peer.handle_datagram(&flight, now).unwrap();
+        assert!(peer.client_hello_processed());
+        assert!(peer.is_handshaking() && peer.zero_rtt_keys_installed());
+        assert!(peer.peer_transport_params_prevalidated);
+        assert!(!peer.peer_ack_params_applied);
+        assert_eq!(peer.peer_ack_delay_exponent, ACK_DELAY_EXPONENT);
+        assert_eq!(peer.peer_max_ack_delay, MAX_ACK_DELAY);
+        assert_eq!(peer.accept_bi(), Some(RELAY_STREAM_ID));
+        assert_eq!(peer.read_stream(RELAY_STREAM_ID), ACK_PARAMETER_EARLY_DATA);
+        drive_at(&mut client, &mut peer, now);
+        assert!(!peer.is_handshaking());
+        assert!(peer.peer_ack_params_applied);
+        assert_eq!(peer.peer_ack_delay_exponent, 6);
+        assert_eq!(peer.peer_max_ack_delay, Duration::from_millis(7));
+    }
+
+    #[test]
+    fn invalid_new_client_ack_parameters_remain_terminal_when_driver_ignores_split_flight_errors() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let client_tp = with_ack_transport_params(
+            TransportParameters::safari_client(&[]).encode_safari_client(),
+            21,
+            25,
+        );
+        let (_, mut peer, flight) =
+            resumption_first_flight_with_client_transport_params(&ticket, stek, client_tp, 0x87);
+        let now = Instant::now();
+        let mut remaining = flight.as_slice();
+        let mut early_packets = Vec::new();
+        let mut initial_errors = Vec::new();
+        while !remaining.is_empty() {
+            let len =
+                packet::long_packet_len(remaining).expect("actual long-header packet boundary");
+            let (packet, rest) = remaining.split_at(len);
+            match packet::first_packet_space(packet) {
+                Some(PacketSpace::Initial) => {
+                    // Match the endpoint's driver behavior: record and ignore
+                    // its initial processing error, then accept another datagram.
+                    if let Err(error) = peer.handle_datagram(packet, now) {
+                        assert!(matches!(
+                            error,
+                            QuicTlsError::Transport {
+                                error_code: 0x08,
+                                ..
+                            }
+                        ));
+                        initial_errors.push(format!("{error:?}"));
+                    }
+                }
+                Some(PacketSpace::ZeroRtt) => early_packets.push(packet),
+                space => panic!("unexpected packet space in resumed first flight: {space:?}"),
+            }
+            remaining = rest;
+        }
+        assert!(
+            !initial_errors.is_empty(),
+            "invalid Initial input must actually return 0x08"
+        );
+        assert!(peer.client_hello_processed());
+        assert!(!early_packets.is_empty());
+        let mut followups_are_closed_drops = true;
+        let early_results: Vec<_> = early_packets
+            .into_iter()
+            .map(|packet| {
+                let result = peer.handle_datagram(packet, now + Duration::from_millis(1));
+                followups_are_closed_drops &= result.is_ok();
+                format!("{result:?}")
+            })
+            .collect();
+        let published = peer.read_stream(RELAY_STREAM_ID);
+        let accepted = peer.accept_bi();
+        assert!(
+            matches!(
+                peer.close_reason(),
+                Some(CloseReason::LocalTransport(0x08, 0x06, _))
+            ) && followups_are_closed_drops
+                && published.is_empty()
+                && accepted.is_none()
+                && !peer.peer_transport_params_prevalidated
+                && !peer.peer_ack_params_applied
+                && peer.peer_ack_delay_exponent == ACK_DELAY_EXPONENT
+                && peer.peer_max_ack_delay == MAX_ACK_DELAY
+                && peer.spaces[SPACE_DATA].recv.largest().is_none(),
+            "ignored Initial errors={initial_errors:?}, followup0RTT={early_results:?}, \
+             close={:?}, published={published:?}, accepted={accepted:?}, \
+             prevalidated={}, ack_applied={}, exponent={}, max_delay={:?}",
+            peer.close_reason(),
+            peer.peer_transport_params_prevalidated,
+            peer.peer_ack_params_applied,
+            peer.peer_ack_delay_exponent,
+            peer.peer_max_ack_delay,
+        );
+    }
+
+    #[test]
+    fn missing_peer_transport_parameters_do_not_cache_prevalidation_or_activate_ack_policy() {
+        let mut client = Connection::new_client(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x86; 8]),
+            ConnectionId::new(&[]),
+        )
+        .unwrap();
+        assert!(client.tls.peer_transport_parameters().is_none());
+        for _ in 0..2 {
+            client.prevalidate_peer_transport_params().unwrap();
+            assert!(!client.peer_transport_params_prevalidated);
+            assert!(!client.peer_ack_params_applied);
+            assert_eq!(client.peer_ack_delay_exponent, ACK_DELAY_EXPONENT);
+            assert_eq!(client.peer_max_ack_delay, MAX_ACK_DELAY);
+        }
+    }
+
+    #[test]
+    fn preconfirmation_data_does_not_arm_or_fire_a_pto() {
+        let now = Instant::now();
+        let (mut client, _) = before_client_finished(CipherSuite::Aes128GcmSha256, now);
+        assert!(!client.handshake_confirmed);
+        client.seal_data_packet(
+            &[Frame::Ping, Frame::Padding(3)],
+            true,
+            SentContent::default(),
+            now,
+        );
+        let data_pto = now + client.pto_duration(SPACE_DATA);
+        assert_ne!(client.next_timeout(), Some(data_pto));
+        let in_flight = client.spaces[SPACE_DATA].sent.in_flight();
+        client.handle_timeout(data_pto);
+        assert_eq!(client.pto_count, 0);
+        assert_eq!(client.probe_pending, 0);
+        assert!(!client.ping_pending);
+        client.queue_probe();
+        assert_eq!(client.spaces[SPACE_DATA].sent.in_flight(), in_flight);
+    }
+
+    fn before_client_finished(suite: CipherSuite, now: Instant) -> (Connection, Connection) {
+        let (mut client, mut server) = handshake_start(suite);
+        while let Some(packet) = client.poll_transmit(now) {
+            server.handle_datagram(&packet, now).unwrap();
+        }
+        while let Some(packet) = server.poll_transmit(now) {
+            client.handle_datagram(&packet, now).unwrap();
+        }
+        assert!(!client.is_handshaking() && server.is_handshaking());
+        assert!(server.spaces[SPACE_DATA].keys.is_some());
+        (client, server)
+    }
+
+    fn key_phase_pair(suite: CipherSuite, now: Instant) -> (Connection, Connection) {
+        let (mut client, mut server) = before_client_finished(suite, now);
+        drive_at(&mut client, &mut server, now);
+        assert!(client.handshake_confirmed && server.handshake_confirmed);
+        // Two actual eliciting packets in each direction establish the current
+        // generation's ACK precondition without bypassing delayed-ACK policy.
+        for _ in 0..2 {
+            let packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            server.handle_datagram(&packet, now).unwrap();
+            let packet = server.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            client.handle_datagram(&packet, now).unwrap();
+        }
+        for _ in 0..16 {
+            drive_at(&mut client, &mut server, now);
+            if !client.spaces[SPACE_DATA].ack_pending && !server.spaces[SPACE_DATA].ack_pending {
+                break;
+            }
+            if client.spaces[SPACE_DATA].ack_pending {
+                let packet = server.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+                client.handle_datagram(&packet, now).unwrap();
+            }
+            if server.spaces[SPACE_DATA].ack_pending {
+                let packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+                server.handle_datagram(&packet, now).unwrap();
+            }
+        }
+        assert!(!client.spaces[SPACE_DATA].ack_pending && !server.spaces[SPACE_DATA].ack_pending);
+        assert!(client.key_phase.tx_acked && server.key_phase.tx_acked);
+        (client, server)
+    }
+
+    fn read_test_ack(receiver: &Connection, mut packet: Vec<u8>) -> Ack {
+        let (_, range) = open_packet(
+            &receiver.spaces[SPACE_DATA].keys.as_ref().unwrap().remote,
+            &mut packet,
+            receiver.scid.len(),
+            receiver.spaces[SPACE_DATA].recv.largest(),
+        )
+        .unwrap();
+        Iter::new(&packet[range])
+            .find_map(|frame| match frame {
+                Ok(Frame::Ack(ack)) => Some(ack),
+                _ => None,
+            })
+            .expect("a real encrypted ACK")
+    }
+
+    #[test]
+    fn delayed_ack_two_ordered_packets_share_one_ack() {
+        let now = Instant::now();
+        let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let first = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&first, now).unwrap();
+        assert!(
+            server.poll_transmit(now).is_none(),
+            "one confirmed ordered packet waits for its bounded tail timer"
+        );
+        let second = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&second, now).unwrap();
+        let ack = read_test_ack(
+            &client,
+            server
+                .poll_transmit(now)
+                .expect("second packet releases ACK"),
+        );
+        assert_eq!(ack.largest, client.spaces[SPACE_DATA].send.peek() - 1);
+    }
+
+    #[test]
+    fn delayed_ack_preserves_largest_stamp_after_ack_and_reports_elapsed_over_25ms() {
+        let now = Instant::now();
+        let (client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let craft = |pn| {
+            let (_, pn_len) = packet::encode_packet_number(pn, None);
+            seal_packet(
+                &client.spaces[SPACE_DATA].keys.as_ref().unwrap().local,
+                client.make_header(SPACE_DATA, pn, pn_len),
+                &[Frame::Ping, Frame::Padding(3)],
+            )
+        };
+        server.handle_datagram(&craft(100), now).unwrap();
+        let first = server.poll_transmit(now + MAX_ACK_DELAY).unwrap();
+        assert_eq!(read_test_ack(&client, first).largest, 100);
+        let later = now + Duration::from_millis(40);
+        server.handle_datagram(&craft(50), later).unwrap();
+        let ack = read_test_ack(&client, server.poll_transmit(later).unwrap());
+        assert_eq!(ack.largest, 100);
+        assert_eq!(
+            ack.delay,
+            40_000 >> ACK_DELAY_EXPONENT,
+            "wire delay retains PN100's original receipt across ACKs, without a 25ms clamp"
+        );
+    }
+
+    #[test]
+    fn delayed_ack_frequency_tail_and_non_eliciting_packets() {
+        let mut now = Instant::now();
+        let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let mut acks = 0;
+        for index in 1..=4 {
+            let packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            server.handle_datagram(&packet, now).unwrap();
+            if index % 2 == 0 {
+                read_test_ack(
+                    &client,
+                    server.poll_transmit(now).expect("every second packet ACK"),
+                );
+                acks += 1;
+                assert_eq!(server.spaces[SPACE_DATA].ack_eliciting_count, 0);
+                assert!(server.spaces[SPACE_DATA].ack_deadline.is_none());
+            } else {
+                assert!(server.poll_transmit(now).is_none());
+                assert_eq!(server.spaces[SPACE_DATA].ack_eliciting_count, 1);
+            }
+        }
+        assert_eq!(acks, 2);
+        let packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&packet, now).unwrap();
+        let deadline = server.spaces[SPACE_DATA].ack_deadline.unwrap();
+        assert_eq!(deadline, now + MAX_ACK_DELAY);
+        let largest = server.spaces[SPACE_DATA].recv.largest().unwrap();
+        now += Duration::from_millis(5);
+        let acknowledged = server.spaces[SPACE_DATA].send.peek() - 1;
+        let pure = client.test_data_packet(&[
+            Frame::Ack(Ack {
+                largest: acknowledged,
+                delay: 0,
+                ranges: vec![(acknowledged, acknowledged)],
+                ecn: None,
+            }),
+            Frame::Padding(3),
+        ]);
+        server.handle_datagram(&pure, now).unwrap();
+        assert_eq!(server.spaces[SPACE_DATA].ack_deadline, Some(deadline));
+        assert_eq!(server.spaces[SPACE_DATA].ack_eliciting_count, 1);
+        assert!(server.spaces[SPACE_DATA].recv.largest().unwrap() > largest);
+        let pto = server.pto_count;
+        assert!(server
+            .poll_transmit(deadline - Duration::from_nanos(1))
+            .is_none());
+        server.handle_timeout(deadline);
+        assert_eq!(server.pto_count, pto);
+        assert!(!server.ping_pending);
+        let ack = read_test_ack(&client, server.poll_transmit(deadline).unwrap());
+        assert_eq!(ack.delay, 20_000 >> ACK_DELAY_EXPONENT);
+        assert_eq!(ack.largest, client.spaces[SPACE_DATA].send.peek() - 1);
+    }
+
+    #[test]
+    fn delayed_ack_new_generation_pure_ack_preserves_existing_deadline() {
+        let now = Instant::now();
+        let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let first = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&first, now).unwrap();
+        let deadline = server.spaces[SPACE_DATA].ack_deadline;
+        assert!(client.initiate_key_update(now).unwrap());
+        let pure = client.test_data_packet(&[Frame::Padding(20)]);
+        server
+            .handle_datagram(&pure, now + Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(server.key_phase.rx, 1);
+        assert_eq!(server.spaces[SPACE_DATA].ack_eliciting_count, 1);
+        assert_eq!(server.spaces[SPACE_DATA].ack_deadline, deadline);
+        assert!(server
+            .poll_transmit(now + Duration::from_millis(5))
+            .is_none());
+        let ack = server.poll_transmit(deadline.unwrap()).unwrap();
+        client.handle_datagram(&ack, deadline.unwrap()).unwrap();
+        assert!(
+            !client.spaces[SPACE_DATA].ack_pending,
+            "new-generation pure ACK cannot start ACK-of-ACK"
+        );
+        assert!(client.spaces[SPACE_DATA].ack_deadline.is_none());
+    }
+
+    #[test]
+    fn delayed_ack_bad_tag_replay_gap_and_ce() {
+        let now = Instant::now();
+        let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&packet, now).unwrap();
+        let deadline = server.spaces[SPACE_DATA].ack_deadline;
+        let stamp = server.last_recv_time;
+        let ce = server.spaces[SPACE_DATA].recv_ecn.ce;
+        let mut bad = packet.clone();
+        *bad.last_mut().unwrap() ^= 0x40;
+        for input in [&packet, &bad] {
+            server
+                .handle_datagram_ecn(input, EcnCodepoint::Ce, now + Duration::from_millis(1))
+                .unwrap();
+            assert_eq!(server.spaces[SPACE_DATA].ack_deadline, deadline);
+            assert_eq!(server.spaces[SPACE_DATA].ack_eliciting_count, 1);
+            assert_eq!(server.last_recv_time, stamp);
+            assert_eq!(server.spaces[SPACE_DATA].recv_ecn.ce, ce);
+        }
+        client.spaces[SPACE_DATA].send.allocate();
+        let gap = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&gap, now).unwrap();
+        read_test_ack(
+            &client,
+            server.poll_transmit(now).expect("gap immediate ACK"),
+        );
+        let ce_packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server
+            .handle_datagram_ecn(&ce_packet, EcnCodepoint::Ce, now)
+            .unwrap();
+        let ack = read_test_ack(
+            &client,
+            server.poll_transmit(now).expect("new CE immediate ACK"),
+        );
+        assert_eq!(ack.ecn.unwrap().ce, ce + 1);
+    }
+
+    #[test]
+    fn delayed_ack_timer_sendability_and_no_pto_side_effects() {
+        let now = Instant::now();
+        let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&packet, now).unwrap();
+        let deadline = server.spaces[SPACE_DATA].ack_deadline.unwrap();
+        assert_eq!(server.next_timeout(), Some(deadline));
+        let keys = server.spaces[SPACE_DATA].keys.take();
+        assert!(
+            server.next_timeout().unwrap() > deadline,
+            "unavailable keys cannot cause expired ACK spin"
+        );
+        server.spaces[SPACE_DATA].keys = keys;
+        server.peer_addr_validated = false;
+        server.anti_amp_recv = 0;
+        server.anti_amp_sent = 0;
+        assert!(
+            server.next_timeout().unwrap() > deadline,
+            "blocked amplification budget cannot spin"
+        );
+        assert!(server.poll_transmit(deadline).is_none());
+        server.peer_addr_validated = true;
+        server.spaces[SPACE_DATA].loss_time = Some(now + Duration::from_millis(3));
+        assert_eq!(server.next_timeout(), Some(now + Duration::from_millis(3)));
+        server.spaces[SPACE_DATA].loss_time = None;
+        server.keepalive_interval = Duration::from_millis(4);
+        assert_eq!(server.next_timeout(), Some(now + Duration::from_millis(4)));
+        server.keepalive_interval = KEEP_ALIVE_MAX;
+        let id = server.open_bi();
+        server.send_stream(id, b"paced data");
+        for _ in 0..10 {
+            server.pacer.on_sent(now, 10_000, 1_000_000, 1);
+        }
+        assert_eq!(server.next_timeout(), server.pacer.next_send_time());
+        assert!(server.next_timeout().unwrap() < deadline);
+        // At the ACK deadline even a later pacing deadline cannot block feedback.
+        server.pacer.on_sent(deadline, 10_000, 1_000_000, 1);
+        server.last_recv_time = Some(now - IDLE_TIMEOUT + Duration::from_millis(5));
+        assert_eq!(server.next_timeout(), Some(now + Duration::from_millis(5)));
+        server.last_recv_time = Some(now);
+        let pto = server.pto_count;
+        let pn = server.spaces[SPACE_DATA].send.peek();
+        server.handle_timeout(deadline);
+        assert_eq!(server.pto_count, pto);
+        assert!(!server.ping_pending);
+        read_test_ack(&client, server.poll_transmit(deadline).unwrap());
+        assert_eq!(server.spaces[SPACE_DATA].send.peek(), pn + 1);
+        assert_eq!(
+            server.data_packets_sealed,
+            server
+                .sealed_packets
+                .iter()
+                .filter(|(_, generation, _)| *generation == server.key_phase.tx)
+                .count() as u64
+        );
+        let packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&packet, deadline).unwrap();
+        server.close(0, b"clear ACK debt");
+        assert!(server.spaces[SPACE_DATA].ack_deadline.is_none());
+        assert!(!server.spaces[SPACE_DATA].ack_pending);
+        client.spaces[SPACE_HANDSHAKE].ack_deadline = Some(deadline);
+        client.spaces[SPACE_HANDSHAKE].ack_eliciting_count = 1;
+        client.discard_space(SPACE_HANDSHAKE);
+        assert!(client.spaces[SPACE_HANDSHAKE].ack_deadline.is_none());
+    }
+
+    #[test]
+    fn key_phase_pre_finished_ciphertexts_cannot_decrypt_or_commit() {
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            for kind in 0..3 {
+                let now = Instant::now();
+                let (mut client, mut server) = before_client_finished(suite, now);
+                let state = server.key_phase;
+                let idle = server.last_recv_time;
+                let received = server.spaces[SPACE_DATA].recv.to_ack(0);
+                let ecn = server.spaces[SPACE_DATA].recv_ecn;
+                let failures = server.data_packets_open_failed;
+                if kind == 2 {
+                    client.install_send_key(1).unwrap(); // malicious premature phase
+                }
+                let frames = match kind {
+                    0 => vec![Frame::Stream {
+                        id: RELAY_STREAM_ID,
+                        offset: 0,
+                        fin: false,
+                        data: b"premature application data",
+                    }],
+                    1 => vec![Frame::Close(super::super::frame::Close {
+                        application: true,
+                        error_code: 77,
+                        frame_type: 0,
+                        reason: b"premature close",
+                    })],
+                    _ => vec![Frame::Ping, Frame::Padding(3)],
+                };
+                let packet = client.test_data_packet(&frames);
+                server
+                    .handle_datagram_ecn(&packet, EcnCodepoint::Ce, now + Duration::from_secs(1))
+                    .unwrap();
+                assert!(server.is_handshaking());
+                assert!(server.close_reason().is_none());
+                assert!(server.streams.is_empty());
+                assert_eq!(server.key_phase, state);
+                assert_eq!(server.last_recv_time, idle);
+                assert_eq!(server.spaces[SPACE_DATA].recv.to_ack(0), received);
+                let after = server.spaces[SPACE_DATA].recv_ecn;
+                assert_eq!(
+                    (after.ect0, after.ect1, after.ce),
+                    (ecn.ect0, ecn.ect1, ecn.ce)
+                );
+                assert_eq!(server.data_packets_open_failed, failures);
+                assert!(server.previous_read_key.is_none());
+                let next = server.next_packet_keys.as_ref().unwrap();
+                assert!(next.local.is_some() && next.remote.is_some());
+            }
+            // A legal earlier CF in the same datagram completes TLS before the
+            // following 1-RTT packet is authenticated and delivered.
+            let now = Instant::now();
+            let (mut client, mut server) = before_client_finished(suite, now);
+            client.send_stream(RELAY_STREAM_ID, b"after client Finished");
+            let mut datagram = Vec::new();
+            let mut application = None;
+            while let Some(packet) = client.poll_transmit(now) {
+                if packet::first_packet_space(&packet) != Some(PacketSpace::OneRtt) {
+                    datagram.extend(packet);
+                } else {
+                    let mut inspect = packet.clone();
+                    let (_, range) = open_packet(
+                        &server.spaces[SPACE_DATA].keys.as_ref().unwrap().remote,
+                        &mut inspect,
+                        server.scid.len(),
+                        server.spaces[SPACE_DATA].recv.largest(),
+                    )
+                    .unwrap();
+                    if Iter::new(&inspect[range])
+                        .any(|frame| matches!(frame, Ok(Frame::Stream { .. })))
+                    {
+                        application = Some(packet);
+                    }
+                }
+            }
+            // A short-header packet has no Length and must be last. Other short
+            // control packets are lost rather than placed before the CF packet.
+            datagram.extend(application.expect("one final STREAM packet"));
+            server.handle_datagram(&datagram, now).unwrap();
+            assert!(!server.is_handshaking());
+            assert_eq!(
+                server.read_stream(RELAY_STREAM_ID),
+                b"after client Finished"
+            );
+
+            // The client also rejects early ciphertext before server Finished,
+            // including before its provider has made application read keys ready.
+            let (mut client, mut server) = handshake_start(suite);
+            while let Some(packet) = client.poll_transmit(now) {
+                server.handle_datagram(&packet, now).unwrap();
+            }
+            while let Some(packet) = server.poll_transmit(now) {
+                if packet::first_packet_space(&packet) == Some(PacketSpace::Handshake) {
+                    break; // withhold the server's Finished flight
+                }
+                client.handle_datagram(&packet, now).unwrap();
+            }
+            assert!(client.is_handshaking());
+            let state = client.key_phase;
+            let idle = client.last_recv_time;
+            let failures = client.data_packets_open_failed;
+            let packet = server.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            client.handle_datagram(&packet, now).unwrap();
+            assert_eq!(client.key_phase, state);
+            assert_eq!(client.last_recv_time, idle);
+            assert_eq!(client.data_packets_open_failed, failures);
+            assert_eq!(client.spaces[SPACE_DATA].recv.largest(), None);
+        }
+    }
+
+    #[test]
+    fn key_phase_handshake_close_batch_is_bounded_and_preflighted() {
+        let now = Instant::now();
+        for application in [false, true] {
+            let (mut client, server) = before_client_finished(CipherSuite::Aes128GcmSha256, now);
+            if application {
+                client.close(79, b"application reason");
+            } else {
+                client.close_transport(0x07, 0x12, b"transport reason");
+            }
+            let mut batch = client.poll_transmit(now).unwrap();
+            assert!(batch.len() <= client.pmtud.current_mtu());
+            let length = packet::long_packet_len(&batch).expect("Handshake close first");
+            let (_, body) = open_packet(
+                &server.spaces[SPACE_HANDSHAKE].keys.as_ref().unwrap().remote,
+                &mut batch[..length],
+                server.scid.len(),
+                server.spaces[SPACE_HANDSHAKE].recv.largest(),
+            )
+            .unwrap();
+            let lower = Iter::new(&batch[body]).next().unwrap().unwrap();
+            let Frame::Close(lower) = lower else {
+                panic!("expected lower-level close")
+            };
+            assert!(!lower.application);
+            assert_eq!(
+                lower.error_code,
+                if application { APPLICATION_ERROR } else { 0x07 }
+            );
+            assert_eq!(lower.frame_type, if application { 0 } else { 0x12 });
+            assert_eq!(
+                lower.reason,
+                if application {
+                    b"".as_slice()
+                } else {
+                    b"transport reason".as_slice()
+                }
+            );
+            let (_, body) = open_packet(
+                &server.spaces[SPACE_DATA].keys.as_ref().unwrap().remote,
+                &mut batch[length..],
+                server.scid.len(),
+                server.spaces[SPACE_DATA].recv.largest(),
+            )
+            .unwrap();
+            let Frame::Close(upper) = Iter::new(&batch[length + body.start..length + body.end])
+                .next()
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected 1-RTT close")
+            };
+            assert_eq!(upper.application, application);
+            assert_eq!(upper.error_code, if application { 79 } else { 0x07 });
+            assert_eq!(upper.frame_type, if application { 0 } else { 0x12 });
+        }
+        for failure in 0..4 {
+            let (mut client, _) = before_client_finished(CipherSuite::Aes128GcmSha256, now);
+            client.close_transport(0x07, 0x12, &vec![1; if failure == 3 { 10_000 } else { 20 }]);
+            let reason = client.closed.clone();
+            if failure == 0 {
+                client.data_packets_sealed = client.spaces[SPACE_DATA]
+                    .keys
+                    .as_ref()
+                    .unwrap()
+                    .local
+                    .packet
+                    .confidentiality_limit();
+            } else if failure == 1 {
+                client.spaces[SPACE_DATA].send = PacketNumberSpace::exhausted_for_test();
+            } else if failure == 2 {
+                client.spaces[SPACE_HANDSHAKE].send = PacketNumberSpace::exhausted_for_test();
+            }
+            let before = [
+                client.spaces[SPACE_HANDSHAKE].send.peek(),
+                client.spaces[SPACE_DATA].send.peek(),
+            ];
+            let seals = client.sealed_packets.len();
+            assert!(client.build_close_packet(now).is_none());
+            assert_eq!(
+                [
+                    client.spaces[SPACE_HANDSHAKE].send.peek(),
+                    client.spaces[SPACE_DATA].send.peek()
+                ],
+                before
+            );
+            assert_eq!(client.sealed_packets.len(), seals);
+            assert_eq!(client.closed, reason);
+        }
+        let (mut client, _) = before_client_finished(CipherSuite::Aes128GcmSha256, now);
+        client.close_transport(0x07, 0x12, &vec![1; 900]);
+        let data_pn = client.spaces[SPACE_DATA].send.peek();
+        let batch = client.build_close_packet(now).unwrap();
+        assert!(batch.len() <= client.pmtud.current_mtu());
+        assert_eq!(
+            packet::long_packet_len(&batch),
+            Some(batch.len()),
+            "oversize pair falls back to one intact Handshake packet"
+        );
+        assert_eq!(client.spaces[SPACE_DATA].send.peek(), data_pn);
+        let (mut client, _) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        assert!(client.spaces[SPACE_HANDSHAKE].keys.is_none());
+        client.close(1, b"confirmed close");
+        let batch = client.build_close_packet(now).unwrap();
+        assert_eq!(
+            packet::first_packet_space(&batch),
+            Some(PacketSpace::OneRtt)
+        );
+        assert!(client
+            .build_close_packet_in_space(SPACE_HANDSHAKE, now)
+            .is_none());
+    }
+
+    fn assert_seal_numbers(conn: &Connection) {
+        let mut seen = std::collections::BTreeSet::new();
+        for &(direction, generation, pn) in &conn.sealed_packets {
+            assert_eq!(direction, conn.side);
+            assert!(
+                seen.insert((u8::from(direction == Side::Server), generation, pn)),
+                "key/IV and PN reused"
+            );
+        }
+        for pair in conn.sealed_packets.windows(2) {
+            assert!(pair[0].2 < pair[1].2, "global PN must not reset");
+            assert!(pair[0].1 <= pair[1].1, "sending generation never goes back");
+        }
+    }
+
+    #[test]
+    fn key_phase_one_way_successive_responses_are_accepted() {
+        let mut rejected = 0;
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let now = Instant::now();
+            let (mut client, mut server) = key_phase_pair(suite, now);
+            assert!(server.initiate_key_update(now).unwrap());
+            let first = server.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            client.handle_datagram(&first, now).unwrap();
+            let first_ack = client
+                .poll_transmit(now)
+                .expect("first-generation response ACK");
+            server.handle_datagram(&first_ack, now).unwrap();
+            assert_eq!((server.key_phase.tx, server.key_phase.rx), (1, 1));
+            assert!(server.key_phase.tx_acked);
+            assert!(server.key_phase.update_ack_pending);
+            let second_time = server.next_update_at.unwrap() + Duration::from_millis(1);
+            assert!(server.initiate_key_update(second_time).unwrap());
+            assert_eq!((server.key_phase.tx, server.key_phase.rx), (2, 1));
+            let second = server.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            client.handle_datagram(&second, second_time).unwrap();
+            let second_ack = client
+                .poll_transmit(second_time)
+                .expect("second-generation response ACK");
+            if server.handle_datagram(&second_ack, second_time).is_err() {
+                rejected += 1;
+            }
+        }
+        assert_eq!(
+            rejected, 0,
+            "legitimate responses to locally initiated updates must be accepted"
+        );
+    }
+
+    #[test]
+    fn key_phase_one_way_updates_with_pure_ack_loss_in_both_roles() {
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            for initiates_server in [false, true] {
+                for lose_ack in [false, true] {
+                    let now = Instant::now();
+                    let (mut client, mut server) = key_phase_pair(suite, now);
+                    let (sender, responder) = if initiates_server {
+                        (&mut server, &mut client)
+                    } else {
+                        (&mut client, &mut server)
+                    };
+                    let mut time = now;
+                    for generation in 1..=3 {
+                        assert!(sender.initiate_key_update(time).unwrap());
+                        let packet = sender.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+                        responder.handle_datagram(&packet, time).unwrap();
+                        let mut ack = responder.poll_transmit(time).expect("pure ACK response");
+                        if lose_ack {
+                            assert!(!sender
+                                .initiate_key_update(time + Duration::from_secs(1))
+                                .unwrap());
+                            let retry = sender.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+                            responder.handle_datagram(&retry, time).unwrap();
+                            time = responder.pending_data_ack_deadline().unwrap();
+                            responder.handle_timeout(time);
+                            ack = responder
+                                .poll_transmit(time)
+                                .expect("replacement pure ACK at bounded tail deadline");
+                        }
+                        sender.handle_datagram(&ack, time).unwrap();
+                        assert_eq!(
+                            (sender.key_phase.tx, sender.key_phase.rx),
+                            (generation, generation)
+                        );
+                        assert!(sender.key_phase.tx_acked);
+                        assert!(
+                            sender.key_phase.update_ack_pending,
+                            "pure ACK does not elicit an ACK"
+                        );
+                        let state = sender.key_phase;
+                        sender.handle_datagram(&ack, time).unwrap();
+                        assert_eq!(sender.key_phase, state);
+                        time = sender.next_update_at.unwrap() + Duration::from_millis(1);
+                    }
+                    assert_seal_numbers(sender);
+                    assert_seal_numbers(responder);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn key_phase_real_connections_automatically_rotate_twice_in_both_directions() {
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            for initiator in 0..3 {
+                let now = Instant::now();
+                let (mut client, mut server) = key_phase_pair(suite, now);
+                if initiator != 1 {
+                    client.key_update_soft_limit = Some(1);
+                }
+                if initiator != 0 {
+                    server.key_update_soft_limit = Some(1);
+                }
+                for generation in 1..=2 {
+                    let mut time = now + Duration::from_secs(2 * generation);
+                    client.ping_pending = true;
+                    server.ping_pending = true;
+                    // Simultaneously consume the local halves before delivering
+                    // either packet; responding must not advance a second time.
+                    if initiator == 2 {
+                        let c = client.poll_transmit(time).unwrap();
+                        let s = server.poll_transmit(time).unwrap();
+                        assert_eq!(
+                            (client.key_phase.tx, client.key_phase.rx),
+                            (generation, generation - 1)
+                        );
+                        server.handle_datagram(&c, time).unwrap();
+                        client.handle_datagram(&s, time).unwrap();
+                    }
+                    drive_acked_at(&mut client, &mut server, &mut time);
+                    // A responder might otherwise send only a non-eliciting ACK
+                    // in its new generation, which cannot itself be confirmed.
+                    client.ping_pending = true;
+                    server.ping_pending = true;
+                    drive_acked_at(&mut client, &mut server, &mut time);
+                    for conn in [&client, &server] {
+                        assert_eq!(
+                            (conn.key_phase.tx, conn.key_phase.rx),
+                            (generation, generation)
+                        );
+                        assert!(conn.key_phase.tx_acked);
+                        let next = conn.next_packet_keys.as_ref().unwrap();
+                        assert_eq!(next.generation, generation + 1);
+                        assert!(next.local.is_some() && next.remote.is_some());
+                        assert!(!conn.is_closed());
+                        assert_seal_numbers(conn);
+                    }
+                }
+                client.send_stream(RELAY_STREAM_ID, b"payload after two phase flips");
+                let mut end = now + Duration::from_secs(5);
+                drive_acked_at(&mut client, &mut server, &mut end);
+                assert_eq!(
+                    server.read_stream(RELAY_STREAM_ID),
+                    b"payload after two phase flips"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_phase_loss_reordering_replay_and_fixed_retirement() {
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let now = Instant::now();
+            let (mut client, mut server) = key_phase_pair(suite, now);
+            let replay = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            server.handle_datagram(&replay, now).unwrap();
+            let reordered = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            let too_late = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            assert!(client.initiate_key_update(now).unwrap());
+            let lost_first = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            let next = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            server.handle_datagram(&next, now).unwrap();
+            let deadline = server.previous_read_key.as_ref().unwrap().retire_at;
+            assert!(server.next_timeout().unwrap() <= deadline);
+            let _lost_ack = server.poll_transmit(now).unwrap();
+            assert!(
+                !client.initiate_key_update(deadline).unwrap(),
+                "lost ACK cannot unlock update"
+            );
+            server
+                .handle_datagram(&reordered, now + Duration::from_millis(1))
+                .unwrap();
+            let state = server.key_phase;
+            let last_recv = server.last_recv_time;
+            let received = server.spaces[SPACE_DATA].recv.to_ack(0);
+            let ecn = server.spaces[SPACE_DATA].recv_ecn;
+            for packet in [&replay, &reordered] {
+                server
+                    .handle_datagram_ecn(packet, EcnCodepoint::Ce, now + Duration::from_millis(2))
+                    .unwrap();
+                assert_eq!(server.key_phase, state);
+                assert_eq!(server.last_recv_time, last_recv);
+                assert_eq!(server.spaces[SPACE_DATA].recv.to_ack(0), received);
+                let after = server.spaces[SPACE_DATA].recv_ecn;
+                assert_eq!(
+                    (after.ect0, after.ect1, after.ce),
+                    (ecn.ect0, ecn.ect1, ecn.ce)
+                );
+                assert_eq!(
+                    server.previous_read_key.as_ref().unwrap().retire_at,
+                    deadline
+                );
+            }
+            // Re-delivery of the lost first new-phase packet also authenticates
+            // with the current key, despite having a smaller PN than the first seen.
+            server
+                .handle_datagram(&lost_first, now + Duration::from_millis(3))
+                .unwrap();
+            let ack = server
+                .poll_transmit(now + Duration::from_millis(3))
+                .unwrap();
+            client
+                .handle_datagram(&ack, now + Duration::from_millis(3))
+                .unwrap();
+            assert!(client.key_phase.tx_acked);
+            let client_state = client.key_phase;
+            let client_idle = client.last_recv_time;
+            client
+                .handle_datagram(&ack, now + Duration::from_millis(4))
+                .unwrap();
+            assert_eq!(
+                client.key_phase, client_state,
+                "duplicate ACK changes no phase state"
+            );
+            assert_eq!(client.last_recv_time, client_idle);
+            assert!(!client
+                .initiate_key_update(now + Duration::from_millis(4))
+                .unwrap());
+            server.handle_timeout(deadline);
+            assert!(server.previous_read_key.is_none());
+            let state = server.key_phase;
+            let last_recv = server.last_recv_time;
+            let failures = server.data_packets_open_failed;
+            server.handle_datagram(&too_late, deadline).unwrap();
+            assert_eq!(server.key_phase, state);
+            assert_eq!(server.last_recv_time, last_recv);
+            assert_eq!(server.data_packets_open_failed, failures + 1);
+            let next_update = client.next_update_at.unwrap();
+            assert!(client.initiate_key_update(next_update).unwrap());
+            let second = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+            server.handle_datagram(&second, next_update).unwrap();
+            assert_eq!((server.key_phase.rx, server.key_phase.tx), (2, 2));
+            assert_eq!(
+                server.data_packets_open_failed,
+                failures + 1,
+                "integrity count survives rotation"
+            );
+            assert_seal_numbers(&client);
+            assert_seal_numbers(&server);
+        }
+    }
+
+    #[test]
+    fn key_phase_lost_stream_retransmits_under_current_key_and_fresh_pn() {
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let now = Instant::now();
+            let (mut client, mut server) = key_phase_pair(suite, now);
+            let payload = b"lost under generation zero, retransmitted under generation one";
+            client.send_stream(RELAY_STREAM_ID, payload);
+            let old_pn = client.spaces[SPACE_DATA].send.peek();
+            let _lost_stream = client.poll_transmit(now).unwrap();
+            assert_eq!(
+                client.sealed_packets.last(),
+                Some(&(Side::Client, 0, old_pn))
+            );
+            assert!(client.initiate_key_update(now).unwrap());
+            client.ping_pending = true;
+            drive_at(&mut client, &mut server, now);
+            let mut received = server.read_stream(RELAY_STREAM_ID);
+            for _ in 0..8 {
+                if received.len() == payload.len() {
+                    break;
+                }
+                let time = client.next_timeout().unwrap();
+                client.handle_timeout(time);
+                drive_at(&mut client, &mut server, time);
+                received.extend(server.read_stream(RELAY_STREAM_ID));
+            }
+            assert_eq!(received, payload);
+            assert_eq!((client.key_phase.tx, server.key_phase.rx), (1, 1));
+            assert!(client
+                .sealed_packets
+                .iter()
+                .any(|&(side, generation, pn)| side == Side::Client
+                    && generation == 1
+                    && pn > old_pn));
+            assert_seal_numbers(&client);
+        }
+    }
+
+    #[test]
+    fn key_phase_forged_headers_and_tags_cannot_commit_any_receive_state() {
+        let now = Instant::now();
+        let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let valid = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        let state = server.key_phase;
+        let received = server.spaces[SPACE_DATA].recv.to_ack(0);
+        let idle = server.last_recv_time;
+        let cids = (server.initial_dcid, server.dcid, server.peer_cid_adopted);
+        let ecn = server.spaces[SPACE_DATA].recv_ecn;
+        let next = server.next_packet_keys.as_ref().unwrap().generation;
+        for kind in 0..3 {
+            let mut forged = valid.clone();
+            match kind {
+                0 => forged[0] ^= 0x04,                     // protected phase bit
+                1 => *forged.last_mut().unwrap() ^= 0x80,   // AEAD tag
+                _ => forged[1 + server.scid.len()] ^= 0x01, // protected PN
+            }
+            let failures = server.data_packets_open_failed;
+            server
+                .handle_datagram_ecn(&forged, EcnCodepoint::Ce, now + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(server.key_phase, state);
+            assert_eq!(server.spaces[SPACE_DATA].recv.to_ack(0), received);
+            assert_eq!(server.last_recv_time, idle);
+            assert_eq!(
+                (server.initial_dcid, server.dcid, server.peer_cid_adopted),
+                cids
+            );
+            let after = server.spaces[SPACE_DATA].recv_ecn;
+            assert_eq!(
+                (after.ect0, after.ect1, after.ce),
+                (ecn.ect0, ecn.ect1, ecn.ce)
+            );
+            let cached = server.next_packet_keys.as_ref().unwrap();
+            assert_eq!(cached.generation, next);
+            assert!(cached.local.is_some() && cached.remote.is_some());
+            assert!(server.previous_read_key.is_none());
+            assert_eq!(server.data_packets_open_failed, failures + 1);
+        }
+        server.handle_datagram(&valid, now).unwrap();
+        assert_eq!(server.key_phase.rx, 0);
+        assert!(client.initiate_key_update(now).unwrap());
+        let valid_next = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&valid_next, now).unwrap();
+        assert_eq!((server.key_phase.rx, server.key_phase.tx), (1, 1));
+    }
+
+    #[test]
+    fn key_phase_authenticated_invalid_frontier_and_old_key_ack_are_rejected() {
+        let now = Instant::now();
+        let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let gap = client.spaces[SPACE_DATA].send.allocate();
+        let old = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&old, now).unwrap();
+        assert!(!server.spaces[SPACE_DATA].recv.contains(gap));
+        assert!(client.initiate_key_update(now).unwrap());
+        let new = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        server.handle_datagram(&new, now).unwrap();
+        let state = server.key_phase;
+        let received = server.spaces[SPACE_DATA].recv.to_ack(0);
+        let (_, pn_len) = packet::encode_packet_number(gap, None);
+        let invalid = seal_packet(
+            &client.spaces[SPACE_DATA].keys.as_ref().unwrap().local,
+            client.make_header(SPACE_DATA, gap, pn_len),
+            &[Frame::Ping, Frame::Padding(3)],
+        );
+        assert!(matches!(
+            server.handle_datagram(&invalid, now),
+            Err(QuicTlsError::Transport {
+                error_code: 0x0e,
+                ..
+            })
+        ));
+        assert_eq!(server.key_phase, state);
+        assert_eq!(server.spaces[SPACE_DATA].recv.to_ack(0), received);
+
+        let (mut client, mut server) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let pn = client.spaces[SPACE_DATA].send.peek();
+        let old_ack = server.test_data_packet(&[
+            Frame::Ack(Ack {
+                largest: pn,
+                delay: 0,
+                ranges: vec![(pn, pn)],
+                ecn: None,
+            }),
+            Frame::Padding(3),
+        ]);
+        assert!(client.initiate_key_update(now).unwrap());
+        let _new = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+        assert!(matches!(
+            client.handle_datagram(&old_ack, now),
+            Err(QuicTlsError::Transport {
+                error_code: 0x0e,
+                ..
+            })
+        ));
+        assert!(!client.key_phase.tx_acked);
+        assert!(!client
+            .initiate_key_update(now + Duration::from_secs(2))
+            .unwrap());
+    }
+
+    #[test]
+    fn key_phase_unconfirmed_or_unacknowledged_updates_and_exhaustion_fail_closed() {
+        let now = Instant::now();
+        let (mut client, _) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        client.handshake_confirmed = false;
+        assert!(!client.initiate_key_update(now).unwrap());
+        client.handshake_confirmed = true;
+        client.key_phase.tx_acked = false;
+        assert!(!client.initiate_key_update(now).unwrap());
+        client.key_phase.tx_acked = true;
+        client.data_packets_sealed = client.spaces[SPACE_DATA]
+            .keys
+            .as_ref()
+            .unwrap()
+            .local
+            .packet
+            .confidentiality_limit();
+        client.close(27, b"keep original reason");
+        let reason = client.closed.clone();
+        let pn = client.spaces[SPACE_DATA].send.peek();
+        let sealed = client.sealed_packets.len();
+        assert!(client.poll_transmit(now).is_none());
+        assert!(client.build_close_packet(now).is_none());
+        assert_eq!(client.closed, reason);
+        assert_eq!(
+            client.key_phase.tx, 0,
+            "closing cannot rotate to buy a close"
+        );
+        assert_eq!(client.spaces[SPACE_DATA].send.peek(), pn);
+        assert_eq!(client.sealed_packets.len(), sealed);
+
+        let (mut client, _) = key_phase_pair(CipherSuite::Aes128GcmSha256, now);
+        let pn = client.spaces[SPACE_DATA].send.peek();
+        client.next_packet_keys = None; // simulate derivation/ownership failure
+        client.key_update_soft_limit = Some(1);
+        client.ping_pending = true;
+        assert!(client.poll_transmit(now).is_none());
+        assert!(client.is_closed());
+        assert_eq!(client.spaces[SPACE_DATA].send.peek(), pn);
+        assert_eq!(client.key_phase.tx, 0);
+    }
+
+    #[test]
+    fn quic_guard_regression_replays_do_not_commit_receive_state() {
+        for evict in [false, true] {
+            let (mut client, mut server) = connected_pair();
+            let t0 = Instant::now() + Duration::from_secs(1);
+            let first_pn = client.spaces[SPACE_DATA].send.peek();
+            let datagram = client.test_data_packet(&[Frame::Stream {
+                id: RELAY_STREAM_ID,
+                offset: 0,
+                fin: false,
+                data: b"authenticated bytes that must only arrive once",
+            }]);
+            // A forgery of this PN must not reserve it or refresh idle: the
+            // subsequent authentic packet with that same PN must still work.
+            let mut forged = datagram.clone();
+            *forged.last_mut().unwrap() ^= 1;
+            let before_forgery = server.spaces[SPACE_DATA].recv.to_ack(0);
+            let idle_before = server.last_recv_time;
+            server
+                .handle_datagram_ecn(&forged, EcnCodepoint::Ce, t0)
+                .unwrap();
+            assert_eq!(server.spaces[SPACE_DATA].recv.to_ack(0), before_forgery);
+            assert_eq!(server.last_recv_time, idle_before);
+            server
+                .handle_datagram_ecn(&datagram, EcnCodepoint::Ect0, t0)
+                .unwrap();
+            assert_eq!(
+                server.read_stream(RELAY_STREAM_ID),
+                b"authenticated bytes that must only arrive once"
+            );
+            if evict {
+                // Forty gapped authenticated packets evict the first PN from
+                // the 32-range ACK set, while keeping PN reconstruction unambiguous.
+                for _ in 0..40 {
+                    client.spaces[SPACE_DATA].send.allocate();
+                    let packet = client.test_data_packet(&[Frame::Ping, Frame::Padding(3)]);
+                    server
+                        .handle_datagram_ecn(&packet, EcnCodepoint::Ect0, t0)
+                        .unwrap();
+                }
+                assert!(server.spaces[SPACE_DATA].recv.contains(first_pn));
+                assert!(
+                    !server.spaces[SPACE_DATA]
+                        .recv
+                        .to_ack(0)
+                        .unwrap()
+                        .ranges
+                        .iter()
+                        .any(|&(lo, hi)| lo <= first_pn && first_pn <= hi),
+                    "PN really evicted"
+                );
+            }
+            // Demonstrate that the replay still authenticates, including after
+            // eviction: this is a deduplication check, not an AEAD-failure test.
+            let mut replay_check = datagram.clone();
+            let (header, _) = open_packet(
+                &server.spaces[SPACE_DATA].keys.as_ref().unwrap().remote,
+                &mut replay_check,
+                server.scid.len(),
+                server.spaces[SPACE_DATA].recv.largest(),
+            )
+            .unwrap();
+            assert_eq!(header.packet_number(), first_pn);
+            let received = server.spaces[SPACE_DATA].recv.to_ack(0);
+            let ack_pending = server.spaces[SPACE_DATA].ack_pending;
+            let ack_schedule = (
+                server.spaces[SPACE_DATA].ack_eliciting_count,
+                server.spaces[SPACE_DATA].ack_deadline,
+            );
+            let largest_time = server.spaces[SPACE_DATA].largest_recv_time;
+            let ecn = server.spaces[SPACE_DATA].recv_ecn;
+            let cids = (server.initial_dcid, server.dcid, server.peer_cid_adopted);
+            server
+                .handle_datagram_ecn(&datagram, EcnCodepoint::Ce, t0 + IDLE_TIMEOUT / 2)
+                .unwrap();
+            assert_eq!(server.last_recv_time, Some(t0), "replay cannot extend idle");
+            assert_eq!(server.spaces[SPACE_DATA].recv.to_ack(0), received);
+            assert_eq!(server.spaces[SPACE_DATA].ack_pending, ack_pending);
+            assert_eq!(
+                (
+                    server.spaces[SPACE_DATA].ack_eliciting_count,
+                    server.spaces[SPACE_DATA].ack_deadline
+                ),
+                ack_schedule
+            );
+            assert_eq!(server.spaces[SPACE_DATA].largest_recv_time, largest_time);
+            let after = server.spaces[SPACE_DATA].recv_ecn;
+            assert_eq!(
+                (after.ect0, after.ect1, after.ce),
+                (ecn.ect0, ecn.ect1, ecn.ce)
+            );
+            assert_eq!(
+                (server.initial_dcid, server.dcid, server.peer_cid_adopted),
+                cids
+            );
+            assert!(server.read_stream(RELAY_STREAM_ID).is_empty());
+            server.handle_timeout(t0 + IDLE_TIMEOUT);
+            assert_eq!(server.close_reason(), Some(&CloseReason::IdleTimeout));
+        }
+    }
+
+    #[test]
+    fn quic_guard_regression_confidentiality_budget_includes_close() {
+        for at_limit in [false, true] {
+            for mode in 0..4 {
+                let mut conn = Connection::new_server(
+                    Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+                    &server_key(),
+                    vec![b"h3".to_vec()],
+                    server_tp(),
+                    ConnectionId::new(&[0x64; 4]),
+                )
+                .unwrap();
+                conn.spaces[SPACE_DATA].keys = Some(Keys {
+                    local: test_keys(),
+                    remote: test_keys(),
+                });
+                conn.peer_addr_validated = true;
+                let limit = conn.spaces[SPACE_DATA]
+                    .keys
+                    .as_ref()
+                    .unwrap()
+                    .local
+                    .packet
+                    .confidentiality_limit();
+                assert_eq!(limit, 1 << 23, "real AES-GCM budget");
+                if mode == 0 {
+                    conn.ping_pending = true;
+                } else if mode == 2 {
+                    conn.close_transport(0x1, 0, b"pending transport close");
+                } else {
+                    conn.close(0x42, b"pending application close");
+                }
+                conn.data_packets_sealed = limit - u64::from(!at_limit);
+                let pn_before = conn.spaces[SPACE_DATA].send.peek();
+                let sealed_before = conn.data_packets_sealed;
+                let now = Instant::now();
+                let first = if mode == 3 {
+                    conn.build_close_packet(now)
+                } else {
+                    conn.poll_transmit(now)
+                };
+                assert_eq!(
+                    first.is_some(),
+                    !at_limit,
+                    "mode={mode}, at_limit={at_limit}"
+                );
+                if let Some(mut packet) = first {
+                    open_packet(&test_keys(), &mut packet, conn.dcid.len(), None)
+                        .expect("last permitted packet is genuinely AEAD protected");
+                }
+                for _ in 0..3 {
+                    assert!(
+                        conn.poll_transmit(now).is_none(),
+                        "no protected packet after exhaustion: q={}",
+                        conn.data_packets_sealed
+                    );
+                    assert!(
+                        conn.build_close_packet(now).is_none(),
+                        "close builder enforces its own budget"
+                    );
+                }
+                assert_eq!(conn.data_packets_sealed, limit);
+                assert!(conn.data_packets_sealed >= sealed_before);
+                assert_eq!(
+                    conn.spaces[SPACE_DATA].send.peek(),
+                    pn_before + u64::from(!at_limit)
+                );
             }
         }
     }
@@ -5076,7 +8629,7 @@ mod tests {
             ConnectionId::new(&[0x6e; 4]),
         )
         .unwrap();
-        drive(&mut client, &mut server);
+        drive_acked_at(&mut client, &mut server, &mut now);
 
         // Validate a large MTU, then model a route that only carries BASE-sized
         // datagrams. Bypass pacing to isolate packetization and loss recovery.
@@ -5276,7 +8829,7 @@ mod tests {
             ConnectionId::new(&[0x21, 0x43, 0x65, 0x87]),
         )
         .unwrap();
-        drive(&mut client, &mut server);
+        drive_acked_at(&mut client, &mut server, &mut now);
         assert!(!client.is_handshaking() && !server.is_handshaking());
 
         let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
@@ -5329,7 +8882,7 @@ mod tests {
 
     #[test]
     fn congestion_window_limits_the_in_flight_burst() {
-        let now = Instant::now();
+        let mut now = Instant::now();
         let dcid = ConnectionId::new(&[0x30; 8]);
         let mut client =
             Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
@@ -5342,7 +8895,7 @@ mod tests {
             ConnectionId::new(&[0x31, 0x41, 0x59, 0x26]),
         )
         .unwrap();
-        drive(&mut client, &mut server);
+        drive_acked_at(&mut client, &mut server, &mut now);
         assert!(!client.is_handshaking());
 
         // Offer far more than one initial congestion window (12000 bytes) of data
@@ -5380,15 +8933,23 @@ mod tests {
             ConnectionId::new(&[0xab, 0xba, 0xab, 0xba]),
         )
         .unwrap();
-        drive(&mut client, &mut server);
+        let mut now = Instant::now();
+        drive_acked_at(&mut client, &mut server, &mut now);
         assert!(
-            client.handshake_confirmed,
+            client.handshake_confirmed && server.handshake_confirmed,
             "handshake confirmed before idle"
         );
+        assert!(
+            client.pending_data_ack_deadline().is_none()
+                && server.pending_data_ack_deadline().is_none(),
+            "post-handshake ACK debt is settled before idle"
+        );
+        assert_eq!(client.bytes_in_flight(), 0);
+        assert_eq!(server.bytes_in_flight(), 0);
 
-        // Capture a clock at/after the last send, then idle past the keep-alive
-        // interval and fire the timer.
-        let mut now = Instant::now();
+        // A fixed-time drive can leave delayed ACKs behind. Even a scheduler gap
+        // of one ACK interval must remain idle after the timer-driven drain.
+        now += MAX_ACK_DELAY;
         assert!(
             client.poll_transmit(now).is_none(),
             "connection is idle after the handshake"
@@ -5397,15 +8958,26 @@ mod tests {
         // fires regardless of this connection's random draw.
         now += KEEP_ALIVE_MAX + Duration::from_secs(1);
         client.handle_timeout(now);
+        assert!(client.ping_pending);
+        assert_eq!(client.probe_pending, 0, "no outstanding flight needs a PTO");
         let ping = client
             .poll_transmit(now)
             .expect("an idle, confirmed connection queues a keep-alive PING");
+        assert!(!client.ping_pending, "the queued keep-alive PING was sent");
 
         // The PING is ack-eliciting: the server schedules an ACK on receipt.
         server.handle_datagram(&ping, now).unwrap();
-        assert!(
-            server.poll_transmit(now).is_some(),
-            "the server ACKs the keep-alive PING — the connection stays live"
+        let ack_deadline = server
+            .pending_data_ack_deadline()
+            .expect("the keep-alive PING schedules an ACK");
+        let ack = server
+            .poll_transmit(ack_deadline)
+            .expect("the server ACKs the keep-alive PING at its deadline");
+        client.handle_datagram(&ack, ack_deadline).unwrap();
+        assert_eq!(
+            client.bytes_in_flight(),
+            0,
+            "the peer's ACK retires the keep-alive PING"
         );
     }
 
@@ -5496,7 +9068,8 @@ mod tests {
             ConnectionId::new(&[0xac, 0xeb, 0xac, 0xeb]),
         )
         .unwrap();
-        drive(&mut client, &mut server);
+        let mut t0 = Instant::now();
+        drive_acked_at(&mut client, &mut server, &mut t0);
         assert!(client.handshake_confirmed && server.handshake_confirmed);
 
         // Craft two 1-RTT packets with the CLIENT's local 1-RTT keys (the server opens
@@ -5517,7 +9090,6 @@ mod tests {
         // PN=50: a reordered ack-eliciting PING that triggers the ACK.
         let smaller_eliciting = craft(&client, 50, &[Frame::Ping, Frame::Padding(3)]);
 
-        let t0 = Instant::now();
         // Largest (PN=100) received first; it owes no ACK by itself but sets the stamp.
         server.handle_datagram(&larger_non_eliciting, t0).unwrap();
         assert!(
@@ -5949,22 +9521,22 @@ mod tests {
             ConnectionId::new(&[0x72; 8]),
         )
         .unwrap();
-        let start = Instant::now();
-        drive_at(&mut client, &mut server, start);
-        for iteration in 0..(MAX_PEER_STREAMS * 3) {
-            let now = start + Duration::from_millis(iteration as u64 * 10);
+        let mut now = Instant::now();
+        drive_acked_at(&mut client, &mut server, &mut now);
+        for _ in 0..(MAX_PEER_STREAMS * 3) {
+            now += Duration::from_millis(10);
             let id = client.open_bi();
             client.send_stream(id, b"request");
             client.finish_stream(id);
-            drive_at(&mut client, &mut server, now);
+            drive_acked_at(&mut client, &mut server, &mut now);
             assert_eq!(server.accept_bi(), Some(id));
             assert_eq!(server.read_stream(id), b"request");
             server.send_stream(id, b"response");
             server.finish_stream(id);
-            drive_at(&mut client, &mut server, now);
+            drive_acked_at(&mut client, &mut server, &mut now);
             assert_eq!(client.read_stream(id), b"response");
             assert!(client.stream_recv_finished(id));
-            drive_at(&mut client, &mut server, now);
+            drive_acked_at(&mut client, &mut server, &mut now);
             assert!(
                 client.streams.is_empty(),
                 "client retained finished stream {id}"
@@ -5992,13 +9564,13 @@ mod tests {
         assert!(server.accept_bidi.is_empty());
         // STOP_SENDING must elicit RESET_STREAM even for a newly opened empty
         // request; otherwise cancelled streams can never finish both halves.
-        for iteration in 0..MAX_PEER_STREAMS * 2 {
-            let now = start + Duration::from_secs(3) + Duration::from_millis(iteration as u64 * 10);
+        for _ in 0..MAX_PEER_STREAMS * 2 {
+            now += Duration::from_millis(10);
             let id = client.open_bi();
             client.cancel_stream(id, 0x10c);
-            drive_at(&mut client, &mut server, now);
+            drive_acked_at(&mut client, &mut server, &mut now);
             assert_eq!(server.accept_bi(), None);
-            drive_at(&mut client, &mut server, now);
+            drive_acked_at(&mut client, &mut server, &mut now);
             assert!(client.streams.is_empty() && server.streams.is_empty());
         }
     }
@@ -6042,11 +9614,11 @@ mod tests {
             ConnectionId::new(&[0x75; 8]),
         )
         .unwrap();
-        drive(&mut client, &mut server);
+        let mut now = Instant::now();
+        drive_acked_at(&mut client, &mut server, &mut now);
         let id = client.open_uni();
         client.send_stream(id, b"control");
         client.finish_stream(id);
-        let now = Instant::now();
         let first = client.build_stream_packet(id, now);
         server.handle_datagram(&first, now).unwrap();
         assert_eq!(server.accept_uni(), Some(id));
@@ -6064,7 +9636,7 @@ mod tests {
         server.handle_datagram(&retry, now).unwrap();
         assert!(!server.streams.contains_key(&id));
         assert!(server.accept_uni().is_none());
-        drive(&mut client, &mut server);
+        drive_acked_at(&mut client, &mut server, &mut now);
         assert!(!client.streams.contains_key(&id));
         assert_eq!(server.recv_data_total, 7);
         assert_eq!(server.recv_data_consumed, 7);
@@ -6382,7 +9954,7 @@ mod tests {
             ecn: None,
         };
         let err = server
-            .recv_ack(SPACE_DATA, &ack, Instant::now())
+            .recv_ack(SPACE_DATA, &ack, Some(0), Instant::now())
             .expect_err("an ACK of a never-sent packet is rejected");
         assert!(matches!(err, QuicTlsError::Protocol(_)), "got {err:?}");
     }
@@ -6614,17 +10186,31 @@ mod tests {
         // The next key-update generation must be direction-consistent: the server's
         // seal key must pair with the client's open key and vice versa. If the server
         // omitted the local/remote swap, one direction fails to decrypt.
-        let ckp = client.next_1rtt_keys().expect("client 1-RTT update keys");
-        let skp = server.next_1rtt_keys().expect("server 1-RTT update keys");
-        let tag = ckp.local.tag_len();
+        let ckp = client
+            .next_packet_keys
+            .as_ref()
+            .expect("client 1-RTT update keys");
+        let skp = server
+            .next_packet_keys
+            .as_ref()
+            .expect("server 1-RTT update keys");
+        let tag = ckp.local.as_ref().unwrap().tag_len();
 
         // client -> server: client seals (local), server opens (remote).
         let c2s = b"key-update probe client to server";
         let mut buf = c2s.to_vec();
         buf.resize(c2s.len() + tag, 0);
-        ckp.local.encrypt_in_place(42, &[], &mut buf).unwrap();
+        ckp.local
+            .as_ref()
+            .unwrap()
+            .encrypt_in_place(42, &[], &mut buf)
+            .unwrap();
         assert_eq!(
-            skp.remote.decrypt_in_place(42, &[], &mut buf).unwrap(),
+            skp.remote
+                .as_ref()
+                .unwrap()
+                .decrypt_in_place(42, &[], &mut buf)
+                .unwrap(),
             c2s,
             "server opens a packet the client sealed with the updated keys"
         );
@@ -6633,9 +10219,17 @@ mod tests {
         let s2c = b"key-update probe server to client";
         let mut buf2 = s2c.to_vec();
         buf2.resize(s2c.len() + tag, 0);
-        skp.local.encrypt_in_place(7, &[], &mut buf2).unwrap();
+        skp.local
+            .as_ref()
+            .unwrap()
+            .encrypt_in_place(7, &[], &mut buf2)
+            .unwrap();
         assert_eq!(
-            ckp.remote.decrypt_in_place(7, &[], &mut buf2).unwrap(),
+            ckp.remote
+                .as_ref()
+                .unwrap()
+                .decrypt_in_place(7, &[], &mut buf2)
+                .unwrap(),
             s2c,
             "client opens a packet the server sealed with the updated keys"
         );

@@ -267,6 +267,11 @@ authorized_sni = ["cloudflare.com"]
 strict_tls13 = true
 ```
 
+The server's replay cache requires durable writes. On Unix, its filesystem must
+support syncing both the cache file and its parent directory; an I/O or sync
+failure rejects the authenticated handshake. Choose a writable local filesystem
+with those guarantees rather than a mount that cannot persist directory changes.
+
 Minimal generated client shape:
 
 ```toml
@@ -346,6 +351,19 @@ See the [threat model](./docs/security/threat-model.md),
 and [release SBOM/provenance verification](./supply-chain/RELEASE-VERIFICATION.md).
 Strict cargo-vet remains failing until missing source audits are completed;
 policy validation does not grant exemptions or imply completed audits.
+
+Check the protocol state machines (handshake, PQ rekey, identity, 0-RTT,
+reconnect, replay insert, UDP probe, QUIC key install, close, BBR mode, and
+the QUIC first byte). `check` exhausts the model and fails if a new
+`src/**/*.rs` file is missing from the coverage ledger. `correspond` checks
+that the Rust control flow still matches it. TLC runs in the `formal` GitHub
+Actions workflow. See [`formal/README.md`](formal/README.md) and
+[`formal/COVERAGE.md`](formal/COVERAGE.md). This is not a proof of every byte.
+
+```bash
+python3 formal/plx_formal.py check
+python3 formal/plx_formal.py correspond
+```
 
 ---
 

@@ -5,7 +5,7 @@
 //! transport installs, plus the Finished/exporter/key-update material. All
 //! intermediate secrets are held in `Zeroizing`.
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::keys::{DirectionalKeys, KeyPair, Keys, PacketKey};
 use super::suite::CipherSuite;
@@ -56,10 +56,12 @@ pub(crate) struct KeySchedule {
     server_hs_secret: Zeroizing<Vec<u8>>,
     /// `exporter_master_secret` (RFC 5705 exporter), set once 1-RTT is derived.
     exporter_master: Option<Zeroizing<Vec<u8>>>,
-    /// `master_secret`, retained so `resumption_master_secret` can be derived after
-    /// the client Finished is added to the transcript (RFC 8446 §7.1). `None` until
-    /// `derive_application` runs.
+    /// `master_secret`, retained only until `finish_handshake` caches resumption
+    /// material over client Finished (RFC 8446 §7.1), then erased.
     master_secret: Option<Zeroizing<Vec<u8>>>,
+    /// Cached through client Finished, so tickets do not require retaining the
+    /// master/handshake ancestors of the initial application traffic keys.
+    resumption_master: Option<Zeroizing<Vec<u8>>>,
     /// The NEXT 1-RTT application secrets to hand out from
     /// [`Self::next_1rtt_packet_keys`] (already advanced one generation past the
     /// installed 1-RTT keys, matching the QUIC key-update contract).
@@ -112,6 +114,7 @@ impl KeySchedule {
                 server_hs_secret,
                 exporter_master: None,
                 master_secret: None,
+                resumption_master: None,
                 next_client_app_secret: None,
                 next_server_app_secret: None,
             },
@@ -141,6 +144,9 @@ impl KeySchedule {
         base_secret: &[u8],
         transcript_hash: &[u8],
     ) -> Result<Vec<u8>, QuicTlsError> {
+        if base_secret.is_empty() {
+            return Err(QuicTlsError::Crypto("handshake secrets retired".into()));
+        }
         let finished_key = Zeroizing::new(self.suite.hkdf_expand_label(
             base_secret,
             "finished",
@@ -158,6 +164,11 @@ impl KeySchedule {
         &mut self,
         transcript_hash: &[u8],
     ) -> Result<Keys, QuicTlsError> {
+        if self.handshake_secret.is_empty() || self.master_secret.is_some() {
+            return Err(QuicTlsError::Crypto(
+                "application secrets already derived".into(),
+            ));
+        }
         let zeros = vec![0_u8; self.suite.hash_len()];
         let empty_hash = self.suite.digest(&[]);
         // `derived` is master-secret-equivalent (master = HKDF-Extract(derived, 0)),
@@ -263,21 +274,31 @@ impl KeySchedule {
         Ok(())
     }
 
-    /// `resumption_master_secret = Derive-Secret(master, "res master", th)` where
-    /// `transcript_hash` runs through the *client* Finished (RFC 8446 §7.1). The
-    /// per-ticket PSK is then [`resumption_psk`] of this secret and a ticket nonce.
-    pub(crate) fn resumption_master_secret(
-        &self,
-        transcript_hash: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
+    /// Cache the resumption master at the client-Finished boundary, then erase
+    /// ancestors capable of reconstructing previous application generations.
+    pub(crate) fn finish_handshake(&mut self, transcript_hash: &[u8]) -> Result<(), QuicTlsError> {
         let master = self.master_secret.as_ref().ok_or_else(|| {
-            QuicTlsError::Crypto("resumption master requested before 1-RTT".into())
+            QuicTlsError::Crypto("handshake completion without master secret".into())
         })?;
-        Ok(Zeroizing::new(self.suite.derive_secret(
+        let resumption = Zeroizing::new(self.suite.derive_secret(
             master,
             "res master",
             transcript_hash,
-        )?))
+        )?);
+        self.resumption_master = Some(resumption);
+        self.master_secret = None;
+        self.handshake_secret.zeroize();
+        self.client_hs_secret.zeroize();
+        self.server_hs_secret.zeroize();
+        Ok(())
+    }
+
+    /// The cached resumption master remains available for late/multiple NSTs.
+    pub(crate) fn resumption_master_secret(&self) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
+        self.resumption_master
+            .as_ref()
+            .map(|secret| Zeroizing::new(secret.to_vec()))
+            .ok_or_else(|| QuicTlsError::Crypto("resumption master before client Finished".into()))
     }
 }
 
@@ -312,7 +333,8 @@ pub(crate) fn binder_finished_key(
     early_secret: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
     let empty_hash = suite.digest(&[]);
-    let binder_key = suite.derive_secret(early_secret, "res binder", &empty_hash)?;
+    let binder_key =
+        Zeroizing::new(suite.derive_secret(early_secret, "res binder", &empty_hash)?);
     Ok(Zeroizing::new(suite.hkdf_expand_label(
         &binder_key,
         "finished",
@@ -406,6 +428,54 @@ mod tests {
         assert_ne!(b1, b2, "successive key-update generations must differ");
     }
 
+    #[test]
+    fn finished_retires_ancestors_but_keeps_exporter_tickets_and_successors() {
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let (mut schedule, _) =
+                KeySchedule::after_server_hello(suite, None, &[0x55; 32], &suite.digest(b"ch..sh"))
+                    .unwrap();
+            schedule
+                .derive_application(&suite.digest(b"ch..sf"))
+                .unwrap();
+            let hash_cf = suite.digest(b"ch..cf");
+            let expected = Zeroizing::new(
+                suite
+                    .derive_secret(
+                        schedule.master_secret.as_ref().unwrap(),
+                        "res master",
+                        &hash_cf,
+                    )
+                    .unwrap(),
+            );
+            let mut exporter_before = [0; 32];
+            schedule
+                .export_keying_material(&mut exporter_before, b"label", b"context")
+                .unwrap();
+            assert!(schedule.resumption_master_secret().is_err());
+            schedule.finish_handshake(&hash_cf).unwrap();
+            assert!(schedule.master_secret.is_none());
+            assert!(schedule.handshake_secret.is_empty());
+            assert!(schedule.client_hs_secret.is_empty());
+            assert!(schedule.server_hs_secret.is_empty());
+            assert_eq!(&*schedule.resumption_master_secret().unwrap(), &*expected);
+            assert_eq!(&*schedule.resumption_master_secret().unwrap(), &*expected);
+            assert!(schedule.finish_handshake(&hash_cf).is_err());
+            assert!(schedule.derive_application(&hash_cf).is_err());
+            assert!(schedule.client_finished_verify_data(&hash_cf).is_err());
+            let mut exporter_after = [0; 32];
+            schedule
+                .export_keying_material(&mut exporter_after, b"label", b"context")
+                .unwrap();
+            assert_eq!(exporter_before, exporter_after);
+            schedule.next_1rtt_packet_keys().unwrap();
+            schedule.next_1rtt_packet_keys().unwrap();
+        }
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -465,16 +535,15 @@ mod tests {
         let (mut sched, _keys) =
             KeySchedule::after_server_hello(suite, None, &shared, &th_sh).unwrap();
         // resumption_master is unavailable until the application secrets are derived.
-        assert!(sched
-            .resumption_master_secret(&suite.digest(b"early"))
-            .is_err());
+        assert!(sched.resumption_master_secret().is_err());
         let _ = sched.derive_application(&suite.digest(b"ch..sf")).unwrap();
 
         let th_cf = suite.digest(b"ch..client-finished");
-        let res_master = sched.resumption_master_secret(&th_cf).unwrap();
+        sched.finish_handshake(&th_cf).unwrap();
+        let res_master = sched.resumption_master_secret().unwrap();
         assert_eq!(res_master.len(), suite.hash_len());
         // Same transcript -> same resumption master (both ends must agree).
-        let res_master2 = sched.resumption_master_secret(&th_cf).unwrap();
+        let res_master2 = sched.resumption_master_secret().unwrap();
         assert_eq!(res_master, res_master2);
 
         // Distinct ticket nonces yield distinct PSKs; each is hash-length.

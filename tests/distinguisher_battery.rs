@@ -15,8 +15,10 @@
 //!    (KS p→0, AUC→1). Proves it has discriminating power, not just low variance.
 //! 4. **ParallaX vs Safari (length, fast)** — drive ParallaX's production record
 //!    encoder, compare its uplink record-length distribution to Safari's, and
-//!    report the KS verdict. The richer socket-level timing/direction comparison
-//!    is an `#[ignore]` placeholder pending an end-to-end authenticated harness.
+//!    report the KS verdict. `e2e_tunnel_roundtrip` separately captures real TCP
+//!    record timing/direction through the full authenticated production tunnel.
+//!    Its loopback echo workload is a harness check, not a matched Safari corpus
+//!    or an indistinguishability gate.
 
 mod distinguisher;
 
@@ -161,6 +163,20 @@ fn roc_auc_handles_ties_and_perfect_ranking() {
     assert!((roc_auc(&tied) - 0.5).abs() < 1e-9);
 }
 
+#[test]
+fn missing_or_invalid_evidence_cannot_report_chance_auc_or_ks_null() {
+    for scored in [vec![], vec![(0.5, 0)], vec![(f64::NAN, 0), (0.5, 1)]] {
+        assert!(std::panic::catch_unwind(|| roc_auc(&scored)).is_err());
+    }
+    assert!(std::panic::catch_unwind(|| cross_validated_auc(&[], FOLDS)).is_err());
+    assert!(std::panic::catch_unwind(|| two_sample_ks(&[], &[1.0])).is_err());
+    assert!(std::panic::catch_unwind(|| two_sample_ks(&[f64::NAN], &[1.0])).is_err());
+    assert!(std::panic::catch_unwind(|| chi_square_gof(&[], &[])).is_err());
+    assert!(std::panic::catch_unwind(|| chi_square_gof(&[1.0], &[1.0])).is_err());
+    assert!(std::panic::catch_unwind(|| ljung_box(&[], 10)).is_err());
+    assert!(std::panic::catch_unwind(|| ljung_box(&[1.0; 5], 2)).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Helpers for tiers 2–4: build classifier samples from two traces.
 // ---------------------------------------------------------------------------
@@ -204,11 +220,11 @@ fn load_safari() -> Trace {
 }
 
 // ---------------------------------------------------------------------------
-// Tier 2: self-test — Safari is indistinguishable from itself.
+// Tier 2: same-source machinery self-check (not independent capture evidence).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn self_test_safari_is_indistinguishable_from_itself() {
+fn self_test_safari_split_stays_near_chance() {
     let safari = load_safari();
     let (a, b) = split_halves(&safari);
 
@@ -221,8 +237,8 @@ fn self_test_safari_is_indistinguishable_from_itself() {
         ks.p_value
     );
 
-    // Classifier AUC must sit in the documented indistinguishability gate. This
-    // is the contract from the module header and PR — no fallback escape hatch.
+    // Keep the same-source numerical machinery regression gate. This cannot
+    // establish independent-capture or unseen-site generalization.
     // Deterministic (fixed LCG seed + fixed corpus), so the measured AUC is
     // stable rather than flaky; `separability` is reported for diagnostics only.
     let samples = samples_from(&a, &b);

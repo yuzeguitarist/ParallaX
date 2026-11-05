@@ -57,6 +57,12 @@ pub const RELAY_READ_BUFFER_TARGET: usize = 256 * 1024;
 
 const PADDING_LEN_FIELD: usize = 2;
 
+// Conservative outbound AES-GCM retirement policy for these bounded records.
+// RFC 9001 Appendix B gives q <= 2^35 / l, where l is plaintext + AAD blocks.
+// Limit l to 2^12 and q to 2^23; check AAD too because the constructor is public.
+const AES_GCM_RECORD_LIMIT: u64 = 1 << 23;
+const AES_GCM_MAX_AUTH_BLOCKS: usize = 1 << 12;
+
 #[derive(Debug, Error)]
 pub enum DataRecordError {
     #[error("TLS record error: {0}")]
@@ -69,6 +75,10 @@ pub enum DataRecordError {
     Traffic(#[from] TrafficError),
     #[error("record_lens do not sum to plaintext length")]
     InvalidRecordLens,
+    #[error("exact-padding count or aggregate wire length is invalid")]
+    InvalidExactPadding,
+    #[error("AES-GCM record key usage budget exceeded; establish a fresh session")]
+    KeyUsageLimit,
 }
 
 pub struct DataRecordCodec {
@@ -132,6 +142,194 @@ fn validate_record_lens(
     Ok(())
 }
 
+fn exact_padded_record_capacity(
+    payload_len: usize,
+    total_pad: usize,
+) -> Result<usize, DataRecordError> {
+    if total_pad > u16::MAX as usize {
+        return Err(record::TlsRecordError::PayloadTooLarge(total_pad).into());
+    }
+    let tls_len = payload_len
+        .checked_add(total_pad)
+        .and_then(|len| len.checked_add(PADDING_LEN_FIELD + AEAD_TAG_LEN))
+        .ok_or(record::TlsRecordError::PayloadTooLarge(usize::MAX))?;
+    if tls_len > OUTER_TLS_RECORD_LIMIT {
+        return Err(record::TlsRecordError::PayloadTooLarge(tls_len).into());
+    }
+    tls_len
+        .checked_add(record::TLS_HEADER_LEN)
+        .ok_or(DataRecordError::InvalidExactPadding)
+}
+
+/// Validate the entire window before output allocation, RNG use or AEAD. In
+/// particular, a bad LAST pad cannot consume a nonce for an earlier record.
+fn validate_exact_padded_record_lens(
+    record_lens: &[usize],
+    pad_lens: &[usize],
+    plaintext_len: usize,
+) -> Result<usize, DataRecordError> {
+    validate_record_lens(record_lens, plaintext_len)?;
+    if record_lens.len() != pad_lens.len() {
+        return Err(DataRecordError::InvalidExactPadding);
+    }
+    record_lens
+        .iter()
+        .zip(pad_lens)
+        .try_fold(0usize, |total, (&len, &pad)| {
+            total
+                .checked_add(exact_padded_record_capacity(len, pad)?)
+                .ok_or(DataRecordError::InvalidExactPadding)
+        })
+}
+
+/// Outbound policy for the bounded record layer, shared with its Kani proofs.
+fn checked_seal_end(
+    usable: Result<(), SessionError>,
+    suite: CipherSuite,
+    sequence: u64,
+    record_count: u64,
+    aad_len: usize,
+) -> Result<u64, DataRecordError> {
+    usable?;
+    if record_count == 0 {
+        return Ok(sequence);
+    }
+    let end = sequence
+        .checked_add(record_count)
+        .ok_or(SessionError::NonceExhausted)?;
+    if suite == CipherSuite::Aes256Gcm {
+        let auth_blocks = (OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN)
+            .div_ceil(16)
+            .checked_add(aad_len.div_ceil(16));
+        if end > AES_GCM_RECORD_LIMIT
+            || auth_blocks.map_or(true, |blocks| blocks > AES_GCM_MAX_AUTH_BLOCKS)
+        {
+            return Err(DataRecordError::KeyUsageLimit);
+        }
+    }
+    Ok(end)
+}
+
+fn check_padded_len(len: usize) -> Result<(), DataRecordError> {
+    if len > OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN {
+        return Err(
+            record::TlsRecordError::PayloadTooLarge(len.saturating_add(AEAD_TAG_LEN)).into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn exact_padding_capacity_rejects_overflow_and_bounds_the_complete_record() {
+        let payload_len: usize = kani::any();
+        let pad: usize = kani::any();
+        let result = exact_padded_record_capacity(payload_len, pad);
+        let mathematical_tls_len = payload_len as u128 + pad as u128 + 18;
+        let permitted =
+            pad <= u16::MAX as usize && mathematical_tls_len <= OUTER_TLS_RECORD_LIMIT as u128;
+        assert_eq!(result.is_ok(), permitted);
+        if let Ok(wire_len) = result {
+            assert_eq!(
+                wire_len as u128,
+                mathematical_tls_len + record::TLS_HEADER_LEN as u128
+            );
+            assert!(wire_len <= OUTER_TLS_RECORD_LIMIT + record::TLS_HEADER_LEN);
+        }
+    }
+
+    #[kani::proof]
+    fn padded_length_guard_enforces_the_budgeted_record_bound() {
+        let len: usize = kani::any();
+        let permitted = check_padded_len(len).is_ok();
+        assert_eq!(permitted, len <= OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN);
+        if permitted {
+            assert!(len.checked_add(AEAD_TAG_LEN).unwrap() <= OUTER_TLS_RECORD_LIMIT);
+        }
+    }
+
+    #[kani::proof]
+    fn outbound_budget_acceptance_implies_bounded_unique_sequence_range() {
+        let sequence: u64 = kani::any();
+        let count: u64 = kani::any();
+        let aad_len: usize = kani::any();
+        let suite = if kani::any() {
+            CipherSuite::Aes256Gcm
+        } else {
+            CipherSuite::ChaCha20Poly1305
+        };
+        if let Ok(end) = checked_seal_end(Ok(()), suite, sequence, count, aad_len) {
+            assert_eq!(sequence.checked_add(count), Some(end));
+            if count != 0 {
+                if suite == CipherSuite::Aes256Gcm {
+                    assert!(end <= AES_GCM_RECORD_LIMIT);
+                    let blocks =
+                        (OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN).div_ceil(16) + aad_len.div_ceil(16);
+                    assert!(blocks <= AES_GCM_MAX_AUTH_BLOCKS);
+                    // Independent security target: do not derive this bound
+                    // from the configurable implementation limit constants.
+                    assert!((end as u128) * (blocks as u128) <= (1u128 << 35));
+                }
+                let index: u64 = kani::any();
+                if index < count {
+                    let used = sequence.checked_add(index).unwrap();
+                    assert!(used < end);
+                    assert!(used < u64::MAX);
+                }
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn outbound_budget_rejects_overflow_and_excess_usage() {
+        let sequence: u64 = kani::any();
+        let count: u64 = kani::any();
+        let aad_len: usize = kani::any();
+        let result = checked_seal_end(Ok(()), CipherSuite::Aes256Gcm, sequence, count, aad_len);
+        if count == 0 {
+            assert_eq!(result.unwrap(), sequence);
+        } else {
+            let end = sequence.checked_add(count);
+            let blocks = (OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN)
+                .div_ceil(16)
+                .checked_add(aad_len.div_ceil(16));
+            let permitted = end.map_or(false, |end| end <= AES_GCM_RECORD_LIMIT)
+                && blocks.map_or(false, |blocks| blocks <= AES_GCM_MAX_AUTH_BLOCKS);
+            assert_eq!(result.is_ok(), permitted);
+        }
+    }
+
+    #[kani::proof]
+    fn outbound_budget_rejects_poisoned_state_even_for_empty_batches() {
+        let poisoned: bool = kani::any();
+        let sequence: u64 = kani::any();
+        let count: u64 = kani::any();
+        let aad_len: usize = kani::any();
+        let suite = if kani::any() {
+            CipherSuite::Aes256Gcm
+        } else {
+            CipherSuite::ChaCha20Poly1305
+        };
+        let usable = if poisoned {
+            Err(SessionError::Aead)
+        } else {
+            Ok(())
+        };
+        let result = checked_seal_end(usable, suite, sequence, count, aad_len);
+        if poisoned {
+            assert!(matches!(
+                result,
+                Err(DataRecordError::Aead(SessionError::Aead))
+            ));
+        } else if count == 0 {
+            assert_eq!(result.unwrap(), sequence);
+        }
+    }
+}
+
 impl DataRecordCodec {
     pub fn new(aead: AeadCodec, padding: PaddingProfile, aad: &'static [u8]) -> Self {
         Self { aead, padding, aad }
@@ -139,6 +337,28 @@ impl DataRecordCodec {
 
     pub fn protect_secret_memory(&self) {
         self.aead.protect_secret_memory();
+    }
+
+    fn ensure_seal_budget(&self, record_count: usize) -> Result<(), DataRecordError> {
+        checked_seal_end(
+            self.aead.ensure_usable(),
+            self.aead.suite(),
+            self.aead.sequence(),
+            record_count as u64,
+            self.aad.len(),
+        )
+        .map(|_| ())
+    }
+
+    fn seal_padded_payload(
+        &mut self,
+        plaintext: &mut [u8],
+    ) -> Result<[u8; AEAD_TAG_LEN], DataRecordError> {
+        self.ensure_seal_budget(1)?;
+        check_padded_len(plaintext.len())?;
+        self.aead
+            .seal_in_place_detached(plaintext, self.aad)
+            .map_err(Into::into)
     }
 
     pub fn seal<R>(&mut self, payload: &[u8], rng: &mut R) -> Result<Vec<u8>, DataRecordError>
@@ -209,6 +429,11 @@ impl DataRecordCodec {
     {
         let record_start = builder.record_start;
         let ciphertext_start = record_start + record::TLS_HEADER_LEN;
+        if let Err(err) = self.ensure_seal_budget(1) {
+            out[ciphertext_start..].zeroize();
+            out.truncate(record_start);
+            return Err(err);
+        }
         let payload_len = out.len() - ciphertext_start;
         self.padding.apply_suffix_into(payload_len, rng, out);
         let padded_len = out.len() - ciphertext_start;
@@ -222,15 +447,12 @@ impl DataRecordCodec {
             "data_record.seal_plaintext",
             &out[ciphertext_start..],
         );
-        let tag = match self
-            .aead
-            .seal_in_place_detached(&mut out[ciphertext_start..], self.aad)
-        {
+        let tag = match self.seal_padded_payload(&mut out[ciphertext_start..]) {
             Ok(tag) => tag,
             Err(err) => {
                 out[ciphertext_start..].zeroize();
                 out.truncate(record_start);
-                return Err(err.into());
+                return Err(err);
             }
         };
         out.extend_from_slice(&tag);
@@ -263,6 +485,7 @@ impl DataRecordCodec {
         R: rand::Rng + rand::RngCore + ?Sized,
         F: FnOnce(&PaddingProfile, usize, &mut R, &mut Vec<u8>),
     {
+        self.ensure_seal_budget(1)?;
         out.reserve(
             record::TLS_HEADER_LEN + payload.len() + reserve_pad + PADDING_LEN_FIELD + AEAD_TAG_LEN,
         );
@@ -287,15 +510,12 @@ impl DataRecordCodec {
             "data_record.seal_plaintext",
             &out[ciphertext_start..],
         );
-        let tag = match self
-            .aead
-            .seal_in_place_detached(&mut out[ciphertext_start..], self.aad)
-        {
+        let tag = match self.seal_padded_payload(&mut out[ciphertext_start..]) {
             Ok(tag) => tag,
             Err(err) => {
                 out[ciphertext_start..].zeroize();
                 out.truncate(record_start);
-                return Err(err.into());
+                return Err(err);
             }
         };
         out.extend_from_slice(&tag);
@@ -401,6 +621,7 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
+        self.ensure_seal_budget(chunks.len())?;
         let aggregate_pad = crate::protocol::command::FramedChunk::aggregate_pad_len(rng);
         let last = chunks.len().saturating_sub(1);
         for (idx, chunk) in chunks.iter().enumerate() {
@@ -437,11 +658,12 @@ impl DataRecordCodec {
     where
         R: rand::Rng + rand::RngCore + ?Sized,
     {
-        records.clear();
         let max_chunk_len = self.max_plaintext_len();
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
+        self.ensure_seal_budget(chunk_count(payload.len(), max_chunk_len))?;
+        records.clear();
         let max_padding = self.padding.max_len();
         if payload.len() <= max_chunk_len {
             out.reserve(record_capacity(payload.len(), max_padding));
@@ -483,6 +705,7 @@ impl DataRecordCodec {
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
+        self.ensure_seal_budget(chunk_count(payload.len(), max_chunk_len))?;
         let max_padding = self.padding.max_len();
         if payload.len() <= max_chunk_len {
             out.reserve(record_capacity(payload.len(), max_padding));
@@ -514,6 +737,7 @@ impl DataRecordCodec {
         if max_chunk_len == 0 {
             return Err(record::TlsRecordError::PayloadTooLarge(payload.len()).into());
         }
+        self.ensure_seal_budget(chunk_count(payload.len(), max_chunk_len))?;
         if payload.is_empty() {
             return Ok(vec![self.seal(payload, rng)?]);
         }
@@ -634,9 +858,46 @@ impl DataRecordCodec {
         // Contract: record_lens must sum to plaintext.len(). Internal callers always
         // satisfy this; the guard turns a contract violation into a clean error.
         validate_record_lens(record_lens, plaintext.len())?;
+        self.ensure_seal_budget(record_lens.len())?;
         let mut offset = 0;
         for &len in record_lens {
             self.seal_into(&plaintext[offset..offset + len], rng, out)?;
+            offset += len;
+        }
+        Ok(())
+    }
+
+    /// Experimental mux-only serial batch. Exact padding replaces profile
+    /// sampling, and the complete window is checked before any output or nonce
+    /// changes. The existing serial/parallel APIs retain their usual behavior.
+    pub(crate) fn seal_records_into_exact_padded<R>(
+        &mut self,
+        plaintext: &[u8],
+        record_lens: &[usize],
+        pad_lens: &[usize],
+        rng: &mut R,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError>
+    where
+        R: Rng + rand::RngCore + ?Sized,
+    {
+        let reserve = validate_exact_padded_record_lens(record_lens, pad_lens, plaintext.len())?;
+        self.ensure_seal_budget(record_lens.len())?;
+        out.len()
+            .checked_add(reserve)
+            .ok_or(DataRecordError::InvalidExactPadding)?;
+        out.reserve(reserve);
+        let start = out.len();
+        let mut offset = 0;
+        for (&len, &pad) in record_lens.iter().zip(pad_lens) {
+            if let Err(err) =
+                self.seal_into_exact_padded(&plaintext[offset..offset + len], pad, rng, out)
+            {
+                self.aead.poison();
+                out[start..].zeroize();
+                out.truncate(start);
+                return Err(err);
+            }
             offset += len;
         }
         Ok(())
@@ -664,6 +925,7 @@ impl DataRecordCodec {
         R: Rng + rand::RngCore + ?Sized,
         F: FnMut(usize, &mut Vec<u8>),
     {
+        self.ensure_seal_budget(record_lens.len())?;
         let total: usize = record_lens.iter().sum();
         out.reserve(chunked_records_capacity(
             total,
@@ -740,20 +1002,17 @@ impl DataRecordCodec {
         // instead of being silently sealed as nothing.
         validate_record_lens(record_lens, plaintext.len())?;
         let record_count = record_lens.len();
+        self.ensure_seal_budget(record_count)?;
         if record_count == 0 {
             return Ok(());
         }
-        self.aead.ensure_usable()?;
+        // Reserve before dispatch: a failed sibling must never make a nonce
+        // already used by another worker available for a later seal.
+        let base_sequence = self.aead.reserve_sequence(record_count as u64)?;
         let group_count = pool.width().max(1).min(record_count);
 
         let cipher = self.aead.cipher();
         let nonce_base = self.aead.nonce_base();
-        let base_sequence = self.aead.sequence();
-        // Defense in depth: reject a batch that would wrap the per-direction
-        // sequence counter past u64::MAX before any record is sealed.
-        if base_sequence.checked_add(record_count as u64).is_none() {
-            return Err(SessionError::NonceExhausted.into());
-        }
         let aad = self.aad;
         let padding = self.padding;
 
@@ -789,13 +1048,18 @@ impl DataRecordCodec {
         let segments = parallel::dispatch_blocking(|| pool.run_ordered(jobs));
         let mut sealed = Vec::with_capacity(segments.len());
         for segment in segments {
-            sealed.push(segment?);
+            match segment {
+                Ok(segment) => sealed.push(segment),
+                Err(err) => {
+                    self.aead.poison();
+                    return Err(err);
+                }
+            }
         }
         out.reserve(sealed.iter().map(Vec::len).sum());
         for segment in &sealed {
             out.extend_from_slice(segment);
         }
-        self.aead.advance_sequence(record_count as u64);
         Ok(())
     }
 
@@ -994,7 +1258,7 @@ where
         "data_record.seal_plaintext",
         &out[ciphertext_start..],
     );
-    let tag = match session::seal_in_place_detached_with(
+    let tag = match seal_worker_payload(
         cipher,
         nonce_base,
         sequence,
@@ -1005,7 +1269,7 @@ where
         Err(err) => {
             out[ciphertext_start..].zeroize();
             out.truncate(record_start);
-            return Err(err.into());
+            return Err(err);
         }
     };
     out.extend_from_slice(&tag);
@@ -1014,6 +1278,18 @@ where
     out[record_start + 3] = len[0];
     out[record_start + 4] = len[1];
     Ok(())
+}
+
+fn seal_worker_payload(
+    cipher: &LessSafeKey,
+    nonce_base: &[u8; NONCE_LEN],
+    sequence: u64,
+    plaintext: &mut [u8],
+    aad: &[u8],
+) -> Result<[u8; AEAD_TAG_LEN], DataRecordError> {
+    check_padded_len(plaintext.len())?;
+    session::seal_in_place_detached_with(cipher, nonce_base, sequence, plaintext, aad)
+        .map_err(Into::into)
 }
 
 /// Seals a contiguous run of records (one worker's share) into a fresh buffer,
@@ -1208,6 +1484,108 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
+
+    #[test]
+    fn exact_padded_batch_has_exact_wire_lengths_and_one_nonce_per_record() {
+        for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            let mut enc = DataRecordCodec::new(
+                AeadCodec::new_with_suite(suite, [1; KEY_LEN], [2; NONCE_LEN]),
+                PaddingProfile::new(7, 32).unwrap(),
+                SERVER_TO_CLIENT_AAD,
+            );
+            let mut dec = DataRecordCodec::new(
+                AeadCodec::new_with_suite(suite, [1; KEY_LEN], [2; NONCE_LEN]),
+                PaddingProfile::new(7, 32).unwrap(),
+                SERVER_TO_CLIENT_AAD,
+            );
+            let lens = [3, 5, 1];
+            let targets = [1386, 4246, 16401];
+            let pads = [
+                targets[0] - lens[0] - 18,
+                targets[1] - lens[1] - 18,
+                targets[2] - lens[2] - 18,
+            ];
+            let mut rng = StdRng::seed_from_u64(131);
+            let mut out = b"prefix".to_vec();
+            enc.seal_records_into_exact_padded(b"abcdefghi", &lens, &pads, &mut rng, &mut out)
+                .unwrap();
+            assert_eq!(&out[..6], b"prefix");
+            let mut at = 6;
+            let mut plaintext = Vec::new();
+            for target in targets {
+                let header = record::parse_header(&out[at..]).unwrap();
+                assert_eq!(header.payload_len, target);
+                plaintext.extend(dec.open(&out[at..at + header.total_len]).unwrap());
+                at += header.total_len;
+            }
+            assert_eq!(at, out.len());
+            assert_eq!(plaintext, b"abcdefghi");
+            assert_eq!(enc.aead.sequence(), 3);
+            let next = enc.seal(b"next nonce", &mut rng).unwrap();
+            assert_eq!(dec.open(&next).unwrap(), b"next nonce");
+        }
+    }
+
+    #[test]
+    fn exact_padded_batch_rejects_bad_last_pad_or_lens_before_output_nonce_and_rng() {
+        for (lens, pads) in [
+            (vec![1, 1], vec![0, 16401]),
+            (vec![1, 1], vec![0, u16::MAX as usize + 1]),
+            (vec![1, 1], vec![0, usize::MAX]),
+            (vec![1, 1], vec![0]),
+            (vec![1, 1], vec![0, 0, 0]),
+            (vec![1, 2], vec![0, 0]),
+            (vec![usize::MAX, 3], vec![0, 0]),
+        ] {
+            let mut enc = DataRecordCodec::new(
+                AeadCodec::new([1; KEY_LEN], [2; NONCE_LEN]),
+                PaddingProfile::new(0, 0).unwrap(),
+                SERVER_TO_CLIENT_AAD,
+            );
+            let mut rng = StdRng::seed_from_u64(132);
+            let mut untouched_rng = rng.clone();
+            let mut out = b"prefix".to_vec();
+            let capacity = out.capacity();
+            assert!(enc
+                .seal_records_into_exact_padded(b"ab", &lens, &pads, &mut rng, &mut out)
+                .is_err());
+            assert_eq!(out, b"prefix");
+            assert_eq!(out.capacity(), capacity);
+            assert_eq!(enc.aead.sequence(), 0);
+            assert_eq!(
+                rand::RngCore::next_u64(&mut rng),
+                rand::RngCore::next_u64(&mut untouched_rng)
+            );
+            enc.seal(b"still unused", &mut rng).unwrap();
+            assert_eq!(enc.aead.sequence(), 1);
+        }
+    }
+
+    #[test]
+    fn exact_padded_batch_checks_whole_aes_budget_before_the_first_record() {
+        let mut enc = DataRecordCodec::new(
+            AeadCodec::new_with_suite(CipherSuite::Aes256Gcm, [1; KEY_LEN], [2; NONCE_LEN]),
+            PaddingProfile::new(0, 0).unwrap(),
+            SERVER_TO_CLIENT_AAD,
+        );
+        enc.aead.advance_sequence(AES_GCM_RECORD_LIMIT - 1);
+        let mut rng = StdRng::seed_from_u64(133);
+        let mut untouched_rng = rng.clone();
+        let mut out = b"prefix".to_vec();
+        assert!(matches!(
+            enc.seal_records_into_exact_padded(b"ab", &[1, 1], &[1367, 1367], &mut rng, &mut out),
+            Err(DataRecordError::KeyUsageLimit)
+        ));
+        assert_eq!(out, b"prefix");
+        assert_eq!(enc.aead.sequence(), AES_GCM_RECORD_LIMIT - 1);
+        assert_eq!(
+            rand::RngCore::next_u64(&mut rng),
+            rand::RngCore::next_u64(&mut untouched_rng)
+        );
+        enc.seal_records_into_exact_padded(b"a", &[1], &[1367], &mut rng, &mut out)
+            .unwrap();
+        assert_eq!(enc.aead.sequence(), AES_GCM_RECORD_LIMIT);
+    }
     #[test]
     fn data_record_round_trip() {
         let key = [1_u8; KEY_LEN];
@@ -2353,6 +2731,60 @@ mod tests {
     }
 
     #[test]
+    fn empty_seal_batches_reject_poisoned_codecs_without_side_effects() {
+        let pool = test_pool();
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut violations = Vec::new();
+        for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            for state in 0..3 {
+                for mode in 0..5 {
+                    let mut enc = DataRecordCodec::new(
+                        AeadCodec::new_with_suite(suite, [11; KEY_LEN], [12; NONCE_LEN]),
+                        padding,
+                        CLIENT_TO_SERVER_AAD,
+                    );
+                    if state != 0 {
+                        enc.aead.poison();
+                    }
+                    if state == 2 {
+                        enc.rekey([13; KEY_LEN], [14; NONCE_LEN]);
+                    }
+                    let mut rng = StdRng::seed_from_u64(90);
+                    let mut untouched_rng = rng.clone();
+                    let mut out = b"prefix".to_vec();
+                    let result = match mode {
+                        0 => enc.seal_records_into(&[], &[], &mut rng, &mut out),
+                        1 => enc.seal_records_into_exact_padded(&[], &[], &[], &mut rng, &mut out),
+                        2 => enc.seal_records_into_inplace(&[], &mut rng, &mut out, |_, _| {
+                            panic!("empty batch must not call fill")
+                        }),
+                        3 => enc.seal_records_into_parallel(&pool, &[], &[], &mut rng, &mut out),
+                        _ => enc.seal_pq_flight(&[], &mut rng, &mut out),
+                    };
+                    let rejected_poison =
+                        matches!(result, Err(DataRecordError::Aead(SessionError::Aead)));
+                    let unchanged_rng = rand::RngCore::next_u64(&mut rng)
+                        == rand::RngCore::next_u64(&mut untouched_rng);
+                    // A healthy empty PQ flight still samples its existing
+                    // aggregate pad. Rejected work must never sample it.
+                    if (state == 0 && result.is_err())
+                        || (state != 0 && !rejected_poison)
+                        || out != b"prefix"
+                        || enc.aead.sequence() != 0
+                        || ((state != 0 || mode != 4) && !unchanged_rng)
+                    {
+                        violations.push((suite, state, mode));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "failed empty-batch cases: {violations:?}"
+        );
+    }
+
+    #[test]
     fn parallel_seal_rejects_sequence_overflow() {
         let key = [11_u8; KEY_LEN];
         let nonce = [12_u8; NONCE_LEN];
@@ -2369,6 +2801,156 @@ mod tests {
         assert!(matches!(
             enc.seal_records_into_parallel(&test_pool(), &payload, &lens, &mut rng, &mut out),
             Err(DataRecordError::Aead(SessionError::NonceExhausted))
+        ));
+    }
+
+    #[test]
+    fn aes_budget_is_shared_by_serial_and_parallel_seals_and_fresh_rekey() {
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let pool = test_pool();
+        let mut rng = StdRng::seed_from_u64(92);
+        for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            let mut enc = DataRecordCodec::new(
+                AeadCodec::new_with_suite(suite, [1; KEY_LEN], [2; NONCE_LEN]),
+                padding,
+                CLIENT_TO_SERVER_AAD,
+            );
+            let mut dec = DataRecordCodec::new(
+                AeadCodec::new_with_suite(suite, [1; KEY_LEN], [2; NONCE_LEN]),
+                padding,
+                CLIENT_TO_SERVER_AAD,
+            );
+            enc.aead.advance_sequence(AES_GCM_RECORD_LIMIT - 3);
+            dec.aead.advance_sequence(AES_GCM_RECORD_LIMIT - 3);
+            let first = enc.seal(b"first", &mut rng).unwrap();
+            assert_eq!(dec.open(&first).unwrap(), b"first");
+            let mut batch = Vec::new();
+            enc.seal_records_into_parallel(&pool, b"ab", &[1, 1], &mut rng, &mut batch)
+                .unwrap();
+            let mut opened = Vec::new();
+            dec.open_concat_records_parallel(&pool, &batch, &mut opened)
+                .unwrap();
+            assert_eq!(opened, b"ab");
+            assert_eq!(enc.aead.sequence(), AES_GCM_RECORD_LIMIT);
+            let mut out = b"prefix".to_vec();
+            let result = enc.seal_into(b"next", &mut rng, &mut out);
+            if suite == CipherSuite::Aes256Gcm {
+                assert!(matches!(result, Err(DataRecordError::KeyUsageLimit)));
+                assert_eq!(out, b"prefix");
+                assert_eq!(enc.aead.sequence(), AES_GCM_RECORD_LIMIT);
+            } else {
+                let range = result.unwrap();
+                assert_eq!(dec.open(&out[range]).unwrap(), b"next");
+            }
+            enc.rekey([3; KEY_LEN], [4; NONCE_LEN]);
+            dec.rekey([3; KEY_LEN], [4; NONCE_LEN]);
+            assert_eq!(enc.aead.sequence(), 0);
+            let fresh = enc.seal(b"fresh key", &mut rng).unwrap();
+            assert_eq!(dec.open(&fresh).unwrap(), b"fresh key");
+        }
+    }
+
+    #[test]
+    fn aes_batches_reject_crossing_budget_before_output_or_callbacks() {
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let pool = test_pool();
+        for mode in 0..7 {
+            let mut enc = DataRecordCodec::new(
+                AeadCodec::new_with_suite(CipherSuite::Aes256Gcm, [5; KEY_LEN], [6; NONCE_LEN]),
+                padding,
+                CLIENT_TO_SERVER_AAD,
+            );
+            enc.aead.advance_sequence(AES_GCM_RECORD_LIMIT - 1);
+            let max_len = enc.max_plaintext_len();
+            let payload = vec![7; max_len + 1];
+            let mut rng = StdRng::seed_from_u64(93);
+            let mut out = b"prefix".to_vec();
+            let result = match mode {
+                0 => enc
+                    .seal_chunks_into(&payload, &mut rng, &mut out)
+                    .map(|_| ()),
+                1 => enc.seal_chunks_into_untracked(&payload, &mut rng, &mut out),
+                2 => enc.seal_chunks(&payload, &mut rng).map(|_| ()),
+                3 => enc.seal_records_into(&payload, &[max_len, 1], &mut rng, &mut out),
+                4 => enc.seal_records_into_inplace(&[max_len, 1], &mut rng, &mut out, |_, _| {
+                    panic!("over-budget batch must not call fill")
+                }),
+                5 => enc.seal_records_into_parallel(
+                    &pool,
+                    &payload,
+                    &[max_len, 1],
+                    &mut rng,
+                    &mut out,
+                ),
+                _ => enc.seal_pq_flight(&[vec![1], vec![2]], &mut rng, &mut out),
+            };
+            assert!(
+                matches!(result, Err(DataRecordError::KeyUsageLimit)),
+                "mode {mode}"
+            );
+            assert_eq!(out, b"prefix", "mode {mode}");
+            assert_eq!(enc.aead.sequence(), AES_GCM_RECORD_LIMIT - 1);
+        }
+    }
+
+    #[test]
+    fn aes_budget_bounds_aad_and_cleans_unfinished_records() {
+        const MAX_AAD_LEN: usize =
+            (AES_GCM_MAX_AUTH_BLOCKS - (OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN).div_ceil(16)) * 16;
+        static MAX_AAD: [u8; MAX_AAD_LEN] = [0; MAX_AAD_LEN];
+        static OVER_AAD: [u8; MAX_AAD_LEN + 1] = [0; MAX_AAD_LEN + 1];
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut rng = StdRng::seed_from_u64(94);
+        for aad in [&MAX_AAD[..], &OVER_AAD[..]] {
+            let mut enc = DataRecordCodec::new(
+                AeadCodec::new_with_suite(CipherSuite::Aes256Gcm, [7; KEY_LEN], [8; NONCE_LEN]),
+                padding,
+                aad,
+            );
+            let mut out = b"prefix".to_vec();
+            let builder = enc.begin_record(&mut out);
+            out.extend_from_slice(b"private plaintext");
+            let result = enc.finish_record(builder, &mut rng, &mut out);
+            if aad.len() == MAX_AAD_LEN {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(DataRecordError::KeyUsageLimit)));
+                assert_eq!(out, b"prefix");
+                assert_eq!(enc.aead.sequence(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_seal_failure_reserves_nonces_and_poisons_even_after_rekey() {
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut enc = DataRecordCodec::new(
+            AeadCodec::new([9; KEY_LEN], [10; NONCE_LEN]),
+            padding,
+            CLIENT_TO_SERVER_AAD,
+        );
+        let payload = vec![0; OUTER_TLS_RECORD_LIMIT + 1];
+        let mut rng = StdRng::seed_from_u64(95);
+        let mut out = b"prefix".to_vec();
+        assert!(enc
+            .seal_records_into_parallel(
+                &test_pool(),
+                &payload,
+                &[1, OUTER_TLS_RECORD_LIMIT],
+                &mut rng,
+                &mut out,
+            )
+            .is_err());
+        assert_eq!(out, b"prefix");
+        assert_eq!(enc.aead.sequence(), 2);
+        assert!(matches!(
+            enc.seal(b"retry", &mut rng),
+            Err(DataRecordError::Aead(SessionError::Aead))
+        ));
+        enc.rekey([11; KEY_LEN], [12; NONCE_LEN]);
+        assert!(matches!(
+            enc.seal(b"retry after rekey", &mut rng),
+            Err(DataRecordError::Aead(SessionError::Aead))
         ));
     }
 

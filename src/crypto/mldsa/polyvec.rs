@@ -124,8 +124,7 @@ impl Polyvecl {
     /// domain (with the `2^-32` Montgomery factor), for each of the `L` elements.
     pub fn pointwise_poly_montgomery(&mut self, a: &Poly, v: &Polyvecl) {
         for i in 0..L {
-            let vi = v.vec[i];
-            self.vec[i].pointwise_montgomery(a, &vi);
+            self.vec[i].pointwise_montgomery(a, &v.vec[i]);
         }
     }
 
@@ -135,7 +134,7 @@ impl Polyvecl {
     /// `<u, v>`). Used to form each row of `A . y`.
     pub fn pointwise_acc_montgomery(w: &mut Poly, u: &Polyvecl, v: &Polyvecl) {
         w.pointwise_montgomery(&u.vec[0], &v.vec[0]);
-        let mut t = Poly::zero();
+        let mut t = zeroize::Zeroizing::new(Poly::zero());
         for i in 1..L {
             t.pointwise_montgomery(&u.vec[i], &v.vec[i]);
             // In-place accumulate (`w += t`) rather than `let wcur = *w; w.add(&wcur, &t)`:
@@ -276,8 +275,7 @@ impl Polyveck {
     /// domain (with the `2^-32` factor), for each of the `K` elements.
     pub fn pointwise_poly_montgomery(&mut self, a: &Poly, v: &Polyveck) {
         for i in 0..K {
-            let vi = v.vec[i];
-            self.vec[i].pointwise_montgomery(a, &vi);
+            self.vec[i].pointwise_montgomery(a, &v.vec[i]);
         }
     }
 

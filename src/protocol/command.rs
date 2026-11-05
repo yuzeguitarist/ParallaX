@@ -26,6 +26,10 @@ const MAX_HOST_LEN: usize = 255;
 const CONNECT_FIXED_LEN: usize = 4 + 2 + 2 + 4;
 const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
 
+/// Shared TCP mux liveness budget. The server's bounded receipt delay uses
+/// half this existing client suspect interval, leaving a return-path margin.
+pub(crate) const MUX_CARRIER_SUSPECT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Per-record wire overhead a sealed data record adds on top of its plaintext:
 /// the 2-byte self-describing pad-length trailer + the AEAD tag. So a CONNECT
 /// record's on-wire TLS `length` field = plaintext + this. Used to translate a

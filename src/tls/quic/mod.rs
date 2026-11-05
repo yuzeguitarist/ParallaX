@@ -212,11 +212,8 @@ pub(crate) trait TlsSession: Send {
     fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError>;
     /// Emit outgoing CRYPTO bytes; return a [`KeyChange`] on a space transition.
     fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange>;
-    /// The next 1-RTT packet-key generation (RFC 9001 §6 key update). Implemented +
-    /// tested; the relay closes at the AEAD limit rather than rotating, so no
-    /// production caller invokes it yet.
-    #[allow(dead_code)]
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>>;
+    /// Derive the next 1-RTT packet-key generation (RFC 9001 §6).
+    fn next_1rtt_keys(&mut self) -> Result<KeyPair<PacketKey>, QuicTlsError>;
     fn is_handshaking(&self) -> bool;
     /// The peer's raw `quic_transport_parameters` blob, once available.
     fn peer_transport_parameters(&self) -> Option<&[u8]>;
@@ -268,7 +265,7 @@ impl TlsSession for ClientHandshake {
     fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
         ClientHandshake::write_handshake(self, out)
     }
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
+    fn next_1rtt_keys(&mut self) -> Result<KeyPair<PacketKey>, QuicTlsError> {
         ClientHandshake::next_1rtt_keys(self)
     }
     fn is_handshaking(&self) -> bool {
@@ -297,7 +294,7 @@ impl TlsSession for ServerHandshake {
     fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
         ServerHandshake::write_handshake(self, out)
     }
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
+    fn next_1rtt_keys(&mut self) -> Result<KeyPair<PacketKey>, QuicTlsError> {
         ServerHandshake::next_1rtt_keys(self)
     }
     fn is_handshaking(&self) -> bool {

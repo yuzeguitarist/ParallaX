@@ -1,0 +1,179 @@
+rules:
+  - id: parallax-mldsa-no-unwiped-xof-wrapper
+    languages: [rust]
+    severity: ERROR
+    message: Production SHAKE must use the reviewed core and owned wiping buffers; digest wrappers leave input/output caches unscrubbed.
+    patterns:
+      - pattern-not-inside: 'mod tests { ... }'
+      - pattern-either:
+          - pattern: 'Shake128::default()'
+          - pattern: 'Shake256::default()'
+          - pattern: 'sha3::Shake128::default()'
+          - pattern: 'sha3::Shake256::default()'
+          - pattern: '$HASH.finalize_xof()'
+
+  - id: parallax-mldsa-absorb-buffer-wipe
+    languages: [rust]
+    severity: ERROR
+    message: The entire absorb block, including bytes beyond the cursor, must be explicitly zeroized.
+    patterns:
+      - pattern: 'fn clear(...) { ... }'
+      - pattern-not: 'fn clear(...) { wipe_bytes(self.0.pad_with_zeros().as_mut_slice()); }'
+
+  - id: parallax-mldsa-wipe-bytes
+    languages: [rust]
+    severity: ERROR
+    message: The shipping wipe helper must zeroize the exact borrowed live slice.
+    patterns:
+      - pattern: 'fn wipe_bytes(...) { ... }'
+      - pattern-not: 'fn wipe_bytes(...) { bytes.zeroize(); }'
+
+  - id: parallax-mldsa-wipe-no-early-return
+    languages: [rust]
+    severity: ERROR
+    message: Retaining the canonical wipe does not excuse an earlier or nested return.
+    patterns:
+      - pattern-inside: 'fn wipe_bytes(...) { ... }'
+      - pattern-either:
+          - pattern: 'return;'
+          - pattern: 'return $VALUE;'
+      - pattern-not: 'return bytes.zeroize();'
+
+  - id: parallax-mldsa-absorb-drop-wipe
+    languages: [rust]
+    severity: ERROR
+    message: Dropping the absorb owner must call its full-block wipe, including during unwinding.
+    patterns:
+      - pattern: 'fn drop(...) { ... }'
+      - pattern-not: 'fn drop(...) { self.clear(); }'
+
+  - id: parallax-mldsa-output-block-wipe
+    languages: [rust]
+    severity: ERROR
+    message: The owned output byte adapter must zeroize its complete block.
+    patterns:
+      - pattern: 'fn zeroize(...) { ... }'
+      - pattern-not: 'fn zeroize(...) { wipe_bytes(self.bytes.as_mut_slice()); }'
+
+  - id: parallax-mldsa-output-cache-owner
+    languages: [rust]
+    severity: ERROR
+    message: A SHAKE reader owns one zeroizing output block and a public cursor, not an unprotected cache.
+    patterns:
+      - pattern: 'struct WipingReader { ... }'
+      - pattern-not: |
+          struct WipingReader {
+            core: R,
+            block: Zeroizing<BlockBytes<R>>,
+            offset: usize,
+          }
+
+  - id: parallax-mldsa-output-cache-read
+    languages: [rust]
+    severity: ERROR
+    message: Empty reads never advance the core; consumed bytes are wiped while unread bytes remain available.
+    patterns:
+      - pattern-inside: 'impl WipingReader<$R> { ... }'
+      - pattern: 'fn read(...) { ... }'
+      - pattern-not: |
+          fn read(...) {
+            while !out.is_empty() {
+              if self.offset == self.block.bytes.len() {
+                self.block = Zeroizing::new(BlockBytes { bytes: self.core.read_block() });
+                self.offset = 0;
+              }
+              let count = self.read_cached_prefix(out);
+              out = &mut out[count..];
+            }
+          }
+
+  - id: parallax-mldsa-output-cache-prefix
+    languages: [rust]
+    severity: ERROR
+    message: The proved shipping cached-prefix operation must bound, copy, wipe and advance exactly the consumed range.
+    patterns:
+      - pattern: 'fn read_cached_prefix(...) { ... }'
+      - pattern-not: |
+          fn read_cached_prefix(...) {
+            let count = (self.block.bytes.len() - self.offset).min(out.len());
+            let end = self.offset + count;
+            out[..count].copy_from_slice(&self.block.bytes[self.offset..end]);
+            wipe_bytes(&mut self.block.bytes[self.offset..end]);
+            self.offset = end;
+            count
+          }
+
+  - id: parallax-mldsa-prefix-no-early-return
+    languages: [rust]
+    severity: ERROR
+    message: Retaining the canonical cached-prefix operation does not excuse an earlier or nested return.
+    patterns:
+      - pattern-inside: 'fn read_cached_prefix(...) { ... }'
+      - pattern: 'return $VALUE;'
+      - pattern-not: 'return count;'
+
+  - id: parallax-mldsa-core-absorb-owner
+    languages: [rust]
+    severity: ERROR
+    message: The SHAKE core must absorb through the wiping owner and finalize into the wiping reader.
+    patterns:
+      - pattern: 'fn new_reader(...) { ... }'
+      - pattern-not: |
+          fn new_reader(...) {
+            let mut core = C::default();
+            let mut buffer = WipingBuffer::<C>(Buffer::<C>::default());
+            for chunk in inputs {
+              buffer.0.digest_blocks(chunk, |blocks| UpdateCore::update_blocks(&mut core, blocks));
+            }
+            WipingReader::new(core.finalize_xof_core(&mut buffer.0))
+          }
+
+  - id: parallax-mldsa-borrow-pointwise-input
+    languages: [rust]
+    severity: ERROR
+    message: Pointwise products borrow secret input polynomials rather than creating an unprotected Copy local.
+    patterns:
+      - pattern: 'fn pointwise_poly_montgomery(...) { ... }'
+      - pattern-not: |
+          fn pointwise_poly_montgomery(...) {
+            for i in 0..$LEN {
+              self.vec[i].pointwise_montgomery(a, &v.vec[i]);
+            }
+          }
+
+  - id: parallax-mldsa-wiping-accumulator-temp
+    languages: [rust]
+    severity: ERROR
+    message: Matrix-vector product temporaries contain secret-derived coefficients and require a zeroizing owner.
+    patterns:
+      - pattern: 'fn pointwise_acc_montgomery(...) { ... }'
+      - pattern-not: |
+          fn pointwise_acc_montgomery(...) {
+            w.pointwise_montgomery(&u.vec[0], &v.vec[0]);
+            let mut t = zeroize::Zeroizing::new(Poly::zero());
+            for i in 1..L {
+              t.pointwise_montgomery(&u.vec[i], &v.vec[i]);
+              w.add_assign(&t);
+            }
+          }
+
+  - id: parallax-mldsa-no-extra-secret-poly-copy
+    languages: [rust]
+    severity: ERROR
+    message: Retaining the canonical borrowed multiply does not excuse an additional input polynomial copy.
+    patterns:
+      - pattern-inside: 'fn pointwise_poly_montgomery(...) { ... }'
+      - pattern: 'let $COPY = v.vec[$INDEX];'
+
+  - id: parallax-mldsa-no-output-cache-copy
+    languages: [rust]
+    severity: ERROR
+    message: Do not create a new unprotected copy of the secret-derived output cache.
+    patterns:
+      - pattern-inside: 'impl WipingReader<$R> { ... }'
+      - pattern-either:
+          - pattern-inside: 'fn read(...) { ... }'
+          - pattern-inside: 'fn read_cached_prefix(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.block.bytes.clone()'
+          - pattern: 'let $COPY = self.block.bytes;'

@@ -1,0 +1,33 @@
+{
+  "verifier_source": {
+    "version": "2.05",
+    "url": "https://bblanche.gitlabpages.inria.fr/proverif/proverif2.05.tar.gz",
+    "sha256": "4871f53c32ab4a04669a060c4886ba5d9080496963fb980a9a62d2c429ceabc4"
+  },
+  "regions": [
+    {"id": "identity_message", "path": "src/crypto/identity.rs", "function": "identity_message", "sha256": "ba2102e885504f29868a1bbcdc7c8e35b63853c01be9a09028538bfbbb41fc66"},
+    {"id": "pq_rekey_binding", "path": "src/crypto/identity.rs", "function": "pq_rekey_binding", "sha256": "76bf70eb69c8a36bd7be40eba0945373714a166c556908fd9a6ede42730bb1a6"},
+    {"id": "sign_server_identity", "path": "src/crypto/identity.rs", "function": "sign_server_identity", "sha256": "91fcde7d7af461be8d95b5c85432613ce4ced023122ea55673d5226c6c5da587"},
+    {"id": "verify_server_identity", "path": "src/crypto/identity.rs", "function": "verify_server_identity", "sha256": "c55a406b8ece691393409346f2489759712a547e32ffd11dbb6f18489788074a"},
+    {"id": "identity_domain_labels", "path": "src/crypto/identity.rs", "start": "const IDENTITY_CONTEXT:", "end": "#[derive(Debug, Error)]", "sha256": "bdbad13a4a6bc8b4d9dda3c08bf1bfb99257f4a668c87796bf1e4133c2e8b6ed"},
+    {"id": "identity_binding", "path": "src/handshake/client.rs", "function": "identity_binding", "sha256": "04a3c422589c00151693db079154cd75ffdbe5bc96a424b8ac72d39d278077ae"},
+    {"id": "build_pq_rekey_record", "path": "src/handshake/client.rs", "function": "build_pq_rekey_record", "sha256": "dcf915186b529437ee3da00e00924063b6871673cb78dd19e258a79486a66745"},
+    {"id": "apply_pq_rekey_shared", "path": "src/handshake/client.rs", "function": "apply_pq_rekey_shared", "sha256": "dfa4001ab4f8f8b803ae2b07e9d86a939d5eb2db73b28ea78ca832c2f5dc1689"},
+    {"id": "apply_pq_rekey_shared_with_identity_binding", "path": "src/handshake/client.rs", "function": "apply_pq_rekey_shared_with_identity_binding", "sha256": "46fbe70e4e762253fe6065e566da3981c2ef9ad13a9c97f17d1b327ce8cda3b2"},
+    {"id": "apply_server_pq_rekey", "path": "src/handshake/server.rs", "function": "apply_server_pq_rekey", "sha256": "31516abdeb91ef532097813eb4277a9e73e30436875be7fadbd6094955119887"},
+    {"id": "hybrid_sandwich_rekey", "path": "src/crypto/pq.rs", "function": "hybrid_sandwich_rekey", "sha256": "2c0b441f35ce5969a3b809717875d46ca97cfce9b53aabfdfe83d1f2d4e3d103"},
+    {"id": "write_hybrid_rekey_ikm", "path": "src/crypto/pq.rs", "function": "write_hybrid_rekey_ikm", "sha256": "4c5e91416603478d337d24a5635563c4dbcbedfb69e1a4151f5736ee9e075f8f"},
+    {"id": "write_hybrid_rekey_ikm_vec", "path": "src/crypto/pq.rs", "function": "write_hybrid_rekey_ikm_vec", "sha256": "8fe8fae56003ef255dd357d5ea755c7d3f78e496950e987ccbf38fcdc1c2fbb7"},
+    {"id": "expand_epoch_keys", "path": "src/crypto/session.rs", "function": "expand_epoch_keys", "sha256": "ca4c0bcc57e74a3fafe5f1bc35e23b9ff14f837160fc5fe2633a7237acc76d9e"},
+    {"id": "expand", "path": "src/crypto/session.rs", "function": "expand", "sha256": "f2fba67ed024475e939d5cd26de209e771c6a2af7498d7b8caa74ba89cb850ec"},
+    {"id": "write_epoch_hkdf_info", "path": "src/crypto/session.rs", "function": "write_epoch_hkdf_info", "sha256": "be90397baafea463688b98aaac14fb247b66f23df12173f8131be927188ff8ff"},
+    {"id": "transcript_hash", "path": "src/handshake/transcript.rs", "function": "transcript_hash", "sha256": "773b18bb3797b082e78f9d6b7a6048d0b4392b8a79aefa6768a8b7ee6dac028d"},
+    {"id": "encode_with_suite", "path": "src/protocol/command.rs", "function": "encode_with_suite", "sha256": "adb6d561377fff06994dc81d10699f7a4b7ef20a18315dd9b2c9865c6eaf4f04"},
+    {"id": "decode_ref_with_suite", "path": "src/protocol/command.rs", "function": "decode_ref_with_suite", "sha256": "72af50bf169fe0b22bcbb01a4b0e8e916cb947b8d4f4a08bf67aea815e11d951"},
+    {"id": "apply_server_key_exchange_record_blocking", "path": "src/client/runtime.rs", "function": "apply_server_key_exchange_record_blocking", "sha256": "14b59b35182721f89adc72ca0ac969252b048ea1069f3d1e828083211ef26e5b"},
+    {"id": "verify_server_identity_payload_blocking", "path": "src/client/runtime.rs", "function": "verify_server_identity_payload_blocking", "sha256": "ffc39dd87611d1ccbb3424ad171c5746aeb28d5e4cd154fb7c4c3b53491424ad"},
+    {"id": "establish_authenticated_data_session_inner", "path": "src/client/runtime.rs", "function": "establish_authenticated_data_session_inner", "sha256": "cc7220ba821f081ce91193a64cfe1ee46e57f587ea0bf05e2d81d0bd35501436"},
+    {"id": "server_pq_wire_binding", "path": "src/handshake/server.rs", "start": "let key_exchange_payload = ServerKeyExchange {", "end": "crate::process_hardening::protect_secret_bytes(\n                            \"pq_rekey.mlkem_shared_secret\",", "sha256": "eebb9e8e305d5e53ec6bcd55385361039efd726f895d2e8cf62f0144676890b1"},
+    {"id": "server_identity_call_fields", "path": "src/handshake/server.rs", "start": "let identity_signature = sign_server_identity_blocking(", "end": "let identity_payload = ServerIdentityProof {", "sha256": "599c6b64ae0c8bdaf27adebea44e7ddb8a22e41db77591cc412ba9574b95004f"}
+  ]
+}

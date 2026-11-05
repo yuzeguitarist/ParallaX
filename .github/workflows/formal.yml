@@ -1,0 +1,89 @@
+name: formal
+
+# Protocol state-machine check. The Python checker exhausts the models in
+# formal/plx_formal.py (session, QUIC handshake, 0-RTT, replay insert, UDP
+# probe, inbound gates, key install, QUIC close, BBR mode, first byte). TLC
+# then checks the generated TLA+ with an independent engine. Correspondence
+# fails the job if the Rust control flow those models describe has moved.
+#
+# The same Python tests also run from ci-pr's lint job (no Java). This workflow
+# adds TLC, on the protocol paths and on a weekly schedule.
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'formal/**'
+      - 'src/handshake/**'
+      - 'src/client/runtime.rs'
+      - 'src/tls/quic/**'
+      - 'src/transport/udp/zero_rtt.rs'
+      - 'src/transport/udp/quic/**'
+      - 'src/transport/udp/probe.rs'
+      - 'src/protocol/data.rs'
+      - 'src/protocol/command.rs'
+      - 'src/crypto/identity.rs'
+      - 'src/crypto/pq.rs'
+      - 'src/crypto/session.rs'
+      - 'src/crypto/replay.rs'
+      - '.github/workflows/formal.yml'
+  push:
+    branches: [main, master]
+    paths:
+      - 'formal/**'
+      - 'src/handshake/**'
+      - 'src/client/runtime.rs'
+      - 'src/tls/quic/**'
+      - 'src/transport/udp/zero_rtt.rs'
+      - 'src/transport/udp/quic/**'
+      - 'src/transport/udp/probe.rs'
+      - 'src/protocol/data.rs'
+      - 'src/protocol/command.rs'
+      - 'src/crypto/identity.rs'
+      - 'src/crypto/pq.rs'
+      - 'src/crypto/session.rs'
+      - 'src/crypto/replay.rs'
+      - '.github/workflows/formal.yml'
+  schedule:
+    - cron: '17 5 * * 1' # Mondays 05:17 UTC (offset from the kani lane)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formal:
+    name: protocol state machines (model + TLC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Exhaustive model check and TLA+ freshness
+        run: python3 formal/plx_formal.py check
+
+      - name: Rust control-flow correspondence
+        run: python3 formal/plx_formal.py correspond
+
+      - name: Formal checker tests
+        run: python3 -m unittest discover -s formal -p 'test_*.py'
+
+      - name: Install Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install TLA+ tools 1.7.4
+        run: |
+          curl -fsSL -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  tla2tools.jar" | sha256sum -c
+
+      - name: TLC
+        run: python3 formal/plx_formal.py tlc --jar tla2tools.jar

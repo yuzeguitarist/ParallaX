@@ -1,0 +1,98 @@
+# Observation-only AST queries consumed by check_mux_record_planning.py.
+# Expected matches are not violations. The checker requires one encoder call
+# per complete production function, including calls in nested branches/scopes.
+rules:
+  - id: observe-mux-data-piece-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete data-piece function range for encoder cardinality checks.
+    pattern: 'fn encode_mux_data_piece(...) { ... }'
+  - id: observe-mux-data-piece-encoder
+    languages: [rust]
+    severity: INFO
+    message: Each actual mux encoder call inside the data-piece function.
+    patterns:
+      - pattern-inside: 'fn encode_mux_data_piece(...) { ... }'
+      - pattern-either:
+          - pattern: 'MuxFrame::encode_borrowed_into(...)'
+          - pattern: '$FRAME.encode_into(...)'
+  - id: observe-mux-record-planner-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete ready-planner function range for encoder cardinality checks.
+    pattern: 'fn plan_ready_mux_records(...) { ... }'
+  - id: observe-mux-record-planner-encoder
+    languages: [rust]
+    severity: INFO
+    message: Each actual direct mux encoder call inside the ready planner.
+    patterns:
+      - pattern-inside: 'fn plan_ready_mux_records(...) { ... }'
+      - pattern-either:
+          - pattern: '$FRAME.encode_into(...)'
+          - pattern: 'MuxFrame::encode_borrowed_into(...)'
+  - id: observe-mux-record-padding-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete planner range for per-record pad-vector cardinality.
+    pattern: 'fn plan_ready_mux_records(...) { ... }'
+  - id: observe-mux-record-positive-data-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete planner range for the one positive Data assignment.
+    pattern: 'fn plan_ready_mux_records(...) { ... }'
+  - id: observe-mux-record-positive-data-encoder
+    languages: [rust]
+    severity: INFO
+    message: Each positive Data assignment, including nested extra assignments.
+    patterns:
+      - pattern-inside: 'fn plan_ready_mux_records(...) { ... }'
+      - pattern: 'has_positive_data = ...'
+  - id: observe-mux-record-padding-encoder
+    languages: [rust]
+    severity: INFO
+    message: Each pad-vector insertion, including extra canonical blocks.
+    patterns:
+      - pattern-inside: 'fn plan_ready_mux_records(...) { ... }'
+      - pattern-either:
+          - pattern: 'scratch.exact_pad_lens.push(...)'
+          - pattern: 'scratch.exact_pad_lens.append(...)'
+          - pattern: 'scratch.exact_pad_lens.extend(...)'
+          - pattern: 'scratch.exact_pad_lens.extend_from_slice(...)'
+          - pattern: 'scratch.exact_pad_lens.resize(...)'
+          - pattern: 'scratch.exact_pad_lens.insert(...)'
+  - id: observe-mux-record-exact-sealer-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete writer range for one exact sealer site.
+    pattern: 'async fn write_server_mux_frames_planned(...) { ... }'
+  - id: observe-mux-record-exact-sealer-encoder
+    languages: [rust]
+    severity: INFO
+    message: Each exact-padding batch call, including nested extra branches.
+    patterns:
+      - pattern-inside: 'async fn write_server_mux_frames_planned(...) { ... }'
+      - pattern: 'codec.seal_records_into_exact_padded(...)'
+  - id: observe-mux-record-writer-window-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete helper for one real client-facing write site.
+    pattern: 'async fn write_server_mux_frames_planned(...) { ... }'
+  - id: observe-mux-record-writer-window-encoder
+    languages: [rust]
+    severity: INFO
+    message: Each real client-facing write site, including duplicate complete guarded blocks.
+    patterns:
+      - pattern-inside: 'async fn write_server_mux_frames_planned(...) { ... }'
+      - pattern: 'writer.write_records(...)'
+  - id: observe-mux-record-writer-loop-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete production loop for one progressing batch helper site.
+    pattern: 'async fn server_mux_writer_loop(...) { ... }'
+  - id: observe-mux-record-writer-loop-encoder
+    languages: [rust]
+    severity: INFO
+    message: Each batch helper call including extra timeout-wrapped copies.
+    patterns:
+      - pattern-inside: 'async fn server_mux_writer_loop(...) { ... }'
+      - pattern: 'write_server_mux_frames_planned(...)'

@@ -419,19 +419,20 @@ fn handshake_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
     m
 }
 
-/// ServerHello: pins TLS 1.3 + `TLS_AES_128_GCM_SHA256`, echoes the (empty)
-/// session id, and carries supported_versions + the X25519MLKEM768 key_share.
+/// ServerHello: selects TLS 1.3 and the supplied cipher suite, echoes the session
+/// id, and carries supported_versions + the X25519MLKEM768 key_share.
 fn build_server_hello(
     session_id_echo: &[u8],
     server_key_share: &[u8],
     random: &[u8; 32],
     psk_selected: bool,
+    suite: CipherSuite,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     put_u16(&mut body, TLS13_LEGACY_VERSION);
     body.extend_from_slice(random);
     put_vec_u8(&mut body, session_id_echo);
-    put_u16(&mut body, TLS_AES_128_GCM_SHA256);
+    put_u16(&mut body, suite.to_u16());
     body.push(0); // null compression
 
     let mut exts = Vec::new();
@@ -592,7 +593,7 @@ impl ServerHandshake {
     /// Build a server handshake with the cover certificate chain (DER), the
     /// ECDSA P-256 signing key (PKCS#8) that signs CertificateVerify, the ALPN
     /// list to select from, and the server's transport-parameters blob. The QUIC
-    /// v1 Initial suite (`TLS_AES_128_GCM_SHA256`) is pinned.
+    /// application suite is pinned to `TLS_AES_128_GCM_SHA256`.
     pub fn new(
         cert_chain: Arc<Vec<Vec<u8>>>,
         signing_key_pkcs8: &[u8],
@@ -677,14 +678,25 @@ impl ServerHandshake {
         !self.handshake_complete
     }
 
+    /// Exercise complete handshakes with each supported AEAD, without adding a
+    /// production configuration surface or changing the server's suite policy.
+    #[cfg(test)]
+    pub(crate) fn set_test_suite(&mut self, suite: CipherSuite) {
+        assert_eq!(self.state, ServerState::ExpectClientHello);
+        self.suite = suite;
+    }
+
     /// The next 1-RTT packet-key generation for a key update (RFC 9001 §6).
-    #[allow(dead_code)] // key-update keys: implemented + tested; the relay closes at the AEAD limit, not rotates
-    pub fn next_1rtt_keys(&mut self) -> Option<KeyPair<PacketKey>> {
+    pub fn next_1rtt_keys(&mut self) -> Result<KeyPair<PacketKey>, QuicTlsError> {
         // The schedule is side-agnostic (local = client, remote = server). The server
         // seals with the server key and opens with the client key, so swap — exactly
         // as `swap()` does for the handshake Keys (RFC 9001 §6 key update).
-        let pair = self.schedule.as_mut()?.next_1rtt_packet_keys().ok()?;
-        Some(KeyPair {
+        let pair = self
+            .schedule
+            .as_mut()
+            .ok_or_else(|| QuicTlsError::Crypto("key update before key schedule".into()))?
+            .next_1rtt_packet_keys()?;
+        Ok(KeyPair {
             local: pair.remote,
             remote: pair.local,
         })
@@ -787,6 +799,12 @@ impl ServerHandshake {
             (ServerState::ExpectClientFinished, HANDSHAKE_FINISHED) => {
                 self.verify_client_finished(&message[4..])?;
                 self.transcript.extend_from_slice(message);
+                let transcript_hash = self.suite.digest(&self.transcript);
+                self.schedule
+                    .as_mut()
+                    .ok_or_else(|| QuicTlsError::Crypto("Finished without schedule".into()))?
+                    .finish_handshake(&transcript_hash)?;
+                self.expected_client_finished = None;
                 self.state = ServerState::Complete;
                 self.handshake_complete = true;
                 self.issue_session_ticket()?;
@@ -891,6 +909,7 @@ impl ServerHandshake {
             &server_share,
             &random,
             accepted_psk.is_some(),
+            self.suite,
         );
         self.transcript.extend_from_slice(&server_hello);
         let hash_sh = self.suite.digest(&self.transcript);
@@ -1044,8 +1063,7 @@ impl ServerHandshake {
             .schedule
             .as_ref()
             .ok_or_else(|| QuicTlsError::Crypto("session ticket before schedule".into()))?;
-        let transcript_hash = self.suite.digest(&self.transcript);
-        let res_master = schedule.resumption_master_secret(&transcript_hash)?;
+        let res_master = schedule.resumption_master_secret()?;
         // Empty ticket nonce: Safari 26.4's NewSessionTicket carries nonce len 0.
         let psk = resumption_psk(self.suite, &res_master, &[])?;
         let issued_at = SystemTime::now()
@@ -1556,6 +1574,28 @@ mod tests {
             &state.psk[..],
             "client and server derive the same resumption PSK"
         );
+
+        client.read_handshake(&post).unwrap();
+        let first_ticket = client.take_session_ticket(1_000_000).unwrap();
+        assert_eq!(first_ticket.psk, client_psk);
+        let mut exporter_before = [0; 32];
+        client
+            .export_keying_material(&mut exporter_before, b"label", b"context")
+            .unwrap();
+        // Deriving later generations must not invalidate the cached Finished
+        // boundary used by a late, independently issued NewSessionTicket.
+        client.next_1rtt_keys().unwrap();
+        server.next_1rtt_keys().unwrap();
+        server.issue_session_ticket().unwrap();
+        let later_post = drain(|b| server.write_handshake(b));
+        client.read_handshake(&later_post).unwrap();
+        let later_ticket = client.take_session_ticket(1_001_000).unwrap();
+        assert_eq!(later_ticket.psk, client_psk);
+        let mut exporter_after = [0; 32];
+        client
+            .export_keying_material(&mut exporter_after, b"label", b"context")
+            .unwrap();
+        assert_eq!(exporter_before, exporter_after);
 
         // A server can issue a resumption ticket without granting 0-RTT. This
         // application's cache only drives 0-RTT, so it leaves the slot empty and

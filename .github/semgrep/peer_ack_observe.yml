@@ -1,0 +1,557 @@
+rules:
+  - id: observe-peer-ack-prevalidate-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete early parser scope, distinct from authenticated adoption.
+    pattern: 'fn prevalidate_peer_transport_params(...) { ... }'
+  - id: observe-peer-ack-prevalidate-read
+    languages: [rust]
+    severity: INFO
+    message: One actual early TP parse.
+    patterns:
+      - pattern-inside: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern: 'TransportParameters::read(...)'
+  - id: observe-peer-ack-prevalidate-validated
+    languages: [rust]
+    severity: INFO
+    message: One successful validation flag commit.
+    patterns:
+      - pattern-inside: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern: 'self.peer_transport_params_prevalidated = ...'
+  - id: observe-peer-ack-prevalidate-getter
+    languages: [rust]
+    severity: INFO
+    message: Use this TLS handshake's getter, never ticket state.
+    patterns:
+      - pattern-inside: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern: 'self.tls.peer_transport_parameters()'
+  - id: observe-peer-ack-prevalidate-close
+    languages: [rust]
+    severity: INFO
+    message: One actual terminal transport-close call on parse failure.
+    patterns:
+      - pattern-inside: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern: 'self.close_transport(...)'
+  - id: observe-peer-ack-prevalidate-return
+    languages: [rust]
+    severity: INFO
+    message: Count full return nodes including closure tails.
+    patterns:
+      - pattern-inside: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern: 'return $VALUE'
+  - id: observe-peer-ack-prevalidate-reason
+    languages: [rust]
+    severity: INFO
+    message: Complete error-reason expression; a canonical format tail must not excuse an enclosing side effect.
+    patterns:
+      - pattern-inside: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern: 'transport_error(0x08, 0x06, $EARLY_REASON)'
+      - focus-metavariable: $EARLY_REASON
+  - id: observe-peer-ack-prevalidate-missing
+    languages: [rust]
+    severity: INFO
+    message: Rust let-else missing-input return, which Semgrep does not normalize as an ordinary return node.
+    patterns:
+      - pattern-inside: 'fn prevalidate_peer_transport_params(...) { ... }'
+      - pattern: 'let Some(blob) = self.tls.peer_transport_parameters() else { return Ok(()); };'
+  - id: observe-peer-ack-apply-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+  - id: observe-peer-ack-apply-read
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+      - pattern: 'TransportParameters::read(...)'
+  - id: observe-peer-ack-apply-exponent
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+      - pattern: 'self.peer_ack_delay_exponent = ...'
+  - id: observe-peer-ack-apply-maximum
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+      - pattern: 'self.peer_max_ack_delay = ...'
+  - id: observe-peer-ack-apply-applied
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+      - pattern: 'self.peer_ack_params_applied = ...'
+  - id: observe-peer-ack-apply-return
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+      - pattern: 'return $VALUE'
+  - id: observe-peer-ack-apply-authenticated
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn apply_authenticated_peer_ack_params(...) { ... }'
+      - pattern: 'self.tls.is_handshaking()'
+  - id: observe-peer-ack-decode-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn decoded_ack_delay(...) { ... }'
+  - id: observe-peer-ack-decode-duration
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn decoded_ack_delay(...) { ... }'
+      - pattern: 'Duration::new(...)'
+  - id: observe-peer-ack-decode-return
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn decoded_ack_delay(...) { ... }'
+      - pattern: 'return $VALUE'
+  - id: observe-peer-ack-cap-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn cap_decoded_peer_ack_delay(...) { ... }'
+  - id: observe-peer-ack-cap-return
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn cap_decoded_peer_ack_delay(...) { ... }'
+      - pattern: 'return $VALUE'
+  - id: observe-peer-ack-cap-clamp
+    languages: [rust]
+    severity: INFO
+    message: One reviewed clamp; deep expression matching cannot hide a second preconfirmation clamp.
+    patterns:
+      - pattern-inside: 'fn cap_decoded_peer_ack_delay(...) { ... }'
+      - pattern: 'delay.min(peer_max)'
+  - id: observe-peer-ack-wrapper-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete production decoding-to-policy wrapper.
+    pattern: 'fn ack_delay_for_recovery(...) { ... }'
+  - id: observe-peer-ack-wrapper-decode
+    languages: [rust]
+    severity: INFO
+    message: One actual wire decoder.
+    patterns:
+      - pattern-inside: 'fn ack_delay_for_recovery(...) { ... }'
+      - pattern: 'decoded_ack_delay(...)'
+  - id: observe-peer-ack-wrapper-cap
+    languages: [rust]
+    severity: INFO
+    message: One actual post-decoding cap policy.
+    patterns:
+      - pattern-inside: 'fn ack_delay_for_recovery(...) { ... }'
+      - pattern: 'cap_decoded_peer_ack_delay(...)'
+  - id: observe-peer-ack-eligible-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn pto_space_eligible(...) { ... }'
+  - id: observe-peer-ack-eligible-return
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn pto_space_eligible(...) { ... }'
+      - pattern: 'return $VALUE'
+  - id: observe-peer-ack-extra-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn peer_ack_delay_for_pto(...) { ... }'
+  - id: observe-peer-ack-extra-return
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn peer_ack_delay_for_pto(...) { ... }'
+      - pattern: 'return $VALUE'
+  - id: observe-peer-ack-receive-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn process_packet(...) { ... }'
+  - id: observe-peer-ack-receive-apply
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.apply_authenticated_peer_ack_params()'
+  - id: observe-peer-ack-receive-prevalidate
+    languages: [rust]
+    severity: INFO
+    message: One early validation before completing this packet.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.prevalidate_peer_transport_params()'
+  - id: observe-peer-ack-rtt-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn recv_ack(...) { ... }'
+  - id: observe-peer-ack-rtt-delay
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn recv_ack(...) { ... }'
+      - pattern: 'ack_delay_for_recovery(...)'
+  - id: observe-peer-ack-rtt-update
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn recv_ack(...) { ... }'
+      - pattern: 'self.rtt.update(...)'
+  - id: observe-peer-ack-pto-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn pto_duration(...) { ... }'
+  - id: observe-peer-ack-pto-extra
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn pto_duration(...) { ... }'
+      - pattern: 'peer_ack_delay_for_pto(...)'
+  - id: observe-peer-ack-drain-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn drain_duration(...) { ... }'
+  - id: observe-peer-ack-drain-extra
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn drain_duration(...) { ... }'
+      - pattern: 'peer_ack_delay_for_pto(...)'
+  - id: observe-peer-ack-next-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn next_timeout(...) { ... }'
+  - id: observe-peer-ack-next-eligible
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn next_timeout(...) { ... }'
+      - pattern: 'pto_space_eligible(...)'
+  - id: observe-peer-ack-timeout-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn handle_timeout(...) { ... }'
+  - id: observe-peer-ack-timeout-eligible
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn handle_timeout(...) { ... }'
+      - pattern: 'pto_space_eligible(...)'
+  - id: observe-peer-ack-probe-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    pattern: 'fn queue_probe(...) { ... }'
+  - id: observe-peer-ack-probe-eligible
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'fn queue_probe(...) { ... }'
+      - pattern: 'pto_space_eligible(...)'
+  - id: observe-peer-ack-parser-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed function scope.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern: 'fn read(...) { ... }'
+  - id: observe-peer-ack-parser-exponent
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: 'tp.ack_delay_exponent = ...'
+  - id: observe-peer-ack-parser-maximum
+    languages: [rust]
+    severity: INFO
+    message: Direct reviewed effect, including nested scopes.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: 'tp.max_ack_delay_ms = ...'
+  - id: observe-peer-ack-initial-connection-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed initializer owner.
+    patterns:
+      - pattern: 'fn new_inner(...) { ... }'
+  - id: observe-peer-ack-initial-connection-expression
+    languages: [rust]
+    severity: INFO
+    message: Complete Self struct expression with full initializer-expression metavariables; schema changes require review.
+    patterns:
+      - pattern-inside: 'fn new_inner(...) { ... }'
+      - pattern: &peer_ack_connection_fields |
+          Self {
+            side: $INIT_SIDE,
+            version: $INIT_VERSION,
+            initial_dcid: $INIT_INITIAL_DCID,
+            dcid: $INIT_DCID,
+            scid: $INIT_SCID,
+            peer_cid_adopted: $INIT_PEER_CID_ADOPTED,
+            tls: $INIT_TLS,
+            spaces: $INIT_SPACES,
+            rtt: $INIT_RTT,
+            cc: $INIT_CC,
+            pacer: $INIT_PACER,
+            pmtud: $INIT_PMTUD,
+            mtu_probe_pn: $INIT_MTU_PROBE_PN,
+            peer_ecn_ce: $INIT_PEER_ECN_CE,
+            delivered: $INIT_DELIVERED,
+            pto_count: $INIT_PTO_COUNT,
+            probe_pending: $INIT_PROBE_PENDING,
+            data_packets_sealed: $INIT_DATA_PACKETS_SEALED,
+            zero_rtt_packets_sealed: $INIT_ZERO_RTT_PACKETS_SEALED,
+            key_phase: $INIT_KEY_PHASE,
+            next_packet_keys: $INIT_NEXT_PACKET_KEYS,
+            previous_read_key: $INIT_PREVIOUS_READ_KEY,
+            next_update_at: $INIT_NEXT_UPDATE_AT,
+            key_update_soft_limit: $INIT_KEY_UPDATE_SOFT_LIMIT,
+            sealed_packets: $INIT_SEALED_PACKETS,
+            data_packets_open_failed: $INIT_DATA_PACKETS_OPEN_FAILED,
+            handshake_done_pending: $INIT_HANDSHAKE_DONE_PENDING,
+            handshake_confirmed: $INIT_HANDSHAKE_CONFIRMED,
+            peer_ack_delay_exponent: $INIT_PEER_ACK_DELAY_EXPONENT,
+            peer_max_ack_delay: $INIT_PEER_MAX_ACK_DELAY,
+            peer_ack_params_applied: $INIT_PEER_ACK_PARAMS_APPLIED,
+            peer_transport_params_prevalidated: $INIT_PEER_TRANSPORT_PARAMS_PREVALIDATED,
+            discard_initial_after_ack: $INIT_DISCARD_INITIAL_AFTER_ACK,
+            peer_addr_validated: $INIT_PEER_ADDR_VALIDATED,
+            anti_amp_recv: $INIT_ANTI_AMP_RECV,
+            anti_amp_sent: $INIT_ANTI_AMP_SENT,
+            last_send_time: $INIT_LAST_SEND_TIME,
+            keepalive_interval: $INIT_KEEPALIVE_INTERVAL,
+            ping_pending: $INIT_PING_PENDING,
+            write_level: $INIT_WRITE_LEVEL,
+            zero_rtt_keys: $INIT_ZERO_RTT_KEYS,
+            streams: $INIT_STREAMS,
+            next_bidi: $INIT_NEXT_BIDI,
+            next_uni: $INIT_NEXT_UNI,
+            peer_streams_opened: $INIT_PEER_STREAMS_OPENED,
+            recv_max_streams: $INIT_RECV_MAX_STREAMS,
+            recv_max_streams_sent: $INIT_RECV_MAX_STREAMS_SENT,
+            need_max_streams: $INIT_NEED_MAX_STREAMS,
+            send_max_streams: $INIT_SEND_MAX_STREAMS,
+            accept_bidi: $INIT_ACCEPT_BIDI,
+            accept_uni: $INIT_ACCEPT_UNI,
+            closed: $INIT_CLOSED,
+            close_pending: $INIT_CLOSE_PENDING,
+            close_sent: $INIT_CLOSE_SENT,
+            close_time: $INIT_CLOSE_TIME,
+            drained: $INIT_DRAINED,
+            last_recv_time: $INIT_LAST_RECV_TIME,
+            created_at: $INIT_CREATED_AT,
+            send_max_data: $INIT_SEND_MAX_DATA,
+            send_data_total: $INIT_SEND_DATA_TOTAL,
+            recv_max_data: $INIT_RECV_MAX_DATA,
+            recv_max_data_sent: $INIT_RECV_MAX_DATA_SENT,
+            recv_data_total: $INIT_RECV_DATA_TOTAL,
+            recv_data_consumed: $INIT_RECV_DATA_CONSUMED,
+            recv_pending_total: $INIT_RECV_PENDING_TOTAL,
+            need_max_data: $INIT_NEED_MAX_DATA,
+            peer_flow_applied: $INIT_PEER_FLOW_APPLIED,
+            peer_msd_bidi_local: $INIT_PEER_MSD_BIDI_LOCAL,
+            peer_msd_bidi_remote: $INIT_PEER_MSD_BIDI_REMOTE,
+            peer_msd_uni: $INIT_PEER_MSD_UNI,
+          }
+  - id: observe-peer-ack-initial-parser-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed initializer owner.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern: 'fn read(...) { ... }'
+  - id: observe-peer-ack-initial-parser-expression
+    languages: [rust]
+    severity: INFO
+    message: Complete Self struct expression with full initializer-expression metavariables; schema changes require review.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: &peer_ack_tp_fields |
+          Self {
+            initial_max_data: $INIT_INITIAL_MAX_DATA,
+            initial_max_stream_data_bidi_local: $INIT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+            initial_max_stream_data_bidi_remote: $INIT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+            initial_max_stream_data_uni: $INIT_INITIAL_MAX_STREAM_DATA_UNI,
+            initial_max_streams_bidi: $INIT_INITIAL_MAX_STREAMS_BIDI,
+            initial_max_streams_uni: $INIT_INITIAL_MAX_STREAMS_UNI,
+            ack_delay_exponent: $INIT_ACK_DELAY_EXPONENT,
+            max_ack_delay_ms: $INIT_MAX_ACK_DELAY_MS,
+            active_connection_id_limit: $INIT_ACTIVE_CONNECTION_ID_LIMIT,
+            initial_src_cid: $INIT_INITIAL_SRC_CID,
+          }
+  - id: observe-peer-ack-initial-connection-peer_ack_delay_exponent
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'fn new_inner(...) { ... }'
+      - pattern: *peer_ack_connection_fields
+      - focus-metavariable: $INIT_PEER_ACK_DELAY_EXPONENT
+  - id: observe-peer-ack-initial-connection-peer_max_ack_delay
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'fn new_inner(...) { ... }'
+      - pattern: *peer_ack_connection_fields
+      - focus-metavariable: $INIT_PEER_MAX_ACK_DELAY
+  - id: observe-peer-ack-initial-connection-peer_ack_params_applied
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'fn new_inner(...) { ... }'
+      - pattern: *peer_ack_connection_fields
+      - focus-metavariable: $INIT_PEER_ACK_PARAMS_APPLIED
+  - id: observe-peer-ack-initial-connection-peer_transport_params_prevalidated
+    languages: [rust]
+    severity: INFO
+    message: Complete initializer expression for the independent early-validation flag.
+    patterns:
+      - pattern-inside: 'fn new_inner(...) { ... }'
+      - pattern: *peer_ack_connection_fields
+      - focus-metavariable: $INIT_PEER_TRANSPORT_PARAMS_PREVALIDATED
+  - id: observe-peer-ack-initial-parser-ack_delay_exponent
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: *peer_ack_tp_fields
+      - focus-metavariable: $INIT_ACK_DELAY_EXPONENT
+  - id: observe-peer-ack-initial-parser-max_ack_delay_ms
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn read(...) { ... }'
+      - pattern: *peer_ack_tp_fields
+      - focus-metavariable: $INIT_MAX_ACK_DELAY_MS
+  - id: observe-peer-ack-initial-safari-ack_delay_exponent
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn safari_client(...) { ... }'
+      - pattern: *peer_ack_tp_fields
+      - focus-metavariable: $INIT_ACK_DELAY_EXPONENT
+  - id: observe-peer-ack-initial-safari-max_ack_delay_ms
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn safari_client(...) { ... }'
+      - pattern: *peer_ack_tp_fields
+      - focus-metavariable: $INIT_MAX_ACK_DELAY_MS
+  - id: observe-peer-ack-initial-server-ack_delay_exponent
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn server(...) { ... }'
+      - pattern: *peer_ack_tp_fields
+      - focus-metavariable: $INIT_ACK_DELAY_EXPONENT
+  - id: observe-peer-ack-initial-server-max_ack_delay_ms
+    languages: [rust]
+    severity: INFO
+    message: Full field initializer expression, not a canonical prefix.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn server(...) { ... }'
+      - pattern: *peer_ack_tp_fields
+      - focus-metavariable: $INIT_MAX_ACK_DELAY_MS
+  - id: observe-peer-ack-initial-safari-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed initializer owner.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern: 'fn safari_client(...) { ... }'
+  - id: observe-peer-ack-initial-safari-expression
+    languages: [rust]
+    severity: INFO
+    message: Complete Self struct expression with full initializer-expression metavariables; schema changes require review.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn safari_client(...) { ... }'
+      - pattern: |
+          Self {
+            initial_max_data: $INIT_INITIAL_MAX_DATA,
+            initial_max_stream_data_bidi_local: $INIT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+            initial_max_stream_data_bidi_remote: $INIT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+            initial_max_stream_data_uni: $INIT_INITIAL_MAX_STREAM_DATA_UNI,
+            initial_max_streams_bidi: $INIT_INITIAL_MAX_STREAMS_BIDI,
+            initial_max_streams_uni: $INIT_INITIAL_MAX_STREAMS_UNI,
+            ack_delay_exponent: $INIT_ACK_DELAY_EXPONENT,
+            max_ack_delay_ms: $INIT_MAX_ACK_DELAY_MS,
+            active_connection_id_limit: $INIT_ACTIVE_CONNECTION_ID_LIMIT,
+            initial_src_cid: $INIT_INITIAL_SRC_CID,
+          }
+  - id: observe-peer-ack-initial-server-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete reviewed initializer owner.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern: 'fn server(...) { ... }'
+  - id: observe-peer-ack-initial-server-expression
+    languages: [rust]
+    severity: INFO
+    message: Complete Self struct expression with full initializer-expression metavariables; schema changes require review.
+    patterns:
+      - pattern-inside: 'impl TransportParameters { ... }'
+      - pattern-inside: 'fn server(...) { ... }'
+      - pattern: |
+          Self {
+            initial_max_data: $INIT_INITIAL_MAX_DATA,
+            initial_max_stream_data_bidi_local: $INIT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+            initial_max_stream_data_bidi_remote: $INIT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+            initial_max_stream_data_uni: $INIT_INITIAL_MAX_STREAM_DATA_UNI,
+            initial_max_streams_bidi: $INIT_INITIAL_MAX_STREAMS_BIDI,
+            initial_max_streams_uni: $INIT_INITIAL_MAX_STREAMS_UNI,
+            ack_delay_exponent: $INIT_ACK_DELAY_EXPONENT,
+            max_ack_delay_ms: $INIT_MAX_ACK_DELAY_MS,
+            active_connection_id_limit: $INIT_ACTIVE_CONNECTION_ID_LIMIT,
+            initial_src_cid: $INIT_INITIAL_SRC_CID,
+          }

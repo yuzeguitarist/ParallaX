@@ -272,9 +272,8 @@ fn fallback_server_config(fallback_addr: SocketAddr) -> (ServerConfig, tempfile:
         private_key: STANDARD.encode(server_keys.private).into(),
         identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
         replay_cache_path,
-        // The fallback path never touches the replay cache; any positive
-        // capacity is fine. (`DEFAULT_REPLAY_CACHE_CAPACITY` is `pub(crate)` and
-        // unreachable from an integration test.)
+        // Any positive capacity is fine. (`DEFAULT_REPLAY_CACHE_CAPACITY` is
+        // `pub(crate)` and unreachable from an integration test.)
         replay_cache_capacity: 1024,
         authorized_sni: vec![ORIGIN_SNI.to_owned()],
         strict_tls13: true,
