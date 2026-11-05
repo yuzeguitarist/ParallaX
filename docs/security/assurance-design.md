@@ -108,7 +108,7 @@ test must never be described as a passing dependency source audit.
 The first review used three independent agents for concurrency/runtime,
 protocol/fault behavior and dependency/release security. Implementation is
 partitioned into isolated branches after resolving their design objections.
-A fresh adversarial code-review round follows integration. Each actionable
+A fresh adversarial code-review round was run after integration. Each actionable
 finding must be fixed and rechecked, or retained as a clearly scoped external
 limitation. Passing checks are reported for the actual candidate commit.
 
@@ -132,6 +132,28 @@ limitation. Passing checks are reported for the actual candidate commit.
   filter executes the actual selected tests. Dedicated suites also reject any
   ignored or missing case, and failures remain failures while other suites
   collect additional evidence.
+- **Self-consistent hashes do not validate SBOM/native inventory structure.**
+  The independent supply reviewer passed a dictionary-valued component field,
+  empty dependency graph and nearly empty native inventory through the initial
+  signer. The corrected contract checks bounded typed components, a complete
+  rooted acyclic graph, source/target/coverage metadata, final-byte-bound UUIDs,
+  and native versions/checksums across both binary SBOMs. The reviewer rebuilt
+  valid outer hashes for 32 malformed inventories; all were rejected, while
+  three representative target fixtures passed. This is structural consistency,
+  not proof that a compromised builder reports truthful contents.
+- **Legacy Cargo aliases can bypass a manifest-only exclusion.** The std-only
+  canary guard now rejects `dev_dependencies` and `build_dependencies`
+  recursively. The supply reviewer independently checked both aliases at the
+  package, workspace and target positions with the unchanged lockfile; all six
+  failed at the intended manifest policy check.
+- **A real SBOM producer differs from a synthetic fixture.** The pinned
+  cargo-cyclonedx output omits the serial required by the attestation action;
+  assign and verify a canonical UUID bound to source, target, binary and final
+  digest. Empty-cache reproduction also showed why a release-only build is
+  insufficient for later offline metadata. Fetch the complete locked graph
+  before offline SBOM generation, preserve errors, and recheck lock bytes.
+  Real ARM cold-cache packaging passed the same inline signer validator;
+  native Linux and Intel macOS smoke results remain separate evidence.
 - **Old socket fixtures intentionally leaked temporary directories.** Actual
   ASan/LSan execution found two 15-byte path allocations in splice equivalence
   and five in socket chaos. Replace `mem::forget` with ownership in the handler
@@ -155,6 +177,9 @@ only produced by the guarded release event after this change is adopted.
 - Loom: <https://github.com/tokio-rs/loom>
 - Shuttle: <https://docs.rs/shuttle/latest/shuttle/>
 - Rust sanitizers: <https://doc.rust-lang.org/unstable-book/compiler-flags/sanitizer.html>
+- Rust external sanitizer runtime: <https://doc.rust-lang.org/unstable-book/compiler-flags/external-clangrt.html>
+- LLVM fcntl interceptor fix: <https://github.com/llvm/llvm-project/pull/221064>
+- Rust tracking issue: <https://github.com/rust-lang/rust/issues/130037>
 - cargo-vet criteria: <https://mozilla.github.io/cargo-vet/built-in-criteria.html>
 - GitHub artifact attestations: <https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations>
 - SLSA Build requirements: <https://slsa.dev/spec/v1.2/build-requirements>
