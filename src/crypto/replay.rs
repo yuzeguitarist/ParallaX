@@ -1433,11 +1433,14 @@ mod tests {
         let psk = b"0123456789abcdef0123456789abcdef";
         let mac_key = cache_mac_key(psk);
         let now = current_unix_timestamp().unwrap();
-        let entry = |byte| ReplayEntry {
+        // These deduplication keys flow into journal MACs. Generate them at
+        // runtime rather than using literal-derived cryptographic fixtures.
+        let entries: [ReplayEntry; 3] = std::array::from_fn(|_| ReplayEntry {
             timestamp: now,
-            nonce: [byte; 8],
-            transcript_fingerprint: [byte; 32],
-        };
+            nonce: rand::random(),
+            transcript_fingerprint: rand::random(),
+        });
+        let entry = |index: usize| entries[index - 1].clone();
         let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, psk).unwrap();
         assert!(cache.insert_new(entry(1), now).unwrap());
         assert_eq!(cache.auth_journal.unwrap().count, 1);
