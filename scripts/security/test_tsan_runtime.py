@@ -349,6 +349,105 @@ class RuntimeProcessGuards(unittest.TestCase):
         self.assertFalse(Path((self.root / "work.path").read_text()).exists())
         self.assert_descendants_exited()
 
+    def cancellation_during(self, point, number):
+        report = {"commands": []}
+        commands = rt.Commands(self.root, rt.clean_environment(dict(os.environ)), report)
+        original_popen = rt.subprocess.Popen
+        original_finish = commands.finish_group
+        previous = {item: signal.getsignal(item) for item in rt.TERMINATION.signals}
+        work_paths = []
+
+        def launch(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            self.groups.add(process.pid)
+            self.wait_for(self.root / "grandchild.pid")
+            if point == "launch":
+                # The owned session already exists, but Commands.run has not
+                # received the Popen handle yet. The handler must defer here.
+                os.kill(os.getpid(), number)
+            return process
+
+        def finish(process, record):
+            if point == "cleanup":
+                os.kill(os.getpid(), number)
+            original_finish(process, record)
+
+        def build_fixture(_args):
+            with rt.work_directory(self.root, commands) as work:
+                work_paths.append(work)
+                mode = "hang" if point == "launch" else "fail"
+                commands.run([sys.executable, str(self.helper), mode, str(self.root)],
+                             "cancel-fixture", work, timeout=10)
+
+        with mock.patch.object(rt.subprocess, "Popen", side_effect=launch), \
+                mock.patch.object(commands, "finish_group", side_effect=finish), \
+                mock.patch.object(rt, "build_runtime", side_effect=build_fixture):
+            self.assertEqual(rt.main([]), 1)
+        self.assertTrue(report["commands"][0]["cleanup_complete"])
+        self.assertEqual(rt.TERMINATION.deferred, 0)
+        self.assertIsNone(rt.TERMINATION.pending)
+        for item, handler in previous.items():
+            self.assertEqual(signal.getsignal(item), handler)
+        for work in work_paths:
+            self.assertFalse(work.exists())
+        self.assert_descendants_exited()
+
+    def test_sigterm_during_launch_waits_for_handle_registration(self):
+        self.cancellation_during("launch", signal.SIGTERM)
+
+    def test_sigint_during_launch_waits_for_handle_registration(self):
+        self.cancellation_during("launch", signal.SIGINT)
+
+    def test_first_sigterm_during_cleanup_does_not_interrupt_cleanup(self):
+        self.cancellation_during("cleanup", signal.SIGTERM)
+
+    def test_permission_denial_during_confirmation_requires_later_esrch(self):
+        commands = rt.Commands(self.root, {}, {"commands": []})
+        commands.safe_to_clean = False
+        record = {"cleanup_complete": False}
+        process = mock.Mock(pid=self.caller_group + 1000000)
+        with mock.patch.object(rt.os, "killpg", side_effect=[
+                None, PermissionError("query denied"), ProcessLookupError()]) as kill_group, \
+                mock.patch.object(rt.time, "sleep"), \
+                mock.patch.object(rt.time, "monotonic", side_effect=[0, 0, 1]):
+            commands.finish_group(process, record)
+        self.assertEqual(kill_group.call_args_list, [
+            mock.call(process.pid, signal.SIGKILL), mock.call(process.pid, 0),
+            mock.call(process.pid, 0)])
+        self.assertTrue(commands.safe_to_clean)
+        self.assertTrue(record["cleanup_complete"])
+
+    def test_persistent_permission_denial_fails_and_retains_sources(self):
+        report = {"commands": []}
+        commands = rt.Commands(self.root, {}, report)
+        commands.safe_to_clean = False
+        record = {"cleanup_complete": False}
+        process = mock.Mock(pid=self.caller_group + 1000000)
+        with mock.patch.object(rt.os, "killpg", side_effect=[
+                None, PermissionError("query denied"), PermissionError("query denied")]), \
+                mock.patch.object(rt.time, "sleep"), \
+                mock.patch.object(rt.time, "monotonic", side_effect=[0, 0, 1, 6]):
+            with self.assertRaisesRegex(rt.BuildError, "could not confirm"):
+                with rt.work_directory(self.root, commands) as work:
+                    commands.finish_group(process, record)
+        self.assertFalse(commands.safe_to_clean)
+        self.assertFalse(record["cleanup_complete"])
+        self.assertTrue(work.is_dir())
+        self.assertEqual(report["retained_work_directory"], str(work))
+
+    def test_permission_denial_sending_kill_is_immediately_fatal(self):
+        commands = rt.Commands(self.root, {}, {"commands": []})
+        commands.safe_to_clean = False
+        record = {"cleanup_complete": False}
+        process = mock.Mock(pid=self.caller_group + 1000000)
+        with mock.patch.object(rt.os, "killpg", side_effect=PermissionError("kill denied")) as kill_group:
+            with self.assertRaisesRegex(PermissionError, "kill denied"):
+                commands.finish_group(process, record)
+        kill_group.assert_called_once_with(process.pid, signal.SIGKILL)
+        process.wait.assert_not_called()
+        self.assertFalse(commands.safe_to_clean)
+        self.assertFalse(record["cleanup_complete"])
+
     def test_unconfirmed_cleanup_retains_work_for_failed_report(self):
         report = {"commands": []}
         commands = rt.Commands(self.root, {}, report)

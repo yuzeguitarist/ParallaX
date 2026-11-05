@@ -61,6 +61,43 @@ class BuildError(RuntimeError):
     pass
 
 
+class Termination:
+    """Defer asynchronous cancellation until command ownership is registered."""
+
+    signals = (signal.SIGTERM, signal.SIGINT)
+
+    def __init__(self):
+        self.deferred = 0
+        self.pending = None
+
+    def handle(self, signum, _frame) -> None:
+        self.pending = signum
+        if not self.deferred:
+            self.check()
+
+    def check(self) -> None:
+        if self.pending is not None:
+            signum, self.pending = self.pending, None
+            # Once cancellation is delivered, let the registered cleanup
+            # finish without a second signal interrupting its finally block.
+            for number in self.signals:
+                signal.signal(number, signal.SIG_IGN)
+            raise BuildError(f"runtime build terminated by signal {signum}")
+
+    @contextlib.contextmanager
+    def defer(self):
+        self.deferred += 1
+        try:
+            yield
+        finally:
+            self.deferred -= 1
+            if not self.deferred:
+                self.check()
+
+
+TERMINATION = Termination()
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -246,6 +283,20 @@ class Commands:
         self.report = report
         self.safe_to_clean = True
 
+    def wait(self, process: subprocess.Popen, timeout: int) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            # The signal handler only records cancellation while a command
+            # is owned. Deliver it inside the already-registered finally block.
+            TERMINATION.check()
+            remaining = max(0, deadline - time.monotonic())
+            try:
+                process.wait(timeout=min(0.1, remaining))
+                return
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(process.args, timeout) from None
+
     def finish_group(self, process: subprocess.Popen, record: dict) -> None:
         # CMake can have Ninja/compiler descendants after its own exit. Each
         # command owns a session, so cleanup must target that group, never the
@@ -265,8 +316,12 @@ class Commands:
                 self.safe_to_clean = True
                 record["cleanup_complete"] = True
                 return
+            except PermissionError:
+                # Permission denial is not proof of exit. Retry the query
+                # within the same deadline; only ESRCH confirms disappearance.
+                pass
             if time.monotonic() >= deadline:
-                raise BuildError(f"command group {process.pid} did not exit after SIGKILL")
+                raise BuildError(f"could not confirm command group {process.pid} exited after SIGKILL")
             time.sleep(0.02)
 
     def run(self, command: list[str], label: str, cwd: Path,
@@ -280,19 +335,22 @@ class Commands:
         with log.open("w", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
             stream.flush()
-            process = subprocess.Popen(command, cwd=cwd, env=self.environment,
-                                       stdout=stream, stderr=subprocess.STDOUT,
-                                       start_new_session=True)
-            self.safe_to_clean = False
-            record["process_group"] = process.pid
-            record["cleanup_complete"] = False
-            try:
-                process.wait(timeout=timeout)
-            finally:
+            with TERMINATION.defer():
+                process = None
                 try:
-                    self.finish_group(process, record)
+                    process = subprocess.Popen(command, cwd=cwd, env=self.environment,
+                                               stdout=stream, stderr=subprocess.STDOUT,
+                                               start_new_session=True)
+                    self.safe_to_clean = False
+                    record["process_group"] = process.pid
+                    record["cleanup_complete"] = False
+                    self.wait(process, timeout)
                 finally:
-                    record["returncode"] = process.returncode
+                    if process is not None:
+                        try:
+                            self.finish_group(process, record)
+                        finally:
+                            record["returncode"] = process.returncode
         text = log.read_text(encoding="utf-8", errors="replace")
         if process.returncode:
             raise BuildError(f"{label} failed ({process.returncode}); see {log}\n{text[-4000:]}")
@@ -529,23 +587,19 @@ def arguments(argv=None):
     return args
 
 
-def terminate_build(signum, _frame) -> None:
-    # The outer sanitizer runner allows cleanup before escalating to SIGKILL.
-    # Ignore repeated TERM while unwinding the active command's finally block.
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    raise BuildError(f"runtime build terminated by signal {signum}")
-
-
 def main(argv=None) -> int:
-    previous = signal.signal(signal.SIGTERM, terminate_build)
+    previous = {number: signal.getsignal(number) for number in TERMINATION.signals}
     try:
+        for number in TERMINATION.signals:
+            signal.signal(number, TERMINATION.handle)
         try:
             report = build_runtime(arguments(argv))
         except (BuildError, OSError, ValueError) as error:
             print(f"{TOOL}: {error}", file=sys.stderr)
             return 1
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        for number, handler in previous.items():
+            signal.signal(number, handler)
     print(json.dumps({"report": str(Path(report["archive"]["path"]).parent / "report.json"),
                       "archive": report["archive"], "dynamic_list": report["dynamic_list"]},
                      sort_keys=True))
