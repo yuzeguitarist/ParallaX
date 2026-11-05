@@ -111,6 +111,14 @@ const MAX_SERVER_FLIGHT_RECORDS: usize = 256;
 /// Finished) fits within one max-size message plus framing for the small ones.
 const MAX_SERVER_FLIGHT_DECRYPTED_BYTES: usize = MAX_ENCRYPTED_HANDSHAKE_MESSAGE + 64 * 1024;
 
+/// Keep the aggregate limit's exact inclusive boundary independently testable.
+/// A complete TLS flight may fail another validation before accumulating this
+/// much plaintext, but defense-in-depth still requires rejecting the first
+/// byte *past* the budget, not a byte *at* the budget.
+fn server_flight_exceeds_decrypted_budget(total_decrypted: usize) -> bool {
+    total_decrypted > MAX_SERVER_FLIGHT_DECRYPTED_BYTES
+}
+
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
@@ -693,7 +701,7 @@ impl Safari26TlsSession {
                         ));
                     }
                     total_decrypted = total_decrypted.saturating_add(decrypted.plaintext.len());
-                    if total_decrypted > MAX_SERVER_FLIGHT_DECRYPTED_BYTES {
+                    if server_flight_exceeds_decrypted_budget(total_decrypted) {
                         return Err(Safari26TlsError::Handshake(
                             "server flight exceeded maximum decrypted size".to_owned(),
                         ));
@@ -5272,6 +5280,16 @@ mod tests {
         share[MLKEM768_CIPHERTEXT_LEN..].copy_from_slice(&peer.public);
         let hello = server_hello_with(GROUP_X25519_MLKEM768, share);
         assert_eq!(session.tls_shared_secret(&hello).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn decrypted_server_flight_budget_is_inclusive_at_its_exact_limit() {
+        let cap = MAX_SERVER_FLIGHT_DECRYPTED_BYTES;
+        assert!(!server_flight_exceeds_decrypted_budget(0));
+        assert!(!server_flight_exceeds_decrypted_budget(cap - 1));
+        assert!(!server_flight_exceeds_decrypted_budget(cap));
+        assert!(server_flight_exceeds_decrypted_budget(cap + 1));
+        assert!(server_flight_exceeds_decrypted_budget(usize::MAX));
     }
 
     #[test]
