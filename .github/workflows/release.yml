@@ -470,18 +470,51 @@ jobs:
               assets.extend(str(directory / filename) for filename in published + bundles)
           # Resolve the exact remote tag namespace, including annotated tags. Do not use
           # the ambiguous commits/<name> API, which can select a same-named branch.
-          response = subprocess.check_output(["gh", "api", f"repos/{repo}/git/ref/tags/{tag}"], text=True)
-          obj = json.loads(response)["object"]
-          for _ in range(8):
-              if obj["type"] == "commit":
-                  break
-              require(obj["type"] == "tag" and re.fullmatch(r"[0-9a-f]{40}", obj["sha"]), "unexpected tag object")
-              response = subprocess.check_output(["gh", "api", f"repos/{repo}/git/tags/{obj['sha']}"], text=True)
+          def check_tag():
+              response = subprocess.check_output(["gh", "api", f"repos/{repo}/git/ref/tags/{tag}"], text=True)
               obj = json.loads(response)["object"]
-          require(obj["type"] == "commit" and obj["sha"] == source, "release tag moved after build")
+              for _ in range(8):
+                  if obj["type"] == "commit":
+                      break
+                  require(obj["type"] == "tag" and re.fullmatch(r"[0-9a-f]{40}", obj["sha"]), "unexpected tag object")
+                  response = subprocess.check_output(["gh", "api", f"repos/{repo}/git/tags/{obj['sha']}"], text=True)
+                  obj = json.loads(response)["object"]
+              require(obj["type"] == "commit" and obj["sha"] == source, "release tag moved after build")
+          check_tag()
           # Creation fails on any existing release; never overwrite published bytes.
           # A failed upload leaves a draft for explicit maintainer inspection.
           run(["gh", "release", "create", tag, *assets, "--repo", repo, "--verify-tag",
                "--draft", "--generate-notes", "--title", tag])
+          # A separate tag check cannot close the check/publish race. Require
+          # GitHub to prevent tag updates AND deletion, with no bypass actors.
+          # The workflow only observes policy; it never changes repository rules.
+          # Missing policy or API permissions leave the verified assets in draft.
+          pages = json.loads(subprocess.check_output([
+              "gh", "api", "--paginate", "--slurp",
+              f"repos/{repo}/rulesets?includes_parents=false&per_page=100"], text=True))
+          protected = False
+          for entry in (entry for page in pages for entry in page):
+              if entry.get("target") != "tag" or entry.get("enforcement") != "active":
+                  continue
+              rule_id = entry.get("id")
+              require(type(rule_id) is int and rule_id > 0, "invalid tag ruleset id")
+              ruleset = json.loads(subprocess.check_output([
+                  "gh", "api", f"repos/{repo}/rulesets/{rule_id}"], text=True))
+              conditions = ruleset.get("conditions", {}).get("ref_name", {})
+              # Deliberately accept only unambiguous release-tag patterns.
+              # Arbitrary fnmatch syntax has different semantics on GitHub.
+              includes = conditions.get("include", [])
+              excludes = conditions.get("exclude", [])
+              matches = any(pattern in ("~ALL", ref, "refs/tags/v*") for pattern in includes)
+              kinds = {rule.get("type") for rule in ruleset.get("rules", [])}
+              if (ruleset.get("target") == "tag" and ruleset.get("enforcement") == "active"
+                      and ruleset.get("bypass_actors") == [] and matches and excludes == []
+                      and {"update", "deletion"} <= kinds):
+                  protected = True
+                  break
+          require(protected, "release stays draft: active non-bypassable tag update/deletion protection required")
+          # Catch any movement before protection became effective. GitHub's
+          # enforced rule, rather than this observation, closes the final race.
+          check_tag()
           run(["gh", "release", "edit", tag, "--repo", repo, "--draft=false"])
           PY

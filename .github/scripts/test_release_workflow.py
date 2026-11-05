@@ -442,8 +442,15 @@ class PublishTests(unittest.TestCase):
             for suffix in (".provenance.sigstore.jsonl", ".parallax.sbom.sigstore.jsonl", ".plx.sbom.sigstore.jsonl"):
                 (out / f"{prefix}{suffix}").write_text("fixture bundle\n")
         self.calls = []
+        self.tag_reads = 0
+        self.ruleset = {
+            "id": 17, "target": "tag", "enforcement": "active", "bypass_actors": [],
+            "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+            "rules": [{"type": "update"}, {"type": "deletion"}],
+        }
 
-    def publish(self, fail_verify=False, tag_commit=COMMIT, annotated=False):
+    def publish(self, fail_verify=False, tag_commit=COMMIT, annotated=False,
+                second_tag_commit=None, rules_api_failure=False):
         def run(args, check):
             self.assertTrue(check)
             self.calls.append(args)
@@ -452,9 +459,18 @@ class PublishTests(unittest.TestCase):
         def response(args, text):
             self.assertTrue(text)
             self.calls.append(args)
+            if "/rulesets?" in args[-1]:
+                if rules_api_failure:
+                    raise subprocess.CalledProcessError(403, args)
+                return json.dumps([[] if self.ruleset is None else [self.ruleset]])
+            if args[-1].endswith("/rulesets/17"):
+                return json.dumps(self.ruleset)
+            if "/git/ref/tags/" in args[-1]:
+                self.tag_reads += 1
+            commit = second_tag_commit if self.tag_reads > 1 and second_tag_commit else tag_commit
             if annotated and "/git/ref/tags/" in args[-1]:
                 return json.dumps({"object": {"type": "tag", "sha": "b" * 40}})
-            return json.dumps({"object": {"type": "commit", "sha": tag_commit}})
+            return json.dumps({"object": {"type": "commit", "sha": commit}})
         with patch.dict(os.environ, {
             "RELEASE_TAG": TAG, "SOURCE_SHA": COMMIT, "GITHUB_REPOSITORY": "yuzeguitarist/ParallaX",
             "GITHUB_REF": f"refs/tags/{TAG}", "ARTIFACT_DIR": str(self.artifacts),
@@ -465,14 +481,78 @@ class PublishTests(unittest.TestCase):
         self.publish(annotated=True)
         first_write = next(i for i, call in enumerate(self.calls) if call[1:3] == ["release", "create"])
         verifies = [call for call in self.calls[:first_write] if call[1:3] == ["attestation", "verify"]]
-        self.assertEqual(len(verifies), 30)
-        for call in verifies:
-            for flag in ("--source-ref", "--source-digest", "--signer-workflow", "--deny-self-hosted-runners"):
-                self.assertIn(flag, call)
+        expected = []
+        for target in ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"):
+            directory = self.artifacts / f"signed-{target}"
+            prefix = f"parallax-{TAG[1:]}-{target}"
+            binding = ["--repo", "yuzeguitarist/ParallaX", "--signer-workflow",
+                       "yuzeguitarist/ParallaX/.github/workflows/release.yml", "--source-ref",
+                       f"refs/tags/{TAG}", "--source-digest", COMMIT, "--deny-self-hosted-runners"]
+            subjects = [f"{prefix}{suffix}" for suffix in (
+                ".tar.gz", ".tar.gz.sha256", ".parallax.cdx.json", ".plx.cdx.json",
+                ".native.json", ".manifest.json")]
+            for subject in subjects + ["parallax", "plx"]:
+                expected.append(["gh", "attestation", "verify", str(directory / subject),
+                                 "--bundle", str(directory / f"{prefix}.provenance.sigstore.jsonl"),
+                                 *binding])
+            for binary in ("parallax", "plx"):
+                expected.append(["gh", "attestation", "verify", str(directory / binary), "--bundle",
+                                 str(directory / f"{prefix}.{binary}.sbom.sigstore.jsonl"),
+                                 "--predicate-type", "https://cyclonedx.org/bom", *binding])
+        self.assertCountEqual(verifies, expected)
+        self.assertEqual(len([call for call in self.calls if call[1:3] == ["attestation", "verify"]]),
+                         len(expected))
         self.assertTrue(any("/git/tags/" in call[-1] for call in self.calls if call[1] == "api"))
         self.assertIn("--draft", self.calls[first_write])
         self.assertNotIn("--clobber", str(self.calls))
         self.assertEqual(self.calls[-1][1:3], ["release", "edit"])
+
+    def assert_stays_draft(self):
+        self.assertTrue(any(call[1:3] == ["release", "create"] and "--draft" in call
+                            for call in self.calls))
+        self.assertFalse(any(call[1:3] == ["release", "edit"] for call in self.calls))
+
+    def test_missing_or_bypassable_tag_protection_leaves_draft(self):
+        for mutation in ("missing", "inactive", "bypass", "update-only", "delete-only", "wrong-tag", "excluded"):
+            with self.subTest(mutation=mutation):
+                ruleset = json.loads(json.dumps(self.ruleset))
+                if mutation == "missing":
+                    ruleset = None
+                elif mutation == "inactive":
+                    ruleset["enforcement"] = "evaluate"
+                elif mutation == "bypass":
+                    ruleset["bypass_actors"] = [{"actor_id": 1, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+                elif mutation == "update-only":
+                    ruleset["rules"] = [{"type": "update"}]
+                elif mutation == "delete-only":
+                    ruleset["rules"] = [{"type": "deletion"}]
+                elif mutation == "wrong-tag":
+                    ruleset["conditions"]["ref_name"]["include"] = ["refs/tags/unrelated"]
+                else:
+                    ruleset["conditions"]["ref_name"]["exclude"] = [f"refs/tags/{TAG}"]
+                with patch.object(self, "ruleset", ruleset):
+                    self.calls.clear()
+                    with self.assertRaisesRegex(SystemExit, "stays draft"):
+                        self.publish()
+                    self.assert_stays_draft()
+
+    def test_unreadable_tag_protection_leaves_draft(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.publish(rules_api_failure=True)
+        self.assert_stays_draft()
+
+    def test_tag_movement_before_protection_took_effect_leaves_draft(self):
+        with self.assertRaisesRegex(SystemExit, "tag moved"):
+            self.publish(second_tag_commit="c" * 40)
+        self.assert_stays_draft()
+
+    def test_exact_and_all_tag_rules_are_accepted(self):
+        for pattern in ("~ALL", f"refs/tags/{TAG}"):
+            with self.subTest(pattern=pattern):
+                self.ruleset["conditions"]["ref_name"]["include"] = [pattern]
+                self.calls.clear()
+                self.publish()
+                self.assertEqual(self.calls[-1][1:3], ["release", "edit"])
 
     def test_verification_or_moved_remote_tag_blocks_writes(self):
         with self.assertRaises(subprocess.CalledProcessError):
