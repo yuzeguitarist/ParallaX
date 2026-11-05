@@ -1,0 +1,19 @@
+tests/e2e_tunnel_roundtrip.rs
+  s_27cf9424f2c8dd::t_245851e613fed9 31-33,41-43,47,49,51,63-64,85-98,177-190,194-216,218-223,225-257,260-263,266,270,272,294,297,310,312,351,354,365,367,377-378,391,404,406-431,439-440,481,483-485,488-511,513-514,516-517,533-540,542-543,587-606,609-630,632-644
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4f3fae7251c5fdd6337657d3b0ecdfc05cf9bab3",
+  "prompts": {},
+  "sessions": {
+    "s_27cf9424f2c8dd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6df-f7ec-7ef2-b5ce-4b4102d93194",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
