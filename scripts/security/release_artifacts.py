@@ -13,9 +13,11 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
+import uuid
 
 TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin")
 BINARIES = ("parallax", "plx")
@@ -84,6 +86,10 @@ def bind_sbom(bom, binary, sha256, tag, target, commit, package_version):
         "purl": f"pkg:github/yuzeguitarist/ParallaX@{commit}#{binary}",
         "hashes": [{"alg": "SHA-256", "content": sha256}],
     })
+    # cargo-cyclonedx 0.5.9 omits this optional CycloneDX field, but the
+    # attestation action requires it. Bind a canonical UUID URN to final bytes.
+    identity = f"https://github.com/yuzeguitarist/ParallaX/{commit}/{target}/{binary}/sha256/{sha256}"
+    bom["serialNumber"] = uuid.uuid5(uuid.NAMESPACE_URL, identity).urn
     props = bom["metadata"].setdefault("properties", [])
     props.extend({"name": key, "value": value} for key, value in {
         "parallax:source:commit": commit,
@@ -120,11 +126,14 @@ def native_inventory(root, paths, target, sboms):
                 hashes = {h["alg"]: h["content"] for h in item.get("hashes", [])}
                 require(re.fullmatch(r"[0-9a-f]{64}", hashes.get("SHA-256", "")) is not None,
                         "Native source bundle lacks a crate checksum")
-                bundles[item["name"]] = {
+                entry = {
                     "crate": item["name"], "version": item["version"],
                     "crate_sha256": hashes["SHA-256"],
                     "scope": "Bundled source including native C/assembly; not a separate upstream audit",
                 }
+                require(item["name"] not in bundles or bundles[item["name"]] == entry,
+                        "Native source versions/checksums disagree between binary SBOMs")
+                bundles[item["name"]] = entry
     require(set(bundles) == NATIVE_CRATES, "Expected native source bundles are missing")
     return {
         "schema": 1, "target": target, "external_libraries": linked,
@@ -193,6 +202,11 @@ def package(root, out, tag, target, commit, cyclonedx):
     require(command(cyclonedx + ["--version"], root) == "cargo-cyclonedx-cyclonedx 0.5.9",
             "Expected cargo-cyclonedx 0.5.9")
     lock_before = digest(root / "Cargo.lock")
+    # A release-only build does not populate Cargo's cache with dev-only and
+    # other-target packages that cargo metadata still resolves. Fetch the whole
+    # locked graph before disabling network access for the SBOM generator.
+    command(["cargo", "fetch", "--locked"], root)
+    require(digest(root / "Cargo.lock") == lock_before, "Locked prefetch changed Cargo.lock")
     epoch = int(command(["git", "show", "-s", "--format=%ct", commit], root))
     env = {**os.environ, "CARGO_NET_OFFLINE": "true", "SOURCE_DATE_EPOCH": str(epoch)}
     # 0.5.9 has no --locked flag. Offline operation plus the before/after
@@ -228,7 +242,16 @@ def main():
     root = Path(__file__).resolve().parents[2]
     tool = ([str(args.cyclonedx_bin.resolve()), "cyclonedx"] if args.cyclonedx_bin
             else ["cargo", "cyclonedx"])
-    package(root, args.output.resolve(), args.tag, args.target, args.commit, tool)
+    try:
+        package(root, args.output.resolve(), args.tag, args.target, args.commit, tool)
+    except subprocess.CalledProcessError as error:
+        # capture_output preserves diagnostics, but the exception's default
+        # traceback omits them. Keep the actual metadata/linker failure visible.
+        print(f"Packaging subprocess failed: {error}", file=sys.stderr)
+        for output in (error.stdout, error.stderr):
+            if output:
+                print(output[-32768:], file=sys.stderr)
+        raise SystemExit(error.returncode if error.returncode > 0 else 1) from error
     print(f"Packaged {args.tag} for {args.target}: {args.output}")
 
 if __name__ == "__main__":

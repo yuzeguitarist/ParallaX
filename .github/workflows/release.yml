@@ -165,7 +165,9 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
-          import gzip, hashlib, io, json, os, re, tarfile
+          import gzip, hashlib, io, json, os, re, tarfile, uuid
+          from graphlib import CycleError, TopologicalSorter
+          from urllib.parse import unquote
           from pathlib import Path
           def require(value, message):
               if not value:
@@ -182,6 +184,32 @@ jobs:
           def sha(path):
               with path.open("rb") as stream:
                   return hashlib.file_digest(stream, "sha256").hexdigest()
+          def bounded_text(value, limit=1024):
+              return isinstance(value, str) and 0 < len(value) <= limit and all(ord(c) >= 32 and ord(c) != 127 for c in value)
+          def properties(value):
+              require(isinstance(value, list) and 1 <= len(value) <= 32, "invalid SBOM properties")
+              for item in value:
+                  require(isinstance(item, dict) and set(item) == {"name", "value"}, "invalid SBOM property")
+                  require(bounded_text(item["name"], 128) and bounded_text(item["value"], 2048), "invalid SBOM property text")
+              return unique((item["name"], item["value"]) for item in value)
+          def crate_hash(component):
+              hashes = component.get("hashes")
+              require(isinstance(hashes, list) and len(hashes) == 1 and isinstance(hashes[0], dict),
+                      "missing/invalid SBOM crate checksum")
+              entry = hashes[0]
+              require(set(entry) == {"alg", "content"} and entry["alg"] == "SHA-256"
+                      and isinstance(entry["content"], str) and re.fullmatch(r"[0-9a-f]{64}", entry["content"]),
+                      "missing/invalid SBOM crate checksum")
+              return entry["content"]
+          version_pattern = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
+          coverage = (
+              "Cargo dependencies for this target and default release features, including "
+              "build dependencies and excluding dev-only dependencies. Bundled native code "
+              "is identified by the enclosing crate source checksum; its internal upstream "
+              "components are not individually inventoried. OS/SDK libraries are external "
+              "runtime dependencies; their installed versions are not asserted."
+          )
+          native_names = {"aws-lc-sys", "ring"}
           tag, target, commit = (os.environ[key] for key in ("RELEASE_TAG", "TARGET", "SOURCE_SHA"))
           require(re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", tag) and len(tag) <= 100, "invalid tag")
           require(target in ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"), "invalid target")
@@ -198,6 +226,7 @@ jobs:
           manifest = read_json(root / manifest_name)
           require(manifest["schema"] == 1 and manifest["tag"] == tag and manifest["target"] == target, "wrong manifest")
           require(manifest["source_commit"] == commit and manifest["source_ref"] == f"refs/tags/{tag}", "wrong source")
+          require(manifest.get("coverage") == coverage, "wrong manifest coverage declaration")
           require(set(manifest["files"]) == files, "wrong manifest file set")
           require(re.fullmatch(r"[0-9a-f]{64}", manifest["cargo_lock_sha256"]), "invalid Cargo.lock digest")
           for filename, entry in manifest["files"].items():
@@ -205,17 +234,104 @@ jobs:
               require(type(entry["size"]) is int and entry["size"] == path.stat().st_size, "size mismatch")
               require(entry["sha256"] == sha(path), "digest mismatch")
           require((root / f"{name}.tar.gz.sha256").read_text() == f"{sha(root / (name + '.tar.gz'))}  {name}.tar.gz\n", "wrong checksum file")
+          # Bounded contract for the pinned producer, not a full schema audit or
+          # proof that a compromised builder reports its components truthfully.
+          native_sboms = {}
+          cargo_versions = set()
           for binary in ("parallax", "plx"):
               bom = read_json(root / f"{name}.{binary}.cdx.json")
-              require(bom["bomFormat"] == "CycloneDX" and bom["specVersion"] == "1.5", "wrong SBOM format")
-              require(bom["metadata"]["component"]["name"] == binary, "wrong SBOM binary")
-              require(bom["metadata"]["component"]["hashes"] == [{"alg": "SHA-256", "content": sha(root / binary)}], "SBOM binary mismatch")
-              props = unique((entry["name"], entry["value"]) for entry in bom["metadata"]["properties"])
-              require(props["parallax:source:commit"] == commit and props["parallax:source:ref"] == f"refs/tags/{tag}", "SBOM source mismatch")
-              require(props["parallax:release:target"] == target, "SBOM target mismatch")
-              require(bom["components"], "empty SBOM")
+              require(isinstance(bom, dict) and bom.get("bomFormat") == "CycloneDX" and bom.get("specVersion") == "1.5", "wrong SBOM format")
+              require(type(bom.get("version")) is int and bom["version"] == 1, "wrong SBOM version")
+              binary_hash = sha(root / binary)
+              identity = f"https://github.com/yuzeguitarist/ParallaX/{commit}/{target}/{binary}/sha256/{binary_hash}"
+              require(bom.get("serialNumber") == uuid.uuid5(uuid.NAMESPACE_URL, identity).urn, "invalid/unbound SBOM serialNumber")
+              metadata = bom.get("metadata")
+              require(isinstance(metadata, dict), "invalid SBOM metadata")
+              application = metadata.get("component")
+              require(isinstance(application, dict) and application.get("name") == binary, "wrong SBOM binary")
+              root_ref = f"urn:parallax:{commit}:{target}:{binary}"
+              require(application.get("type") == "application" and application.get("version") == tag[1:]
+                      and application.get("bom-ref") == root_ref
+                      and application.get("purl") == f"pkg:github/yuzeguitarist/ParallaX@{commit}#{binary}", "wrong SBOM root")
+              require(application.get("hashes") == [{"alg": "SHA-256", "content": binary_hash}], "SBOM binary mismatch")
+              props = properties(metadata.get("properties"))
+              require(props.get("parallax:source:commit") == commit and props.get("parallax:source:ref") == f"refs/tags/{tag}", "SBOM source mismatch")
+              require(props.get("parallax:release:target") == target and props.get("cdx:rustc:sbom:target:triple") == target, "SBOM target mismatch")
+              require(props.get("parallax:sbom:coverage") == coverage, "wrong SBOM coverage declaration")
+              cargo_version = props.get("parallax:cargo:package-version")
+              require(bounded_text(cargo_version, 128) and re.fullmatch(version_pattern, cargo_version), "invalid SBOM Cargo version")
+              cargo_versions.add(cargo_version)
+              components = bom.get("components")
+              require(isinstance(components, list) and 1 <= len(components) <= 4096, "invalid SBOM components")
+              refs, native_components = {root_ref}, {}
+              for component in components:
+                  require(isinstance(component, dict) and component.get("type") == "library", "invalid SBOM component")
+                  crate, version, ref = (component.get(key) for key in ("name", "version", "bom-ref"))
+                  require(bounded_text(crate, 128) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", crate), "invalid SBOM crate name")
+                  require(bounded_text(version, 128) and re.fullmatch(version_pattern, version), "invalid SBOM crate version")
+                  require(bounded_text(ref) and ref == f"registry+https://github.com/rust-lang/crates.io-index#{crate}@{version}"
+                          and ref not in refs, "invalid/duplicate SBOM component ref")
+                  require(bounded_text(component.get("purl"), 2048)
+                          and unquote(component["purl"]) == f"pkg:cargo/{crate}@{version}", "invalid SBOM component purl")
+                  checksum = crate_hash(component)
+                  refs.add(ref)
+                  if crate in native_names:
+                      require(crate not in native_components, "ambiguous native SBOM component")
+                      native_props = properties(component.get("properties"))
+                      require(native_props.get("parallax:native:source-scope") ==
+                              "Bundled native source and assembly identified by this crate checksum", "wrong native SBOM scope")
+                      native_components[crate] = (version, checksum)
+              dependencies = bom.get("dependencies")
+              require(isinstance(dependencies, list) and len(dependencies) == len(refs), "invalid SBOM dependency graph")
+              graph, edge_count = {}, 0
+              for entry in dependencies:
+                  require(isinstance(entry, dict) and set(entry) <= {"ref", "dependsOn"}, "invalid SBOM dependency entry")
+                  ref, edges = entry.get("ref"), entry.get("dependsOn", [])
+                  require(isinstance(ref, str) and ref in refs and ref not in graph, "invalid/duplicate SBOM graph ref")
+                  require(isinstance(edges, list) and len(edges) <= len(refs), "invalid SBOM graph edges")
+                  require(all(isinstance(edge, str) and edge in refs and edge != ref for edge in edges), "dangling/self SBOM graph edge")
+                  require(len(set(edges)) == len(edges), "duplicate SBOM graph edge")
+                  edge_count += len(edges)
+                  require(edge_count <= 65536, "oversized SBOM dependency graph")
+                  graph[ref] = edges
+              require(set(graph) == refs and graph[root_ref], "missing SBOM root dependency edge")
+              reached, pending = set(), [root_ref]
+              while pending:
+                  ref = pending.pop()
+                  if ref not in reached:
+                      reached.add(ref)
+                      pending.extend(graph[ref])
+              require(reached == refs, "unreachable SBOM component")
+              try:
+                  tuple(TopologicalSorter(graph).static_order())
+              except CycleError:
+                  require(False, "cyclic SBOM dependency graph")
+              require(set(native_components) == native_names, "missing native SBOM components")
+              native_sboms[binary] = native_components
+          require(len(cargo_versions) == 1, "binary SBOM Cargo versions disagree")
           native = read_json(root / f"{name}.native.json")
-          require(native["schema"] == 1 and native["target"] == target, "wrong native inventory")
+          require(isinstance(native, dict) and set(native) == {"schema", "target", "coverage", "external_libraries", "bundled_sources"},
+                  "missing/invalid native inventory fields")
+          require(type(native["schema"]) is int and native["schema"] == 1 and native["target"] == target, "wrong native inventory")
+          require(native["coverage"] == coverage, "wrong native coverage declaration")
+          libraries = native["external_libraries"]
+          require(isinstance(libraries, dict) and set(libraries) == {"parallax", "plx"}, "wrong native binary inventory")
+          for values in libraries.values():
+              require(isinstance(values, list) and 1 <= len(values) <= 256, "missing/invalid native library list")
+              require(all(bounded_text(value, 2048) and value.strip() == value for value in values), "invalid native library name")
+              require(len(set(values)) == len(values), "duplicate native library")
+          bundles = native["bundled_sources"]
+          require(isinstance(bundles, list) and len(bundles) == len(native_names), "missing/invalid native source bundles")
+          declared = {}
+          for bundle in bundles:
+              require(isinstance(bundle, dict) and set(bundle) == {"crate", "version", "crate_sha256", "scope"}, "invalid native source bundle")
+              crate = bundle["crate"]
+              require(isinstance(crate, str) and crate in native_names and crate not in declared, "unexpected/duplicate native source bundle")
+              require(bundle["scope"] == "Bundled source including native C/assembly; not a separate upstream audit", "wrong native bundle scope")
+              require(bounded_text(bundle["version"], 128) and re.fullmatch(version_pattern, bundle["version"])
+                      and isinstance(bundle["crate_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", bundle["crate_sha256"]), "invalid native source version/checksum")
+              declared[crate] = (bundle["version"], bundle["crate_sha256"])
+          require(set(declared) == native_names and all(value == declared for value in native_sboms.values()), "native inventory disagrees with binary SBOMs")
           # Read bounded archive data; never extract or execute downloaded files.
           # Bind the bytes users unpack to the separately signed binary SBOMs.
           with gzip.open(root / f"{name}.tar.gz", "rb") as compressed:

@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,7 +19,15 @@ SPEC.loader.exec_module(DEP)
 
 class PolicyTests(unittest.TestCase):
     def setUp(self):
+        # Prevent inherited Git configuration from launching fsmonitor (or
+        # redirecting the repository) while temporary policy fixtures exist.
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+        isolation = patch.dict(os.environ, env, clear=True)
+        isolation.start()
+        self.addCleanup(isolation.stop)
         self.temp = tempfile.TemporaryDirectory()
+        # Clean up the repository before restoring inherited Git configuration.
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
@@ -90,6 +99,18 @@ class PolicyTests(unittest.TestCase):
         self.std.write_text(self.std.read_text() + '\n[target."cfg(unix)".dependencies]\nlibc="0.2"\n')
         with self.assertRaisesRegex(ValueError, "acquired dependencies"):
             DEP.policy(self.root)
+
+    def test_std_only_rejects_legacy_dependency_aliases_in_every_table(self):
+        original = self.std.read_text()
+        for table in ("dev_dependencies", "build_dependencies",
+                      'target."cfg(unix)".dev_dependencies', 'target."cfg(unix)".build_dependencies',
+                      "workspace.dev_dependencies", "workspace.build_dependencies"):
+            with self.subTest(table=table):
+                # Keep the one-package lock unchanged: manifest validation
+                # must reject Cargo 2021 aliases before stale-lock detection.
+                self.std.write_text(original + f'\n[{table}]\nlibc="0.2"\n')
+                with self.assertRaisesRegex(ValueError, "acquired dependencies"):
+                    DEP.policy(self.root)
 
     def test_std_only_lock_cannot_hide_third_party_package(self):
         path = self.std.with_name("Cargo.lock")

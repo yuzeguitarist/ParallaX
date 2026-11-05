@@ -50,18 +50,43 @@ def fixture(root, out, target=TARGET):
     out.mkdir(parents=True)
     for filename in ("README.md", "LICENSE", "NOTICE", "Cargo.lock"):
         (root / filename).write_text(f"fixture {filename}\n")
+    crates = (("aws-lc-sys", "0.45.0", "a" * 64), ("ring", "0.17.14", "b" * 64),
+              ("fixture-dependency", "1.2.3", "c" * 64))
+    refs = {crate: f"registry+https://github.com/rust-lang/crates.io-index#{crate}@{version}"
+            for crate, version, _ in crates}
     sboms = {}
     for binary in PACKAGE.BINARIES:
         (out / binary).write_bytes(f"fixture final {binary}".encode())
         raw = {
             "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
-            "metadata": {"component": {"name": "parallax", "bom-ref": "path+file:///private/source"}},
-            "components": [{"name": "fixture-dependency", "version": "1.2.3"}],
-            "dependencies": [{"ref": "path+file:///private/source", "dependsOn": []}],
+            "metadata": {
+                "component": {"name": "parallax", "type": "application", "bom-ref": "path+file:///private/source"},
+                "properties": [{"name": "cdx:rustc:sbom:target:triple", "value": target}],
+            },
+            "components": [
+                {"type": "library", "name": crate, "version": version, "bom-ref": refs[crate],
+                 "purl": f"pkg:cargo/{crate}@{version}", "hashes": [{"alg": "SHA-256", "content": checksum}]}
+                for crate, version, checksum in crates
+            ],
+            "dependencies": [
+                {"ref": "path+file:///private/source", "dependsOn": [refs["aws-lc-sys"], refs["ring"]]},
+                {"ref": refs["aws-lc-sys"], "dependsOn": [refs["fixture-dependency"]]},
+                {"ref": refs["ring"], "dependsOn": [refs["fixture-dependency"]]},
+                {"ref": refs["fixture-dependency"]},
+            ],
         }
         sboms[binary] = PACKAGE.bind_sbom(raw, binary, PACKAGE.digest(out / binary),
                                           TAG, target, COMMIT, "0.1.0")
-    native = {"schema": 1, "target": target, "coverage": PACKAGE.COVERAGE}
+    library = "/usr/lib/libSystem.B.dylib" if target.endswith("apple-darwin") else "libc.so.6"
+    native = {
+        "schema": 1, "target": target, "coverage": PACKAGE.COVERAGE,
+        "external_libraries": {binary: [library] for binary in PACKAGE.BINARIES},
+        "bundled_sources": [
+            {"crate": crate, "version": version, "crate_sha256": checksum,
+             "scope": "Bundled source including native C/assembly; not a separate upstream audit"}
+            for crate, version, checksum in crates if crate in PACKAGE.NATIVE_CRATES
+        ],
+    }
     PACKAGE.assemble(root, out, TAG, target, COMMIT, "fixture rustc", sboms, native, 123456789)
     return out
 
@@ -143,6 +168,11 @@ class ArtifactTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.out = fixture(self.root / "source", self.root / "artifacts")
         self.name = PACKAGE.prefix(TAG, TARGET)
+        self.valid_sboms = json.dumps({
+            binary: PACKAGE.read_json(self.out / f"{self.name}.{binary}.cdx.json")
+            for binary in PACKAGE.BINARIES
+        })
+        self.valid_native = (self.out / f"{self.name}.native.json").read_text()
 
     def validate(self, **env):
         with patch.dict(os.environ, {
@@ -158,6 +188,157 @@ class ArtifactTests(unittest.TestCase):
             "sha256": PACKAGE.digest(self.out / filename), "size": (self.out / filename).stat().st_size,
         }
         PACKAGE.write_json(path, manifest)
+
+    def repackage_inventory(self, mutate):
+        sboms, native = json.loads(self.valid_sboms), json.loads(self.valid_native)
+        mutate(sboms, native)
+        # Recompute the archive and manifest too. These negative fixtures must
+        # fail the inventory contract, not an unrelated stale outer checksum.
+        PACKAGE.assemble(self.root / "source", self.out, TAG, TARGET, COMMIT,
+                         "fixture rustc", sboms, native, 123456789)
+
+    def test_locked_prefetch_precedes_offline_metadata(self):
+        fetched = False
+        def command(args, root, env=None):
+            nonlocal fetched
+            if args == ["git", "rev-parse", "HEAD"]:
+                return COMMIT
+            if args == ["rustc", "-vV"]:
+                return f"host: {TARGET}"
+            if args == ["cargo", "cyclonedx", "--version"]:
+                return "cargo-cyclonedx-cyclonedx 0.5.9"
+            if args == ["cargo", "fetch", "--locked"]:
+                fetched = True
+                return ""
+            if args[:2] == ["git", "show"]:
+                return "123456789"
+            self.assertTrue(fetched, "metadata ran before the whole locked graph was fetched")
+            self.assertEqual(args[:2], ["cargo", "cyclonedx"])
+            self.assertEqual(env["CARGO_NET_OFFLINE"], "true")
+            raise RuntimeError("offline metadata reached")
+        with patch.object(PACKAGE, "command", side_effect=command):
+            with self.assertRaisesRegex(RuntimeError, "offline metadata reached"):
+                PACKAGE.package(self.root / "source", self.root / "output", TAG, TARGET,
+                                COMMIT, ["cargo", "cyclonedx"])
+
+    def test_packager_prints_metadata_failure_details(self):
+        failure = subprocess.CalledProcessError(
+            1, ["cargo", "cyclonedx"], stderr="offline metadata: fixture source missing")
+        arguments = ["release_artifacts.py", "--tag", TAG, "--target", TARGET,
+                     "--commit", COMMIT, "--output", str(self.root / "output")]
+        with patch.object(PACKAGE, "package", side_effect=failure), patch.object(
+                sys, "argv", arguments), patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as stopped:
+                PACKAGE.main()
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertIn(failure.stderr, stderr.getvalue())
+
+    def test_sbom_component_shape_identity_and_checksums_are_required(self):
+        cases = (
+            ("dictionary", lambda b: b.__setitem__("components", {"pretend": "inventory"})),
+            ("empty", lambda b: b.__setitem__("components", [])),
+            ("scalar entry", lambda b: b["components"].__setitem__(0, 42)),
+            ("missing version", lambda b: b["components"][0].pop("version")),
+            ("duplicate ref", lambda b: b["components"].append(b["components"][0])),
+            ("misleading purl", lambda b: b["components"][0].__setitem__("purl", "pkg:cargo/unrelated@1.0.0")),
+            ("missing checksum", lambda b: b["components"][0].pop("hashes")),
+            ("wrong checksum type", lambda b: b["components"][0].__setitem__("hashes", {"SHA-256": "a" * 64})),
+            ("bad checksum", lambda b: b["components"][0]["hashes"][0].__setitem__("content", "not-a-digest")),
+            ("oversized components", lambda b: b.__setitem__("components", b["components"] * 1366)),
+        )
+        for label, change in cases:
+            with self.subTest(case=label):
+                self.repackage_inventory(lambda sboms, native: change(sboms["parallax"]))
+                with self.assertRaisesRegex(SystemExit, "SBOM"):
+                    self.validate()
+
+    def test_sbom_requires_rooted_complete_dependency_graph(self):
+        def orphan(bom):
+            for entry in bom["dependencies"][1:]:
+                entry.pop("dependsOn", None)
+        cases = (
+            ("absent graph", lambda b: b.pop("dependencies")),
+            ("dictionary graph", lambda b: b.__setitem__("dependencies", {"ref": "pretend"})),
+            ("empty graph", lambda b: b.__setitem__("dependencies", [])),
+            ("missing root", lambda b: b["dependencies"].pop(0)),
+            ("empty root edge", lambda b: b["dependencies"][0].__setitem__("dependsOn", [])),
+            ("dangling edge", lambda b: b["dependencies"][0]["dependsOn"].append("not-listed")),
+            ("duplicate node", lambda b: b["dependencies"].__setitem__(-1, b["dependencies"][1])),
+            ("duplicate edge", lambda b: b["dependencies"][0]["dependsOn"].append(b["dependencies"][0]["dependsOn"][0])),
+            ("orphan component", orphan),
+            ("cycle", lambda b: b["dependencies"][-1].__setitem__("dependsOn", [b["dependencies"][1]["ref"]])),
+        )
+        for label, change in cases:
+            with self.subTest(case=label):
+                self.repackage_inventory(lambda sboms, native: change(sboms["parallax"]))
+                with self.assertRaisesRegex(SystemExit, "SBOM"):
+                    self.validate()
+
+    def test_sbom_requires_serial_source_target_and_coverage(self):
+        cases = (
+            ("missing serial", lambda b: b.pop("serialNumber")),
+            ("malformed serial", lambda b: b.__setitem__("serialNumber", "urn:uuid:garbage")),
+            ("wrong root", lambda b: b["metadata"]["component"].__setitem__("bom-ref", "wrong-root")),
+            ("string version", lambda b: b.__setitem__("version", "1")),
+            ("dictionary properties", lambda b: b["metadata"].__setitem__("properties", {"pretend": "properties"})),
+        )
+        for label, change in cases:
+            with self.subTest(case=label):
+                self.repackage_inventory(lambda sboms, native: change(sboms["parallax"]))
+                with self.assertRaisesRegex(SystemExit, "SBOM"):
+                    self.validate()
+        for name in ("parallax:source:commit", "parallax:source:ref", "parallax:release:target",
+                     "cdx:rustc:sbom:target:triple", "parallax:sbom:coverage", "parallax:cargo:package-version"):
+            with self.subTest(missing=name):
+                def remove_property(sboms, native):
+                    metadata = sboms["parallax"]["metadata"]
+                    metadata["properties"] = [p for p in metadata["properties"] if p["name"] != name]
+                self.repackage_inventory(remove_property)
+                with self.assertRaisesRegex(SystemExit, "SBOM"):
+                    self.validate()
+
+    def test_native_inventory_cannot_be_empty_malformed_or_unbound(self):
+        cases = (
+            ("bare schema", lambda n: (n.clear(), n.update({"schema": 1, "target": TARGET}))),
+            ("no binary inventory", lambda n: n.pop("external_libraries")),
+            ("missing binary", lambda n: n["external_libraries"].pop("plx")),
+            ("empty library list", lambda n: n["external_libraries"].__setitem__("parallax", [])),
+            ("dictionary library list", lambda n: n["external_libraries"].__setitem__("parallax", {"pretend": "library"})),
+            ("nonstring library", lambda n: n["external_libraries"].__setitem__("parallax", [1])),
+            ("missing bundles", lambda n: n.pop("bundled_sources")),
+            ("empty bundles", lambda n: n.__setitem__("bundled_sources", [])),
+            ("missing checksum", lambda n: n["bundled_sources"][0].pop("crate_sha256")),
+            ("malformed checksum", lambda n: n["bundled_sources"][0].__setitem__("crate_sha256", "bad")),
+            ("different checksum", lambda n: n["bundled_sources"][0].__setitem__("crate_sha256", "0" * 64)),
+            ("different version", lambda n: n["bundled_sources"][0].__setitem__("version", "99.0.0")),
+            ("duplicate crate", lambda n: n["bundled_sources"].__setitem__(1, n["bundled_sources"][0])),
+            ("empty coverage", lambda n: n.__setitem__("coverage", "")),
+            ("oversized coverage", lambda n: n.__setitem__("coverage", "x" * 4096)),
+            ("unasserted scope", lambda n: n["bundled_sources"][0].__setitem__("scope", "fully audited")),
+        )
+        for label, change in cases:
+            with self.subTest(case=label):
+                self.repackage_inventory(lambda sboms, native: change(native))
+                with self.assertRaisesRegex(SystemExit, "native"):
+                    self.validate()
+
+    def test_native_sources_must_appear_and_agree_in_both_binary_sboms(self):
+        def remove_ring(sboms, native):
+            bom = sboms["plx"]
+            ref = next(c["bom-ref"] for c in bom["components"] if c["name"] == "ring")
+            bom["components"] = [c for c in bom["components"] if c["name"] != "ring"]
+            bom["dependencies"] = [d for d in bom["dependencies"] if d["ref"] != ref]
+            for entry in bom["dependencies"]:
+                if "dependsOn" in entry:
+                    entry["dependsOn"] = [edge for edge in entry["dependsOn"] if edge != ref]
+        self.repackage_inventory(remove_ring)
+        with self.assertRaisesRegex(SystemExit, "missing native SBOM components"):
+            self.validate()
+        def mismatch(sboms, native):
+            sboms["plx"]["components"][0]["hashes"][0]["content"] = "0" * 64
+        self.repackage_inventory(mismatch)
+        with self.assertRaisesRegex(SystemExit, "native inventory disagrees"):
+            self.validate()
 
     def test_complete_package_is_accepted_and_archive_has_licenses(self):
         self.validate()

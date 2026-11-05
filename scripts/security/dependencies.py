@@ -88,7 +88,8 @@ def validate_std_only(manifest, lock):
     def no_dependencies(value):
         if isinstance(value, dict):
             for key, child in value.items():
-                require(key not in {"dependencies", "dev-dependencies", "build-dependencies"} or not child,
+                require(key not in {"dependencies", "dev-dependencies", "build-dependencies",
+                                    "dev_dependencies", "build_dependencies"} or not child,
                         "Std-only sanitizer workspace acquired dependencies")
                 no_dependencies(child)
     no_dependencies(manifest)
