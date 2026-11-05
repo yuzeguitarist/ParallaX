@@ -1076,6 +1076,14 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     }
 }
 
+/// One connection on the public entry.
+///
+/// Shares one authenticated replay cache per path, the same object every
+/// direct caller uses, and passes it in. A per-call `load_or_create` used to
+/// give concurrent callers distinct snapshots, so a ClientHello accepted by
+/// one could be rekeyed by another before either fsync. A missing cache still
+/// fails closed in `commit_pending_replay_entry`. The accept-loop admission
+/// permit stays with [`run`], which keeps the cache it loaded at startup.
 pub async fn handle_connection(
     client: TcpStream,
     config: &ServerConfig,
@@ -1085,7 +1093,68 @@ pub async fn handle_connection(
 ) -> Result<(), HandshakeServerError> {
     let cid = NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let secrets = ServerRuntimeSecrets::decode(config)?;
-    handle_connection_inner(client, config, traffic, udp, psk, None, &secrets, cid, None).await
+    let replay_cache = shared_replay_cache(config, psk).await?;
+    handle_connection_inner(
+        client,
+        config,
+        traffic,
+        udp,
+        psk,
+        Some(replay_cache),
+        &secrets,
+        cid,
+        None,
+    )
+    .await
+}
+
+type ReplayCacheKey = (std::path::PathBuf, usize, [u8; 32]);
+
+fn shared_replay_cache_table() -> &'static Mutex<HashMap<ReplayCacheKey, Arc<Mutex<ReplayCache>>>> {
+    static TABLE: OnceLock<Mutex<HashMap<ReplayCacheKey, Arc<Mutex<ReplayCache>>>>> =
+        OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The replay cache for `config.replay_cache_path`. The first caller loads it
+/// on a blocking thread; every later caller with the same path, capacity, and
+/// PSK receives that `Arc`. A second load that loses the race is dropped
+/// before any insert, so it cannot overwrite the winner's journal.
+async fn shared_replay_cache(
+    config: &ServerConfig,
+    psk: &[u8],
+) -> Result<Arc<Mutex<ReplayCache>>, HandshakeServerError> {
+    let mut mac = Sha256::new();
+    mac.update(psk);
+    let key: ReplayCacheKey = (
+        config.replay_cache_path.clone(),
+        config.replay_cache_capacity,
+        mac.finalize().into(),
+    );
+    {
+        let table = shared_replay_cache_table()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = table.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+    }
+    let path = config.replay_cache_path.clone();
+    let capacity = config.replay_cache_capacity;
+    let psk = Zeroizing::new(psk.to_vec());
+    let window = replay_freshness_window_secs();
+    let loaded = tokio::task::spawn_blocking(move || {
+        ReplayCache::load_or_create_authenticated_with_window(&path, capacity, &psk, window)
+    })
+    .await??;
+    let cache = Arc::new(Mutex::new(loaded));
+    let mut table = shared_replay_cache_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match table.entry(key) {
+        std::collections::hash_map::Entry::Occupied(existing) => Ok(Arc::clone(existing.get())),
+        std::collections::hash_map::Entry::Vacant(slot) => Ok(Arc::clone(slot.insert(cache))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3704,8 +3773,11 @@ async fn insert_replay_entry_blocking(
 async fn commit_pending_replay_entry(
     pending_replay: &mut Option<PendingReplayEntry>,
 ) -> Result<bool, HandshakeServerError> {
+    // No cache means this handshake was not recorded. Treating that as a fresh
+    // insert let a caller rekey with replay protection skipped. Fail closed the
+    // same way a replay does: the data path returns before `apply_server_pq_rekey`.
     let Some(pending) = pending_replay.take() else {
-        return Ok(true);
+        return Ok(false);
     };
     insert_replay_entry_blocking(pending.cache, pending.entry).await
 }
@@ -8822,6 +8894,53 @@ mod tests {
         assert!(first.is_none());
         assert!(!commit_pending_replay_entry(&mut replayed).await.unwrap());
         assert!(replayed.is_none());
+
+        let mut missing = None;
+        assert!(
+            !commit_pending_replay_entry(&mut missing).await.unwrap(),
+            "a missing replay cache is not a fresh insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_connections_share_one_replay_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_keys = X25519KeyPair::generate();
+        let identity_keys = identity::keypair();
+        let config = authenticated_server_config(
+            "127.0.0.1:1".parse().unwrap(),
+            &server_keys,
+            &identity_keys,
+            dir.path().join("replay.cache"),
+        );
+        let first = shared_replay_cache(&config, PSK).await.unwrap();
+        let second = shared_replay_cache(&config, PSK).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two direct callers of one path must commit into the same cache"
+        );
+        let now = current_unix_timestamp().unwrap();
+        let entry = ReplayEntry {
+            timestamp: now,
+            nonce: [9; 8],
+            transcript_fingerprint: [9; 32],
+        };
+        assert_eq!(
+            first
+                .lock()
+                .unwrap()
+                .insert_new_outcome(entry.clone(), now)
+                .unwrap(),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(
+            second
+                .lock()
+                .unwrap()
+                .insert_new_outcome(entry, now)
+                .unwrap(),
+            ReplayInsertOutcome::Replayed
+        );
     }
 
     #[test]
@@ -13285,13 +13404,16 @@ mod tests {
         let mut client = TcpStream::connect(parallax_addr).await.unwrap();
         let auth_key =
             *derive_client_auth_key(PSK, &client_keys.private, &server_keys.public).unwrap();
+        // `handle_connection` now commits this ClientHello into a real replay
+        // cache before the PQ rekey. A frozen 2023 timestamp is Stale and the
+        // server closes instead of answering PX1K.
         let client_hello = masked_authed_client_hello(
             &server_keys.private,
             &client_keys.public,
             &[0x44_u8; 32],
             "example.com",
             &auth_key,
-            1_700_000_001,
+            current_unix_timestamp().unwrap(),
         );
         let mut rng = StdRng::seed_from_u64(20);
         client.write_all(&client_hello).await.unwrap();

@@ -340,6 +340,19 @@ Run the GFW simulator directly:
 cargo test --locked --test gfw_simulator
 ```
 
+Check the protocol state machines (handshake, PQ rekey, identity, 0-RTT,
+reconnect, replay insert, UDP probe, QUIC key install, close, BBR mode, and
+the QUIC first byte). `check` exhausts the model and fails if a new
+`src/**/*.rs` file is missing from the coverage ledger. `correspond` checks
+that the Rust control flow still matches it. TLC runs in the `formal` GitHub
+Actions workflow. See [`formal/README.md`](formal/README.md) and
+[`formal/COVERAGE.md`](formal/COVERAGE.md). This is not a proof of every byte.
+
+```bash
+python3 formal/plx_formal.py check
+python3 formal/plx_formal.py correspond
+```
+
 ---
 
 ## Benchmarking and speed evidence

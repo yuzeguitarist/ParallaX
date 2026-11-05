@@ -59,8 +59,8 @@ fn live_server_config(fallback_addr: SocketAddr) -> ServerConfig {
     let server_identity_keys = identity::keypair();
     let replay_dir = tempfile::tempdir().unwrap();
     let replay_cache_path = replay_dir.path().join("parallax-replay.cache");
-    // Leak the tempdir (test-only): the no-replay handle_connection fallback path
-    // never opens it, but this keeps the path valid for the whole process.
+    // Leak the tempdir (test-only). `handle_connection` opens the replay cache
+    // at this path, so the directory has to outlive the process.
     std::mem::forget(replay_dir);
 
     ServerConfig {
