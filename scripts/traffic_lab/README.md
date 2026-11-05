@@ -156,6 +156,9 @@ TCP bytes unchanged to a fixed loopback port, adding the same fixed delay to
 each direction. A chunk's due time is its userspace read time plus the delay;
 independent reader/writer tasks allow chunks to wait concurrently instead of
 adding another full delay per chunk. It does not parse TLS or CONNECT targets.
+Failure diagnostics use a bounded, best-effort queue. If stdout stalls, new
+diagnostic events can be dropped so forwarding and shutdown do not wait for
+the log consumer.
 
 ```sh
 python3 -B ops/traffic-lab/shaper.py \

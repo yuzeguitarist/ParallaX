@@ -8917,15 +8917,23 @@ mod tests {
             ConnectionId::new(&[0xab, 0xba, 0xab, 0xba]),
         )
         .unwrap();
-        drive(&mut client, &mut server);
+        let mut now = Instant::now();
+        drive_acked_at(&mut client, &mut server, &mut now);
         assert!(
-            client.handshake_confirmed,
+            client.handshake_confirmed && server.handshake_confirmed,
             "handshake confirmed before idle"
         );
+        assert!(
+            client.pending_data_ack_deadline().is_none()
+                && server.pending_data_ack_deadline().is_none(),
+            "post-handshake ACK debt is settled before idle"
+        );
+        assert_eq!(client.bytes_in_flight(), 0);
+        assert_eq!(server.bytes_in_flight(), 0);
 
-        // Capture a clock at/after the last send, then idle past the keep-alive
-        // interval and fire the timer.
-        let mut now = Instant::now();
+        // A fixed-time drive can leave delayed ACKs behind. Even a scheduler gap
+        // of one ACK interval must remain idle after the timer-driven drain.
+        now += MAX_ACK_DELAY;
         assert!(
             client.poll_transmit(now).is_none(),
             "connection is idle after the handshake"
@@ -8934,15 +8942,26 @@ mod tests {
         // fires regardless of this connection's random draw.
         now += KEEP_ALIVE_MAX + Duration::from_secs(1);
         client.handle_timeout(now);
+        assert!(client.ping_pending);
+        assert_eq!(client.probe_pending, 0, "no outstanding flight needs a PTO");
         let ping = client
             .poll_transmit(now)
             .expect("an idle, confirmed connection queues a keep-alive PING");
+        assert!(!client.ping_pending, "the queued keep-alive PING was sent");
 
         // The PING is ack-eliciting: the server schedules an ACK on receipt.
         server.handle_datagram(&ping, now).unwrap();
-        assert!(
-            server.poll_transmit(now).is_some(),
-            "the server ACKs the keep-alive PING — the connection stays live"
+        let ack_deadline = server
+            .pending_data_ack_deadline()
+            .expect("the keep-alive PING schedules an ACK");
+        let ack = server
+            .poll_transmit(ack_deadline)
+            .expect("the server ACKs the keep-alive PING at its deadline");
+        client.handle_datagram(&ack, ack_deadline).unwrap();
+        assert_eq!(
+            client.bytes_in_flight(),
+            0,
+            "the peer's ACK retires the keep-alive PING"
         );
     }
 

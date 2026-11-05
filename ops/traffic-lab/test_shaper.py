@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import select
 import signal
@@ -194,21 +195,19 @@ class ShaperTests(unittest.IsolatedAsyncioTestCase):
         async def origin(_reader, _writer):
             await asyncio.Future()
         port = await self.origin(origin)
-        with mock.patch.object(shaper, "IO_TIMEOUT", 0.03), mock.patch("builtins.print") as logged:
+        with mock.patch.object(shaper, "IO_TIMEOUT", 0.03), \
+             mock.patch.object(shaper, "report_connection_failure") as logged:
             _, reader, _writer = await self.connect(port, 0)
             self.assertEqual(await asyncio.wait_for(reader.read(), 0.5), b"")
-            self.assertEqual(json.loads(logged.call_args.args[0]), {
-                "event": "shaper_connection_failed", "phase": "forward", "error_type": "TimeoutError"})
+            logged.assert_called_once_with("forward", "TimeoutError")
         reservation = socket.socket()
         reservation.bind(("127.0.0.1", 0))
         unused = reservation.getsockname()[1]
         reservation.close()
-        with mock.patch("builtins.print") as logged:
+        with mock.patch.object(shaper, "report_connection_failure") as logged:
             _, reader, _writer = await self.connect(unused, 0)
             self.assertEqual(await asyncio.wait_for(reader.read(), 0.5), b"")
-            self.assertEqual(json.loads(logged.call_args.args[0]), {
-                "event": "shaper_connection_failed", "phase": "connect",
-                "error_type": "ConnectionRefusedError"})
+            logged.assert_called_once_with("connect", "ConnectionRefusedError")
 
     async def test_close_aborts_a_transport_that_cannot_finish_close(self):
         writer = mock.Mock()
@@ -244,6 +243,37 @@ class ShaperTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_diagnostics_share_one_writer_and_drop_newest_when_queue_is_full(self):
+        with mock.patch.object(shaper, "_diagnostics", None), \
+             mock.patch.object(shaper.threading.Thread, "start") as start:
+            shaper.report_connection_failure("forward", "TimeoutError")
+            for _ in range(shaper.DIAGNOSTIC_QUEUE_EVENTS - 1):
+                shaper.report_connection_failure("connect", "ConnectionRefusedError")
+            for _ in range(10):
+                shaper.report_connection_failure("connect", "BrokenPipeError")
+            sink = shaper._diagnostics
+            start.assert_called_once_with()
+            self.assertTrue(sink.thread.daemon)
+            self.assertEqual(sink.events.maxsize, shaper.DIAGNOSTIC_QUEUE_EVENTS)
+            self.assertEqual(sink.events.qsize(), shaper.DIAGNOSTIC_QUEUE_EVENTS)
+            self.assertEqual(sink.dropped, 10)
+            self.assertEqual([sink.events.get_nowait() for _ in range(shaper.DIAGNOSTIC_QUEUE_EVENTS)],
+                             [("forward", "TimeoutError")]
+                             + [("connect", "ConnectionRefusedError")] * (shaper.DIAGNOSTIC_QUEUE_EVENTS - 1))
+
+    def test_diagnostic_writer_keeps_json_redacted_and_handles_partial_or_failed_writes(self):
+        with mock.patch.object(shaper.threading.Thread, "start"):
+            sink = shaper._DiagnosticSink(123)
+        sink.report("forward", "TimeoutError")
+        sink.report("connect", "ConnectionRefusedError")
+        record = (json.dumps({"event": "shaper_connection_failed", "phase": "forward",
+                              "error_type": "TimeoutError"}) + "\n").encode()
+        with mock.patch.object(shaper.os, "write", side_effect=[3, len(record) - 3, BrokenPipeError]) as write:
+            sink.write_events()
+        self.assertEqual(write.call_args_list, [mock.call(123, record), mock.call(123, record[3:]),
+            mock.call(123, (json.dumps({"event": "shaper_connection_failed", "phase": "connect",
+                                      "error_type": "ConnectionRefusedError"}) + "\n").encode())])
+
     def test_ports_delay_and_direct_loop_are_validated_without_binding(self):
         base = ["--listen-port", "58454", "--upstream-port", "58444", "--delay-ms", "50"]
         self.assertEqual(shaper.parse_args(base).delay_ms, 50)
@@ -302,6 +332,81 @@ class CliTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
             process.communicate(timeout=3)
+
+    def test_full_diagnostic_pipe_does_not_stall_failures_forwarding_or_sigterm(self):
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream_port = upstream.getsockname()[1]
+        upstream.close()
+        reservation = socket.socket()
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+        reservation.close()
+        read_fd, write_fd = os.pipe()
+        output = os.fdopen(read_fd, "rb", buffering=0)
+        process = subprocess.Popen([
+            sys.executable, "-B", str(Path(shaper.__file__).resolve()),
+            "--listen-port", str(port), "--upstream-port", str(upstream_port),
+            "--delay-ms", "0",
+        ], stdout=write_fd, stderr=subprocess.PIPE)
+        client, accepted = None, None
+        try:
+            self.assertTrue(select.select([output], [], [], 3)[0], "shaper did not start")
+            self.assertTrue(json.loads(output.readline())["ready"])
+
+            def refused_connection():
+                with socket.create_connection(("127.0.0.1", port), timeout=2) as refused:
+                    try:
+                        self.assertEqual(refused.recv(1), b"")
+                    except TimeoutError:
+                        self.assertFalse(select.select([], [write_fd], [], 0)[1],
+                                         "connection stalled before the diagnostic pipe filled")
+                        raise
+
+            # The unused upstream port refuses every connection.
+            # Keep stdout unread, and use the retained pipe write end only to
+            # observe saturation without changing shared descriptor flags.
+            for _ in range(4096):
+                refused_connection()
+            self.assertFalse(select.select([], [write_fd], [], 0)[1])
+            for _ in range(64):
+                refused_connection()
+            self.assertFalse(select.select([], [write_fd], [], 0)[1])
+
+            upstream = socket.socket()
+            upstream.bind(("127.0.0.1", upstream_port))
+            upstream.listen()
+            upstream.settimeout(2)
+            client = socket.create_connection(("127.0.0.1", port), timeout=2)
+            accepted, _ = upstream.accept()
+            accepted.settimeout(2)
+            payload, response = b"forward after full diagnostic pipe", b"loopback response"
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            received = bytearray()
+            while chunk := accepted.recv(1024):
+                received.extend(chunk)
+            self.assertEqual(received, payload)
+            accepted.sendall(response)
+            accepted.shutdown(socket.SHUT_WR)
+            received = bytearray()
+            while chunk := client.recv(1024):
+                received.extend(chunk)
+            self.assertEqual(received, response)
+
+            process.send_signal(signal.SIGTERM)
+            # Do not communicate/drain stdout: a blocked diagnostic writer must
+            # neither stop the event loop nor hang interpreter shutdown.
+            self.assertEqual(process.wait(timeout=3), 0)
+        finally:
+            for stream in (client, accepted, upstream):
+                if stream is not None:
+                    stream.close()
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+            os.close(write_fd)
+            output.close()
 
 
 if __name__ == "__main__":

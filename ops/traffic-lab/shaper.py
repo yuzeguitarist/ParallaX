@@ -12,7 +12,9 @@ import datetime
 import json
 import math
 import os
+import queue
 import signal
+import threading
 
 
 CHUNK_BYTES = 16384
@@ -22,6 +24,46 @@ IO_TIMEOUT = 90
 CLOSE_TIMEOUT = 1
 SHUTDOWN_TIMEOUT = 3
 MAX_DELAY_MS = 60000
+DIAGNOSTIC_QUEUE_EVENTS = 64
+_diagnostics = None
+
+
+class _DiagnosticSink:
+    def __init__(self, fd):
+        self.fd = fd
+        self.events = queue.Queue(maxsize=DIAGNOSTIC_QUEUE_EVENTS)
+        self.dropped = 0
+        self.thread = threading.Thread(target=self.write_events, daemon=True)
+        self.thread.start()
+
+    def report(self, phase, error_type):
+        try:
+            self.events.put_nowait((phase, error_type))
+        except queue.Full:
+            self.dropped += 1
+
+    def write_events(self):
+        while True:
+            phase, error_type = self.events.get()
+            data = (json.dumps({"event": "shaper_connection_failed", "phase": phase,
+                                "error_type": error_type}) + "\n").encode()
+            try:
+                while data:
+                    written = os.write(self.fd, data)
+                    if written == 0:
+                        return
+                    data = data[written:]
+            except OSError:
+                return
+
+
+def report_connection_failure(phase, error_type):
+    global _diagnostics
+    if _diagnostics is None:
+        # One process-wide daemon may block in os.write; no relay waits for it
+        # or joins it at exit, and it never holds Python's stdout buffer lock.
+        _diagnostics = _DiagnosticSink(1)
+    _diagnostics.report(phase, error_type)
 
 
 async def close_streams(*writers):
@@ -119,8 +161,7 @@ class DelayShaper:
             # after seeing that FIN, and retains its independent I/O backstop.
             await asyncio.gather(*directions)
         except (OSError, asyncio.TimeoutError) as error:
-            print(json.dumps({"event": "shaper_connection_failed", "phase": phase,
-                              "error_type": type(error).__name__}), flush=True)
+            report_connection_failure(phase, type(error).__name__)
         finally:
             for task in directions:
                 task.cancel()
