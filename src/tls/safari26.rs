@@ -3385,6 +3385,41 @@ mod tests {
     }
 
     #[test]
+    fn post_handshake_ticket_accepts_exact_minimum_and_maximum_lengths() {
+        let minimum = post_handshake_ticket(&[], &[0], &[]);
+        assert_eq!(minimum.len(), 4 + 14);
+        assert_eq!(
+            parse_post_handshake_message(&minimum),
+            Ok(Some(PostHandshakeMessage::NewSessionTicket(minimum.len())))
+        );
+
+        // Exercise both nonzero high length bytes, the inclusive message cap,
+        // and the largest allowed extension vector using one opaque extension.
+        for body_len in [256, MAX_POST_HANDSHAKE_MESSAGE] {
+            let ticket = vec![0; body_len - 13];
+            let message = post_handshake_ticket(&[], &ticket, &[]);
+            assert_eq!(
+                parse_post_handshake_message(&message),
+                Ok(Some(PostHandshakeMessage::NewSessionTicket(4 + body_len)))
+            );
+        }
+        assert_eq!(
+            parse_post_handshake_message(&[HANDSHAKE_NEW_SESSION_TICKET, 1, 0, 1]),
+            Err("post-handshake message length exceeds maximum")
+        );
+        for length in [65_534, 65_535] {
+            let mut extensions = vec![0xfe, 0xed];
+            extensions.extend_from_slice(&((length - 4) as u16).to_be_bytes());
+            extensions.resize(length, 0);
+            let message = post_handshake_ticket(&[], &[0], &extensions);
+            assert_eq!(
+                validate_new_session_ticket(&message[4..]).is_ok(),
+                length == 65_534
+            );
+        }
+    }
+
+    #[test]
     fn post_handshake_ticket_rejects_malformed_body_and_extensions() {
         let valid = post_handshake_ticket(&[], b"ticket", &[]);
         for len in 0..14 {

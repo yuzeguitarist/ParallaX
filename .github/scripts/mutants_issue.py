@@ -88,8 +88,11 @@ def render(state, total):
 
 
 def main():
-    m = re.search(r"shard-(\d+)", ART)
-    shard = m.group(1) if m else "?"
+    m = re.fullmatch(r"mutants-out-shard-([0-7])", os.path.basename(os.path.normpath(ART)))
+    if not m:
+        print("not a nightly shard artifact; leaving the rolling nightly report unchanged")
+        return
+    shard = m.group(1)
 
     missed = read_lines("missed.txt")
     entry = {
@@ -115,6 +118,10 @@ def main():
                 state = json.loads(mm.group(1))
             except json.JSONDecodeError:
                 state = {}
+
+    # Older versions stored manual module sweeps under "?", mixing unrelated
+    # surfaces into the nightly totals (and showing 9/8 shards indefinitely).
+    state = {k: v for k, v in state.items() if k in {str(i) for i in range(NSHARDS)}}
 
     # Diff this shard's survivors against what we last stored for it, so a
     # *reopen* means genuine new news (a survivor this shard didn't have before),

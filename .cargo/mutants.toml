@@ -43,6 +43,10 @@ exclude_globs = [
     "src/crypto/mldsa/**",
 ]
 
+# Kani proof harnesses are verified by Kani, and are absent from cargo test.
+# Mutating their assertions under the ordinary test runner always reports MISSED.
+exclude_re = ["post_handshake_proofs::"]
+
 # Match the repo-wide `--locked` convention (CI always builds/tests `--locked`):
 # pass it to every Cargo invocation the mutation run makes (build + test).
 additional_cargo_args = ["--locked"]

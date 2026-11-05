@@ -161,6 +161,7 @@ jobs:
             --test mldsa_differential \
             --test no_timeout_ratchet \
             --test prober_loop \
+            --test replay_dedup_oracle \
             --test safari_h2_parity_baseline \
             --test safari_h2_settings \
             --test safari_h3_clienthello_0rtt_baseline \

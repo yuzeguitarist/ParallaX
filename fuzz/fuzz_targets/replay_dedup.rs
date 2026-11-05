@@ -1,4 +1,5 @@
-#![no_main]
+#![cfg_attr(not(test), no_main)]
+#[cfg(not(test))]
 use libfuzzer_sys::fuzz_target;
 use parallax::crypto::replay::{ReplayCache, ReplayEntry, ReplayInsertOutcome};
 use std::collections::{HashSet, VecDeque};
@@ -54,20 +55,13 @@ impl RefModel {
             && timestamp.saturating_add(self.window_secs) >= now
     }
 
-    // Same as ReplayCache::prune_expired: pop the ARRIVAL-ordered front while it
-    // is not fresh, stopping at the first fresh entry. This is deliberately a
-    // prefix prune, NOT a full sweep — it mirrors the cache's documented
-    // "arrival order == expiry order" assumption, so the reference stays faithful
-    // even on out-of-order timestamps.
+    // Retain every unexpired arrival, including entries behind a fresh front.
+    // Future-dated entries must survive clock rollback to keep blocking replays.
     fn prune(&mut self, now: u64) {
-        while let Some((ts, _, _)) = self.order.front() {
-            if self.is_fresh(*ts, now) {
-                break;
-            }
-            let (_, n, t) = self.order.pop_front().expect("front just checked");
-            self.nonces.remove(&n);
-            self.transcripts.remove(&t);
-        }
+        self.order
+            .retain(|(ts, _, _)| ts.saturating_add(self.window_secs) >= now);
+        self.nonces = self.order.iter().map(|(_, n, _)| *n).collect();
+        self.transcripts = self.order.iter().map(|(_, _, t)| *t).collect();
     }
 
     fn insert(
@@ -99,7 +93,7 @@ impl RefModel {
     }
 }
 
-fuzz_target!(|data: &[u8]| {
+fn check_input(data: &[u8]) {
     if data.len() < 2 {
         return;
     }
@@ -149,4 +143,35 @@ fuzz_target!(|data: &[u8]| {
             nonce[0], transcript[0]
         );
     }
-});
+}
+
+#[cfg(not(test))]
+fuzz_target!(|data: &[u8]| check_input(data));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_223_out_of_order_expiry() {
+        // Minimized nightly crash: cap=2, window=120. The second arrival
+        // expires behind the still-fresh first one, freeing the third slot.
+        check_input(&[
+            0xbb, 0xba, 0xba, 0xba, 0xff, 0, 0xff, 0xff, 0xa6, 0x31, 0, 0, 0, 0x3a,
+        ]);
+    }
+
+    #[test]
+    fn clock_rollback_retains_previously_accepted_future_entries() {
+        let mut model = RefModel::new(2, 120);
+        assert_eq!(
+            model.insert(1_005, [1; 8], [1; 32], 1_000),
+            ReplayInsertOutcome::Inserted
+        );
+        model.prune(900);
+        assert_eq!(
+            model.insert(1_005, [1; 8], [1; 32], 1_005),
+            ReplayInsertOutcome::Replayed
+        );
+    }
+}
