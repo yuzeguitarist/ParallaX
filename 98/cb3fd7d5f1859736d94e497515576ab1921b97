@@ -1,0 +1,65 @@
+src/crypto/parallel.rs
+  s_835d9bd821cc07::t_cab438c4914feb 15,17,48-54,144-178
+src/crypto/pool.rs
+  s_835d9bd821cc07::t_33e649dda15aa5 1-215
+src/transport/fd_budget.rs
+  s_835d9bd821cc07::t_37bc523d6066cc 1-42
+src/transport/tcp.rs
+  s_835d9bd821cc07::t_b1d4b1ebcab99e 19-20
+verification/concurrency/src/lib.rs
+  s_835d9bd821cc07::t_4125ee4b91f85b 1-65
+verification/concurrency/tests/common/mod.rs
+  s_835d9bd821cc07::t_fdc770c685da1a 1-9
+verification/concurrency/tests/loom.rs
+  s_835d9bd821cc07::t_00b92de91189d8 1-60
+verification/concurrency/tests/shuttle.rs
+  s_835d9bd821cc07::t_db89cef93d1cce 1-71
+verification/concurrency/tests/std.rs
+  s_835d9bd821cc07::t_5c29ce850be3eb 1-16
+src/concurrency.rs
+  s_27cf9424f2c8dd::t_b275ba8a7c2ee6 1-11
+src/crypto/mod.rs
+  s_27cf9424f2c8dd::t_8495dd6027dc5e 5
+src/handshake/source_limit.rs
+  s_27cf9424f2c8dd::t_af1e1bd4c5341a 26,29-30
+src/lib.rs
+  s_27cf9424f2c8dd::t_0fdd377dae4f1e 4
+src/transport/mod.rs
+  s_27cf9424f2c8dd::t_4d2bed48fb8dd9 1
+verification/concurrency/Cargo.lock
+  s_27cf9424f2c8dd::t_01222d33d8e2bf 1-612
+verification/concurrency/README.md
+  s_2e4cf85eec9b64::t_432f43b5aefd4e 1-203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "98cb3fd7d5f1859736d94e497515576ab1921b97",
+  "prompts": {},
+  "sessions": {
+    "s_27cf9424f2c8dd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6df-f7ec-7ef2-b5ce-4b4102d93194",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_2e4cf85eec9b64": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a6ee-377f-7ff2-91ac-ec2cdf32381b",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_835d9bd821cc07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d498bf26-5e3d-44fa-a1fd-5041f126d038",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
