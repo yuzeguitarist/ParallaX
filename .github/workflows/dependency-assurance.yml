@@ -101,6 +101,14 @@ jobs:
         run: |
           python3 scripts/security/release_artifacts.py --tag v0.0.0-smoke --target "$TARGET" --commit "$SOURCE_SHA" --output "target/release-smoke/$TARGET"
           python3 .github/scripts/test_release_workflow.py validate-artifacts --directory "target/release-smoke/$TARGET" --tag v0.0.0-smoke --target "$TARGET" --commit "$SOURCE_SHA"
+      - name: Run final stripped native binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "target/release-smoke/$TARGET/parallax" --version
+          "target/release-smoke/$TARGET/plx" --version
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned-package-smoke-${{ matrix.target }}
