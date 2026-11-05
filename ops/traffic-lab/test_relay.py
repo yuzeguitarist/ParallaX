@@ -10,6 +10,7 @@ import json
 import pathlib
 import re
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -225,6 +226,7 @@ vm.runInNewContext(input.script,context,{timeout:1000});
 """
 
 
+@unittest.skipUnless(shutil.which("node"), "Node.js is required for emitted browser-JS tests")
 class BrowserWorkloadTests(unittest.TestCase):
     def emitted_page(self, host, profile):
         server = relay.http.server.ThreadingHTTPServer(("127.0.0.1", 0), relay.LabHandler)

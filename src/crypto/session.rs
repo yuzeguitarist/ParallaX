@@ -829,9 +829,9 @@ impl AeadCodec {
         *self.nonce_base
     }
 
-    /// Advances the sequence counter by `count`. The single checked path for every
-    /// counter advance: the batch seal/open paths call it with the batch size, and
-    /// the serial `seal_in_place_detached` / `open_in_place_split` call it with `1`.
+    /// Advances the sequence counter by `count` after serial seal/open or a
+    /// successful batch open. Batch sealing instead consumes its range up front
+    /// through [`Self::reserve_sequence`]; it must not advance again afterward.
     ///
     /// The counter is a nonce input, so a silent wrap (the prior `saturating_add`,
     /// which pins it at `u64::MAX`) would risk nonce reuse. Both classes of caller
@@ -845,12 +845,16 @@ impl AeadCodec {
         self.records.advance(count);
     }
 
+    /// Reserves and consumes `count` sequence numbers before batch sealing,
+    /// returning the first number in the range. A later worker failure does not
+    /// restore them: the caller must [`Self::poison`] on any failure after this
+    /// reservation, rather than retrying a partially used nonce range.
     pub(crate) fn reserve_sequence(&mut self, count: u64) -> Result<u64, SessionError> {
         self.records.reserve(count)
     }
 
-    /// Permanently marks the codec unusable. Called by the batch open paths
-    /// when a partial failure may have advanced the sequence counter, turning
+    /// Permanently marks the codec unusable. Called by batch seal and open paths
+    /// when a partial failure may have consumed sequence numbers, turning
     /// the "any failure must fail-close" caller convention into a type-enforced
     /// guarantee.
     pub(crate) fn poison(&mut self) {

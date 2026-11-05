@@ -8,7 +8,11 @@ Run integrity tests with:
 
 ```sh
 python3 -B -m unittest discover -s scripts/traffic_lab -p 'test_*.py' -v
+python3 -B -m unittest discover -s ops/traffic-lab -p 'test_*.py' -v
 ```
+
+Node.js is required for the helper's emitted browser-JavaScript tests. Those
+tests skip locally when Node.js is absent; CI requires it before running them.
 
 Run the corpus evaluation with:
 
@@ -61,6 +65,8 @@ network, and capture vantage. Include a corresponding `parallax` capture in the
 same group. Artifacts are checked against their hashes; duplicate artifacts
 cannot count as independent captures. Supported formats are `pcap`, the E2E
 capture's `record_tsv`, and the existing Safari fixture's `safari_tsv`.
+Capture paths must resolve inside the manifest's directory, including symlink
+targets. Put the manifest at the root of the intended corpus.
 
 For browser/browser negative controls set `purpose` to `negative_control`, use
 `class_label: "A"` and `class_label: "B"` instead of `label`, and truthfully
@@ -77,9 +83,11 @@ sizes, counts, direction runs and inter-arrival times.
 ## Holdouts and uncertainty
 
 By default, separate evaluations hold out entire capture groups, sites,
-workloads, days and networks. Each axis has a deterministic 60/20/20
-train/calibration/test split. At least six groups and both classes in every
-partition are required; more observations are needed for useful uncertainty.
+workloads, days and networks. Each axis deterministically orders its groups,
+then cuts at `max(2, floor(3*n/5))` and `max(3, floor(4*n/5))` for the
+train/calibration/test split. This approximates 60/20/20; six groups split as
+3/1/2. At least six groups and two captures per class in every partition are
+required; more observations are needed for useful uncertainty.
 Use repeated `--holdout` arguments for a deliberately narrower evaluation and
 retain that limitation in any claim. A single-day corpus cannot establish
 cross-day generalization.

@@ -1398,8 +1398,99 @@ mod tests {
         client.read_handshake(&server_hello).unwrap();
         assert!(client.x25519.private.iter().all(|byte| *byte == 0));
         assert!(client.mlkem_secret.is_empty());
-        assert!(client.resumption_psk.is_none());
         assert!(client.resumption_master_secret().is_err());
+    }
+
+    #[test]
+    fn resumed_server_hello_retires_offered_psk_whether_accepted_or_rejected() {
+        use aws_lc_rs::{
+            rand::SystemRandom,
+            signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
+        };
+
+        fn drain(mut write: impl FnMut(&mut Vec<u8>) -> Option<KeyChange>) -> Vec<u8> {
+            let mut all = Vec::new();
+            loop {
+                let mut bytes = Vec::new();
+                let change = write(&mut bytes);
+                if bytes.is_empty() && change.is_none() {
+                    return all;
+                }
+                all.extend_from_slice(&bytes);
+            }
+        }
+
+        let signing =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let cert_chain = Arc::new(vec![vec![0x30, 3, 2, 1, 0]]);
+        let stek = Zeroizing::new([0x5c; 32]);
+        let mut client = handshake();
+        let config = client.config.clone();
+        let mut server = super::super::ServerHandshake::new(
+            cert_chain.clone(),
+            signing.as_ref(),
+            vec![b"h3".to_vec()],
+            vec![0x0f, 0],
+            Some(stek.clone()),
+        )
+        .unwrap();
+        server
+            .read_handshake(&drain(|bytes| client.write_handshake(bytes)))
+            .unwrap();
+        client
+            .read_handshake(&drain(|bytes| server.write_handshake(bytes)))
+            .unwrap();
+        server
+            .read_handshake(&drain(|bytes| client.write_handshake(bytes)))
+            .unwrap();
+        client
+            .read_handshake(&drain(|bytes| server.write_handshake(bytes)))
+            .unwrap();
+        let ticket = client.take_session_ticket(1_000_000).unwrap();
+
+        for accept_psk in [true, false] {
+            let mut resumed = ClientHandshake::new_resumption(
+                config.clone(),
+                QUIC_VERSION_V1,
+                "example.com",
+                vec![0x0f, 0],
+                &[],
+                &ticket,
+                1_005_000,
+            )
+            .unwrap();
+            assert_eq!(resumed.resumption_psk.as_deref(), Some(ticket.psk.as_ref()));
+            let mut server = super::super::ServerHandshake::new(
+                cert_chain.clone(),
+                signing.as_ref(),
+                vec![b"h3".to_vec()],
+                vec![0x0f, 0],
+                accept_psk.then(|| stek.clone()),
+            )
+            .unwrap();
+            server
+                .read_handshake(&drain(|bytes| resumed.write_handshake(bytes)))
+                .unwrap();
+            let mut server_hello = Vec::new();
+            while server_hello.is_empty() {
+                let change = server.write_handshake(&mut server_hello);
+                assert!(change.is_some() || !server_hello.is_empty());
+            }
+            resumed.read_handshake(&server_hello).unwrap();
+            assert_eq!(resumed.psk_accepted, accept_psk);
+            assert!(resumed.resumption_psk.is_none());
+            assert!(resumed.x25519.private.iter().all(|byte| *byte == 0));
+            assert!(resumed.mlkem_secret.is_empty());
+            resumed
+                .read_handshake(&drain(|bytes| server.write_handshake(bytes)))
+                .unwrap();
+            server
+                .read_handshake(&drain(|bytes| resumed.write_handshake(bytes)))
+                .unwrap();
+            assert!(!resumed.is_handshaking());
+            assert!(!server.is_handshaking());
+        }
     }
 
     /// Extract the client's X25519 key_share (group 0x001d) from a ClientHello

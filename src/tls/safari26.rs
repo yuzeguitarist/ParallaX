@@ -1777,7 +1777,11 @@ fn parse_post_handshake_message(
     let total = 4 + len;
     match bytes[0] {
         HANDSHAKE_NEW_SESSION_TICKET => {
-            Ok((bytes.len() >= total).then_some(PostHandshakeMessage::NewSessionTicket(total)))
+            if bytes.len() < total {
+                return Ok(None);
+            }
+            validate_new_session_ticket(&bytes[4..total])?;
+            Ok(Some(PostHandshakeMessage::NewSessionTicket(total)))
         }
         HANDSHAKE_KEY_UPDATE => {
             if len != 1 {
@@ -1801,6 +1805,35 @@ fn parse_post_handshake_message(
         }
         _ => Err("unexpected post-handshake message"),
     }
+}
+
+/// Validate RFC 8446 §4.6.1's ticket body before discarding it. The ticket and
+/// nonce remain opaque, and unrecognized extensions are deliberately ignored.
+fn validate_new_session_ticket(body: &[u8]) -> Result<(), &'static str> {
+    let malformed = |_| "malformed NewSessionTicket";
+    if body.len() < 14 {
+        return Err("NewSessionTicket body is too short");
+    }
+    let mut ticket = TlsCursor::new(body);
+    ticket.bytes(8).map_err(malformed)?;
+    ticket.vec_u8().map_err(malformed)?;
+    if ticket.vec_u16().map_err(malformed)?.is_empty() {
+        return Err("NewSessionTicket ticket is empty");
+    }
+    let extensions = ticket.vec_u16().map_err(malformed)?;
+    if extensions.len() > 65_534 || ticket.remaining() != 0 {
+        return Err("malformed NewSessionTicket extensions");
+    }
+    let mut extensions = TlsCursor::new(extensions);
+    let mut seen = std::collections::BTreeSet::new();
+    while extensions.remaining() > 0 {
+        let ext_type = extensions.u16().map_err(malformed)?;
+        let data = extensions.vec_u16().map_err(malformed)?;
+        if !seen.insert(ext_type) || (ext_type == 0x002a && data.len() != 4) {
+            return Err("invalid NewSessionTicket extension");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(kani)]
@@ -1856,6 +1889,35 @@ mod post_handshake_proofs {
         } else {
             assert!(result.is_err());
         }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn minimal_ticket_requires_nonempty_ticket_and_exact_vector_lengths() {
+        let nonce_len: u8 = kani::any();
+        let ticket_len: [u8; 2] = kani::any();
+        let extensions_len: [u8; 2] = kani::any();
+        let opaque_ticket: u8 = kani::any();
+        let body = [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            nonce_len,
+            ticket_len[0],
+            ticket_len[1],
+            opaque_ticket,
+            extensions_len[0],
+            extensions_len[1],
+        ];
+        assert_eq!(
+            validate_new_session_ticket(&body).is_ok(),
+            nonce_len == 0 && ticket_len == [0, 1] && extensions_len == [0, 0]
+        );
     }
 }
 
@@ -3259,6 +3321,77 @@ mod tests {
 
     // ---- drain_post_handshake ----
 
+    fn post_handshake_ticket(nonce: &[u8], ticket: &[u8], extensions: &[u8]) -> Vec<u8> {
+        let mut body = vec![0; 8];
+        body.push(nonce.len() as u8);
+        body.extend_from_slice(nonce);
+        body.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+        body.extend_from_slice(ticket);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+        let mut message = vec![HANDSHAKE_NEW_SESSION_TICKET];
+        push_u24(&mut message, body.len()).unwrap();
+        message.extend_from_slice(&body);
+        message
+    }
+
+    #[test]
+    fn post_handshake_ticket_rejects_malformed_body_and_extensions() {
+        let valid = post_handshake_ticket(&[], b"ticket", &[]);
+        for len in 0..14 {
+            let mut message = vec![HANDSHAKE_NEW_SESSION_TICKET];
+            push_u24(&mut message, len).unwrap();
+            message.extend_from_slice(&valid[4..4 + len]);
+            assert!(
+                parse_post_handshake_message(&message).is_err(),
+                "body length {len}"
+            );
+        }
+        let mut bad_nonce = valid.clone();
+        bad_nonce[12] = u8::MAX;
+        let mut bad_ticket = valid.clone();
+        bad_ticket[13..15].copy_from_slice(&u16::MAX.to_be_bytes());
+        let mut bad_extensions = valid.clone();
+        let end = bad_extensions.len();
+        bad_extensions[end - 2..].copy_from_slice(&1_u16.to_be_bytes());
+        let mut trailing_body = valid;
+        trailing_body.push(0);
+        let len = trailing_body.len() - 4;
+        trailing_body[1..4].copy_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        for message in [
+            bad_nonce,
+            bad_ticket,
+            bad_extensions,
+            trailing_body,
+            post_handshake_ticket(&[], &[], &[]),
+            post_handshake_ticket(&[], b"ticket", &[0]),
+            post_handshake_ticket(&[], b"ticket", &[0xfe, 0xed, 0, 1]),
+            post_handshake_ticket(&[], b"ticket", &[0xfe, 0xed, 0, 0, 0xfe, 0xed, 0, 0]),
+            post_handshake_ticket(&[], b"ticket", &[0, 0x2a, 0, 3, 0, 0, 0]),
+        ] {
+            assert!(parse_post_handshake_message(&message).is_err());
+        }
+    }
+
+    #[test]
+    fn post_handshake_ticket_preserves_fragments_and_ignores_unknown_extensions() {
+        let opaque = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1];
+        let message = post_handshake_ticket(&opaque, &opaque, &[0xfe, 0xed, 0, 2, 0xaa, 0xbb]);
+        for split in 0..message.len() {
+            assert_eq!(parse_post_handshake_message(&message[..split]), Ok(None));
+        }
+        assert_eq!(
+            parse_post_handshake_message(&message),
+            Ok(Some(PostHandshakeMessage::NewSessionTicket(message.len())))
+        );
+        assert!(parse_post_handshake_message(&post_handshake_ticket(
+            &[],
+            b"ticket",
+            &[0, 0x2a, 0, 4, 0, 0, 0, 7]
+        ))
+        .is_ok());
+    }
+
     #[test]
     fn post_handshake_parser_rejects_bad_key_update_and_bounds_ticket_lengths() {
         for request in 0..=u8::MAX {
@@ -3285,11 +3418,10 @@ mod tests {
             parse_post_handshake_message(&[HANDSHAKE_KEY_UPDATE, 0, 0, 1]),
             Ok(None)
         );
-        let mut ticket = vec![HANDSHAKE_NEW_SESSION_TICKET, 0, 0, 5];
-        ticket.extend_from_slice(&[HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1]);
+        let ticket = post_handshake_ticket(&[], &[HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1], &[]);
         assert_eq!(
             parse_post_handshake_message(&ticket),
-            Ok(Some(PostHandshakeMessage::NewSessionTicket(9)))
+            Ok(Some(PostHandshakeMessage::NewSessionTicket(ticket.len())))
         );
     }
 
@@ -3424,8 +3556,7 @@ mod tests {
             let update = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1];
             // Embedded KU bytes are only opaque ticket body, followed by the
             // actual KU prefix that ends in the H2 phase's next handshake record.
-            let mut prefix = vec![HANDSHAKE_NEW_SESSION_TICKET, 0, 0, 5];
-            prefix.extend_from_slice(&update);
+            let mut prefix = post_handshake_ticket(&[], &update, &[]);
             prefix.extend_from_slice(&update[..split]);
             let first = peer_keys
                 .server_application
@@ -3511,8 +3642,7 @@ mod tests {
         keys.negotiated_alpn = Some(b"h2".to_vec());
         let mut peer_keys = app_keys();
         let update = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1];
-        let mut messages = vec![HANDSHAKE_NEW_SESSION_TICKET, 0, 0, 5];
-        messages.extend_from_slice(&update);
+        let mut messages = post_handshake_ticket(&[], &update, &[]);
         messages.extend_from_slice(&update);
         let record = peer_keys
             .server_application
@@ -3666,9 +3796,10 @@ mod tests {
             let (mut stream, mut peer) = loopback().await;
             let mut keys = app_keys();
             let mut peer_keys = app_keys();
+            let message = post_handshake_ticket(&[], b"ticket", &[]);
             let ticket = peer_keys
                 .server_application
-                .encrypt_record(TLS_RECORD_HANDSHAKE, &[4, 0, 0, 0])
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &message)
                 .unwrap();
             peer.write_all(&ticket[..split]).await.unwrap();
             stream.readable().await.unwrap();
@@ -3683,14 +3814,14 @@ mod tests {
             // exactly once, including when the next record arrives after draining.
             let next = peer_keys
                 .server_application
-                .encrypt_record(TLS_RECORD_HANDSHAKE, &[4, 0, 0, 0])
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &message)
                 .unwrap();
             assert_eq!(
                 keys.server_application
                     .decrypt_record(&next)
                     .unwrap()
                     .plaintext,
-                [4, 0, 0, 0]
+                message
             );
         }
     }
@@ -3732,7 +3863,10 @@ mod tests {
         // bytes must never enter the HTTP/2 frame buffer.
         let ticket = peer_keys
             .server_application
-            .encrypt_record(TLS_RECORD_HANDSHAKE, &[4, 0, 0, 0])
+            .encrypt_record(
+                TLS_RECORD_HANDSHAKE,
+                &post_handshake_ticket(&[], b"ticket", &[]),
+            )
             .unwrap();
         let early = peer_keys
             .server_application

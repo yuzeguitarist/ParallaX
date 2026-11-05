@@ -53,7 +53,9 @@ jobs:
   lint:
     name: lint (fmt + clippy)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Complete-source mutation guards exceeded 20 minutes on hosted runners.
+    # Leave room for all guards, maintenance regressions and Clippy.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -98,10 +100,15 @@ jobs:
             --semgrep /tmp/parallax-security-rules/bin/semgrep
           python3 .github/scripts/check_mux_record_planning.py \
             --semgrep /tmp/parallax-security-rules/bin/semgrep
+          /tmp/parallax-security-rules/bin/python .github/scripts/check_mux_receipts.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
+          /tmp/parallax-security-rules/bin/python .github/scripts/check_replay_persistence.py \
+            --semgrep /tmp/parallax-security-rules/bin/semgrep
       - name: Maintenance regression tests
         run: |
           command -v git
           command -v gh
+          command -v node
           python3 -m unittest discover -s .github/scripts -p 'test_*.py'
           python3 -m unittest discover -s tests -p 'test_*.py'
           python3 -m unittest discover -s ops/fuzz-cluster/tests -p 'test_*.py'

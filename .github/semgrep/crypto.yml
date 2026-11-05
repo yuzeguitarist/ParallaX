@@ -1,4 +1,33 @@
 rules:
+  - id: parallax-record-seal-usability
+    languages: [rust]
+    severity: ERROR
+    message: Every batch, including an empty one, must pass the direction's actual AEAD usability result to the shared seal policy.
+    patterns:
+      - pattern: 'fn ensure_seal_budget(...) { ... }'
+      - pattern-not: |
+          fn ensure_seal_budget(...) {
+            checked_seal_end(self.aead.ensure_usable(), self.aead.suite(), self.aead.sequence(), record_count as u64, self.aad.len()).map(|_| ())
+          }
+  - id: parallax-record-seal-poison-policy
+    languages: [rust]
+    severity: ERROR
+    message: Reject an unusable codec before the empty-batch fast path and preserve whole-batch AEAD budget checks.
+    patterns:
+      - pattern: 'fn checked_seal_end(...) { ... }'
+      - pattern-not: |
+          fn checked_seal_end(...) {
+            usable?;
+            if record_count == 0 { return Ok(sequence); }
+            let end = sequence.checked_add(record_count).ok_or(SessionError::NonceExhausted)?;
+            if suite == CipherSuite::Aes256Gcm {
+              let auth_blocks = (OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN).div_ceil(16).checked_add(aad_len.div_ceil(16));
+              if end > AES_GCM_RECORD_LIMIT || auth_blocks.map_or(true, |blocks| blocks > AES_GCM_MAX_AUTH_BLOCKS) {
+                return Err(DataRecordError::KeyUsageLimit);
+              }
+            }
+            Ok(end)
+          }
   - id: parallax-exact-padding-capacity
     languages: [rust]
     severity: ERROR
@@ -56,7 +85,9 @@ rules:
   - id: parallax-owned-signing-key-copy
     languages: [rust]
     severity: ERROR
-    message: Borrow the serialized signing key or use a zeroizing owner; do not return a bare private-key array copy.
+    # This covers single-array serialized-key conversion helpers. Fresh keygen
+    # tuple ownership is a separate boundary, not a copy of caller-owned SK input.
+    message: Conversion helpers must borrow serialized signing keys or use a zeroizing owner instead of returning a bare key-array copy.
     pattern-either:
       - pattern: 'fn $F(...) -> Result<[u8; SECRETKEYBYTES], $ERR> { ... }'
       - pattern: 'fn $F(...) -> [u8; SECRETKEYBYTES] { ... }'

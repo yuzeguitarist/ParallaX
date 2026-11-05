@@ -468,14 +468,17 @@ def binomial_interval(k, n, alpha=.05):
 def read_manifest(path):
     artifact_hash(path)
     manifest = json.loads(path.read_text())
+    require(isinstance(manifest, dict), "corpus manifest must be an object")
     require(manifest.get("schema") == "parallax-traffic-corpus-v1", "wrong corpus schema")
     purpose = manifest.get("purpose", "protocol_comparison")
     require(purpose in ("protocol_comparison", "negative_control", "positive_control"),
             "unknown corpus purpose")
     captures = manifest.get("captures", [])
+    require(isinstance(captures, list), "corpus captures must be a list")
     require(0 < len(captures) <= 5000, "corpus needs 1..5000 captures")
     rows, ids, hashes = [], set(), set()
     for capture in captures:
+        require(isinstance(capture, dict), "capture entry must be an object")
         for key in ("capture_id", "path", "format", "sha256", *AXES, "vantage"):
             require(isinstance(capture.get(key), str) and bool(capture[key]),
                     "capture metadata missing: " + key)
@@ -494,6 +497,7 @@ def read_manifest(path):
         ids.add(capture["capture_id"])
         datetime.date.fromisoformat(capture["day"])
         artifact = (path.parent / capture["path"]).resolve()
+        require(artifact.is_relative_to(path.parent.resolve()), "capture path outside corpus")
         digest = artifact_hash(artifact)
         require(digest == capture["sha256"], "capture SHA-256 mismatch")
         require(digest not in hashes, "duplicate artifact cannot be independent evidence")

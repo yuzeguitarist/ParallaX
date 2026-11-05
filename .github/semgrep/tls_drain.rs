@@ -51,7 +51,9 @@ fn parse_post_handshake_message(bytes: &[u8]) -> Result<Option<PostHandshakeMess
     let total = 4 + len;
     match bytes[0] {
         HANDSHAKE_NEW_SESSION_TICKET => {
-            Ok((bytes.len() >= total).then_some(PostHandshakeMessage::NewSessionTicket(total)))
+            if bytes.len() < total { return Ok(None); }
+            validate_new_session_ticket(&bytes[4..total])?;
+            Ok(Some(PostHandshakeMessage::NewSessionTicket(total)))
         }
         HANDSHAKE_KEY_UPDATE => {
             if len != 1 { return Err("length"); }
@@ -71,6 +73,29 @@ fn parse_post_handshake_message(bytes: &[u8]) -> Result<Option<PostHandshakeMess
 fn parse_post_handshake_message(bytes: &[u8]) -> Result<Option<PostHandshakeMessage>, &'static str> {
     Ok(None)
 }
+
+// ok: parallax-tls-new-session-ticket-structure
+fn validate_new_session_ticket(body: &[u8]) -> Result<(), &'static str> {
+    let malformed = |_| "malformed NewSessionTicket";
+    if body.len() < 14 { return Err("short body"); }
+    let mut ticket = TlsCursor::new(body);
+    ticket.bytes(8).map_err(malformed)?;
+    ticket.vec_u8().map_err(malformed)?;
+    if ticket.vec_u16().map_err(malformed)?.is_empty() { return Err("empty ticket"); }
+    let extensions = ticket.vec_u16().map_err(malformed)?;
+    if extensions.len() > 65_534 || ticket.remaining() != 0 { return Err("extensions"); }
+    let mut extensions = TlsCursor::new(extensions);
+    let mut seen = std::collections::BTreeSet::new();
+    while extensions.remaining() > 0 {
+        let ext_type = extensions.u16().map_err(malformed)?;
+        let data = extensions.vec_u16().map_err(malformed)?;
+        if !seen.insert(ext_type) || (ext_type == 0x002a && data.len() != 4) { return Err("extension"); }
+    }
+    Ok(())
+}
+
+// ruleid: parallax-tls-new-session-ticket-structure
+fn validate_new_session_ticket(body: &[u8]) -> Result<(), &'static str> { Ok(()) }
 
 // ok: parallax-tls-key-update-response-order, parallax-tls-post-handshake-buffer
 async fn process_post_handshake_record(&mut self, stream: &mut TcpStream, keys: &mut Tls13Keys, plaintext: &[u8]) -> Result<(), Error> {

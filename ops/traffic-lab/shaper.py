@@ -101,6 +101,7 @@ class DelayShaper:
     async def handle(self, reader, writer):
         upstream = None
         directions = []
+        phase = "connect"
         try:
             if self.stopping:
                 return
@@ -109,6 +110,7 @@ class DelayShaper:
                 CONNECT_TIMEOUT,
             )
             self.writers.add(upstream)
+            phase = "forward"
             directions = [
                 asyncio.create_task(delayed_direction(reader, upstream, self.delay)),
                 asyncio.create_task(delayed_direction(upstream_reader, writer, self.delay)),
@@ -116,8 +118,9 @@ class DelayShaper:
             # One clean EOF completes only its direction; the reverse may reply
             # after seeing that FIN, and retains its independent I/O backstop.
             await asyncio.gather(*directions)
-        except (OSError, asyncio.TimeoutError):
-            pass
+        except (OSError, asyncio.TimeoutError) as error:
+            print(json.dumps({"event": "shaper_connection_failed", "phase": phase,
+                              "error_type": type(error).__name__}), flush=True)
         finally:
             for task in directions:
                 task.cancel()

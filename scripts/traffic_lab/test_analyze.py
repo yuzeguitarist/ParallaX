@@ -243,6 +243,44 @@ class StatisticalTests(unittest.TestCase):
 
 
 class ManifestTests(unittest.TestCase):
+    def test_non_object_manifest_and_capture_entries_fail_as_evidence_errors(self):
+        invalid = ([], None, 1, {"schema": "parallax-traffic-corpus-v1", "captures": None},
+                   {"schema": "parallax-traffic-corpus-v1", "captures": {}},
+                   *({"schema": "parallax-traffic-corpus-v1", "captures": [entry]}
+                     for entry in (None, [], 1)))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            for manifest in invalid:
+                with self.subTest(manifest=manifest):
+                    path.write_text(json.dumps(manifest))
+                    with self.assertRaises(analyze.EvidenceError):
+                        analyze.read_manifest(path)
+                    result = subprocess.run(
+                        [sys.executable, "-B", str(Path(analyze.__file__)), "analyze", str(path)],
+                        text=True, capture_output=True, timeout=20)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["status"], "insufficient_evidence")
+                    self.assertEqual(result.stderr, "")
+
+    def test_capture_paths_cannot_escape_corpus_before_hashing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            corpus = directory / "corpus"
+            corpus.mkdir()
+            path, captures = self.make_manifest(corpus)
+            outside = directory / "outside.tsv"
+            outside.write_bytes((corpus / captures[0]["path"]).read_bytes())
+            (corpus / "escaped.tsv").symlink_to(outside)
+            for escape in ("../outside.tsv", str(outside), "escaped.tsv"):
+                with self.subTest(path=escape):
+                    captures[0]["path"] = escape
+                    path.write_text(json.dumps({"schema": "parallax-traffic-corpus-v1",
+                                                "captures": captures}))
+                    with mock.patch.object(analyze, "artifact_hash", wraps=analyze.artifact_hash) as hashed:
+                        with self.assertRaisesRegex(analyze.EvidenceError, "outside corpus"):
+                            analyze.read_manifest(path)
+                        self.assertNotIn(mock.call(outside.resolve()), hashed.call_args_list)
+
     def make_manifest(self, directory):
         captures = []
         for label in ("browser", "parallax"):

@@ -194,15 +194,21 @@ class ShaperTests(unittest.IsolatedAsyncioTestCase):
         async def origin(_reader, _writer):
             await asyncio.Future()
         port = await self.origin(origin)
-        with mock.patch.object(shaper, "IO_TIMEOUT", 0.03):
+        with mock.patch.object(shaper, "IO_TIMEOUT", 0.03), mock.patch("builtins.print") as logged:
             _, reader, _writer = await self.connect(port, 0)
             self.assertEqual(await asyncio.wait_for(reader.read(), 0.5), b"")
+            self.assertEqual(json.loads(logged.call_args.args[0]), {
+                "event": "shaper_connection_failed", "phase": "forward", "error_type": "TimeoutError"})
         reservation = socket.socket()
         reservation.bind(("127.0.0.1", 0))
         unused = reservation.getsockname()[1]
         reservation.close()
-        _, reader, _writer = await self.connect(unused, 0)
-        self.assertEqual(await asyncio.wait_for(reader.read(), 0.5), b"")
+        with mock.patch("builtins.print") as logged:
+            _, reader, _writer = await self.connect(unused, 0)
+            self.assertEqual(await asyncio.wait_for(reader.read(), 0.5), b"")
+            self.assertEqual(json.loads(logged.call_args.args[0]), {
+                "event": "shaper_connection_failed", "phase": "connect",
+                "error_type": "ConnectionRefusedError"})
 
     async def test_close_aborts_a_transport_that_cannot_finish_close(self):
         writer = mock.Mock()

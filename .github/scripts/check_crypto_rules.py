@@ -75,7 +75,42 @@ def check_mutations(semgrep):
 
     def exact_variant(old, new):
         return data[:exact_start] + replace_once(exact, old, new) + data[exact_end:]
+
+    policy = data[data.index("fn checked_seal_end("):data.index("\nfn check_padded_len(")]
+    usability = data[data.index("    fn ensure_seal_budget("):data.index("    fn seal_padded_payload(")]
+
+    def scoped_variant(scope, old, new):
+        return replace_once(data, scope, replace_once(scope, old, new))
+
     variants = {
+        "poison_policy_missing_check.rs": (
+            scoped_variant(policy, "    usable?;\n", ""),
+            "parallax-record-seal-poison-policy",
+        ),
+        "poison_policy_late_check.rs": (
+            scoped_variant(policy,
+                "    usable?;\n    if record_count == 0 {\n        return Ok(sequence);\n    }",
+                "    if record_count == 0 {\n        return Ok(sequence);\n    }\n    usable?;"),
+            "parallax-record-seal-poison-policy",
+        ),
+        "poison_policy_conditional_check.rs": (
+            scoped_variant(policy, "    usable?;", "    if record_count != 0 { usable?; }"),
+            "parallax-record-seal-poison-policy",
+        ),
+        "poison_caller_assumes_usable.rs": (
+            scoped_variant(usability, "self.aead.ensure_usable(),", "Ok(()),"),
+            "parallax-record-seal-usability",
+        ),
+        "poison_caller_empty_fast_path.rs": (
+            scoped_variant(usability, "        checked_seal_end(",
+                "        if record_count == 0 { return Ok(()); }\n        checked_seal_end("),
+            "parallax-record-seal-usability",
+        ),
+        "poison_caller_ignores_check.rs": (
+            scoped_variant(usability, "        checked_seal_end(\n            self.aead.ensure_usable(),",
+                "        let _ = self.aead.ensure_usable();\n        checked_seal_end(\n            Ok(()),"),
+            "parallax-record-seal-usability",
+        ),
         "exact_missing_last_pad_check.rs": (
             replace_once(data, "exact_padded_record_capacity(len, pad)?", "exact_padded_record_capacity(len, 0)?"),
             "parallax-exact-padding-whole-window",
@@ -117,9 +152,9 @@ def check_mutations(semgrep):
             "parallax-exact-padding-batch-preflight",
         ),
         "exact_late_batch_budget.rs": (
-            exact_variant("self.ensure_seal_budget(record_lens.len())?;", "").replace(
+            replace_once(exact_variant("self.ensure_seal_budget(record_lens.len())?;", ""),
                 "for (&len, &pad) in record_lens.iter().zip(pad_lens) {",
-                "for (&len, &pad) in record_lens.iter().zip(pad_lens) { self.ensure_seal_budget(1)?;", 1),
+                "for (&len, &pad) in record_lens.iter().zip(pad_lens) { self.ensure_seal_budget(1)?;"),
             "parallax-exact-padding-batch-preflight",
         ),
         "exact_early_seal_canonical_retained.rs": (

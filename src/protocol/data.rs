@@ -184,11 +184,13 @@ fn validate_exact_padded_record_lens(
 
 /// Outbound policy for the bounded record layer, shared with its Kani proofs.
 fn checked_seal_end(
+    usable: Result<(), SessionError>,
     suite: CipherSuite,
     sequence: u64,
     record_count: u64,
     aad_len: usize,
 ) -> Result<u64, DataRecordError> {
+    usable?;
     if record_count == 0 {
         return Ok(sequence);
     }
@@ -259,7 +261,7 @@ mod kani_proofs {
         } else {
             CipherSuite::ChaCha20Poly1305
         };
-        if let Ok(end) = checked_seal_end(suite, sequence, count, aad_len) {
+        if let Ok(end) = checked_seal_end(Ok(()), suite, sequence, count, aad_len) {
             assert_eq!(sequence.checked_add(count), Some(end));
             if count != 0 {
                 if suite == CipherSuite::Aes256Gcm {
@@ -286,7 +288,7 @@ mod kani_proofs {
         let sequence: u64 = kani::any();
         let count: u64 = kani::any();
         let aad_len: usize = kani::any();
-        let result = checked_seal_end(CipherSuite::Aes256Gcm, sequence, count, aad_len);
+        let result = checked_seal_end(Ok(()), CipherSuite::Aes256Gcm, sequence, count, aad_len);
         if count == 0 {
             assert_eq!(result.unwrap(), sequence);
         } else {
@@ -297,6 +299,33 @@ mod kani_proofs {
             let permitted = end.map_or(false, |end| end <= AES_GCM_RECORD_LIMIT)
                 && blocks.map_or(false, |blocks| blocks <= AES_GCM_MAX_AUTH_BLOCKS);
             assert_eq!(result.is_ok(), permitted);
+        }
+    }
+
+    #[kani::proof]
+    fn outbound_budget_rejects_poisoned_state_even_for_empty_batches() {
+        let poisoned: bool = kani::any();
+        let sequence: u64 = kani::any();
+        let count: u64 = kani::any();
+        let aad_len: usize = kani::any();
+        let suite = if kani::any() {
+            CipherSuite::Aes256Gcm
+        } else {
+            CipherSuite::ChaCha20Poly1305
+        };
+        let usable = if poisoned {
+            Err(SessionError::Aead)
+        } else {
+            Ok(())
+        };
+        let result = checked_seal_end(usable, suite, sequence, count, aad_len);
+        if poisoned {
+            assert!(matches!(
+                result,
+                Err(DataRecordError::Aead(SessionError::Aead))
+            ));
+        } else if count == 0 {
+            assert_eq!(result.unwrap(), sequence);
         }
     }
 }
@@ -311,11 +340,8 @@ impl DataRecordCodec {
     }
 
     fn ensure_seal_budget(&self, record_count: usize) -> Result<(), DataRecordError> {
-        if record_count == 0 {
-            return Ok(());
-        }
-        self.aead.ensure_usable()?;
         checked_seal_end(
+            self.aead.ensure_usable(),
             self.aead.suite(),
             self.aead.sequence(),
             record_count as u64,
@@ -2688,6 +2714,60 @@ mod tests {
         // The pristine record still matches sequence 0, so without poisoning the
         // codec this open would succeed. Poisoning makes every later op fail-close.
         assert!(matches!(dec.open(&good), Err(DataRecordError::Aead(_))));
+    }
+
+    #[test]
+    fn empty_seal_batches_reject_poisoned_codecs_without_side_effects() {
+        let pool = test_pool();
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let mut violations = Vec::new();
+        for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            for state in 0..3 {
+                for mode in 0..5 {
+                    let mut enc = DataRecordCodec::new(
+                        AeadCodec::new_with_suite(suite, [11; KEY_LEN], [12; NONCE_LEN]),
+                        padding,
+                        CLIENT_TO_SERVER_AAD,
+                    );
+                    if state != 0 {
+                        enc.aead.poison();
+                    }
+                    if state == 2 {
+                        enc.rekey([13; KEY_LEN], [14; NONCE_LEN]);
+                    }
+                    let mut rng = StdRng::seed_from_u64(90);
+                    let mut untouched_rng = rng.clone();
+                    let mut out = b"prefix".to_vec();
+                    let result = match mode {
+                        0 => enc.seal_records_into(&[], &[], &mut rng, &mut out),
+                        1 => enc.seal_records_into_exact_padded(&[], &[], &[], &mut rng, &mut out),
+                        2 => enc.seal_records_into_inplace(&[], &mut rng, &mut out, |_, _| {
+                            panic!("empty batch must not call fill")
+                        }),
+                        3 => enc.seal_records_into_parallel(&pool, &[], &[], &mut rng, &mut out),
+                        _ => enc.seal_pq_flight(&[], &mut rng, &mut out),
+                    };
+                    let rejected_poison =
+                        matches!(result, Err(DataRecordError::Aead(SessionError::Aead)));
+                    let unchanged_rng = rand::RngCore::next_u64(&mut rng)
+                        == rand::RngCore::next_u64(&mut untouched_rng);
+                    // A healthy empty PQ flight still samples its existing
+                    // aggregate pad. Rejected work must never sample it.
+                    if (state == 0 && result.is_err())
+                        || (state != 0 && !rejected_poison)
+                        || out != b"prefix"
+                        || enc.aead.sequence() != 0
+                        || ((state != 0 || mode != 4) && !unchanged_rng)
+                    {
+                        violations.push((suite, state, mode));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "failed empty-batch cases: {violations:?}"
+        );
     }
 
     #[test]

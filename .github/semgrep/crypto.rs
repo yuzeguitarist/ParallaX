@@ -1,5 +1,47 @@
 // These syntactic fixtures are parsed by Semgrep, not compiled as Rust.
 
+mod valid_seal_usability {
+    impl DataRecordCodec {
+        // ok: parallax-record-seal-usability
+        fn ensure_seal_budget(&self, record_count: usize) -> Result<(), DataRecordError> {
+            checked_seal_end(self.aead.ensure_usable(), self.aead.suite(), self.aead.sequence(), record_count as u64, self.aad.len()).map(|_| ())
+        }
+    }
+
+    // ok: parallax-record-seal-poison-policy
+    fn checked_seal_end(usable: Result<(), SessionError>, suite: CipherSuite,
+        sequence: u64, record_count: u64, aad_len: usize) -> Result<u64, DataRecordError> {
+        usable?;
+        if record_count == 0 { return Ok(sequence); }
+        let end = sequence.checked_add(record_count).ok_or(SessionError::NonceExhausted)?;
+        if suite == CipherSuite::Aes256Gcm {
+            let auth_blocks = (OUTER_TLS_RECORD_LIMIT - AEAD_TAG_LEN).div_ceil(16).checked_add(aad_len.div_ceil(16));
+            if end > AES_GCM_RECORD_LIMIT || auth_blocks.map_or(true, |blocks| blocks > AES_GCM_MAX_AUTH_BLOCKS) {
+                return Err(DataRecordError::KeyUsageLimit);
+            }
+        }
+        Ok(end)
+    }
+}
+
+mod late_seal_usability {
+    impl DataRecordCodec {
+        // ruleid: parallax-record-seal-usability
+        fn ensure_seal_budget(&self, record_count: usize) -> Result<(), DataRecordError> {
+            if record_count == 0 { return Ok(()); }
+            checked_seal_end(self.aead.ensure_usable(), self.aead.suite(), self.aead.sequence(), record_count as u64, self.aad.len()).map(|_| ())
+        }
+    }
+
+    // ruleid: parallax-record-seal-poison-policy
+    fn checked_seal_end(usable: Result<(), SessionError>, suite: CipherSuite,
+        sequence: u64, record_count: u64, aad_len: usize) -> Result<u64, DataRecordError> {
+        if record_count == 0 { return Ok(sequence); }
+        usable?;
+        Ok(sequence + record_count)
+    }
+}
+
 // ruleid: parallax-owned-signing-key-copy
 fn copied_key(sk: &[u8]) -> Result<[u8; SECRETKEYBYTES], KeyError> {
     Ok(core::array::from_fn(|i| sk[i]))
@@ -18,6 +60,11 @@ fn borrowed_key(sk: &[u8]) -> Result<&[u8; SECRETKEYBYTES], KeyError> {
 // ok: parallax-owned-signing-key-copy
 fn zeroizing_key(sk: &[u8]) -> Zeroizing<[u8; SECRETKEYBYTES]> {
     Zeroizing::new(core::array::from_fn(|i| sk[i]))
+}
+
+// ok: parallax-owned-signing-key-copy
+fn generated_keypair(seed: &[u8; SEEDBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; SECRETKEYBYTES]) {
+    generate_fresh_pair(seed)
 }
 
 // ruleid: parallax-by-value-array-wipe

@@ -62,5 +62,7 @@ rules:
       - pattern-either:
           - pattern: 'sleep(...)'
           - pattern: 'sleep_until(...)'
+          - pattern: 'time::sleep(...)'
+          - pattern: 'time::sleep_until(...)'
           - pattern: 'tokio::time::sleep(...)'
           - pattern: 'tokio::time::sleep_until(...)'

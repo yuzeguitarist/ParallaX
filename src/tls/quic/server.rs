@@ -419,8 +419,8 @@ fn handshake_message(msg_type: u8, body: &[u8]) -> Vec<u8> {
     m
 }
 
-/// ServerHello: pins TLS 1.3 + `TLS_AES_128_GCM_SHA256`, echoes the (empty)
-/// session id, and carries supported_versions + the X25519MLKEM768 key_share.
+/// ServerHello: selects TLS 1.3 and the supplied cipher suite, echoes the session
+/// id, and carries supported_versions + the X25519MLKEM768 key_share.
 fn build_server_hello(
     session_id_echo: &[u8],
     server_key_share: &[u8],

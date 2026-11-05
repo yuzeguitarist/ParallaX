@@ -39,4 +39,8 @@ impl ServerMuxStreamTx {
 async fn handle_local_mux_connection_with_cid() {
     // ruleid: parallax-mux-receipt-no-client-upload-gate
     tokio::time::sleep(MUX_CARRIER_SUSPECT_AFTER).await;
+    // ruleid: parallax-mux-receipt-no-client-upload-gate
+    time::sleep(MUX_CARRIER_SUSPECT_AFTER).await;
+    // ruleid: parallax-mux-receipt-no-client-upload-gate
+    time::sleep_until(deadline).await;
 }

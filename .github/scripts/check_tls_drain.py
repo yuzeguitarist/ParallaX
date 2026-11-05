@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce reviewed ready-only drain and post-handshake KeyUpdate Rust AST.
+"""Enforce reviewed ready-only drain and post-handshake TLS message Rust AST.
 
 This is a blocking syntactic regression check, not a TLS protocol proof. A real
 TLS origin regression withholds post-Finished records until the client opening.
@@ -73,6 +73,8 @@ def mutations(semgrep):
     parser_start = source.index("fn parse_post_handshake_message(")
     parser_end = source.index("#[cfg(kani)]", parser_start)
     parser = source[parser_start:parser_end]
+    ticket_start = source.index("fn validate_new_session_ticket(", parser_start)
+    ticket = source[ticket_start:parser_end]
     h2_start = source.index("    async fn await_http2_settings_ack(")
     h2_end = source.index("    async fn process_http2_frames(", h2_start)
     h2 = source[h2_start:h2_end]
@@ -98,8 +100,34 @@ def mutations(semgrep):
             "parallax-tls-key-update-framing"),
         "oversized_ticket.rs": (parser, replace_once(parser, "if len > MAX_POST_HANDSHAKE_MESSAGE {", "if false {"),
             "parallax-tls-key-update-framing"),
-        "unframed_ticket.rs": (parser, replace_once(parser, "bytes.len() >= total", "true"),
+        "unframed_ticket.rs": (parser, replace_once(parser,
+            "HANDSHAKE_NEW_SESSION_TICKET => {\n            if bytes.len() < total {",
+            "HANDSHAKE_NEW_SESSION_TICKET => {\n            if false {"),
             "parallax-tls-key-update-framing"),
+        "unvalidated_ticket.rs": (parser, replace_once(parser,
+            "            validate_new_session_ticket(&bytes[4..total])?;\n", ""),
+            "parallax-tls-key-update-framing"),
+        "missing_ticket_fields.rs": (ticket, replace_once(ticket,
+            "    ticket.bytes(8).map_err(malformed)?;\n", ""),
+            "parallax-tls-new-session-ticket-structure"),
+        "wrong_ticket_nonce_vector.rs": (ticket, replace_once(ticket,
+            "ticket.vec_u8().map_err(malformed)?", "ticket.vec_u16().map_err(malformed)?"),
+            "parallax-tls-new-session-ticket-structure"),
+        "empty_ticket.rs": (ticket, replace_once(ticket,
+            "ticket.vec_u16().map_err(malformed)?.is_empty()", "false"),
+            "parallax-tls-new-session-ticket-structure"),
+        "ticket_trailing_bytes.rs": (ticket, replace_once(ticket,
+            "ticket.remaining() != 0", "false"),
+            "parallax-tls-new-session-ticket-structure"),
+        "unparsed_ticket_extensions.rs": (ticket, replace_once(ticket,
+            "while extensions.remaining() > 0", "while false"),
+            "parallax-tls-new-session-ticket-structure"),
+        "duplicate_ticket_extensions.rs": (ticket, replace_once(ticket,
+            "!seen.insert(ext_type)", "false"),
+            "parallax-tls-new-session-ticket-structure"),
+        "malformed_ticket_early_data.rs": (ticket, replace_once(ticket,
+            "data.len() != 4", "false"),
+            "parallax-tls-new-session-ticket-structure"),
         "early_send_rotation.rs": (handler, early_rotation, "parallax-tls-key-update-response-order"),
         "missing_receive_rotation.rs": (handler, replace_once(handler,
             "                    keys.update_server_application_keys()?;\n", ""),

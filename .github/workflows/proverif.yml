@@ -54,7 +54,7 @@ jobs:
       - name: Install OCaml compiler
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ocaml-nox
+          sudo apt-get install --yes --no-install-recommends ocaml
       - name: Fetch and verify pinned official ProVerif source
         run: |
           curl --fail --location --retry 3 \

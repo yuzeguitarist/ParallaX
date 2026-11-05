@@ -294,6 +294,11 @@ def mutations(semgrep, canonical):
     add("client_changes_dead_budget", "client", "const MUX_CARRIER_DEAD_AFTER: Duration = Duration::from_secs(25);", "const MUX_CARRIER_DEAD_AFTER: Duration = Duration::from_secs(250);", "receipt-dead-scope")
     add("client_ignores_implicit_confirmation", "client", "                unanswered_opens.remove(&frame.stream_id);", "                if frame.payload.is_empty() { unanswered_opens.remove(&frame.stream_id); }", "receipt-client-loop-scope")
     add("client_waits_before_upload", "client", "    let upload = client_mux_upload_loop(", "    sleep(MUX_CARRIER_SUSPECT_AFTER).await;\n    let upload = client_mux_upload_loop(", "parallax-mux-receipt-no-client-upload-gate")
+    for call in ("time::sleep(MUX_CARRIER_SUSPECT_AFTER)", "time::sleep_until(Instant::now())"):
+        add("client_waits_before_upload_" + call.split("(")[0].replace("::", "_"), "client",
+            "    let upload = client_mux_upload_loop(",
+            "    " + call + ".await;\n    let upload = client_mux_upload_loop(",
+            "parallax-mux-receipt-no-client-upload-gate")
     add("shared_budget_changed", "command", "std::time::Duration::from_secs(5)", "std::time::Duration::from_secs(50)", "receipt-budget-scope")
     add("shared_budget_canonical_decoy", "command", "std::time::Duration::from_secs(5)", "{ let mut budget = std::time::Duration::from_secs(5); budget = std::time::Duration::from_secs(50); budget }", "receipt-budget-scope")
     # Positive complete files exercise every observed production node, not just

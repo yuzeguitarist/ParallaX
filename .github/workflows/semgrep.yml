@@ -33,7 +33,9 @@ jobs:
   semgrep:
     name: semgrep
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # All 13 blocking guards plus the supplementary scan must finish; the
+    # complete-source mutations exceeded the former 20-minute runner budget.
+    timeout-minutes: 60
     permissions:
       contents: read
       security-events: write   # upload SARIF to code scanning
