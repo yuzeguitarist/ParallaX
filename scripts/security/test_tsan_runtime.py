@@ -210,7 +210,90 @@ class RuntimeBuilderGuards(unittest.TestCase):
         self.assertFalse(output.exists())
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX command-group cleanup")
+class ProcessTrackingGuards(unittest.TestCase):
+    def test_proc_identity_handles_parentheses_and_rejects_uncertainty(self):
+        fields = [b"S", b"10", b"20", b"30"] + [b"0"] * 15 + [b"99"]
+        data = b"42 (worker ) tricky (name) " + b" ".join(fields) + b"\n"
+        with mock.patch.object(rt.Path, "read_bytes", return_value=data):
+            self.assertEqual(rt.process_identity(42),
+                             {"pid": 42, "ppid": 10, "pgid": 20, "sid": 30, "start_ticks": 99})
+        with mock.patch.object(rt.Path, "read_bytes", side_effect=FileNotFoundError):
+            self.assertIsNone(rt.process_identity(42))
+        with mock.patch.object(rt.Path, "read_bytes", side_effect=PermissionError):
+            with self.assertRaisesRegex(rt.BuildError, "cannot inspect"):
+                rt.process_identity(42)
+        with mock.patch.object(rt.Path, "read_bytes", return_value=b"malformed"):
+            with self.assertRaisesRegex(rt.BuildError, "malformed process identity"):
+                rt.process_identity(42)
+
+    def identity(self):
+        return {"pid": 123456789, "ppid": os.getpid(), "pgid": 123456789,
+                "sid": os.getsid(0) + 1000000, "start_ticks": 123}
+
+    def test_pidfd_reread_rejects_reused_pid_foreign_parent_and_caller_session(self):
+        observed = self.identity()
+        for field, value in (("start_ticks", 999), ("ppid", 0), ("sid", os.getsid(0))):
+            current = dict(observed, **{field: value})
+            with self.subTest(field=field), \
+                    mock.patch.object(rt.os, "pidfd_open", return_value=123, create=True), \
+                    mock.patch.object(rt.os, "close") as close, \
+                    mock.patch.object(rt, "process_identity", return_value=current), \
+                    mock.patch.object(rt.signal, "pidfd_send_signal", create=True) as send:
+                if field == "sid":
+                    with self.assertRaisesRegex(rt.BuildError, "caller's session"):
+                        rt.kill_adopted_child(observed)
+                else:
+                    rt.kill_adopted_child(observed)
+                send.assert_not_called()
+                close.assert_called_once_with(123)
+
+    def test_pidfd_permission_denial_is_fatal(self):
+        observed = self.identity()
+        with mock.patch.object(rt.os, "pidfd_open", return_value=123, create=True), \
+                mock.patch.object(rt.os, "close"), \
+                mock.patch.object(rt, "process_identity", return_value=observed), \
+                mock.patch.object(rt.signal, "pidfd_send_signal", create=True,
+                                  side_effect=PermissionError("kill denied")):
+            with self.assertRaisesRegex(PermissionError, "kill denied"):
+                rt.kill_adopted_child(observed)
+
+    def test_empty_or_unreadable_census_cannot_confirm_cleanup(self):
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                report = {"commands": []}
+                commands = rt.Commands(root, {}, report)
+                commands.safe_to_clean = False
+                record = {"cleanup_complete": False}
+                process = mock.Mock(pid=os.getsid(0) + 1000000)
+                with mock.patch.object(rt.signal, "pidfd_send_signal", create=True), \
+                        mock.patch.object(rt, "direct_children", return_value=[],
+                                          side_effect=PermissionError("census denied") if unreadable else None), \
+                        mock.patch.object(rt.os, "waitpid", return_value=(0, 0)), \
+                        mock.patch.object(rt.time, "monotonic", side_effect=[0, 0, 6]):
+                    with self.assertRaises((PermissionError, rt.BuildError)):
+                        with rt.work_directory(root, commands) as work:
+                            commands.finish_session(process, 123, record)
+                self.assertFalse(commands.safe_to_clean)
+                self.assertFalse(record["cleanup_complete"])
+                self.assertTrue(work.is_dir())
+                self.assertEqual(report["retained_work_directory"], str(work))
+
+    def test_initial_leader_kill_denial_does_not_claim_cleanup(self):
+        commands = rt.Commands(Path("."), {}, {"commands": []})
+        commands.safe_to_clean = False
+        record = {"cleanup_complete": False}
+        process = mock.Mock(pid=os.getsid(0) + 1000000)
+        with mock.patch.object(rt.signal, "pidfd_send_signal", create=True,
+                               side_effect=PermissionError("kill denied")):
+            with self.assertRaisesRegex(PermissionError, "kill denied"):
+                commands.finish_session(process, 123, record)
+        process.wait.assert_not_called()
+        self.assertFalse(commands.safe_to_clean)
+        self.assertFalse(record["cleanup_complete"])
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux subreaper/pidfd process ownership")
 class RuntimeProcessGuards(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -228,48 +311,63 @@ class RuntimeProcessGuards(unittest.TestCase):
 
             mode, directory = sys.argv[1:]
             root = Path(directory)
-            if mode == "grandchild":
+            if mode in ("grandchild", "split-child", "double-child"):
+                if mode == "split-child":
+                    os.setpgid(0, 0)
+                if mode == "double-child":
+                    (root / "intermediate.pid").write_text(str(os.getpid()))
+                    if os.fork():
+                        os._exit(0)
+                    os.setsid()
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                (root / "child.identity").write_text(
+                    f"{os.getpid()} {os.getpgrp()} {os.getsid(0)}")
                 (root / "grandchild.pid").write_text(str(os.getpid()))
                 while True:
                     time.sleep(0.1)
             (root / "parent.pid").write_text(str(os.getpid()))
-            child = subprocess.Popen([sys.executable, __file__, "grandchild", directory])
+            child_mode = {"split": "split-child", "double": "double-child"}.get(
+                mode, "grandchild")
+            child = subprocess.Popen([sys.executable, __file__, child_mode, directory])
             deadline = time.monotonic() + 10
             while not (root / "grandchild.pid").exists():
                 if time.monotonic() >= deadline:
                     raise RuntimeError("grandchild did not start")
                 time.sleep(0.01)
-            if mode == "fail":
+            if mode in ("fail", "split", "double"):
                 raise SystemExit(7)
             while True:
                 time.sleep(0.1)
             """), encoding="utf-8")
 
     def tearDown(self):
-        # A broken cleanup implementation must not leave test descendants.
-        parent = self.root / "parent.pid"
-        if parent.exists():
-            self.groups.add(int(parent.read_text()))
-        for group in self.groups:
-            if group != self.caller_group and group > 1:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+        # Independent fallback if a regression leaves adopted descendants.
+        deadline = time.monotonic() + 3
+        while True:
+            for child in rt.direct_children():
+                if child["sid"] != os.getsid(0):
+                    rt.kill_adopted_child(child)
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG | rt.LINUX_WAIT_ALL)
+            except ChildProcessError:
+                break
+            if pid == 0:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("test descendants survived fallback cleanup")
+                time.sleep(0.02)
         self.temporary.cleanup()
 
     def wait_for(self, path):
         deadline = time.monotonic() + 10
-        while not path.exists():
+        while not path.exists() or path.stat().st_size == 0:
             if time.monotonic() >= deadline:
                 self.fail(f"fixture did not create {path.name}")
             time.sleep(0.02)
 
     def assert_descendants_exited(self):
         for filename in ("parent.pid", "grandchild.pid"):
-            path = self.root / filename
-            self.assertTrue(path.is_file(), f"missing real-process fixture: {filename}")
+            self.assertTrue((self.root / filename).is_file(), f"missing fixture: {filename}")
+        for path in self.root.glob("*.pid"):
             pid = int(path.read_text())
             with self.assertRaises(ProcessLookupError, msg=f"process {pid} survived cleanup"):
                 os.kill(pid, 0)
@@ -278,19 +376,71 @@ class RuntimeProcessGuards(unittest.TestCase):
     def test_timeout_cleans_real_descendants_without_signalling_caller(self):
         report = {"commands": []}
         commands = rt.Commands(self.root, rt.clean_environment(dict(os.environ)), report)
-        with mock.patch.object(rt.os, "killpg", wraps=os.killpg) as signal_group:
+        with mock.patch.object(rt.os, "killpg", side_effect=AssertionError("PGID-only cleanup")):
             with rt.work_directory(self.root, commands) as work:
                 with self.assertRaises(subprocess.TimeoutExpired):
                     commands.run([sys.executable, str(self.helper), "hang", str(self.root)],
                                  "timeout-fixture", work, timeout=3)
                 self.assertTrue(work.is_dir())
             self.assertFalse(work.exists())
-            self.assertTrue(signal_group.called)
-            for call in signal_group.call_args_list:
-                self.assertGreater(call.args[0], 1)
-                self.assertNotEqual(call.args[0], self.caller_group)
+        self.assertEqual(report["commands"][0]["cleanup_proof"], "linux-subreaper-ECHILD")
+        self.assert_descendants_exited()
+
+    def test_ninja_style_child_in_different_pgid_same_session_is_cleaned(self):
+        report = {"commands": []}
+        commands = rt.Commands(self.root, rt.clean_environment(dict(os.environ)), report)
+        with self.assertRaisesRegex(rt.BuildError, r"failed \(7\)"):
+            commands.run([sys.executable, str(self.helper), "split", str(self.root)],
+                         "split-pgid-fixture", self.root, timeout=10)
+        _pid, group, session = map(int, (self.root / "child.identity").read_text().split())
+        parent = int((self.root / "parent.pid").read_text())
+        self.assertNotEqual(group, parent)
+        self.assertEqual(session, parent)
         self.assertTrue(report["commands"][0]["cleanup_complete"])
         self.assert_descendants_exited()
+
+    def test_double_fork_new_session_and_empty_census_do_not_escape_cleanup(self):
+        report = {"commands": []}
+        commands = rt.Commands(self.root, rt.clean_environment(dict(os.environ)), report)
+        real_children = rt.direct_children
+        census_count = 0
+        def miss_first_census(deadline=None):
+            nonlocal census_count
+            census_count += 1
+            return [] if census_count == 1 else real_children(deadline)
+        with mock.patch.object(rt, "direct_children", side_effect=miss_first_census):
+            with self.assertRaisesRegex(rt.BuildError, r"failed \(7\)"):
+                commands.run([sys.executable, str(self.helper), "double", str(self.root)],
+                             "double-fork-fixture", self.root, timeout=10)
+        _pid, _group, session = map(int, (self.root / "child.identity").read_text().split())
+        self.assertNotEqual(session, int((self.root / "parent.pid").read_text()))
+        self.assertGreater(census_count, 1)
+        self.assertTrue(report["commands"][0]["cleanup_complete"])
+        self.assert_descendants_exited()
+
+    def test_preexisting_children_and_foreign_sigchld_reaper_are_rejected(self):
+        with mock.patch.object(rt.signal, "getsignal", return_value=signal.SIG_IGN):
+            with self.assertRaisesRegex(rt.BuildError, "default SIGCHLD"):
+                rt.prepare_process_tracking()
+        child = subprocess.Popen([sys.executable, str(self.helper), "grandchild", str(self.root)])
+        try:
+            with self.assertRaisesRegex(rt.BuildError, "pre-existing child"):
+                rt.prepare_process_tracking()
+            self.assertIsNone(child.poll())
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+
+    def test_successful_commands_preserve_exit_status_and_reuse_supervisor(self):
+        report = {"commands": []}
+        commands = rt.Commands(self.root, rt.clean_environment(dict(os.environ)), report)
+        for number in range(2):
+            output = commands.run([sys.executable, "--version"], f"success-{number}",
+                                  self.root, timeout=10)
+            self.assertIn("Python", output)
+        self.assertEqual([item["returncode"] for item in report["commands"]], [0, 0])
+        self.assertTrue(all(item["cleanup_proof"] == "linux-subreaper-ECHILD"
+                            for item in report["commands"]))
 
     def test_nonzero_exit_cleans_abandoned_descendants(self):
         report = {"commands": []}
@@ -353,7 +503,7 @@ class RuntimeProcessGuards(unittest.TestCase):
         report = {"commands": []}
         commands = rt.Commands(self.root, rt.clean_environment(dict(os.environ)), report)
         original_popen = rt.subprocess.Popen
-        original_finish = commands.finish_group
+        original_finish = commands.finish_session
         previous = {item: signal.getsignal(item) for item in rt.TERMINATION.signals}
         work_paths = []
 
@@ -367,10 +517,10 @@ class RuntimeProcessGuards(unittest.TestCase):
                 os.kill(os.getpid(), number)
             return process
 
-        def finish(process, record):
+        def finish(process, leader_fd, record):
             if point == "cleanup":
                 os.kill(os.getpid(), number)
-            original_finish(process, record)
+            original_finish(process, leader_fd, record)
 
         def build_fixture(_args):
             with rt.work_directory(self.root, commands) as work:
@@ -380,7 +530,7 @@ class RuntimeProcessGuards(unittest.TestCase):
                              "cancel-fixture", work, timeout=10)
 
         with mock.patch.object(rt.subprocess, "Popen", side_effect=launch), \
-                mock.patch.object(commands, "finish_group", side_effect=finish), \
+                mock.patch.object(commands, "finish_session", side_effect=finish), \
                 mock.patch.object(rt, "build_runtime", side_effect=build_fixture):
             self.assertEqual(rt.main([]), 1)
         self.assertTrue(report["commands"][0]["cleanup_complete"])
@@ -400,53 +550,6 @@ class RuntimeProcessGuards(unittest.TestCase):
 
     def test_first_sigterm_during_cleanup_does_not_interrupt_cleanup(self):
         self.cancellation_during("cleanup", signal.SIGTERM)
-
-    def test_permission_denial_during_confirmation_requires_later_esrch(self):
-        commands = rt.Commands(self.root, {}, {"commands": []})
-        commands.safe_to_clean = False
-        record = {"cleanup_complete": False}
-        process = mock.Mock(pid=self.caller_group + 1000000)
-        with mock.patch.object(rt.os, "killpg", side_effect=[
-                None, PermissionError("query denied"), ProcessLookupError()]) as kill_group, \
-                mock.patch.object(rt.time, "sleep"), \
-                mock.patch.object(rt.time, "monotonic", side_effect=[0, 0, 1]):
-            commands.finish_group(process, record)
-        self.assertEqual(kill_group.call_args_list, [
-            mock.call(process.pid, signal.SIGKILL), mock.call(process.pid, 0),
-            mock.call(process.pid, 0)])
-        self.assertTrue(commands.safe_to_clean)
-        self.assertTrue(record["cleanup_complete"])
-
-    def test_persistent_permission_denial_fails_and_retains_sources(self):
-        report = {"commands": []}
-        commands = rt.Commands(self.root, {}, report)
-        commands.safe_to_clean = False
-        record = {"cleanup_complete": False}
-        process = mock.Mock(pid=self.caller_group + 1000000)
-        with mock.patch.object(rt.os, "killpg", side_effect=[
-                None, PermissionError("query denied"), PermissionError("query denied")]), \
-                mock.patch.object(rt.time, "sleep"), \
-                mock.patch.object(rt.time, "monotonic", side_effect=[0, 0, 1, 6]):
-            with self.assertRaisesRegex(rt.BuildError, "could not confirm"):
-                with rt.work_directory(self.root, commands) as work:
-                    commands.finish_group(process, record)
-        self.assertFalse(commands.safe_to_clean)
-        self.assertFalse(record["cleanup_complete"])
-        self.assertTrue(work.is_dir())
-        self.assertEqual(report["retained_work_directory"], str(work))
-
-    def test_permission_denial_sending_kill_is_immediately_fatal(self):
-        commands = rt.Commands(self.root, {}, {"commands": []})
-        commands.safe_to_clean = False
-        record = {"cleanup_complete": False}
-        process = mock.Mock(pid=self.caller_group + 1000000)
-        with mock.patch.object(rt.os, "killpg", side_effect=PermissionError("kill denied")) as kill_group:
-            with self.assertRaisesRegex(PermissionError, "kill denied"):
-                commands.finish_group(process, record)
-        kill_group.assert_called_once_with(process.pid, signal.SIGKILL)
-        process.wait.assert_not_called()
-        self.assertFalse(commands.safe_to_clean)
-        self.assertFalse(record["cleanup_complete"])
 
     def test_unconfirmed_cleanup_retains_work_for_failed_report(self):
         report = {"commands": []}
@@ -472,15 +575,18 @@ class PinnedInputIntegration(unittest.TestCase):
             source = work / "source"
             rt.extract_sources(archive, source)
             before = rt.source_state(source)
-            commands = rt.Commands(work, rt.clean_environment(dict(os.environ)), {"commands": []})
             git = str(rt.executable("git"))
             template = work / "empty-template"
             template.mkdir()
-            commands.run([git, "init", "--quiet", f"--template={template}"], "git-init", source)
-            commands.run([git, "apply", "--check", "--whitespace=error-all", str(patch)],
-                         "patch-check", source)
-            commands.run([git, "apply", "--whitespace=error-all", str(patch)],
-                         "patch-apply", source)
+            # This optional git-only preflight remains usable on macOS. It
+            # does not exercise the Linux runtime command supervisor.
+            for command in (
+                [git, "init", "--quiet", f"--template={template}"],
+                [git, "apply", "--check", "--whitespace=error-all", str(patch)],
+                [git, "apply", "--whitespace=error-all", str(patch)],
+            ):
+                subprocess.run(command, cwd=source, env=rt.clean_environment(dict(os.environ)),
+                               check=True, timeout=60)
             after = rt.source_state(source)
             rt.check_patch_changes(before, after)
             print("Pinned source/backport verified; runtime NOT built. "

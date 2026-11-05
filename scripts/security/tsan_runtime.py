@@ -5,6 +5,7 @@ The runtime is Rust nightly-2026-06-17's LLVM source with exactly LLVM commit
 09910aa044808dfbfe1e0f96b5e39260789212fb applied. No detector suppression or
 instrumentation change is involved. Requires Python 3.10+, CMake 3.20+, Ninja,
 Git, Clang/Clang++, nm and an installed LLVM development CMake package.
+Process ownership requires Linux /proc, pidfds and child-subreaper support.
 
 Usage: python3 scripts/security/tsan_runtime.py
 Output: target/security/tsan-runtime/{report.json,*.log,*.a,*.a.syms}
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -55,6 +57,8 @@ REQUIRED_SYMBOLS = frozenset(("__tsan_init", "__interceptor_fcntl", "__intercept
 ALLOWED_DOWNLOAD_HOSTS = frozenset(("github.com", "codeload.github.com", "patch-diff.githubusercontent.com"))
 MAX_SOURCE_BYTES = 1024 * 1024 * 1024
 MAX_EXTRACT_BYTES = 2 * MAX_SOURCE_BYTES
+# Linux __WALL: include clone children regardless of their exit signal.
+LINUX_WAIT_ALL = 0x40000000
 
 
 class BuildError(RuntimeError):
@@ -276,6 +280,95 @@ def write_report(output: Path, report: dict) -> None:
     os.replace(temporary, destination)
 
 
+def process_identity(pid: int) -> dict | None:
+    try:
+        data = (Path("/proc") / str(pid) / "stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except PermissionError as error:
+        raise BuildError(f"cannot inspect process {pid} during cleanup") from error
+    # comm is parenthesized and can itself contain spaces or ')' characters.
+    head, separator, tail = data.rpartition(b") ")
+    fields = tail.split()
+    try:
+        if not separator or int(head.split(b" (", 1)[0]) != pid or len(fields) < 20:
+            raise ValueError("invalid process stat record")
+        return {"pid": pid, "ppid": int(fields[1]), "pgid": int(fields[2]),
+                "sid": int(fields[3]), "start_ticks": int(fields[19])}
+    except (ValueError, IndexError) as error:
+        raise BuildError(f"malformed process identity for {pid}") from error
+
+
+def direct_children(deadline: float | None = None) -> list[dict]:
+    children = []
+    with os.scandir("/proc") as entries:
+        for entry in entries:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise BuildError("process census exceeded the cleanup deadline")
+            if entry.name.isascii() and entry.name.isdigit():
+                identity = process_identity(int(entry.name))
+                if identity is not None and identity["ppid"] == os.getpid():
+                    children.append(identity)
+    return children
+
+
+def prepare_process_tracking() -> None:
+    # This is a standalone Linux builder, not a process supervisor embedded in
+    # another application. No existing children/reaper may share its ownership.
+    if sys.platform != "linux" or not all(hasattr(os, name) for name in
+            ("pidfd_open", "waitid", "WNOWAIT")) or not hasattr(signal, "pidfd_send_signal"):
+        raise BuildError("runtime commands require Linux /proc, pidfds and waitid(WNOWAIT)")
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        raise BuildError("runtime builder requires the default SIGCHLD disposition")
+    try:
+        os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT | LINUX_WAIT_ALL)
+    except ChildProcessError:
+        pass
+    else:
+        raise BuildError("runtime builder must not own pre-existing child processes")
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                     ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    # Linux PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER. Keep this ownership
+    # for the standalone builder's lifetime, including failed cleanup.
+    enabled = ctypes.c_int()
+    if (prctl(36, 1, 0, 0, 0) != 0
+            or prctl(37, ctypes.addressof(enabled), 0, 0, 0) != 0):
+        raise OSError(ctypes.get_errno(), "cannot establish Linux child subreaper")
+    if enabled.value != 1 or process_identity(os.getpid()) is None:
+        raise BuildError("cannot verify Linux child ownership")
+    descriptor = os.pidfd_open(os.getpid(), 0)
+    try:
+        signal.pidfd_send_signal(descriptor, 0)
+    finally:
+        os.close(descriptor)
+
+
+def kill_adopted_child(observed: dict) -> None:
+    try:
+        descriptor = os.pidfd_open(observed["pid"], 0)
+    except ProcessLookupError:
+        return
+    try:
+        # Opening the pidfd before re-reading identity binds a signal to that
+        # process even if its numeric PID is recycled before signal delivery.
+        current = process_identity(observed["pid"])
+        if current is None or current["ppid"] != os.getpid():
+            return
+        if current["start_ticks"] != observed["start_ticks"]:
+            return
+        if current["sid"] == os.getsid(0) or current["pid"] == os.getpid():
+            raise BuildError("refusing to signal a process in the caller's session")
+        try:
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
 class Commands:
     def __init__(self, output: Path, environment: dict[str, str], report: dict):
         self.output = output
@@ -286,46 +379,65 @@ class Commands:
     def wait(self, process: subprocess.Popen, timeout: int) -> None:
         deadline = time.monotonic() + timeout
         while True:
-            # The signal handler only records cancellation while a command
-            # is owned. Deliver it inside the already-registered finally block.
             TERMINATION.check()
-            remaining = max(0, deadline - time.monotonic())
+            # Do not reap yet: the reserved direct child cannot have its PID
+            # reused before cleanup has taken responsibility for its children.
             try:
-                process.wait(timeout=min(0.1, remaining))
+                exited = os.waitid(os.P_PID, process.pid,
+                                   os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError as error:
+                raise BuildError("command leader was reaped outside the runtime builder") from error
+            if exited is not None:
                 return
-            except subprocess.TimeoutExpired:
-                if time.monotonic() >= deadline:
-                    raise subprocess.TimeoutExpired(process.args, timeout) from None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            time.sleep(min(0.1, remaining))
 
-    def finish_group(self, process: subprocess.Popen, record: dict) -> None:
-        # CMake can have Ninja/compiler descendants after its own exit. Each
-        # command owns a session, so cleanup must target that group, never the
-        # caller's session. Keep cleanup below the outer runner's 10s grace.
-        if process.pid == os.getpgrp():
-            raise BuildError("refusing to signal the runtime builder's process group")
+    def finish_session(self, process: subprocess.Popen, leader_fd: int | None, record: dict) -> None:
+        if process.pid in (os.getpid(), os.getsid(0)):
+            raise BuildError("refusing to signal the runtime builder's session")
         deadline = time.monotonic() + 5
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            if leader_fd is None:
+                # Only the unreaped direct child uses this fallback if pidfd
+                # acquisition itself failed. Its PID is still reserved.
+                os.kill(process.pid, signal.SIGKILL)
+            else:
+                signal.pidfd_send_signal(leader_fd, signal.SIGKILL)
         except ProcessLookupError:
             pass
         process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        record["reaped_descendants"] = []
+        # Ninja can use different PGIDs, and descendants can fork during a
+        # /proc census. Subreaper adoption plus kernel ECHILD is the completion
+        # proof; an empty snapshot alone is never sufficient. After reaping the
+        # leader, do not use its potentially reusable numeric SID for ownership.
         while True:
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                self.safe_to_clean = True
-                record["cleanup_complete"] = True
-                return
-            except PermissionError:
-                # Permission denial is not proof of exit. Retry the query
-                # within the same deadline; only ESRCH confirms disappearance.
-                pass
+            for child in direct_children(deadline):
+                if time.monotonic() >= deadline:
+                    raise BuildError("command descendant cleanup exceeded its deadline")
+                kill_adopted_child(child)
+            while True:
+                if time.monotonic() >= deadline:
+                    raise BuildError("could not confirm all owned command descendants exited")
+                try:
+                    pid, _status = os.waitpid(-1, os.WNOHANG | LINUX_WAIT_ALL)
+                except ChildProcessError:
+                    self.safe_to_clean = True
+                    record["cleanup_complete"] = True
+                    record["cleanup_proof"] = "linux-subreaper-ECHILD"
+                    return
+                if pid == 0:
+                    break
+                record["reaped_descendants"].append(pid)
             if time.monotonic() >= deadline:
-                raise BuildError(f"could not confirm command group {process.pid} exited after SIGKILL")
+                raise BuildError("could not confirm all owned command descendants exited")
             time.sleep(0.02)
 
     def run(self, command: list[str], label: str, cwd: Path,
             timeout: int = 1800) -> str:
+        prepare_process_tracking()
         log = self.output / f"{label}.log"
         if log.is_symlink():
             raise BuildError(f"refusing to overwrite a symlink log: {log}")
@@ -337,19 +449,29 @@ class Commands:
             stream.flush()
             with TERMINATION.defer():
                 process = None
+                leader_fd = None
                 try:
                     process = subprocess.Popen(command, cwd=cwd, env=self.environment,
                                                stdout=stream, stderr=subprocess.STDOUT,
                                                start_new_session=True)
                     self.safe_to_clean = False
                     record["process_group"] = process.pid
+                    record["session_id"] = process.pid
                     record["cleanup_complete"] = False
+                    leader_fd = os.pidfd_open(process.pid, 0)
+                    identity = process_identity(process.pid)
+                    if (identity is None or identity["sid"] != process.pid
+                            or identity["ppid"] != os.getpid()):
+                        raise BuildError("command leader identity does not match its owned session")
+                    record["leader_start_ticks"] = identity["start_ticks"]
                     self.wait(process, timeout)
                 finally:
                     if process is not None:
                         try:
-                            self.finish_group(process, record)
+                            self.finish_session(process, leader_fd, record)
                         finally:
+                            if leader_fd is not None:
+                                os.close(leader_fd)
                             record["returncode"] = process.returncode
         text = log.read_text(encoding="utf-8", errors="replace")
         if process.returncode:
