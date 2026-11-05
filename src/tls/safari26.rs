@@ -111,6 +111,14 @@ const MAX_SERVER_FLIGHT_RECORDS: usize = 256;
 /// Finished) fits within one max-size message plus framing for the small ones.
 const MAX_SERVER_FLIGHT_DECRYPTED_BYTES: usize = MAX_ENCRYPTED_HANDSHAKE_MESSAGE + 64 * 1024;
 
+/// Keep the aggregate limit's exact inclusive boundary independently testable.
+/// A complete TLS flight may fail another validation before accumulating this
+/// much plaintext, but defense-in-depth still requires rejecting the first
+/// byte *past* the budget, not a byte *at* the budget.
+fn server_flight_exceeds_decrypted_budget(total_decrypted: usize) -> bool {
+    total_decrypted > MAX_SERVER_FLIGHT_DECRYPTED_BYTES
+}
+
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
@@ -297,7 +305,11 @@ impl Safari26TlsCamouflage {
             auth_key.as_slice(),
             &material,
         )?;
-        if !auth.authenticated || auth.x25519_key_share != Some(parallax_x25519.public) {
+        if !own_client_hello_is_authenticated(
+            auth.authenticated,
+            auth.x25519_key_share,
+            parallax_x25519.public,
+        ) {
             return Err(Safari26TlsError::UnauthenticatedClientHello);
         }
 
@@ -316,6 +328,16 @@ impl Safari26TlsCamouflage {
             tap: VecRecordTap::default(),
         })
     }
+}
+
+/// Keep both security requirements observable as independent test cases: a
+/// verified MAC is insufficient if the recovered key_share is not OUR share.
+fn own_client_hello_is_authenticated(
+    authenticated: bool,
+    recovered_share: Option<[u8; 32]>,
+    expected_share: [u8; 32],
+) -> bool {
+    authenticated && recovered_share == Some(expected_share)
 }
 
 pub struct Safari26TlsSession {
@@ -679,7 +701,7 @@ impl Safari26TlsSession {
                         ));
                     }
                     total_decrypted = total_decrypted.saturating_add(decrypted.plaintext.len());
-                    if total_decrypted > MAX_SERVER_FLIGHT_DECRYPTED_BYTES {
+                    if server_flight_exceeds_decrypted_budget(total_decrypted) {
                         return Err(Safari26TlsError::Handshake(
                             "server flight exceeded maximum decrypted size".to_owned(),
                         ));
@@ -959,9 +981,9 @@ impl Safari26TlsSession {
             offset += total;
         }
 
-        if offset > 0 {
-            plaintext.drain(..offset);
-        }
+        // Draining an empty prefix is a no-op. Avoid an equivalent branch
+        // (offset > 0 versus offset >= 0) that adds no parsing protection.
+        plaintext.drain(..offset);
 
         Ok(saw_settings_ack)
     }
@@ -1864,7 +1886,11 @@ impl RecordCipher {
                 "expected encrypted TLS application record".to_owned(),
             ));
         }
-        if record.len() < header.total_len || header.payload_len < AEAD_TAG_LEN + 1 {
+        // A TLS 1.3 ciphertext must contain a 16-byte tag AND at least one
+        // encrypted inner content-type byte. This is exactly <= TAG_LEN,
+        // without an arithmetic expression whose mutations are equivalent
+        // after AEAD rejects the same malformed inputs.
+        if record.len() < header.total_len || header.payload_len <= AEAD_TAG_LEN {
             return Err(Safari26TlsError::Aead);
         }
         let aad = &record[..super::record::TLS_HEADER_LEN];
@@ -1958,7 +1984,7 @@ fn process_server_handshake_messages(
         if buf.len() < 4 {
             return Ok(());
         }
-        let len = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | buf[3] as usize;
+        let len = u32::from_be_bytes([0, buf[1], buf[2], buf[3]]) as usize;
         // Reject on the FIRST record carrying an oversized length header, before
         // the buffer can accumulate toward the declared target — this bounds the
         // handshake buffer to ~MAX_ENCRYPTED_HANDSHAKE_MESSAGE plus one in-flight
@@ -2211,7 +2237,7 @@ fn verify_server_certificate(
         .first()
         .ok_or_else(|| Safari26TlsError::Certificate("missing server certificate".to_owned()))?;
     #[cfg(test)]
-    if sni == "example.com" && Sha256::digest(leaf)[..] == LOOPBACK_CAMOUFLAGE_CERT_SHA256 {
+    if is_loopback_test_certificate(sni, &Sha256::digest(leaf)) {
         return Ok(());
     }
 
@@ -2250,6 +2276,14 @@ fn verify_server_certificate(
     )
     .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?;
     Ok(())
+}
+
+/// The certificate pin is a test-only bypass. Keep BOTH conditions independently
+/// testable: a matching name must not waive a wrong certificate, and a matching
+/// digest must not waive a wrong name.
+#[cfg(test)]
+fn is_loopback_test_certificate(sni: &str, digest: &[u8]) -> bool {
+    sni == "example.com" && digest == LOOPBACK_CAMOUFLAGE_CERT_SHA256
 }
 
 fn native_roots() -> Result<&'static [CertificateDer<'static>], Safari26TlsError> {
@@ -2395,9 +2429,12 @@ impl<'a> TlsCursor<'a> {
         if self.remaining() < 3 {
             return Err(Safari26TlsError::Handshake("TLS data truncated".to_owned()));
         }
-        let value = ((self.data[self.pos] as u32) << 16)
-            | ((self.data[self.pos + 1] as u32) << 8)
-            | self.data[self.pos + 2] as u32;
+        let value = u32::from_be_bytes([
+            0,
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+        ]);
         self.pos += 3;
         Ok(value)
     }
@@ -2427,12 +2464,12 @@ impl<'a> TlsCursor<'a> {
     }
 }
 
-/// Fuzz-only entry points for internal handshake parsers. Compiled ONLY under
-/// `--cfg fuzzing` (which cargo-fuzz sets automatically); absent from normal
-/// `cargo build` / `cargo test` and from CI builds, so it cannot widen the
-/// production API surface. These are thin wrappers (not `pub use`, which would
-/// hit E0364 on the private fns) and erase the crate-internal error type.
-#[cfg(fuzzing)]
+/// Fuzz-only entry points for internal handshake parsers. Built for fuzz targets
+/// or unit tests (to ensure the wrappers actually preserve parser results);
+/// absent from ordinary production builds, so they cannot widen its API.
+/// These are thin wrappers (not `pub use`, which hits E0364 for private fns)
+/// and intentionally erase the crate-internal error type.
+#[cfg(any(fuzzing, test))]
 #[allow(clippy::result_unit_err)] // fuzz-only wrappers intentionally erase the crate error type
 pub mod fuzz {
     pub fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
@@ -4883,6 +4920,22 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_parser_entry_points_preserve_success_and_failure_results() {
+        let body = certificate_body(&[&[0xaa, 0xbb], &[0xcc]]);
+        let compressed = build_compressed_cert_body(body.len(), &body);
+        let expected = vec![vec![0xaa, 0xbb], vec![0xcc]];
+        assert_eq!(fuzz::parse_certificate_body(&body), Ok(expected.clone()));
+        assert_eq!(
+            fuzz::parse_compressed_certificate_body(&compressed),
+            Ok(expected)
+        );
+        // Broken/truncated data must still fail rather than being replaced with
+        // a constant, seemingly successful certificate chain.
+        assert!(fuzz::parse_certificate_body(&[1]).is_err());
+        assert!(fuzz::parse_compressed_certificate_body(&[1]).is_err());
+    }
+
+    #[test]
     fn parse_compressed_certificate_body_accepts_a_chain_exactly_at_the_cap() {
         // Build a valid certificate body whose total length is EXACTLY
         // MAX_DECOMPRESSED_CERT_CHAIN and declare that same length. The original's
@@ -5033,5 +5086,598 @@ mod tests {
             );
         }
         assert!(certificate_verify_algorithm(0x0000).is_err());
+    }
+
+    #[test]
+    fn tls_cursor_rejects_truncation_and_consumes_exact_u8_u24_boundaries() {
+        let mut empty = TlsCursor::new(&[]);
+        assert!(empty.u8().is_err());
+        assert!(empty.u24().is_err());
+
+        let mut one = TlsCursor::new(&[0xa5]);
+        assert_eq!(one.u8().unwrap(), 0xa5);
+        assert_eq!(one.remaining(), 0);
+        assert!(one.u8().is_err());
+        assert!(one.u24().is_err());
+
+        let mut two = TlsCursor::new(&[0x12, 0x34]);
+        assert!(two.u24().is_err());
+        assert_eq!(two.remaining(), 2);
+
+        let mut three = TlsCursor::new(&[0x12, 0x34, 0x56]);
+        assert_eq!(three.u24().unwrap(), 0x123456);
+        assert_eq!(three.remaining(), 0);
+        assert!(three.u24().is_err());
+
+        // A nonzero starting position and nonzero bytes in all three length
+        // octets distinguish mistaken shifts, arithmetic, and cursor advances.
+        let mut mixed = TlsCursor::new(&[0x99, 0xab, 0xcd, 0xef, 0x42]);
+        assert_eq!(mixed.u8().unwrap(), 0x99);
+        assert_eq!(mixed.u24().unwrap(), 0xabcdef);
+        assert_eq!(mixed.u8().unwrap(), 0x42);
+        assert_eq!(mixed.remaining(), 0);
+    }
+
+    #[test]
+    fn tls_cursor_u16_and_byte_slice_advance_exactly_and_fail_closed() {
+        let mut empty = TlsCursor::new(&[]);
+        assert!(empty.u16().is_err());
+        assert!(empty.bytes(1).is_err());
+
+        let mut short = TlsCursor::new(&[0xaa]);
+        assert!(short.u16().is_err());
+        assert_eq!(short.remaining(), 1);
+        assert!(short.bytes(2).is_err());
+        assert_eq!(short.remaining(), 1);
+
+        let mut cursor = TlsCursor::new(&[0x99, 0x12, 0x34, 0xde, 0xad, 0x42]);
+        assert_eq!(cursor.u8().unwrap(), 0x99);
+        assert_eq!(cursor.u16().unwrap(), 0x1234);
+        assert_eq!(cursor.bytes(2).unwrap(), &[0xde, 0xad]);
+        assert_eq!(cursor.u8().unwrap(), 0x42);
+        assert_eq!(cursor.remaining(), 0);
+        assert!(cursor.bytes(1).is_err());
+
+        let mut exact = TlsCursor::new(&[0xcc, 0xdd]);
+        assert_eq!(exact.bytes(2).unwrap(), &[0xcc, 0xdd]);
+        assert_eq!(exact.remaining(), 0);
+    }
+
+    #[test]
+    fn hello_retry_request_rejects_tls12_in_supported_versions() {
+        let id = [0x6b; 32];
+        let mut record = hrr_record(GROUP_SECP256R1, &id, None);
+        let marker = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        let pos = record
+            .windows(marker.len())
+            .position(|bytes| bytes == marker)
+            .expect("the HRR contains the TLS 1.3 supported_versions extension");
+        record[pos + marker.len() - 1] = 0x03; // TLS 1.2, still a two-byte version.
+        assert!(matches!(
+            parse_hello_retry_request(&record, &id),
+            Err(Safari26TlsError::MissingServerHello)
+        ));
+    }
+
+    #[test]
+    fn tls13_keys_finished_mac_is_transcript_and_direction_bound() {
+        let mut transcript = HandshakeTranscript::new();
+        transcript.push(&[HANDSHAKE_CLIENT_HELLO, 0, 0, 1, 0x5a]);
+        let suite = TlsCipherSuite::Aes128GcmSha256;
+        let keys = Tls13Keys::new(suite, &[0x37; 32], &transcript).unwrap();
+        let server = keys.server_finished_verify_data(&transcript).unwrap();
+        let client = keys.client_finished_verify_data(&transcript).unwrap();
+        assert_eq!(server.len(), suite.hash_len());
+        assert_eq!(client.len(), suite.hash_len());
+        assert_eq!(
+            server,
+            finished_verify_data(suite, &keys.server_handshake_secret, transcript.bytes()).unwrap()
+        );
+        assert_eq!(
+            client,
+            finished_verify_data(suite, &keys.client_handshake_secret, transcript.bytes()).unwrap()
+        );
+        assert_ne!(server, client);
+        transcript.push(&[0x08, 0, 0, 0]);
+        assert_ne!(
+            server,
+            keys.server_finished_verify_data(&transcript).unwrap()
+        );
+        assert_ne!(
+            client,
+            keys.client_finished_verify_data(&transcript).unwrap()
+        );
+    }
+
+    #[test]
+    fn tls13_keys_install_real_application_ciphers() {
+        let mut transcript = HandshakeTranscript::new();
+        let mut sender =
+            Tls13Keys::new(TlsCipherSuite::Aes128GcmSha256, &[0x4a; 32], &transcript).unwrap();
+        let mut receiver =
+            Tls13Keys::new(TlsCipherSuite::Aes128GcmSha256, &[0x4a; 32], &transcript).unwrap();
+        assert_eq!(&*sender.client_application.key, &[0_u8; 16]);
+        assert_eq!(&*sender.server_application.key, &[0_u8; 16]);
+        transcript.push(&[HANDSHAKE_FINISHED, 0, 0, 0]);
+        sender.install_application_keys(&transcript).unwrap();
+        receiver.install_application_keys(&transcript).unwrap();
+        assert_ne!(&*sender.client_application.key, &[0_u8; 16]);
+        assert_ne!(&*sender.server_application.key, &[0_u8; 16]);
+        assert_ne!(sender.client_application.key, sender.server_application.key);
+        let server_record = sender
+            .server_application
+            .encrypt_record(TLS_RECORD_APPLICATION_DATA, b"server payload")
+            .unwrap();
+        assert_eq!(
+            receiver
+                .server_application
+                .decrypt_record(&server_record)
+                .unwrap()
+                .plaintext,
+            b"server payload"
+        );
+    }
+
+    #[test]
+    fn handshake_transcript_push_and_record_push_preserve_exact_bytes() {
+        let mut transcript = HandshakeTranscript::new();
+        let first = [HANDSHAKE_CLIENT_HELLO, 0, 0, 1, 0xaa];
+        let second = [HANDSHAKE_SERVER_HELLO, 0, 0, 2, 0xbb, 0xcc];
+        transcript.push(&first);
+        assert_eq!(transcript.bytes(), first);
+        transcript
+            .push_handshake_record(&tls_record(TLS_RECORD_HANDSHAKE, &second))
+            .unwrap();
+        assert_eq!(transcript.bytes(), [first.as_slice(), &second].concat());
+    }
+
+    #[test]
+    fn certificate_verification_fails_closed_for_missing_and_malformed_leaf() {
+        let transcript = HandshakeTranscript::new();
+        assert!(matches!(
+            verify_server_certificate("example.com", &ServerFlight::default(), &transcript),
+            Err(Safari26TlsError::Certificate(_))
+        ));
+        let flight = ServerFlight {
+            certificates: vec![vec![0x30, 0x00]], // DER SEQUENCE with no certificate fields.
+            ..ServerFlight::default()
+        };
+        // The test-only pin bypass requires BOTH matching SNI and a specific
+        // certificate digest. A wrong digest must not bypass verification.
+        for sni in ["example.com", "other.example"] {
+            assert!(matches!(
+                verify_server_certificate(sni, &flight, &transcript),
+                Err(Safari26TlsError::Certificate(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loopback_certificate_exception_requires_exact_domain_and_digest() {
+        let pinned = LOOPBACK_CAMOUFLAGE_CERT_SHA256;
+        let other = [0x42; 32];
+        assert!(is_loopback_test_certificate("example.com", &pinned));
+        for (name, digest) in [
+            ("other.example", pinned),
+            ("example.com", other),
+            ("other.example", other),
+        ] {
+            assert!(
+                !is_loopback_test_certificate(name, &digest),
+                "test-only certificate exception must require both pin and SNI"
+            );
+        }
+    }
+
+    #[test]
+    fn native_root_loader_never_accepts_an_empty_trust_store() {
+        match native_roots() {
+            Ok(roots) => assert!(
+                !roots.is_empty(),
+                "an empty root set must never be accepted"
+            ),
+            // Sandboxes legitimately may have no host roots. In that case
+            // fail-closed is correct; fabricating Ok(empty) is not.
+            Err(Safari26TlsError::Certificate(_)) => {}
+            Err(_) => panic!("unexpected trust-store error variant"),
+        }
+    }
+
+    #[test]
+    fn tls_shared_secret_rejects_retried_group_mismatch_and_accepts_matching_group() {
+        let mut session = test_session();
+        let peer = generate_retry_key_share(GROUP_SECP256R1).unwrap();
+        session.retry_key_share = Some(generate_retry_key_share(GROUP_SECP256R1).unwrap());
+        let mismatch = server_hello_with(GROUP_X25519, vec![0x01; X25519_KEY_LEN]);
+        assert!(matches!(
+            session.tls_shared_secret(&mismatch),
+            Err(Safari26TlsError::Handshake(ref m)) if m.contains("retried group")
+        ));
+        let matched = server_hello_with(GROUP_SECP256R1, peer.public);
+        assert_eq!(session.tls_shared_secret(&matched).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn tls_shared_secret_accepts_exact_hybrid_ciphertext_and_key_share_length() {
+        let session = test_session();
+        let mut share = vec![0_u8; MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN];
+        let peer = X25519KeyPair::generate();
+        share[MLKEM768_CIPHERTEXT_LEN..].copy_from_slice(&peer.public);
+        let hello = server_hello_with(GROUP_X25519_MLKEM768, share);
+        assert_eq!(session.tls_shared_secret(&hello).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn decrypted_server_flight_budget_is_inclusive_at_its_exact_limit() {
+        let cap = MAX_SERVER_FLIGHT_DECRYPTED_BYTES;
+        assert!(!server_flight_exceeds_decrypted_budget(0));
+        assert!(!server_flight_exceeds_decrypted_budget(cap - 1));
+        assert!(!server_flight_exceeds_decrypted_budget(cap));
+        assert!(server_flight_exceeds_decrypted_budget(cap + 1));
+        assert!(server_flight_exceeds_decrypted_budget(usize::MAX));
+    }
+
+    #[test]
+    fn own_client_hello_authentication_requires_both_mac_and_exact_share() {
+        let expected = [0x55; 32];
+        let different = [0x77; 32];
+        assert!(own_client_hello_is_authenticated(
+            true,
+            Some(expected),
+            expected
+        ));
+        for (authenticated, recovered) in [
+            (false, Some(expected)),
+            (true, Some(different)),
+            (true, None),
+            (false, Some(different)),
+            (false, None),
+        ] {
+            assert!(
+                !own_client_hello_is_authenticated(authenticated, recovered, expected),
+                "neither a bad MAC nor a mismatched/missing share may be accepted"
+            );
+        }
+    }
+
+    async fn retry_with_server_cipher_suite(
+        cipher_suite: u16,
+    ) -> Result<Vec<u8>, Safari26TlsError> {
+        let mut session = test_session();
+        let hrr = hrr_record(GROUP_SECP256R1, &session.sent_session_id, None);
+        let mut transcript = HandshakeTranscript::new();
+        transcript.push_handshake_record(&session.client_hello)?;
+        let (mut client, mut peer) = loopback().await;
+        let mut response = valid_safari_server_hello();
+        // Adapt the fixed ServerHello fixture to the live ClientHello's random
+        // session_id. The parser must reach the cipher-suite consistency check,
+        // not fail earlier at the mandatory session_id echo.
+        let session_id_offset = crate::tls::record::TLS_HEADER_LEN + 4 + 2 + 32 + 1;
+        let suite_offset = session_id_offset + session.sent_session_id.len();
+        response[session_id_offset..suite_offset].copy_from_slice(&session.sent_session_id);
+        response[suite_offset..suite_offset + 2].copy_from_slice(&cipher_suite.to_be_bytes());
+        peer.write_all(&response).await.unwrap();
+        session
+            .retry_after_hello_retry_request(&mut client, &mut transcript, &hrr)
+            .await
+    }
+
+    #[tokio::test]
+    async fn hello_retry_requires_same_cipher_suite_in_final_server_hello() {
+        assert!(
+            retry_with_server_cipher_suite(TLS_AES_128_GCM_SHA256)
+                .await
+                .is_ok(),
+            "the HRR cipher suite must remain acceptable in the final ServerHello"
+        );
+        assert!(matches!(
+            retry_with_server_cipher_suite(TLS_AES_256_GCM_SHA384).await,
+            Err(Safari26TlsError::Handshake(ref m)) if m.contains("does not match the HelloRetryRequest")
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_server_hello_accepts_maximum_compat_ccs_then_handshake() {
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        let mut wire = Vec::new();
+        for _ in 0..MAX_CHANGE_CIPHER_SPEC_RECORDS {
+            wire.extend_from_slice(&change_cipher_spec());
+        }
+        let server_hello = valid_safari_server_hello();
+        wire.extend_from_slice(&server_hello);
+        peer.write_all(&wire).await.unwrap();
+        drop(peer);
+
+        assert_eq!(
+            session.read_server_hello_record(&mut client).await.unwrap(),
+            server_hello
+        );
+    }
+
+    #[tokio::test]
+    async fn read_server_hello_rejects_ccs_beyond_limit() {
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        let mut wire = Vec::new();
+        for _ in 0..=MAX_CHANGE_CIPHER_SPEC_RECORDS {
+            wire.extend_from_slice(&change_cipher_spec());
+        }
+        peer.write_all(&wire).await.unwrap();
+        drop(peer);
+
+        assert!(matches!(
+            session.read_server_hello_record(&mut client).await,
+            Err(Safari26TlsError::Handshake(ref m)) if m.contains("too many ChangeCipherSpec")
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_server_hello_surfaces_plaintext_alert() {
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        peer.write_all(&tls_record(TLS_CONTENT_ALERT, &[2, 40]))
+            .await
+            .unwrap();
+        drop(peer);
+        assert!(matches!(
+            session.read_server_hello_record(&mut client).await,
+            Err(Safari26TlsError::Alert {
+                level: 2,
+                description: 40
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_encrypted_flight_accepts_max_ccs_and_partial_handshake_before_alert() {
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        let mut keys = app_keys();
+        let mut peer_keys = app_keys();
+        let mut transcript = HandshakeTranscript::new();
+        let mut wire = Vec::new();
+        for _ in 0..MAX_CHANGE_CIPHER_SPEC_RECORDS {
+            wire.extend_from_slice(&change_cipher_spec());
+        }
+        // Two valid decrypted handshake bytes are a partial header, not an
+        // alert. This also pins the inner-type AND length check: an OR here
+        // would read these as a bogus alert.
+        wire.extend_from_slice(
+            &peer_keys
+                .server_handshake
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &[0x08, 0x00])
+                .unwrap(),
+        );
+        wire.extend_from_slice(&tls_record(TLS_CONTENT_ALERT, &[2, 40]));
+        peer.write_all(&wire).await.unwrap();
+        drop(peer);
+
+        assert!(matches!(
+            session
+                .read_encrypted_server_flight(&mut client, &mut keys, &mut transcript)
+                .await,
+            Err(Safari26TlsError::Alert {
+                level: 2,
+                description: 40
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_encrypted_flight_rejects_ccs_beyond_limit() {
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        let mut keys = app_keys();
+        let mut transcript = HandshakeTranscript::new();
+        let mut wire = Vec::new();
+        for _ in 0..=MAX_CHANGE_CIPHER_SPEC_RECORDS {
+            wire.extend_from_slice(&change_cipher_spec());
+        }
+        peer.write_all(&wire).await.unwrap();
+        drop(peer);
+        assert!(matches!(
+            session
+                .read_encrypted_server_flight(&mut client, &mut keys, &mut transcript)
+                .await,
+            Err(Safari26TlsError::Handshake(ref m)) if m.contains("too many ChangeCipherSpec")
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_encrypted_flight_surfaces_authenticated_alert() {
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        let mut keys = app_keys();
+        let mut peer_keys = app_keys();
+        let mut transcript = HandshakeTranscript::new();
+        let record = peer_keys
+            .server_handshake
+            .encrypt_record(TLS_CONTENT_ALERT, &[2, 42])
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        drop(peer);
+        assert!(matches!(
+            session
+                .read_encrypted_server_flight(&mut client, &mut keys, &mut transcript)
+                .await,
+            Err(Safari26TlsError::Alert {
+                level: 2,
+                description: 42
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_encrypted_flight_rejects_short_authenticated_alert_without_panicking() {
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        let mut keys = app_keys();
+        let mut peer_keys = app_keys();
+        let mut transcript = HandshakeTranscript::new();
+        let record = peer_keys
+            .server_handshake
+            .encrypt_record(TLS_CONTENT_ALERT, &[2])
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        drop(peer);
+        assert!(matches!(
+            session
+                .read_encrypted_server_flight(&mut client, &mut keys, &mut transcript)
+                .await,
+            Err(Safari26TlsError::Handshake(ref m)) if m.contains("expected encrypted handshake")
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_accepts_clean_transport_close() {
+        let mut session = test_session();
+        let (mut client, peer) = loopback().await;
+        let mut keys = app_keys();
+        drop(peer);
+        assert_eq!(
+            session
+                .drain_post_handshake(&mut client, &mut keys)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_propagates_invalid_record_header() {
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        let mut keys = app_keys();
+        // Too large for a TLS record, producing io::ErrorKind::InvalidData;
+        // unlike EOF this is not a clean close.
+        peer.write_all(&[TLS_CONTENT_APPLICATION_DATA, 0x03, 0x03, 0xff, 0xff])
+            .await
+            .unwrap();
+        drop(peer);
+        assert!(matches!(
+            session.drain_post_handshake(&mut client, &mut keys).await,
+            Err(Safari26TlsError::Io(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_timeout_requires_record_boundary() {
+        let mut session = test_session();
+        let (mut client, _silent_peer) = loopback().await;
+        let mut keys = app_keys();
+        assert_eq!(
+            session
+                .drain_post_handshake(&mut client, &mut keys)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let mut session = test_session();
+        let (mut client, mut silent_peer) = loopback().await;
+        let mut keys = app_keys();
+        silent_peer
+            .write_all(&[TLS_CONTENT_APPLICATION_DATA, 0x03, 0x03, 0x00, 0x10, 1])
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.drain_post_handshake(&mut client, &mut keys).await,
+            Err(Safari26TlsError::Handshake(ref m)) if m.contains("mid-record")
+        ));
+    }
+
+    fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut message = vec![kind];
+        push_u24(&mut message, body.len()).unwrap();
+        message.extend_from_slice(body);
+        message
+    }
+
+    /// Build a genuine TLS 1.3 signed server flight. The CertificateVerify
+    /// signature covers the transcript at the precise pre-CV boundary; the
+    /// Finished MAC covers the transcript including CV. This is an independent
+    /// acceptance oracle, not just an error-path assertion.
+    fn signed_server_flight(compressed: bool) -> (Vec<u8>, Vec<u8>) {
+        use aws_lc_rs::{rand::SystemRandom, signature};
+        let certified = rcgen::generate_simple_self_signed(vec!["example.com".to_owned()]).unwrap();
+        let leaf = certified.cert.der().as_ref().to_vec();
+        let keys = app_keys();
+        let mut transcript = HandshakeTranscript::new();
+
+        let ee = handshake_message(HANDSHAKE_ENCRYPTED_EXTENSIONS, &[0, 0]);
+        transcript.push(&ee);
+        let cert_body = certificate_body(&[&leaf]);
+        let certificate = if compressed {
+            let body = build_compressed_cert_body(cert_body.len(), &cert_body);
+            handshake_message(HANDSHAKE_COMPRESSED_CERTIFICATE, &body)
+        } else {
+            handshake_message(HANDSHAKE_CERTIFICATE, &cert_body)
+        };
+        transcript.push(&certificate);
+
+        let mut signed = vec![0x20; 64];
+        signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        signed.push(0);
+        signed.extend_from_slice(&keys.suite.digest(transcript.bytes()));
+        let signer = signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &certified.key_pair.serialize_der(),
+        )
+        .unwrap();
+        let sig = signer.sign(&SystemRandom::new(), &signed).unwrap();
+        let mut verify_body = SIG_ECDSA_SECP256R1_SHA256.to_be_bytes().to_vec();
+        push_vec_u16(&mut verify_body, sig.as_ref()).unwrap();
+        let cert_verify = handshake_message(HANDSHAKE_CERTIFICATE_VERIFY, &verify_body);
+        transcript.push(&cert_verify);
+        let finished = finished_message(&keys.server_finished_verify_data(&transcript).unwrap());
+        ([ee, certificate, cert_verify, finished].concat(), leaf)
+    }
+
+    #[test]
+    fn accepts_real_signed_uncompressed_and_compressed_server_flights() {
+        for compressed in [false, true] {
+            let (mut wire, leaf) = signed_server_flight(compressed);
+            let mut transcript = HandshakeTranscript::new();
+            let mut flight = ServerFlight::default();
+            let mut keys = app_keys();
+            let expected_transcript = wire.clone();
+            process_server_handshake_messages(&mut wire, &mut flight, &mut transcript, &mut keys)
+                .unwrap();
+            assert!(flight.encrypted_extensions_seen);
+            assert!(flight.certificate_verify_seen);
+            assert!(flight.finished);
+            assert_eq!(flight.certificates, vec![leaf]);
+            assert!(wire.is_empty());
+            assert_eq!(transcript.bytes(), expected_transcript);
+        }
+    }
+
+    #[test]
+    fn signed_server_flight_rejects_tampered_certificate_verify_signature() {
+        let (mut wire, _) = signed_server_flight(false);
+        let mut offset = 0;
+        // Skip EncryptedExtensions and Certificate, then corrupt one byte of
+        // CertificateVerify's DER signature while leaving all lengths intact.
+        for _ in 0..2 {
+            let len = ((wire[offset + 1] as usize) << 16)
+                | ((wire[offset + 2] as usize) << 8)
+                | wire[offset + 3] as usize;
+            offset += 4 + len;
+        }
+        assert_eq!(wire[offset], HANDSHAKE_CERTIFICATE_VERIFY);
+        wire[offset + 8] ^= 1; // first signature byte (after type, len, scheme, siglen)
+
+        let mut transcript = HandshakeTranscript::new();
+        let mut flight = ServerFlight::default();
+        let mut keys = app_keys();
+        assert!(matches!(
+            process_server_handshake_messages(&mut wire, &mut flight, &mut transcript, &mut keys),
+            Err(Safari26TlsError::Certificate(_))
+        ));
+        assert!(flight.encrypted_extensions_seen);
+        assert!(!flight.certificates.is_empty());
+        assert!(!flight.certificate_verify_seen);
+        assert!(!flight.finished);
     }
 }
