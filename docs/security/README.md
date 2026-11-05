@@ -17,6 +17,7 @@ metadata. Model/canary crates are isolated non-shipping workspaces.
 | --- | --- |
 | `python3 scripts/security/assurance.py protocol` | Independent parser/AEAD oracles, faulty I/O and existing ML-DSA oracle/vectors |
 | `python3 scripts/security/assurance.py listener` | Real child server/TLS, replay persistence/capacity/corruption and source quota recovery; localhost only |
+| `python3 scripts/security/assurance.py std` | Production limiter, FD budget and pool scenarios with standard-library synchronization |
 | `python3 scripts/security/assurance.py loom` | Actual production limiter, FD budget and pool under bounded Loom exploration |
 | `python3 scripts/security/assurance.py shuttle` | Same source under seeded scheduling and schedule replay |
 | `python3 scripts/security/sanitizers.py address` | ASan controls and instrumented application |
@@ -76,7 +77,9 @@ bounds and toolchain; logs include completed executions and failure replay.
 
 Overrides: `PARALLAX_MODEL_WORKLOAD_SEED`, `PARALLAX_LOOM_PREEMPTIONS`,
 `PARALLAX_SHUTTLE_SEED`, `PARALLAX_SHUTTLE_ITERATIONS`.
-Use `PARALLAX_SHUTTLE_REPLAY` for the emitted encoded schedule.
+Use `PARALLAX_SHUTTLE_REPLAY` for the emitted encoded schedule together with
+`assurance.py shuttle --replay-test EXACT_CASE_NAME`; the runner rejects an
+encoded schedule without its exact case selection.
 Smaller bounds are different experiments. Tokio, global pool initialization,
 wall-clock eviction and arbitrary yielding panic destructors are not fully modeled.
 
@@ -99,7 +102,7 @@ fallthrough mutations (2 seconds and 17 seconds) exercise this oracle.
 
 ## Actions
 
-- `security-assurance.yml`: protocol/listener/Loom/Shuttle jobs on relevant PRs,
+- `security-assurance.yml`: protocol/listener/std/Loom/Shuttle jobs on relevant PRs,
   primary-branch pushes and weekly.
 - `security-sanitizers.yml`: native Linux ASan/TSan/LSan matrix on relevant PRs,
   primary-branch pushes and weekly; canary/application failures fail jobs.

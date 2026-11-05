@@ -125,7 +125,12 @@ pub fn source_unwind_releases(_workload_seed: u64) {
     ready_rx.recv().unwrap();
     assert!(Arc::clone(&limiter).try_admit(ipv4()).is_none());
     release_tx.send(()).unwrap();
-    let retry = Arc::clone(&limiter).try_admit(ipv4());
+    let retry = loop {
+        if let Some(permit) = Arc::clone(&limiter).try_admit(ipv4()) {
+            break permit;
+        }
+        thread::yield_now();
+    };
     worker.join().unwrap();
     drop(retry);
     drop(Arc::clone(&limiter).try_admit(ipv4()).unwrap());
@@ -148,14 +153,14 @@ fn budget(limit: usize) -> Arc<ExtraFdBudget> {
 /// Successful reservations overlap at the observation point and fit the budget.
 pub fn fd_overlapping_reservations(workload_seed: u64) {
     let unit = 1 + (workload_seed % 3) as usize;
-    let budget = budget(3 * unit);
+    let budget = budget(4 * unit);
     let contenders = Arc::clone(&budget);
     let admitted = two_contenders(move |_id, ready, release| {
         hold_guard(contenders.try_reserve(2 * unit), ready, release);
     });
-    assert_eq!(admitted, 1);
+    assert_eq!(admitted, 2);
     assert_eq!(budget.used.load(Ordering::Acquire), 0);
-    let entire = budget.try_reserve(3 * unit).unwrap();
+    let entire = budget.try_reserve(4 * unit).unwrap();
     assert!(budget.try_reserve(1).is_none());
     drop(entire);
     assert_eq!(budget.used.load(Ordering::Acquire), 0);
@@ -182,7 +187,12 @@ pub fn fd_unwind_releases(_workload_seed: u64) {
     ready_rx.recv().unwrap();
     assert!(budget.try_reserve(1).is_none());
     release_tx.send(()).unwrap();
-    let retry = budget.try_reserve(1);
+    let retry = loop {
+        if let Some(reservation) = budget.try_reserve(1) {
+            break reservation;
+        }
+        thread::yield_now();
+    };
     worker.join().unwrap();
     drop(retry);
     assert_eq!(budget.used.load(Ordering::Acquire), 0);

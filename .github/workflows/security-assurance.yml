@@ -56,6 +56,8 @@ jobs:
             toolchain: stable
           - suite: listener
             toolchain: stable
+          - suite: std
+            toolchain: stable
           - suite: loom
             toolchain: nightly-2026-06-17
           - suite: shuttle
@@ -73,7 +75,7 @@ jobs:
           python3 -m unittest discover -s .github/scripts -p 'test_security_*.py'
           python3 scripts/security/test_tsan_runtime.py
       - name: Check isolated workspace formatting
-        if: matrix.suite == 'loom' || matrix.suite == 'shuttle'
+        if: matrix.suite == 'std' || matrix.suite == 'loom' || matrix.suite == 'shuttle'
         run: cargo fmt --manifest-path verification/concurrency/Cargo.toml -- --check
       - name: Execute bounded project suite
         env:

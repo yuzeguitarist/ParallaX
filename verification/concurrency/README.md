@@ -2,7 +2,7 @@
 
 This independent Cargo workspace runs **the production implementations** of
 source admission, optional file-descriptor reservations, and AEAD worker
-scheduling under Loom and Shuttle. It does not reproduce those algorithms in
+scheduling under standard-library synchronization, Loom and Shuttle. It does not reproduce those algorithms in
 test-only models.
 
 ## Connection to the application
@@ -48,9 +48,9 @@ The same ten case functions run with all three backends:
 | --- | --- |
 | `source_mapped_alias` | IPv4 and its IPv4-mapped IPv6 spelling share one live admission slot; the slot is reusable after both contenders finish |
 | `source_ipv6_aggregate` | Two distinct /64s compete for the last slot in one /48; the aggregate releases all permits and does not block a different /48 |
-| `source_unwind_releases` | Unwinding the connection owner releases its permit while another caller retries; zero-cap sources reject admission |
-| `fd_overlapping_reservations` | Both successful reservations remain live at the observation point, so oversubscription cannot be hidden by early release; final usage is zero |
-| `fd_unwind_releases` | Unwinding releases the reservation exactly once while another caller retries |
+| `source_unwind_releases` | Another caller retries until admission succeeds before joining the unwinding owner; zero-cap sources reject admission |
+| `fd_overlapping_reservations` | Both `2 * unit` reservations succeed and remain live at the observation point within a `4 * unit` budget; final usage is zero |
+| `fd_unwind_releases` | Another caller retries until a reservation succeeds before joining the unwinding owner; release occurs exactly once |
 | `fd_overflow_and_zero` | `usize::MAX` overflow rejects; zero-sized reservations do not disturb accounting |
 | `pool_concurrent_order` | Two submitters receive only their own results in input order; every job runs once; dropping the first owner's reference does not shut down the remaining caller |
 | `pool_panics_complete_and_release` | Both caller and worker panics finish the batch, release all captures and leave workers usable for the next batch |
@@ -115,6 +115,10 @@ Select exactly one model feature. Enabling both fails compilation. Each explicit
 model target contains ten tests; automation should enumerate the selected target
 before running it and reject an empty test list.
 
+Security-assurance CI runs all three backends through
+`scripts/security/assurance.py std`, `loom`, and `shuttle`, retaining each
+backend's selected test list and completed execution evidence.
+
 Formatting and linting this workspace are separate from the application:
 
 ```sh
@@ -178,6 +182,15 @@ cargo test --locked --release \
   --manifest-path verification/concurrency/Cargo.toml \
   --features shuttle --test shuttle pool_concurrent_order \
   -- --exact --test-threads=1 --nocapture
+```
+
+The evidence runner also supports encoded replay, and requires the exact case
+name so the schedule cannot be fed to unrelated tests:
+
+```sh
+PARALLAX_MODEL_WORKLOAD_SEED=257 \
+PARALLAX_SHUTTLE_REPLAY='<encoded schedule from the failure>' \
+python3 scripts/security/assurance.py shuttle --replay-test pool_concurrent_order
 ```
 
 A randomized pass reports the schedules exercised. Shuttle's atomic modeling

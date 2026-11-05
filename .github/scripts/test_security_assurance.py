@@ -1,7 +1,11 @@
 """Fail-closed selection and completion checks for the security runner."""
 import importlib.util
+import contextlib
+import io
+import json
 from pathlib import Path
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -39,6 +43,40 @@ class AssuranceControls(unittest.TestCase):
             self.assertIn("--locked", command)
             self.assertIn("--release", command)
             self.assertEqual(command[-4:], ["--features", kind, "--test", kind])
+
+    def test_native_backend_is_selected_without_model_features(self):
+        command = assurance.selections("std")[0][1]
+        self.assertIn("verification/concurrency/Cargo.toml", command)
+        self.assertIn("--locked", command)
+        self.assertNotIn("--features", command)
+        self.assertEqual(command[-2:], ["--test", "std"])
+        workflow = (ROOT / ".github/workflows/security-assurance.yml").read_text()
+        self.assertIn("- suite: std\n            toolchain: stable", workflow)
+
+    def test_encoded_replay_requires_exact_shuttle_case(self):
+        for arguments, environment in [
+            (["shuttle", "--plan"], {"PARALLAX_SHUTTLE_REPLAY": "schedule"}),
+            (["std", "--plan", "--replay-test", "fd_unwind_releases"],
+             {"PARALLAX_SHUTTLE_REPLAY": "schedule"}),
+            (["shuttle", "--plan", "--replay-test", "fd_unwind_releases"], {}),
+        ]:
+            with self.subTest(arguments=arguments), \
+                    mock.patch.dict(assurance.os.environ, environment, clear=True), \
+                    mock.patch.object(assurance.sys, "argv", ["assurance.py", *arguments]), \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as error:
+                assurance.main()
+            self.assertEqual(error.exception.code, 2)
+
+        with mock.patch.dict(assurance.os.environ,
+                             {"PARALLAX_SHUTTLE_REPLAY": "schedule"}, clear=True), \
+                mock.patch.object(assurance.sys, "argv", [
+                    "assurance.py", "shuttle", "--plan", "--replay-test", "fd_unwind_releases"]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(assurance.main(), 0)
+        plan = json.loads(output.getvalue())
+        self.assertEqual(plan[0][2], ["fd_unwind_releases", "--exact"])
+        self.assertEqual(assurance.selections("shuttle")[0][2], [])
 
 
 if __name__ == "__main__":
