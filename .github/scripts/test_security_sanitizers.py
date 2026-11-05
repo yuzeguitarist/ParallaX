@@ -1,6 +1,7 @@
 """Controls against vacuous sanitizer success and environment contamination."""
 import importlib.util
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -73,6 +74,47 @@ class SanitizerControls(unittest.TestCase):
             archive.write_bytes(b"changed archive")
             with self.assertRaises(RuntimeError):
                 sanitizers.runtime_link_arguments(report, directory)
+
+    def test_patched_build_uses_early_runtime_and_preserves_encoded_paths(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+                sanitizers, "ROOT", Path(temporary)):
+            directory = (Path(temporary) / "target/security/tsan-runtime").resolve()
+            directory.mkdir(parents=True)
+            report = {"schema": 1, "status": "passed", "source_commit": sanitizers.TSAN_SOURCE,
+                      "patch_commit": sanitizers.TSAN_PATCH}
+            for key, name in (("archive", "runtime with spaces.a"),
+                              ("dynamic_list", "runtime with spaces.a.syms")):
+                path = directory / name
+                path.write_bytes(key.encode())
+                report[key] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            (directory / "report.json").write_text(json.dumps(report))
+            runner = sanitizers.Runner("thread", sanitizers.NIGHTLY, False)
+            environments = {}
+
+            def fake_run(label, argv, **kwargs):
+                environments[label] = runner.env.copy()
+                if label == "bundled-epoll-duplicate-fd":
+                    return subprocess.CompletedProcess(
+                        argv, 66, "ThreadSanitizer: data race epoll_publication.rs")
+                output = ""
+                if label.endswith(("same-fd", "duplicate-fd")):
+                    output = f"sanitizer-epoll-publication-control-complete: {argv[-1]}"
+                return subprocess.CompletedProcess(argv, 0, output)
+
+            with patch.object(runner, "run", side_effect=fake_run):
+                runner.prepare_thread_runtime()
+            self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", environments["bundled-epoll-build"])
+            encoded = environments["patched-epoll-build"]["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+            for argument in ("-Wl,--whole-archive", report["archive"]["path"],
+                             "-Wl,--no-whole-archive",
+                             f"-Wl,--dynamic-list={report['dynamic_list']['path']}"):
+                self.assertIn(f"-Zpre-link-arg={argument}", encoded)
+                self.assertNotIn(f"-Clink-arg={argument}", encoded)
+            for argument in ("-lpthread", "-lc"):
+                self.assertIn(f"-Clink-arg={argument}", encoded)
+                self.assertNotIn(f"-Zpre-link-arg={argument}", encoded)
+            self.assertIn("-Zsanitizer=thread", encoded)
+            self.assertIn("-Zexternal-clangrt", encoded)
 
     def test_compile_or_loader_failure_does_not_count_as_detection(self):
         for kind, diagnostic in sanitizers.DIAGNOSTICS.items():
