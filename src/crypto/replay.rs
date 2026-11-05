@@ -1313,6 +1313,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn journal_compaction_only_when_stale_entries_exceed_capacity_floor() {
+        let mut cache = ReplayCache::new(8);
+        let journal = |count| AuthJournalState {
+            generation: 1,
+            count,
+            tail_mac: [0_u8; 32],
+            active_slot: 0,
+        };
+        assert!(!cache.should_compact_authenticated_journal(journal(1024)));
+        assert!(cache.should_compact_authenticated_journal(journal(1025)));
+
+        // A larger cache uses its capacity rather than the 1024-entry floor.
+        cache = ReplayCache::new(2048);
+        assert!(!cache.should_compact_authenticated_journal(journal(2048)));
+        assert!(cache.should_compact_authenticated_journal(journal(2049)));
+    }
+
+    #[test]
     fn rejects_recent_nonce_or_transcript_replay() {
         let mut cache = ReplayCache::new(8);
         let first = ReplayEntry {

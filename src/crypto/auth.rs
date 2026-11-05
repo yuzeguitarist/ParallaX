@@ -486,6 +486,19 @@ mod tests {
     use crate::tls::client_hello::tests::client_hello_fixture;
 
     #[test]
+    fn rejects_degenerate_auth_shared_secret_before_hkdf() {
+        let psk = b"0123456789abcdef0123456789abcdef";
+        assert!(matches!(
+            derive_auth_key_from_shared(psk, &[0_u8; 32]),
+            Err(AuthError::DegenerateSharedSecret)
+        ));
+        assert!(derive_auth_key_from_shared(psk, &[1_u8; 32]).is_ok());
+        // The externally controllable mask ECDH must not acquire the auth-only
+        // guard: doing so would create a distinguishable rejection path.
+        assert!(derive_mask_key(psk, &[0_u8; 32]).is_ok());
+    }
+
+    #[test]
     fn derives_same_ecdh_bound_auth_key() {
         let client = X25519KeyPair::generate();
         let server = X25519KeyPair::generate();
