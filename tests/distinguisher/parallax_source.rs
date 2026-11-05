@@ -21,8 +21,8 @@
 //! production code — the dimension where ParallaX deliberately matches Safari's
 //! 16401-byte record regime, so it is exactly where we want a quantitative
 //! KS verdict. It does NOT synthesise realistic inter-arrival times or the C2S/
-//! S2C interleave (those need a live authenticated session over a socket, which
-//! no existing loopback harness drives end-to-end). Timestamps here are a
+//! S2C interleave (the separate `e2e_tunnel_roundtrip` socket capture drives that
+//! full authenticated path). Timestamps here are a
 //! uniform synthetic cadence; the IAT/direction dimensions are left to the
 //! socket-capture path and are reported separately so loopback scheduling noise
 //! never contaminates the length verdict.

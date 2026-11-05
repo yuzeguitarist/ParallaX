@@ -1,0 +1,22 @@
+# Complete scopes; the checker also verifies owner, cfg, tokens and whole ASTs.
+rules:
+  - id: observe-replay-compaction
+    languages: [rust]
+    severity: INFO
+    message: Complete authenticated compaction.
+    pattern: 'fn compact_authenticated_journal(...) { ... }'
+  - id: observe-replay-sync
+    languages: [rust]
+    severity: INFO
+    message: Both platform-specific directory-sync definitions.
+    pattern: 'fn fsync_parent_dir(...) { ... }'
+  - id: observe-replay-derive
+    languages: [rust]
+    severity: INFO
+    message: Actual HMAC caller must use the wiping helper.
+    pattern: 'fn cache_mac_key(...) { ... }'
+  - id: observe-replay-wipe
+    languages: [rust]
+    severity: INFO
+    message: Complete copy-and-wipe scope, including nested code.
+    pattern: 'fn cache_mac_key_from_digest(...) { ... }'

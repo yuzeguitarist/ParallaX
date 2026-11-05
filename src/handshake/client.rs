@@ -562,6 +562,7 @@ mod tests {
             cover_min_interval_ms: 0,
             cover_max_interval_ms: 0,
             max_concurrent_streams: 1,
+            tcp_mux_record_profile: crate::config::TcpMuxRecordProfile::Off,
         };
         let request = ConnectRequest {
             host: "example.com".to_owned(),
@@ -615,6 +616,7 @@ mod tests {
             cover_min_interval_ms: 0,
             cover_max_interval_ms: 0,
             max_concurrent_streams: 1,
+            tcp_mux_record_profile: crate::config::TcpMuxRecordProfile::Off,
         };
         let request = ConnectRequest {
             host: "example.com".to_owned(),

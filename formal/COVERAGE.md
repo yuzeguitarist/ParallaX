@@ -29,12 +29,12 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/cli.rs` | not-exhaustive | argv parsing and filesystem paths |
 | `src/client/initial_payload.rs` | not-exhaustive | first-record bytes and socket deadlines |
 | `src/client/mod.rs` | not-exhaustive | module wiring |
-| `src/client/runtime.rs` | not-exhaustive | ParallaXSession and ParallaXZeroRtt control order only; the file is TCP and QUIC I/O |
+| `src/client/runtime.rs` | bounded-elsewhere | Kani checks mux activation and bounded tail append arithmetic. ParallaXSession and ParallaXZeroRtt cover control order only; TCP and QUIC I/O are not proved |
 | `src/client/socks.rs` | not-exhaustive | SOCKS byte parser and sockets |
 | `src/config.rs` | not-exhaustive | config files, secrets, and OS paths |
 | `src/crypto/auth.rs` | not-exhaustive | PSK, HMAC, and X25519 shared-secret bytes |
 | `src/crypto/identity.rs` | not-exhaustive | ML-DSA identity-proof bytes |
-| `src/crypto/mldsa/fips202.rs` | not-exhaustive | SHAKE extendable-output bytes |
+| `src/crypto/mldsa/fips202.rs` | bounded-elsewhere | Kani checks fixed-rate SHAKE buffer reads and wiping; it does not prove the SHAKE cryptographic function |
 | `src/crypto/mldsa/mod.rs` | not-exhaustive | ML-DSA-87 scheme assembly |
 | `src/crypto/mldsa/ntt.rs` | not-exhaustive | NTT over polynomial coefficients |
 | `src/crypto/mldsa/packing.rs` | not-exhaustive | public-key, secret-key, and signature byte packing |
@@ -48,14 +48,14 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/crypto/parallel.rs` | not-exhaustive | thread pool and AEAD fan-out |
 | `src/crypto/pq.rs` | not-exhaustive | ML-KEM-1024 encapsulation bytes. ParallaXSession anchors the all-zero X25519 reject in hybrid_sandwich_rekey |
 | `src/crypto/quic_marker.rs` | not-exhaustive | HMAC over ClientHello.random |
-| `src/crypto/replay.rs` | not-exhaustive | ParallaXReplay is the in-memory stage_insert order for one slot; the journal MAC and disk are not |
+| `src/crypto/replay.rs` | bounded-elsewhere | Kani checks post-HMAC digest copying and wiping. ParallaXReplay is the in-memory stage_insert order for one slot; the journal MAC and disk are not proved |
 | `src/crypto/session.rs` | bounded-elsewhere | Kani proves nonce injectivity in the sequence and substream HKDF-info injectivity in the stream id. AEAD and HKDF bytes are not enumerated. ParallaXSession only anchors the degenerate-secret check |
 | `src/fingerprint/http2.rs` | not-exhaustive | HTTP/2 frame bytes |
 | `src/fingerprint/http3.rs` | not-exhaustive | HTTP/3 and QPACK bytes |
 | `src/fingerprint/mod.rs` | not-exhaustive | module wiring |
 | `src/handshake/client.rs` | not-exhaustive | ParallaXSession rekey order only; records and crypto calls do the rest |
 | `src/handshake/mod.rs` | not-exhaustive | module wiring |
-| `src/handshake/server.rs` | not-exhaustive | ParallaXSession, ParallaXInbound, and the ParallaXProbe retention gate; the file is sockets and records |
+| `src/handshake/server.rs` | bounded-elsewhere | Kani checks mux receipt claims, bounded tail append and record-planning arithmetic. ParallaXSession, ParallaXInbound, and the ParallaXProbe retention gate cover control slices; sockets and records are not proved |
 | `src/handshake/source_limit.rs` | not-exhaustive | admission map keyed by IP addresses, not a finite control vector |
 | `src/handshake/transcript.rs` | not-exhaustive | transcript hash bytes |
 | `src/lib.rs` | not-exhaustive | crate root |
@@ -64,7 +64,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/probe.rs` | not-exhaustive | external reachability probe over sockets and clocks; not the UDP probe machine |
 | `src/process_hardening.rs` | not-exhaustive | OS sandbox, rlimits, and procfs |
 | `src/protocol/command.rs` | not-exhaustive | command codecs over unbounded records. The PX1P status byte is exhausted by check_probe_status_bytes for ParallaXProbe; other commands are not |
-| `src/protocol/data.rs` | not-exhaustive | AEAD record bodies |
+| `src/protocol/data.rs` | bounded-elsewhere | Kani checks record capacity, nonce-budget reservation, and poisoned-state rejection; AEAD record bodies are not proved |
 | `src/protocol/mod.rs` | not-exhaustive | module wiring |
 | `src/runtime_guard.rs` | not-exhaustive | OS user, group, and process role |
 | `src/secret_store.rs` | not-exhaustive | sealed secret files and the OS keystore |
@@ -81,7 +81,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/tls/quic/ticket.rs` | not-exhaustive | STEK-sealed ticket bytes |
 | `src/tls/quic/verify.rs` | not-exhaustive | certificate-chain bytes |
 | `src/tls/record.rs` | not-exhaustive | TLS record framing bytes |
-| `src/tls/safari26.rs` | not-exhaustive | Safari fingerprint byte templates |
+| `src/tls/safari26.rs` | bounded-elsewhere | Kani checks bounded post-handshake prefixes, KeyUpdate framing and minimal ticket vectors; Safari templates and the full TLS handshake are not proved |
 | `src/tls/safari_shape.rs` | not-exhaustive | ClientHello shape bytes |
 | `src/tls/server_hello.rs` | not-exhaustive | ServerHello byte parser |
 | `src/traffic.rs` | bounded-elsewhere | Kani proves the padding-length parser does not panic for every input up to 8 bytes. Cover-traffic sampling uses OS randomness |
@@ -95,7 +95,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/transport/udp/mod.rs` | not-exhaustive | module wiring |
 | `src/transport/udp/probe.rs` | not-exhaustive | ParallaXProbe classification only; the HMAC and the socket round-trip are not |
 | `src/transport/udp/quic/congestion.rs` | not-exhaustive | ParallaXBbr is the mode graph only; cwnd, bandwidth, and RTT samples are unbounded |
-| `src/transport/udp/quic/conn.rs` | not-exhaustive | ParallaXClose is the close and drain control only; packets, timers, and streams are not |
+| `src/transport/udp/quic/conn.rs` | bounded-elsewhere | Kani checks frame admission, ACK arithmetic, key-phase transitions and exhausted-close handling. ParallaXClose is the close and drain control only; packets, timers, and streams are not proved |
 | `src/transport/udp/quic/endpoint.rs` | not-exhaustive | async UDP I/O |
 | `src/transport/udp/quic/frame.rs` | not-exhaustive | frame codec over unbounded payloads |
 | `src/transport/udp/quic/mod.rs` | not-exhaustive | module wiring |
@@ -106,9 +106,9 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/transport/udp/quic/packet.rs` | not-exhaustive | ParallaXPacket plus every first-byte value; connection IDs and packet numbers are not |
 | `src/transport/udp/quic/pmtud.rs` | not-exhaustive | DPLPMTUD search over MTU integers and loss counters; unit-tested in Rust, not encoded here |
 | `src/transport/udp/quic/recovery.rs` | not-exhaustive | RTT samples and loss detection over time |
-| `src/transport/udp/quic/spaces.rs` | not-exhaustive | packet numbers are 62-bit; the ack-range cap does not make the number line finite here |
+| `src/transport/udp/quic/spaces.rs` | bounded-elsewhere | Kani checks packet-number allocation and bounded replay-range state preservation; the complete packet-number history is not proved |
 | `src/transport/udp/quic/splice.rs` | not-exhaustive | UDP splice to the camouflage origin |
-| `src/transport/udp/quic/transport_params.rs` | not-exhaustive | transport-parameter byte encoding |
+| `src/transport/udp/quic/transport_params.rs` | bounded-elsewhere | Kani checks selected single-parameter decodes with bounded value bytes; arbitrary parameter streams are not proved |
 | `src/transport/udp/quic/varint.rs` | not-exhaustive | variable-length integers cover 2^62 values |
 | `src/transport/udp/stable.rs` | not-exhaustive | stable QUIC carrier sockets |
 | `src/transport/udp/zero_rtt.rs` | not-exhaustive | ParallaXZeroRtt guard outcomes only; the cache stores ticket bytes on disk |

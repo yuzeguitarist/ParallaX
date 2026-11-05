@@ -1,0 +1,28 @@
+rules:
+  - id: parallax-replay-no-ignored-directory-sync
+    languages: [rust]
+    severity: ERROR
+    message: Directory sync errors must reject an authenticated cache commit.
+    patterns:
+      - pattern-inside: 'fn fsync_parent_dir(...) { ... }'
+      - pattern: 'let _ = $DIR.sync_all();'
+  - id: parallax-replay-no-ignored-compaction-sync
+    languages: [rust]
+    severity: ERROR
+    message: Compaction must propagate directory-sync failure before publication.
+    patterns:
+      - pattern-inside: 'fn compact_authenticated_journal(...) { ... }'
+      - pattern: 'let _ = fsync_parent_dir(...);'
+  - id: parallax-replay-copy-and-wipe
+    languages: [rust]
+    severity: ERROR
+    message: Copy directly into a wiping owner, erase the entire digest, then return.
+    patterns:
+      - pattern: 'fn cache_mac_key_from_digest(...) { ... }'
+      - pattern-not: |
+          fn cache_mac_key_from_digest(digest: &mut [u8]) -> CacheMacKey {
+            let mut key = CacheMacKey([0_u8; 32]);
+            key.0.copy_from_slice(digest);
+            digest.zeroize();
+            key
+          }

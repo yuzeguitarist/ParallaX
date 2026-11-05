@@ -1,15 +1,19 @@
 //! Hand-rolled logistic-regression distinguisher with k-fold cross-validated
 //! AUC — zero external dependencies.
 //!
-//! This is the battery's headline metric. Given per-flow feature vectors for
-//! two corpora (label 0 = Safari ground truth, label 1 = ParallaX), we train a
+//! Given feature vectors for two corpora (label 0 = Safari, label 1 = ParallaX), we train a
 //! logistic regression to tell them apart and measure held-out ROC AUC:
 //!
 //! * **AUC ≈ 0.5** — the classifier cannot separate the corpora better than a
-//!   coin flip ⇒ the two are *statistically indistinguishable*. This is the
-//!   success target (`AUC ∈ [0.45, 0.55]`).
+//!   coin flip on this sample and feature set. This does not establish universal
+//!   indistinguishability or bound another detector's performance.
 //! * **AUC → 1.0** — a trivial linear boundary separates them ⇒ ParallaX is
-//!   *trivially fingerprintable* on these features.
+//!   separable on these features; workload/source confounding still needs review.
+//!
+//! The legacy battery splits windows from individual captures. Those folds are
+//! machinery/perturbation self-checks, not independent held-out network evidence.
+//! Real corpus evaluation must split whole captures and hold out sites, workloads,
+//! days, and networks (see `scripts/traffic_lab/analyze.py`).
 //!
 //! Everything is deterministic (a fixed-seed LCG drives the fold shuffle and
 //! weight init) so the AUC is reproducible across runs — a flaky gate would be
@@ -105,13 +109,18 @@ fn predict(w: &[f64], b: f64, x: &[f64]) -> f64 {
 /// ROC AUC via the Mann–Whitney U statistic (rank-sum), with tie handling.
 ///
 /// `scored` is `(predicted_score, true_label)`. AUC = P(score of a random
-/// positive > score of a random negative). Returns 0.5 if either class is empty.
+/// positive > score of a random negative). Missing classes or nonfinite scores
+/// are invalid evidence and fail explicitly rather than returning chance AUC.
 pub fn roc_auc(scored: &[(f64, u8)]) -> f64 {
+    assert!(
+        scored
+            .iter()
+            .all(|(score, label)| score.is_finite() && *label <= 1),
+        "AUC requires finite scores and binary labels"
+    );
     let n_pos = scored.iter().filter(|(_, y)| *y == 1).count();
     let n_neg = scored.len() - n_pos;
-    if n_pos == 0 || n_neg == 0 {
-        return 0.5;
-    }
+    assert!(n_pos > 0 && n_neg > 0, "AUC requires both classes");
     // Rank scores ascending (average ranks for ties).
     let mut idx: Vec<usize> = (0..scored.len()).collect();
     idx.sort_by(|&i, &j| {
@@ -147,12 +156,19 @@ pub fn roc_auc(scored: &[(f64, u8)]) -> f64 {
 /// k-fold cross-validated AUC of a logistic-regression distinguisher.
 ///
 /// Pools all held-out fold predictions and computes a single AUC over them (a
-/// standard, low-variance CV-AUC estimator for small corpora). Deterministic.
+/// diagnostic for the synthetic/self-check battery). Windows from one capture
+/// are correlated: this does not provide grouped corpus generalization evidence.
 pub fn cross_validated_auc(samples: &[Sample], folds: usize) -> f64 {
-    if samples.is_empty() {
-        return 0.5;
-    }
+    assert!(!samples.is_empty(), "CV requires samples");
     let dim = samples[0].features.len();
+    assert!(
+        dim > 0
+            && samples.iter().all(|s| s.label <= 1
+                && s.features.len() == dim
+                && s.features.iter().all(|v| v.is_finite())),
+        "CV requires consistent finite binary samples"
+    );
+    assert!(folds >= 2, "CV requires at least two folds");
     let mut order: Vec<usize> = (0..samples.len()).collect();
     Lcg::new(0x5151_2026).shuffle(&mut order);
 
@@ -169,8 +185,11 @@ pub fn cross_validated_auc(samples: &[Sample], folds: usize) -> f64 {
                 train.push(samples[si].clone());
             }
         }
-        if train.is_empty() || test.is_empty() {
-            continue;
+        for partition in [&train, &test] {
+            assert!(
+                partition.iter().any(|s| s.label == 0) && partition.iter().any(|s| s.label == 1),
+                "each CV partition requires both classes"
+            );
         }
         standardise(&mut train, &mut test, dim);
         let (w, b) = train_logreg(&train, dim, 300, 0.3, 1e-3);
@@ -179,7 +198,7 @@ pub fn cross_validated_auc(samples: &[Sample], folds: usize) -> f64 {
         }
     }
     // Raw two-sided AUC. The caller decides the gate semantics: the
-    // indistinguishability gate checks `auc ∈ [0.45, 0.55]` (i.e. |auc-0.5| is
+    // same-source self-check checks `auc ∈ [0.45, 0.55]` (i.e. |auc-0.5| is
     // small in *either* direction), while the discriminability self-proof checks
     // separability via `(auc-0.5).abs()` being large. Folding to one side here
     // would hide a backwards-but-separating classifier from the first gate.
@@ -187,7 +206,7 @@ pub fn cross_validated_auc(samples: &[Sample], folds: usize) -> f64 {
 }
 
 /// Two-sided separability: how far the CV-AUC is from chance, in [0, 0.5].
-/// `0` = indistinguishable, `0.5` = perfectly separable in either direction.
+/// `0` = chance performance for this detector, `0.5` = perfectly separable.
 pub fn separability(samples: &[Sample], folds: usize) -> f64 {
     (cross_validated_auc(samples, folds) - 0.5).abs()
 }

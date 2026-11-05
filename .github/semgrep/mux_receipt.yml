@@ -1,0 +1,68 @@
+rules:
+  - id: parallax-mux-receipt-monotone-claim
+    languages: [rust]
+    severity: ERROR
+    message: First publication is a single monotone atomic RMW and returns true only to the first observer of false.
+    patterns:
+      - pattern: 'fn claim_mux_publication(...) { ... }'
+      - pattern-not: |
+          fn claim_mux_publication(first_publication: &AtomicBool) -> bool {
+            !first_publication.swap(true, Ordering::AcqRel)
+          }
+  - id: parallax-mux-receipt-normal-publication
+    languages: [rust]
+    severity: ERROR
+    message: Ordinary Data/Fin/Reset reserve first and publish regardless of receipt-claim result, with no await after claiming.
+    patterns:
+      - pattern-inside: 'impl ServerMuxStreamTx { ... }'
+      - pattern: 'async fn send(...) { ... }'
+      - pattern-not: |
+          async fn send(...) {
+            let permit = self.frames.reserve().await.map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+            if matches!(kind, MuxFrameKind::Data | MuxFrameKind::Fin | MuxFrameKind::Reset) { claim_mux_publication(&self.first_publication); }
+            permit.send(MuxFrame { stream_id: self.stream_id, kind, payload });
+            self.wake.notify_one();
+            Ok(())
+          }
+  - id: parallax-mux-receipt-fallback-publication
+    languages: [rust]
+    severity: ERROR
+    message: Fallback reserves before its one-bit claim and emits at most one empty Data, without awaiting after claiming.
+    patterns:
+      - pattern: 'async fn send_receipt_if_unanswered(...) { ... }'
+      - pattern-not: |
+          async fn send_receipt_if_unanswered(...) {
+            if self.first_publication.load(Ordering::Acquire) { return Ok(()); }
+            let permit = self.frames.reserve().await.map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+            if claim_mux_publication(&self.first_publication) {
+              permit.send(MuxFrame { stream_id: self.stream_id, kind: MuxFrameKind::Data, payload: Vec::new() });
+              self.wake.notify_one();
+            }
+            Ok(())
+          }
+  - id: parallax-mux-receipt-no-state-bypass
+    languages: [rust]
+    severity: ERROR
+    message: Publication and deadline state cannot be reset or replaced through another producer; use the reviewed claim after reservation.
+    patterns:
+      - pattern-either:
+          - pattern: '$TX.first_publication = ...'
+          - pattern: '$TX.receipt_deadline = ...'
+          - patterns:
+              - pattern: '$TX.first_publication.$METHOD(...)'
+              - metavariable-regex:
+                  metavariable: $METHOD
+                  regex: '^(store|swap|compare_exchange|compare_exchange_weak|fetch_.*)$'
+  - id: parallax-mux-receipt-no-client-upload-gate
+    languages: [rust]
+    severity: ERROR
+    message: The local TCP mux producer must not sleep waiting for an Open receipt before starting upload.
+    patterns:
+      - pattern-inside: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
+      - pattern-either:
+          - pattern: 'sleep(...)'
+          - pattern: 'sleep_until(...)'
+          - pattern: 'time::sleep(...)'
+          - pattern: 'time::sleep_until(...)'
+          - pattern: 'tokio::time::sleep(...)'
+          - pattern: 'tokio::time::sleep_until(...)'

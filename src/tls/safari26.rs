@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256, Sha384};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     record::{
@@ -59,10 +59,15 @@ use crate::fingerprint::http2::{Http2Fingerprint, Http2FingerprintError, Http2Fr
 use crate::tls::server_hello::ServerHelloError;
 
 const POST_HANDSHAKE_DRAIN_LIMIT: usize = 4;
+// Only finish a record whose prefix was already consumed; never wait for a new
+// post-handshake record before sending the HTTP/2 opening flight.
 const POST_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(180);
 const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
 const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
+const MAX_POST_HANDSHAKE_MESSAGE: usize = 64 * 1024;
+const POST_HANDSHAKE_BUFFER_LIMIT: usize =
+    MAX_POST_HANDSHAKE_MESSAGE + 4 + super::record::MAX_TLS_RECORD_PAYLOAD + 256;
 
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
@@ -121,10 +126,12 @@ fn server_flight_exceeds_decrypted_budget(total_decrypted: usize) -> bool {
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
+const HANDSHAKE_NEW_SESSION_TICKET: u8 = 0x04;
 const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 const HANDSHAKE_CERTIFICATE: u8 = 0x0b;
 const HANDSHAKE_CERTIFICATE_VERIFY: u8 = 0x0f;
 const HANDSHAKE_FINISHED: u8 = 0x14;
+const HANDSHAKE_KEY_UPDATE: u8 = 0x18;
 const HANDSHAKE_COMPRESSED_CERTIFICATE: u8 = 0x19;
 /// Synthetic handshake type that stands in for ClientHello1 in a
 /// HelloRetryRequest transcript (RFC 8446 §4.4.1). Never sent on the wire.
@@ -325,6 +332,7 @@ impl Safari26TlsCamouflage {
             retry_key_share: None,
             sent_compat_ccs: false,
             pending_http2_plaintext: Vec::new(),
+            pending_post_handshake: Vec::new(),
             tap: VecRecordTap::default(),
         })
     }
@@ -371,6 +379,9 @@ pub struct Safari26TlsSession {
     /// HTTP/2 bytes received alongside post-handshake TLS tickets, before the
     /// client has sent its own HTTP/2 preface. Retain even a partial frame here.
     pending_http2_plaintext: Vec<u8>,
+    /// Exact handshake framing shared by the ready-only drain and H2 phase.
+    /// A fragmented ticket/KeyUpdate cannot be silently dropped at handoff.
+    pending_post_handshake: Vec<u8>,
     tap: VecRecordTap,
 }
 
@@ -428,6 +439,7 @@ impl Safari26TlsSession {
         let negotiated_alpn = keys.negotiated_alpn.clone();
         let post_handshake_records = self.drain_post_handshake(stream, &mut keys).await?;
         self.open_http2_connection(stream, &mut keys).await?;
+        self.ensure_post_handshake_boundary()?;
 
         Ok(CompletedSafari26Handshake {
             client_hello: self.client_hello,
@@ -766,32 +778,36 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
     ) -> Result<usize, Safari26TlsError> {
         let mut observed = 0usize;
-        // One long-lived UNBUFFERED reader across the loop: a per-record timeout
-        // mid-read must NOT discard bytes already pulled off the socket. A
-        // throwaway reader (the old `read_record(stream)` per iteration) would
-        // drop the partially-read header/payload on timeout, desyncing the
-        // data-phase stream we hand off. On timeout we stop cleanly only when the
-        // reader is at a record boundary (the benign slow/absent NewSessionTicket
-        // case); a mid-record stall fails honestly so the connection is dropped
-        // rather than silently desynced.
+        // Drain only immediately readable records before our opening flight.
+        // Keep one UNBUFFERED reader: if the ready-only poll consumes a prefix,
+        // completing that same record is mandatory before handing off the stream.
+        // Late tickets/SETTINGS use the same application keys in the H2 phase.
         let mut reader = TlsRecordReader::new(&mut *stream);
         let mut record = Vec::new();
         for _ in 0..POST_HANDSHAKE_DRAIN_LIMIT {
-            match timeout(
-                POST_HANDSHAKE_DRAIN_TIMEOUT,
-                reader.read_record_into(&mut record),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) if is_clean_close(&err) => return Ok(observed),
-                Ok(Err(err)) => return Err(err.into()),
-                Err(_) if reader.at_record_boundary() => return Ok(observed),
-                Err(_) => {
-                    return Err(Safari26TlsError::Handshake(
-                        "post-handshake drain timed out mid-record".to_owned(),
-                    ))
+            let read = match reader.try_read_record_into(&mut record).await {
+                Some(result) => result,
+                None if reader.at_record_boundary() => return Ok(observed),
+                None => match timeout(
+                    POST_HANDSHAKE_DRAIN_TIMEOUT,
+                    reader.read_record_into(&mut record),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(Safari26TlsError::Handshake(
+                            "post-handshake drain timed out mid-record".to_owned(),
+                        ))
+                    }
+                },
+            };
+            match read {
+                Ok(()) => {}
+                Err(err) if is_clean_close(&err) && reader.at_record_boundary() => {
+                    return Ok(observed)
                 }
+                Err(err) => return Err(err.into()),
             }
             observed += 1;
             self.tap_records(RecordDirection::Inbound, &record);
@@ -801,6 +817,16 @@ impl Safari26TlsSession {
                 TLS_CONTENT_ALERT => return parse_alert(&record),
                 TLS_RECORD_APPLICATION_DATA => {
                     let decrypted = keys.server_application.decrypt_record(&record)?;
+                    if decrypted.content_type == TLS_RECORD_HANDSHAKE {
+                        self.process_post_handshake_record(
+                            reader.get_mut(),
+                            keys,
+                            &decrypted.plaintext,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    self.ensure_post_handshake_boundary()?;
                     if decrypted.content_type == TLS_CONTENT_ALERT && decrypted.plaintext.len() >= 2
                     {
                         let (level, description) = (decrypted.plaintext[0], decrypted.plaintext[1]);
@@ -827,10 +853,69 @@ impl Safari26TlsSession {
                         return Ok(observed);
                     }
                 }
-                _ => {}
+                _ => self.ensure_post_handshake_boundary()?,
             }
         }
         Ok(observed)
+    }
+
+    async fn process_post_handshake_record(
+        &mut self,
+        stream: &mut TcpStream,
+        keys: &mut Tls13Keys,
+        plaintext: &[u8],
+    ) -> Result<(), Safari26TlsError> {
+        if plaintext.is_empty()
+            || self
+                .pending_post_handshake
+                .len()
+                .saturating_add(plaintext.len())
+                > POST_HANDSHAKE_BUFFER_LIMIT
+        {
+            return Err(Safari26TlsError::Handshake(
+                "empty or oversized post-handshake fragment".to_owned(),
+            ));
+        }
+        self.pending_post_handshake.extend_from_slice(plaintext);
+        let mut consumed = 0;
+        while let Some(message) =
+            parse_post_handshake_message(&self.pending_post_handshake[consumed..])
+                .map_err(|message| Safari26TlsError::Handshake(message.to_owned()))?
+        {
+            match message {
+                PostHandshakeMessage::NewSessionTicket(total) => {
+                    // Resumption is unused here. Skip only an exactly framed,
+                    // bounded message, not bytes that happen to contain 0x18.
+                    consumed += total;
+                }
+                PostHandshakeMessage::KeyUpdate { request_update } => {
+                    keys.update_server_application_keys()?;
+                    if request_update {
+                        // RFC 8446 §§4.6.3/7.2: send the response with the OLD
+                        // sending keys, then switch before the next app record.
+                        let response = keys.client_application.encrypt_record(
+                            TLS_RECORD_HANDSHAKE,
+                            &[HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0],
+                        )?;
+                        self.tap_records(RecordDirection::Outbound, &response);
+                        stream.write_all(&response).await?;
+                        keys.update_client_application_keys()?;
+                    }
+                    consumed = self.pending_post_handshake.len();
+                }
+            }
+        }
+        self.pending_post_handshake.drain(..consumed);
+        Ok(())
+    }
+
+    fn ensure_post_handshake_boundary(&self) -> Result<(), Safari26TlsError> {
+        if !self.pending_post_handshake.is_empty() {
+            return Err(Safari26TlsError::Handshake(
+                "incomplete post-handshake message at record-type change or handoff".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn open_http2_connection(
@@ -892,6 +977,7 @@ impl Safari26TlsSession {
             .process_http2_frames(&mut plaintext, stream, keys)
             .await?
         {
+            self.ensure_post_handshake_boundary()?;
             return Ok(());
         }
         // Long-lived UNBUFFERED reader (see drain_post_handshake): a mid-record
@@ -908,9 +994,13 @@ impl Safari26TlsSession {
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(err)) if is_clean_close(&err) => return Ok(()),
+                Ok(Err(err)) if is_clean_close(&err) && reader.at_record_boundary() => {
+                    return self.ensure_post_handshake_boundary()
+                }
                 Ok(Err(err)) => return Err(err.into()),
-                Err(_) if reader.at_record_boundary() => return Ok(()),
+                Err(_) if reader.at_record_boundary() => {
+                    return self.ensure_post_handshake_boundary()
+                }
                 Err(_) => {
                     return Err(Safari26TlsError::Handshake(
                         "http/2 settings ack timed out mid-record".to_owned(),
@@ -924,6 +1014,16 @@ impl Safari26TlsSession {
                 TLS_CONTENT_ALERT => return parse_alert(&record),
                 TLS_RECORD_APPLICATION_DATA => {
                     let chunk = keys.server_application.decrypt_record(&record)?;
+                    if chunk.content_type == TLS_RECORD_HANDSHAKE {
+                        self.process_post_handshake_record(
+                            reader.get_mut(),
+                            keys,
+                            &chunk.plaintext,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    self.ensure_post_handshake_boundary()?;
                     if chunk.content_type != TLS_RECORD_APPLICATION_DATA {
                         if chunk.content_type == TLS_CONTENT_ALERT && chunk.plaintext.len() >= 2 {
                             let (level, description) = (chunk.plaintext[0], chunk.plaintext[1]);
@@ -954,10 +1054,10 @@ impl Safari26TlsSession {
                         return Ok(());
                     }
                 }
-                _ => {}
+                _ => self.ensure_post_handshake_boundary()?,
             }
         }
-        Ok(())
+        self.ensure_post_handshake_boundary()
     }
 
     async fn process_http2_frames(
@@ -1677,6 +1777,184 @@ impl TlsCipherSuite {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostHandshakeMessage {
+    NewSessionTicket(usize),
+    KeyUpdate { request_update: bool },
+}
+
+/// Parse one bounded post-handshake message, without searching inside ticket
+/// bodies. RFC 8446 §5.1 permits fragmentation under the old keys, but a complete
+/// KeyUpdate must end the record: no subsequent old-key bytes may follow it.
+fn parse_post_handshake_message(
+    bytes: &[u8],
+) -> Result<Option<PostHandshakeMessage>, &'static str> {
+    if bytes.len() < 4 {
+        return Ok(None);
+    }
+    let len = ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | bytes[3] as usize;
+    if len > MAX_POST_HANDSHAKE_MESSAGE {
+        return Err("post-handshake message length exceeds maximum");
+    }
+    let total = 4 + len;
+    match bytes[0] {
+        HANDSHAKE_NEW_SESSION_TICKET => {
+            if bytes.len() < total {
+                return Ok(None);
+            }
+            validate_new_session_ticket(&bytes[4..total])?;
+            Ok(Some(PostHandshakeMessage::NewSessionTicket(total)))
+        }
+        HANDSHAKE_KEY_UPDATE => {
+            if len != 1 {
+                return Err("KeyUpdate must contain exactly one request byte");
+            }
+            if bytes.len() < total {
+                return Ok(None);
+            }
+            if bytes.len() != total {
+                return Err("KeyUpdate must end at a record boundary");
+            }
+            match bytes[4] {
+                0 => Ok(Some(PostHandshakeMessage::KeyUpdate {
+                    request_update: false,
+                })),
+                1 => Ok(Some(PostHandshakeMessage::KeyUpdate {
+                    request_update: true,
+                })),
+                _ => Err("invalid KeyUpdate request value"),
+            }
+        }
+        _ => Err("unexpected post-handshake message"),
+    }
+}
+
+/// Validate RFC 8446 §4.6.1's ticket body before discarding it. The ticket and
+/// nonce remain opaque, and unrecognized extensions are deliberately ignored.
+fn validate_new_session_ticket(body: &[u8]) -> Result<(), &'static str> {
+    let malformed = |_| "malformed NewSessionTicket";
+    if body.len() < 14 {
+        return Err("NewSessionTicket body is too short");
+    }
+    let mut ticket = TlsCursor::new(body);
+    ticket.bytes(8).map_err(malformed)?;
+    ticket.vec_u8().map_err(malformed)?;
+    if ticket.vec_u16().map_err(malformed)?.is_empty() {
+        return Err("NewSessionTicket ticket is empty");
+    }
+    let extensions = ticket.vec_u16().map_err(malformed)?;
+    if extensions.len() > 65_534 || ticket.remaining() != 0 {
+        return Err("malformed NewSessionTicket extensions");
+    }
+    let mut extensions = TlsCursor::new(extensions);
+    let mut seen = std::collections::BTreeSet::new();
+    while extensions.remaining() > 0 {
+        let ext_type = extensions.u16().map_err(malformed)?;
+        let data = extensions.vec_u16().map_err(malformed)?;
+        if !seen.insert(ext_type) || (ext_type == 0x002a && data.len() != 4) {
+            return Err("invalid NewSessionTicket extension");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(kani)]
+mod post_handshake_proofs {
+    use super::*;
+
+    #[kani::proof]
+    // Eight input bytes cannot contain the minimum 14-byte ticket body, so
+    // its extension loop is unreachable. Keep unwinding assertions enabled
+    // to verify that bound instead of expanding the unreachable BTreeSet.
+    #[kani::unwind(1)]
+    fn bounded_prefix_parser_never_consumes_unavailable_bytes() {
+        let bytes: [u8; 8] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        if let Ok(Some(message)) = parse_post_handshake_message(&bytes[..len]) {
+            match message {
+                PostHandshakeMessage::NewSessionTicket(total) => {
+                    assert!(total >= 4 && total <= len);
+                    assert!(total <= MAX_POST_HANDSHAKE_MESSAGE + 4);
+                    assert_eq!(bytes[0], HANDSHAKE_NEW_SESSION_TICKET);
+                }
+                PostHandshakeMessage::KeyUpdate { request_update } => {
+                    assert_eq!(len, 5);
+                    // Compare every header byte without a loop in memcmp.
+                    assert_eq!(bytes[0], HANDSHAKE_KEY_UPDATE);
+                    assert_eq!(bytes[1], 0);
+                    assert_eq!(bytes[2], 0);
+                    assert_eq!(bytes[3], 1);
+                    assert_eq!(bytes[4], u8::from(request_update));
+                }
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn key_update_requires_exact_length_value_and_record_end() {
+        let header: [u8; 3] = kani::any();
+        let request: u8 = kani::any();
+        let suffix: u8 = kani::any();
+        let bytes = [
+            HANDSHAKE_KEY_UPDATE,
+            header[0],
+            header[1],
+            header[2],
+            request,
+            suffix,
+        ];
+        let len: usize = kani::any();
+        kani::assume((4..=6).contains(&len));
+        let result = parse_post_handshake_message(&bytes[..len]);
+        if header == [0, 0, 1] && len == 4 {
+            assert_eq!(result, Ok(None));
+        } else if header == [0, 0, 1] && len == 5 && request <= 1 {
+            assert_eq!(
+                result,
+                Ok(Some(PostHandshakeMessage::KeyUpdate {
+                    request_update: request == 1,
+                }))
+            );
+        } else {
+            assert!(result.is_err());
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn minimal_ticket_requires_nonempty_ticket_and_exact_vector_lengths() {
+        let nonce_len: u8 = kani::any();
+        let ticket_len: [u8; 2] = kani::any();
+        let extensions_len: [u8; 2] = kani::any();
+        let opaque_ticket: u8 = kani::any();
+        let body = [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            nonce_len,
+            ticket_len[0],
+            ticket_len[1],
+            opaque_ticket,
+            extensions_len[0],
+            extensions_len[1],
+        ];
+        assert_eq!(
+            validate_new_session_ticket(&body).is_ok(),
+            nonce_len == 0
+                && ticket_len[0] == 0
+                && ticket_len[1] == 1
+                && extensions_len[0] == 0
+                && extensions_len[1] == 0
+        );
+    }
+}
+
 struct Tls13Keys {
     suite: TlsCipherSuite,
     client_handshake: RecordCipher,
@@ -1688,6 +1966,8 @@ struct Tls13Keys {
     // disclosure). The ParallaX tunnel keys are protected separately.
     client_handshake_secret: Zeroizing<Vec<u8>>,
     server_handshake_secret: Zeroizing<Vec<u8>>,
+    client_application_secret: Zeroizing<Vec<u8>>,
+    server_application_secret: Zeroizing<Vec<u8>>,
     master_secret: Zeroizing<Vec<u8>>,
     negotiated_alpn: Option<Vec<u8>>,
 }
@@ -1727,6 +2007,8 @@ impl Tls13Keys {
             server_application: RecordCipher::zero(suite),
             client_handshake_secret,
             server_handshake_secret,
+            client_application_secret: Zeroizing::new(Vec::new()),
+            server_application_secret: Zeroizing::new(Vec::new()),
             master_secret,
             negotiated_alpn: None,
         })
@@ -1748,7 +2030,25 @@ impl Tls13Keys {
         )?);
         self.client_application = RecordCipher::new(self.suite, &client_application_secret)?;
         self.server_application = RecordCipher::new(self.suite, &server_application_secret)?;
+        self.client_application_secret = client_application_secret;
+        self.server_application_secret = server_application_secret;
         Ok(())
+    }
+
+    fn update_server_application_keys(&mut self) -> Result<(), Safari26TlsError> {
+        update_application_traffic_keys(
+            self.suite,
+            &mut self.server_application_secret,
+            &mut self.server_application,
+        )
+    }
+
+    fn update_client_application_keys(&mut self) -> Result<(), Safari26TlsError> {
+        update_application_traffic_keys(
+            self.suite,
+            &mut self.client_application_secret,
+            &mut self.client_application,
+        )
     }
 
     fn server_finished_verify_data(
@@ -1778,6 +2078,20 @@ impl Tls13Keys {
     }
 }
 
+fn update_application_traffic_keys(
+    suite: TlsCipherSuite,
+    secret: &mut Zeroizing<Vec<u8>>,
+    cipher: &mut RecordCipher,
+) -> Result<(), Safari26TlsError> {
+    let next =
+        Zeroizing::new(suite.hkdf_expand_label(secret, "traffic upd", &[], suite.hash_len())?);
+    let next_cipher = RecordCipher::new(suite, &next)?;
+    // Replacement scrubs the old secret/key/IV; the new cipher starts at seq 0.
+    *secret = next;
+    *cipher = next_cipher;
+    Ok(())
+}
+
 fn finished_verify_data(
     suite: TlsCipherSuite,
     traffic_secret: &[u8],
@@ -1801,6 +2115,12 @@ struct RecordCipher {
     key: Zeroizing<Vec<u8>>,
     iv: [u8; TLS13_IV_LEN],
     seq: u64,
+}
+
+impl Drop for RecordCipher {
+    fn drop(&mut self) {
+        self.iv.zeroize();
+    }
 }
 
 impl RecordCipher {
@@ -2790,9 +3110,12 @@ mod tests {
     // inputs: records encrypted with one decrypt cleanly under the other, which
     // lets a test "server" feed encrypted records the session decrypts.
     fn app_keys() -> Tls13Keys {
+        app_keys_for(TlsCipherSuite::Aes128GcmSha256)
+    }
+
+    fn app_keys_for(suite: TlsCipherSuite) -> Tls13Keys {
         let transcript = HandshakeTranscript::new();
-        let mut keys =
-            Tls13Keys::new(TlsCipherSuite::Aes128GcmSha256, &[7_u8; 32], &transcript).unwrap();
+        let mut keys = Tls13Keys::new(suite, &[7_u8; 32], &transcript).unwrap();
         keys.install_application_keys(&transcript).unwrap();
         keys
     }
@@ -3047,6 +3370,536 @@ mod tests {
 
     // ---- drain_post_handshake ----
 
+    fn post_handshake_ticket(nonce: &[u8], ticket: &[u8], extensions: &[u8]) -> Vec<u8> {
+        let mut body = vec![0; 8];
+        body.push(nonce.len() as u8);
+        body.extend_from_slice(nonce);
+        body.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+        body.extend_from_slice(ticket);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+        let mut message = vec![HANDSHAKE_NEW_SESSION_TICKET];
+        push_u24(&mut message, body.len()).unwrap();
+        message.extend_from_slice(&body);
+        message
+    }
+
+    #[test]
+    fn post_handshake_ticket_rejects_malformed_body_and_extensions() {
+        let valid = post_handshake_ticket(&[], b"ticket", &[]);
+        for len in 0..14 {
+            let mut message = vec![HANDSHAKE_NEW_SESSION_TICKET];
+            push_u24(&mut message, len).unwrap();
+            message.extend_from_slice(&valid[4..4 + len]);
+            assert!(
+                parse_post_handshake_message(&message).is_err(),
+                "body length {len}"
+            );
+        }
+        let mut bad_nonce = valid.clone();
+        bad_nonce[12] = u8::MAX;
+        let mut bad_ticket = valid.clone();
+        bad_ticket[13..15].copy_from_slice(&u16::MAX.to_be_bytes());
+        let mut bad_extensions = valid.clone();
+        let end = bad_extensions.len();
+        bad_extensions[end - 2..].copy_from_slice(&1_u16.to_be_bytes());
+        let mut trailing_body = valid;
+        trailing_body.push(0);
+        let len = trailing_body.len() - 4;
+        trailing_body[1..4].copy_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        for message in [
+            bad_nonce,
+            bad_ticket,
+            bad_extensions,
+            trailing_body,
+            post_handshake_ticket(&[], &[], &[]),
+            post_handshake_ticket(&[], b"ticket", &[0]),
+            post_handshake_ticket(&[], b"ticket", &[0xfe, 0xed, 0, 1]),
+            post_handshake_ticket(&[], b"ticket", &[0xfe, 0xed, 0, 0, 0xfe, 0xed, 0, 0]),
+            post_handshake_ticket(&[], b"ticket", &[0, 0x2a, 0, 3, 0, 0, 0]),
+        ] {
+            assert!(parse_post_handshake_message(&message).is_err());
+        }
+    }
+
+    #[test]
+    fn post_handshake_ticket_preserves_fragments_and_ignores_unknown_extensions() {
+        let opaque = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1];
+        let message = post_handshake_ticket(&opaque, &opaque, &[0xfe, 0xed, 0, 2, 0xaa, 0xbb]);
+        for split in 0..message.len() {
+            assert_eq!(parse_post_handshake_message(&message[..split]), Ok(None));
+        }
+        assert_eq!(
+            parse_post_handshake_message(&message),
+            Ok(Some(PostHandshakeMessage::NewSessionTicket(message.len())))
+        );
+        assert!(parse_post_handshake_message(&post_handshake_ticket(
+            &[],
+            b"ticket",
+            &[0, 0x2a, 0, 4, 0, 0, 0, 7]
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn post_handshake_parser_rejects_bad_key_update_and_bounds_ticket_lengths() {
+        for request in 0..=u8::MAX {
+            let result = parse_post_handshake_message(&[HANDSHAKE_KEY_UPDATE, 0, 0, 1, request]);
+            assert_eq!(result.is_ok(), request <= 1);
+        }
+        for message in [
+            vec![HANDSHAKE_KEY_UPDATE, 0, 0, 0],
+            vec![HANDSHAKE_KEY_UPDATE, 0, 0, 2, 0, 0],
+            vec![
+                HANDSHAKE_KEY_UPDATE,
+                0,
+                0,
+                1,
+                0,
+                HANDSHAKE_NEW_SESSION_TICKET,
+            ],
+            vec![HANDSHAKE_NEW_SESSION_TICKET, 0xff, 0xff, 0xff],
+            vec![HANDSHAKE_FINISHED, 0, 0, 0],
+        ] {
+            assert!(parse_post_handshake_message(&message).is_err());
+        }
+        assert_eq!(
+            parse_post_handshake_message(&[HANDSHAKE_KEY_UPDATE, 0, 0, 1]),
+            Ok(None)
+        );
+        let ticket = post_handshake_ticket(&[], &[HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1], &[]);
+        assert_eq!(
+            parse_post_handshake_message(&ticket),
+            Ok(Some(PostHandshakeMessage::NewSessionTicket(ticket.len())))
+        );
+    }
+
+    #[tokio::test]
+    async fn key_update_rotates_only_the_requested_directions_and_responds_with_old_keys() {
+        for suite in [
+            TlsCipherSuite::Aes128GcmSha256,
+            TlsCipherSuite::Aes256GcmSha384,
+            TlsCipherSuite::Chacha20Poly1305Sha256,
+        ] {
+            let mut session = test_session();
+            let (mut stream, mut peer) = loopback().await;
+            let mut keys = app_keys_for(suite);
+            let mut peer_keys = app_keys_for(suite);
+            for request in [0, 1, 1] {
+                let old_server_record = peer_keys
+                    .server_application
+                    .encrypt_record(TLS_RECORD_APPLICATION_DATA, b"retired server generation")
+                    .unwrap();
+                let expected_server_secret = Zeroizing::new(
+                    suite
+                        .hkdf_expand_label(
+                            &keys.server_application_secret,
+                            "traffic upd",
+                            &[],
+                            suite.hash_len(),
+                        )
+                        .unwrap(),
+                );
+                let old_client_secret = Zeroizing::new(keys.client_application_secret.to_vec());
+                session
+                    .process_post_handshake_record(
+                        &mut stream,
+                        &mut keys,
+                        &[HANDSHAKE_KEY_UPDATE, 0, 0, 1, request],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(*keys.server_application_secret, *expected_server_secret);
+                assert_eq!(keys.server_application.seq, 0);
+                assert!(
+                    keys.server_application
+                        .decrypt_record(&old_server_record)
+                        .is_err(),
+                    "retired receive key"
+                );
+                peer_keys.update_server_application_keys().unwrap();
+                let next = peer_keys
+                    .server_application
+                    .encrypt_record(TLS_RECORD_APPLICATION_DATA, b"next server generation")
+                    .unwrap();
+                assert_eq!(
+                    keys.server_application
+                        .decrypt_record(&next)
+                        .unwrap()
+                        .plaintext,
+                    b"next server generation"
+                );
+                assert!(
+                    keys.server_application.decrypt_record(&next).is_err(),
+                    "sequence replay"
+                );
+                if request == 0 {
+                    assert_eq!(*keys.client_application_secret, *old_client_secret);
+                    assert_eq!(keys.client_application.seq, 0);
+                    assert_eq!(session.tap.events().len(), 0, "no unsolicited response");
+                    continue;
+                }
+                let mut response = Vec::new();
+                timeout(
+                    Duration::from_secs(1),
+                    TlsRecordReader::new(&mut peer).read_record_into(&mut response),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    peer_keys
+                        .client_application
+                        .decrypt_record(&response)
+                        .unwrap()
+                        .plaintext,
+                    [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0]
+                );
+                assert_eq!(
+                    keys.client_application.seq, 0,
+                    "response must precede send-key reset"
+                );
+                let mut next_receiver =
+                    RecordCipher::new(suite, &keys.client_application_secret).unwrap();
+                assert!(
+                    next_receiver.decrypt_record(&response).is_err(),
+                    "old response is not a new-key record"
+                );
+                session
+                    .write_application_data(&mut stream, &mut keys, b"next client generation")
+                    .await
+                    .unwrap();
+                let mut application = Vec::new();
+                TlsRecordReader::new(&mut peer)
+                    .read_record_into(&mut application)
+                    .await
+                    .unwrap();
+                assert!(
+                    peer_keys
+                        .client_application
+                        .decrypt_record(&application)
+                        .is_err(),
+                    "old key retired"
+                );
+                peer_keys.update_client_application_keys().unwrap();
+                assert_eq!(
+                    peer_keys
+                        .client_application
+                        .decrypt_record(&application)
+                        .unwrap()
+                        .plaintext,
+                    b"next client generation"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn key_update_fragments_survive_drain_to_h2_and_ack_each_settings() {
+        for split in 1..5 {
+            let mut session = test_session();
+            let (mut stream, mut peer) = loopback().await;
+            let mut keys = app_keys();
+            keys.negotiated_alpn = Some(b"h2".to_vec());
+            let mut peer_keys = app_keys();
+            let update = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1];
+            // Embedded KU bytes are only opaque ticket body, followed by the
+            // actual KU prefix that ends in the H2 phase's next handshake record.
+            let mut prefix = post_handshake_ticket(&[], &update, &[]);
+            prefix.extend_from_slice(&update[..split]);
+            let first = peer_keys
+                .server_application
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &prefix)
+                .unwrap();
+            peer.write_all(&first).await.unwrap();
+            stream.readable().await.unwrap();
+            assert_eq!(
+                session
+                    .drain_post_handshake(&mut stream, &mut keys)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(session.pending_post_handshake, update[..split]);
+            let exchange = async {
+                let mut record = Vec::new();
+                TlsRecordReader::new(&mut peer)
+                    .read_record_into(&mut record)
+                    .await
+                    .unwrap();
+                assert!(peer_keys
+                    .client_application
+                    .decrypt_record(&record)
+                    .unwrap()
+                    .plaintext
+                    .starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
+                let rest = peer_keys
+                    .server_application
+                    .encrypt_record(TLS_RECORD_HANDSHAKE, &update[split..])
+                    .unwrap();
+                peer.write_all(&rest).await.unwrap();
+                peer_keys.update_server_application_keys().unwrap();
+                let mut frames = h2_frame(0x4, 0, &[]).repeat(2);
+                frames.extend_from_slice(&h2_frame(0x4, 1, &[]));
+                let settings = peer_keys
+                    .server_application
+                    .encrypt_record(TLS_RECORD_APPLICATION_DATA, &frames)
+                    .unwrap();
+                peer.write_all(&settings).await.unwrap();
+                TlsRecordReader::new(&mut peer)
+                    .read_record_into(&mut record)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    peer_keys
+                        .client_application
+                        .decrypt_record(&record)
+                        .unwrap()
+                        .plaintext,
+                    [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0]
+                );
+                peer_keys.update_client_application_keys().unwrap();
+                for _ in 0..2 {
+                    TlsRecordReader::new(&mut peer)
+                        .read_record_into(&mut record)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        peer_keys
+                            .client_application
+                            .decrypt_record(&record)
+                            .unwrap()
+                            .plaintext,
+                        h2_frame(0x4, 1, &[])
+                    );
+                }
+            };
+            let (opened, ()) = tokio::join!(
+                session.open_http2_connection(&mut stream, &mut keys),
+                exchange
+            );
+            opened.unwrap();
+            session.ensure_post_handshake_boundary().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_key_update_response_precedes_new_key_opening() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut keys = app_keys();
+        keys.negotiated_alpn = Some(b"h2".to_vec());
+        let mut peer_keys = app_keys();
+        let update = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1];
+        let mut messages = post_handshake_ticket(&[], &update, &[]);
+        messages.extend_from_slice(&update);
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_RECORD_HANDSHAKE, &messages)
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+        stream.readable().await.unwrap();
+        assert_eq!(
+            session
+                .drain_post_handshake(&mut stream, &mut keys)
+                .await
+                .unwrap(),
+            1
+        );
+        peer_keys.update_server_application_keys().unwrap();
+        let mut response = Vec::new();
+        TlsRecordReader::new(&mut peer)
+            .read_record_into(&mut response)
+            .await
+            .unwrap();
+        assert_eq!(
+            peer_keys
+                .client_application
+                .decrypt_record(&response)
+                .unwrap()
+                .plaintext,
+            [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0]
+        );
+        peer_keys.update_client_application_keys().unwrap();
+        let exchange = async {
+            TlsRecordReader::new(&mut peer)
+                .read_record_into(&mut response)
+                .await
+                .unwrap();
+            assert!(peer_keys
+                .client_application
+                .decrypt_record(&response)
+                .unwrap()
+                .plaintext
+                .starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
+            let ack = peer_keys
+                .server_application
+                .encrypt_record(TLS_RECORD_APPLICATION_DATA, &h2_frame(0x4, 1, &[]))
+                .unwrap();
+            peer.write_all(&ack).await.unwrap();
+        };
+        let (opened, ()) = tokio::join!(
+            session.open_http2_connection(&mut stream, &mut keys),
+            exchange
+        );
+        opened.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_key_updates_never_rotate_or_respond() {
+        for message in [
+            vec![HANDSHAKE_KEY_UPDATE, 0, 0, 0],
+            vec![HANDSHAKE_KEY_UPDATE, 0, 0, 2, 0, 0],
+            vec![HANDSHAKE_KEY_UPDATE, 0, 0, 1, 2],
+            vec![HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0, 0],
+        ] {
+            let mut session = test_session();
+            let (mut stream, _peer) = loopback().await;
+            let mut keys = app_keys();
+            let server_before = Zeroizing::new(keys.server_application_secret.to_vec());
+            let client_before = Zeroizing::new(keys.client_application_secret.to_vec());
+            assert!(session
+                .process_post_handshake_record(&mut stream, &mut keys, &message)
+                .await
+                .is_err());
+            assert_eq!(*keys.server_application_secret, *server_before);
+            assert_eq!(*keys.client_application_secret, *client_before);
+            assert!(session.tap.events().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn key_update_response_write_failure_propagates_before_send_key_rotation() {
+        let mut session = test_session();
+        let (mut stream, _peer) = loopback().await;
+        let mut keys = app_keys();
+        let old_client_secret = Zeroizing::new(keys.client_application_secret.to_vec());
+        stream.shutdown().await.unwrap();
+        let error = session
+            .process_post_handshake_record(
+                &mut stream,
+                &mut keys,
+                &[HANDSHAKE_KEY_UPDATE, 0, 0, 1, 1],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Safari26TlsError::Io(_)));
+        assert_eq!(*keys.client_application_secret, *old_client_secret);
+    }
+
+    #[tokio::test]
+    async fn key_update_rejects_interleaving_and_truncated_handoff() {
+        for next_type in [TLS_RECORD_APPLICATION_DATA, TLS_CONTENT_ALERT] {
+            let mut session = test_session();
+            let (mut stream, mut peer) = loopback().await;
+            let mut keys = app_keys();
+            let mut peer_keys = app_keys();
+            let prefix = peer_keys
+                .server_application
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &[HANDSHAKE_KEY_UPDATE, 0, 0, 1])
+                .unwrap();
+            peer.write_all(&prefix).await.unwrap();
+            let next = peer_keys
+                .server_application
+                .encrypt_record(next_type, &[1, 0])
+                .unwrap();
+            peer.write_all(&next).await.unwrap();
+            assert!(session
+                .await_http2_settings_ack(&mut stream, &mut keys)
+                .await
+                .is_err());
+        }
+        let mut session = test_session();
+        let (mut stream, _peer) = loopback().await;
+        let mut keys = app_keys();
+        session
+            .process_post_handshake_record(&mut stream, &mut keys, &[HANDSHAKE_KEY_UPDATE])
+            .await
+            .unwrap();
+        assert!(session.ensure_post_handshake_boundary().is_err());
+        assert!(session
+            .process_post_handshake_record(&mut stream, &mut keys, &[])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_post_handshake_does_not_wait_at_empty_boundary() {
+        let mut session = test_session();
+        let (mut stream, _peer) = loopback().await;
+        let mut keys = app_keys();
+        let observed = timeout(
+            Duration::from_millis(100),
+            session.drain_post_handshake(&mut stream, &mut keys),
+        )
+        .await
+        .expect("absent tickets must not delay the opening flight")
+        .unwrap();
+        assert_eq!(observed, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_resumes_partial_header_and_payload() {
+        for split in [1, 3, 5, 9] {
+            let mut session = test_session();
+            let (mut stream, mut peer) = loopback().await;
+            let mut keys = app_keys();
+            let mut peer_keys = app_keys();
+            let message = post_handshake_ticket(&[], b"ticket", &[]);
+            let ticket = peer_keys
+                .server_application
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &message)
+                .unwrap();
+            peer.write_all(&ticket[..split]).await.unwrap();
+            stream.readable().await.unwrap();
+            let tail = async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                peer.write_all(&ticket[split..]).await.unwrap();
+            };
+            let (drained, ()) =
+                tokio::join!(session.drain_post_handshake(&mut stream, &mut keys), tail);
+            assert_eq!(drained.unwrap(), 1, "record split at {split}");
+            // The resumed record must advance the shared application-key sequence
+            // exactly once, including when the next record arrives after draining.
+            let next = peer_keys
+                .server_application
+                .encrypt_record(TLS_RECORD_HANDSHAKE, &message)
+                .unwrap();
+            assert_eq!(
+                keys.server_application
+                    .decrypt_record(&next)
+                    .unwrap()
+                    .plaintext,
+                message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_post_handshake_rejects_partial_record_timeout_and_eof() {
+        for split in [2, 7] {
+            for close in [false, true] {
+                let mut session = test_session();
+                let (mut stream, mut peer) = loopback().await;
+                let mut keys = app_keys();
+                let record = tls_record(TLS_RECORD_APPLICATION_DATA, &[0; 20]);
+                peer.write_all(&record[..split]).await.unwrap();
+                stream.readable().await.unwrap();
+                if close {
+                    peer.shutdown().await.unwrap();
+                }
+                let err = session
+                    .drain_post_handshake(&mut stream, &mut keys)
+                    .await
+                    .expect_err("a consumed TLS prefix must never be discarded");
+                if !close {
+                    assert!(matches!(err, Safari26TlsError::Handshake(ref message)
+                        if message == "post-handshake drain timed out mid-record"));
+                }
+            }
+        }
+    }
+
     async fn assert_early_h2_settings_are_acked(split: Option<usize>) {
         let mut session = test_session();
         let (mut stream, mut peer) = loopback().await;
@@ -3059,14 +3912,21 @@ mod tests {
         // bytes must never enter the HTTP/2 frame buffer.
         let ticket = peer_keys
             .server_application
-            .encrypt_record(TLS_RECORD_HANDSHAKE, &[4, 0, 0, 0])
+            .encrypt_record(
+                TLS_RECORD_HANDSHAKE,
+                &post_handshake_ticket(&[], b"ticket", &[]),
+            )
             .unwrap();
-        peer.write_all(&ticket).await.unwrap();
         let early = peer_keys
             .server_application
             .encrypt_record(TLS_RECORD_APPLICATION_DATA, &settings[..split])
             .unwrap();
-        peer.write_all(&early).await.unwrap();
+        // One socket write makes both records ready together. Separate small
+        // writes can leave the second one behind TCP's delayed-ACK/Nagle timer.
+        let mut wire = ticket;
+        wire.extend_from_slice(&early);
+        peer.write_all(&wire).await.unwrap();
+        stream.readable().await.unwrap();
         assert_eq!(
             session
                 .drain_post_handshake(&mut stream, &mut session_keys)
@@ -3142,6 +4002,7 @@ mod tests {
             .unwrap();
         peer.write_all(&record).await.unwrap();
         drop(peer);
+        stream.readable().await.unwrap();
 
         let observed = session
             .drain_post_handshake(&mut stream, &mut session_keys)
@@ -3169,6 +4030,7 @@ mod tests {
             .unwrap();
         peer.write_all(&record).await.unwrap();
         drop(peer);
+        stream.readable().await.unwrap();
 
         let err = session
             .drain_post_handshake(&mut stream, &mut session_keys)
@@ -3196,6 +4058,7 @@ mod tests {
             .await
             .unwrap();
         drop(peer);
+        stream.readable().await.unwrap();
 
         let err = session
             .drain_post_handshake(&mut stream, &mut keys)
@@ -3359,14 +4222,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn await_http2_settings_ack_ignores_non_alert_inner_record() {
+    async fn await_http2_settings_ack_rejects_truncated_inner_handshake() {
         let mut session = test_session();
         let (mut stream, mut peer) = loopback().await;
         let mut session_keys = app_keys();
         let mut peer_keys = app_keys();
 
-        // Inner HANDSHAKE record (not application-data, not an alert) with a >=2
-        // byte body: must be skipped, not mis-read as an alert.
+        // A truncated handshake header must not be mis-read as an alert or
+        // silently discarded as an ignorable session ticket.
         let record = peer_keys
             .server_application
             .encrypt_record(TLS_RECORD_HANDSHAKE, &[0xaa, 0xbb])
@@ -3374,10 +4237,11 @@ mod tests {
         peer.write_all(&record).await.unwrap();
         drop(peer);
 
-        session
+        let error = session
             .await_http2_settings_ack(&mut stream, &mut session_keys)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(error, Safari26TlsError::Handshake(_)));
     }
 
     #[tokio::test]
@@ -5555,9 +6419,12 @@ mod tests {
             .await
             .unwrap();
         drop(peer);
+        // The drain polls only ready data at a record boundary. Wait for the
+        // injected header to reach this socket before exercising its rejection.
+        client.readable().await.unwrap();
         assert!(matches!(
             session.drain_post_handshake(&mut client, &mut keys).await,
-            Err(Safari26TlsError::Io(_))
+            Err(Safari26TlsError::Io(ref err)) if err.kind() == std::io::ErrorKind::InvalidData
         ));
     }
 
@@ -5581,9 +6448,13 @@ mod tests {
             .write_all(&[TLS_CONTENT_APPLICATION_DATA, 0x03, 0x03, 0x00, 0x10, 1])
             .await
             .unwrap();
+        // Ensure the ready-only drain consumes the prefix so the outstanding
+        // payload must time out rather than ending at an untouched boundary.
+        client.readable().await.unwrap();
         assert!(matches!(
             session.drain_post_handshake(&mut client, &mut keys).await,
-            Err(Safari26TlsError::Handshake(ref m)) if m.contains("mid-record")
+            Err(Safari26TlsError::Handshake(ref m))
+                if m == "post-handshake drain timed out mid-record"
         ));
     }
 

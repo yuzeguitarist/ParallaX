@@ -40,7 +40,7 @@ pub mod rounding;
 pub mod sign;
 
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use params::{PUBLICKEYBYTES, RNDBYTES, SECRETKEYBYTES, SIGNBYTES};
 
@@ -113,11 +113,9 @@ pub fn keypair() -> (Vec<u8>, Vec<u8>) {
 /// signature ([`SIG_BYTES`] bytes).
 pub fn sign(sk: &[u8], msg: &[u8], ctx: &[u8]) -> Result<Vec<u8>, MlDsaError> {
     let sk_arr = to_sk_array(sk)?;
-    let mut rnd = [0u8; RNDBYTES];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
-    let res = sign::signature_ctx(&sk_arr, msg, ctx, &rnd);
-    rnd.zeroize();
-    drop_sk_array(sk_arr);
+    let mut rnd = Zeroizing::new([0u8; RNDBYTES]);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, rnd.as_mut());
+    let res = sign::signature_ctx(sk_arr, msg, ctx, &rnd);
     // Exhaustive match (not `map_err(|_| ...)`): if `signature_ctx` ever grows a
     // second failure mode, this stops compiling instead of silently relabeling
     // the new error as `ContextTooLong` (security-review fix #4).
@@ -163,29 +161,17 @@ pub fn sign_deterministic(
     rnd: &[u8; RNDBYTES],
 ) -> Result<Vec<u8>, MlDsaError> {
     let sk_arr = to_sk_array(sk)?;
-    let res = sign::signature_ctx(&sk_arr, msg, ctx, rnd);
-    drop_sk_array(sk_arr);
+    let res = sign::signature_ctx(sk_arr, msg, ctx, rnd);
     let sig = res.map_err(|e| match e {
         sign::SignatureCtxError::ContextTooLong => MlDsaError::ContextTooLong,
     })?;
     Ok(sig.to_vec())
 }
 
-/// Copy a secret-key slice into a fixed-size array, validating its length.
-/// The fixed array (not the caller's slice) is what the signing core consumes;
-/// the caller is responsible for zeroizing its own copy.
-fn to_sk_array(sk: &[u8]) -> Result<[u8; SECRETKEYBYTES], MlDsaError> {
-    if sk.len() != SECRETKEYBYTES {
-        return Err(MlDsaError::InvalidSecretKeyLength);
-    }
-    Ok(core::array::from_fn(|i| sk[i]))
-}
-
-/// Zeroize the local secret-key copy made by [`to_sk_array`] before it is
-/// dropped, so the unpacked-then-discarded secret does not linger on the stack
-/// (plan §5; the C reference does not do this — we exceed it).
-fn drop_sk_array(mut sk: [u8; SECRETKEYBYTES]) {
-    sk.zeroize();
+/// Validate and borrow the caller's key without creating another secret copy.
+fn to_sk_array(sk: &[u8]) -> Result<&[u8; SECRETKEYBYTES], MlDsaError> {
+    sk.try_into()
+        .map_err(|_| MlDsaError::InvalidSecretKeyLength)
 }
 
 #[cfg(test)]

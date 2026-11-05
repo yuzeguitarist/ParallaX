@@ -1,0 +1,70 @@
+# Observation-only AST queries; the checker asserts cardinality inside each
+# complete production function, including branches, loops and closures.
+rules:
+  - id: observe-quic-receive-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete receive scope.
+    pattern: 'fn process_packet(...) { ... }'
+  - id: observe-quic-receive-commit
+    languages: [rust]
+    severity: INFO
+    message: Actual generation commit call.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.commit_data_generation(...)'
+  - id: observe-quic-receive-derive
+    languages: [rust]
+    severity: INFO
+    message: Direct traffic-key derivation is forbidden in receive dispatch.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.tls.next_1rtt_keys(...)'
+          - pattern: 'self.cache_next_packet_keys(...)'
+  - id: observe-quic-close-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete close batch scope.
+    pattern: 'fn build_close_packet(...) { ... }'
+  - id: observe-quic-close-build
+    languages: [rust]
+    severity: INFO
+    message: Explicit-space builder call site.
+    patterns:
+      - pattern-inside: 'fn build_close_packet(...) { ... }'
+      - pattern: 'self.build_close_packet_in_space(...)'
+  - id: observe-quic-close-effect
+    languages: [rust]
+    severity: INFO
+    message: Close orchestrator must not allocate or seal directly.
+    patterns:
+      - pattern-inside: 'fn build_close_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'seal_packet(...)'
+          - pattern: 'self.allocate_packet_number(...)'
+          - pattern: 'self.spaces[$SPACE].send.allocate(...)'
+  - id: observe-quic-close-space-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete explicit-space close scope.
+    pattern: 'fn build_close_packet_in_space(...) { ... }'
+  - id: observe-quic-close-size-definition
+    languages: [rust]
+    severity: INFO
+    message: Complete checked close-size calculation, used by the final wire plan.
+    pattern: 'fn close_packet_size(...) { ... }'
+  - id: observe-quic-close-space-allocate
+    languages: [rust]
+    severity: INFO
+    message: Actual protected packet number reservation.
+    patterns:
+      - pattern-inside: 'fn build_close_packet_in_space(...) { ... }'
+      - pattern: 'self.allocate_packet_number(...)'
+  - id: observe-quic-close-space-seal
+    languages: [rust]
+    severity: INFO
+    message: Actual explicit-space close seal site.
+    patterns:
+      - pattern-inside: 'fn build_close_packet_in_space(...) { ... }'
+      - pattern: 'seal_packet(...)'

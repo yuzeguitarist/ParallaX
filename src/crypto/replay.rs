@@ -135,6 +135,8 @@ pub struct ReplayCache {
     /// [`Self::persist_authenticated_entry`] (tests only).
     #[cfg(test)]
     fail_header_commit: Option<HeaderCommitFailure>,
+    #[cfg(all(test, unix))]
+    fail_directory_sync: Option<DirectorySyncFailure>,
     #[cfg(test)]
     prune_scanned_entries: usize,
 }
@@ -153,6 +155,13 @@ enum HeaderCommitFailure {
     AfterDurableWrite,
 }
 
+#[cfg(all(test, unix))]
+#[derive(Debug, Clone, Copy)]
+enum DirectorySyncFailure {
+    Open,
+    Sync,
+}
+
 impl ReplayCache {
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -169,6 +178,8 @@ impl ReplayCache {
             pending_persist: VecDeque::new(),
             #[cfg(test)]
             fail_header_commit: None,
+            #[cfg(all(test, unix))]
+            fail_directory_sync: None,
             #[cfg(test)]
             prune_scanned_entries: 0,
         }
@@ -236,6 +247,23 @@ impl ReplayCache {
         key_material: &[u8],
         window_secs: u64,
     ) -> Result<Self, ReplayCacheError> {
+        Self::load_authenticated_with_window(
+            path,
+            capacity,
+            key_material,
+            window_secs,
+            #[cfg(all(test, unix))]
+            None,
+        )
+    }
+
+    fn load_authenticated_with_window(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        key_material: &[u8],
+        window_secs: u64,
+        #[cfg(all(test, unix))] fail_directory_sync: Option<DirectorySyncFailure>,
+    ) -> Result<Self, ReplayCacheError> {
         let path = path.as_ref().to_path_buf();
         let mac_key = cache_mac_key(key_material);
         let mut cache = Self {
@@ -247,6 +275,8 @@ impl ReplayCache {
                 tail_mac: [0_u8; 32],
                 active_slot: 0,
             }),
+            #[cfg(all(test, unix))]
+            fail_directory_sync,
             ..Self::new(capacity)
         }
         .with_window_secs(window_secs);
@@ -706,12 +736,20 @@ impl ReplayCache {
         mac_key: &CacheMacKey,
     ) -> Result<(), ReplayCacheError> {
         let (raw, journal) = serialize_authenticated_journal(&self.order, mac_key);
+        // A rename or its directory sync can fail after replacing the file.
+        // The caller may then roll back its tentative entry, so an old
+        // count/tail must never be reused for a later append. Retry by rewrite.
+        self.auth_journal = None;
         let tmp = cache_tmp_path(path);
         write_cache_file(&tmp, raw.as_bytes())?;
         fs::rename(tmp, path)?;
         // Make the rename itself durable so a crash right after compaction/heal
         // cannot leave the directory entry pointing at the pre-rename state.
-        fsync_parent_dir(path);
+        fsync_parent_dir(
+            path,
+            #[cfg(all(test, unix))]
+            self.fail_directory_sync.take(),
+        )?;
         self.auth_journal = Some(journal);
         Ok(())
     }
@@ -794,21 +832,38 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Best-effort fsync of `path`'s parent directory so a preceding rename into it
-/// is durable. Errors are ignored (not all filesystems support directory fsync).
+/// Sync `path`'s parent directory after a rename. A Unix directory open or sync
+/// failure must reject the commit, including unsupported-filesystem errors.
 #[cfg(unix)]
-fn fsync_parent_dir(path: &Path) {
+fn fsync_parent_dir(
+    path: &Path,
+    #[cfg(test)] failure: Option<DirectorySyncFailure>,
+) -> io::Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = parent.unwrap_or_else(|| Path::new("."));
-    if let Ok(dir_file) = fs::File::open(dir) {
+    let open = || -> io::Result<fs::File> {
         #[cfg(test)]
-        LAST_FSYNC_PARENT_DIR.with(|last| *last.borrow_mut() = Some(dir.to_path_buf()));
-        let _ = dir_file.sync_all();
+        if matches!(failure, Some(DirectorySyncFailure::Open)) {
+            return Err(io::Error::other("injected directory-open failure"));
+        }
+        fs::File::open(dir)
+    };
+    let dir_file = open()?;
+    #[cfg(test)]
+    LAST_FSYNC_PARENT_DIR.with(|last| *last.borrow_mut() = Some(dir.to_path_buf()));
+    #[cfg(test)]
+    if matches!(failure, Some(DirectorySyncFailure::Sync)) {
+        return Err(io::Error::other("injected directory-sync failure"));
     }
+    dir_file.sync_all()
 }
 
+// Preserve the existing non-Unix behavior. This branch does not provide the
+// Unix directory-entry durability guarantee; no portable directory sync is used.
 #[cfg(not(unix))]
-fn fsync_parent_dir(_path: &Path) {}
+fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 pub fn current_unix_timestamp() -> Result<u64, ReplayCacheError> {
     Ok(SystemTime::now()
@@ -1241,10 +1296,17 @@ fn encode_authenticated_journal_entry(
 fn cache_mac_key(key_material: &[u8]) -> CacheMacKey {
     let mut mac = HmacSha256::new_from_slice(key_material).expect("HMAC accepts any key length");
     mac.update(CACHE_KEY_LABEL);
-    let digest = mac.finalize().into_bytes();
-    let mut out = [0_u8; 32];
-    out.copy_from_slice(&digest);
-    CacheMacKey(out)
+    let mut digest = mac.finalize().into_bytes();
+    cache_mac_key_from_digest(&mut digest)
+}
+
+fn cache_mac_key_from_digest(digest: &mut [u8]) -> CacheMacKey {
+    // The only production input is SHA-256's fixed 32-byte output. Construct
+    // directly in the wiping owner, then erase the named digest copy.
+    let mut key = CacheMacKey([0_u8; 32]);
+    key.0.copy_from_slice(digest);
+    digest.zeroize();
+    key
 }
 
 /// v4 header-slot MAC: binds the GENERATION as well as the count/tail so a
@@ -1318,9 +1380,185 @@ fn hex_value(byte: u8) -> Result<u8, ReplayCacheError> {
     }
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::cache_mac_key_from_digest;
+
+    /// Proves the shipping post-HMAC copy/wipe over every 32-byte digest and
+    /// observation index. This excludes HMAC internals, compiler-created copies
+    /// and filesystem/crash behavior.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn cache_mac_key_copy_preserves_bytes_and_wipes_digest() {
+        let mut digest: [u8; 32] = kani::any();
+        let before = digest;
+        let index: usize = kani::any();
+        kani::assume(index < digest.len());
+        let key = cache_mac_key_from_digest(&mut digest);
+        assert_eq!(key.0[index], before[index]);
+        assert_eq!(digest[index], 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failure_rejects_first_insert_and_allows_retry() {
+        for failure in [DirectorySyncFailure::Open, DirectorySyncFailure::Sync] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("first-directory-sync.cache");
+            let now = current_unix_timestamp().unwrap();
+            let key = b"directory-sync-test-key";
+            let entry = ReplayEntry {
+                timestamp: now,
+                nonce: [1; 8],
+                transcript_fingerprint: [2; 32],
+            };
+            let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            cache.fail_directory_sync = Some(failure);
+
+            assert!(matches!(
+                cache.insert_new_outcome(entry.clone(), now),
+                Err(ReplayCacheError::Io(_))
+            ));
+            assert!(cache.order.is_empty(), "immediate insert must roll back");
+            assert!(cache.auth_journal.is_none(), "rename outcome is uncertain");
+            assert!(path.exists(), "fault occurs after the actual rename");
+
+            assert!(cache.insert_new(entry.clone(), now).unwrap());
+            let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            assert!(!reloaded.insert_new(entry, now).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failure_invalidates_old_journal_before_compaction_retry() {
+        for failure in [DirectorySyncFailure::Open, DirectorySyncFailure::Sync] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("compaction-directory-sync.cache");
+            let now = current_unix_timestamp().unwrap();
+            let key = b"directory-sync-test-key";
+            let entry = |id| ReplayEntry {
+                timestamp: now,
+                nonce: [id; 8],
+                transcript_fingerprint: [id; 32],
+            };
+            let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            assert!(cache.insert_new(entry(1), now).unwrap());
+            assert_eq!(cache.auth_journal.unwrap().count, 1);
+            // Exercise the existing real compaction route for an externally
+            // truncated journal, while its old count/tail remain in memory.
+            fs::write(&path, []).unwrap();
+            cache.fail_directory_sync = Some(failure);
+            assert!(matches!(
+                cache.insert_new_outcome(entry(2), now),
+                Err(ReplayCacheError::Io(_))
+            ));
+            assert_eq!(cache.order.len(), 1);
+            assert!(
+                cache.auth_journal.is_none(),
+                "old count/tail cannot be reused"
+            );
+            let raw = read_cache_file(&path).unwrap();
+            let mac_key = cache.mac_key.as_ref().unwrap();
+            let (renamed_entries, _, _) =
+                parse_authenticated_journal_entries(&raw, mac_key).unwrap();
+            assert_eq!(renamed_entries.len(), 2, "rename landed before the error");
+
+            // This must rewrite the rolled-back in-memory state, not append
+            // using the old count/tail to the already-replaced two-entry file.
+            assert!(cache.insert_new(entry(3), now).unwrap());
+            let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            assert_eq!(reloaded.order.len(), 2);
+            assert!(!reloaded.insert_new(entry(1), now).unwrap());
+            assert!(!reloaded.insert_new(entry(3), now).unwrap());
+            assert!(reloaded.insert_new(entry(2), now).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failure_rejects_load_time_heal() {
+        for failure in [DirectorySyncFailure::Open, DirectorySyncFailure::Sync] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("heal-directory-sync.cache");
+            let key = b"directory-sync-test-key";
+            let (first, second, now) = journal_with_divergent_slots(&path, key);
+            tear_header_slot(&path, 0);
+
+            assert!(matches!(
+                ReplayCache::load_authenticated_with_window(
+                    &path,
+                    8,
+                    key,
+                    DEFAULT_REPLAY_WINDOW_SECS,
+                    Some(failure),
+                ),
+                Err(ReplayCacheError::Io(_))
+            ));
+            let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            assert!(!reloaded.insert_new(first, now).unwrap());
+            assert!(!reloaded.insert_new(second, now).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failure_preserves_deferred_queue_for_retry() {
+        for failure in [DirectorySyncFailure::Open, DirectorySyncFailure::Sync] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("deferred-directory-sync.cache");
+            let now = current_unix_timestamp().unwrap();
+            let key = b"directory-sync-test-key";
+            let entries = [1, 2].map(|id| ReplayEntry {
+                timestamp: now,
+                nonce: [id; 8],
+                transcript_fingerprint: [id; 32],
+            });
+            let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            for entry in &entries {
+                assert_eq!(
+                    cache.insert_new_outcome_deferred(entry.clone(), now),
+                    ReplayInsertOutcome::Inserted
+                );
+            }
+            cache.fail_directory_sync = Some(failure);
+            assert!(matches!(
+                cache.persist_pending(),
+                Err(ReplayCacheError::Io(_))
+            ));
+            assert_eq!(cache.pending_persist.len(), 2);
+            assert!(cache.auth_journal.is_none());
+            assert_eq!(
+                cache.insert_new_outcome_deferred(entries[0].clone(), now),
+                ReplayInsertOutcome::Replayed
+            );
+
+            cache.persist_pending().unwrap();
+            assert!(cache.pending_persist.is_empty());
+            assert_eq!(
+                read_cache_file(&path).unwrap().lines().count(),
+                AUTH_JOURNAL_HEADER_SLOTS + 2
+            );
+            let mut reloaded = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+            for entry in entries {
+                assert!(!reloaded.insert_new(entry, now).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn cache_mac_key_copy_wipes_the_input_digest() {
+        let mut digest = std::array::from_fn::<_, 32, _>(|index| index as u8 + 1);
+        let expected = digest;
+        let key = cache_mac_key_from_digest(&mut digest);
+        assert_eq!(key.0, expected);
+        assert_eq!(digest, [0; 32]);
+    }
 
     #[test]
     fn journal_compaction_only_when_stale_entries_exceed_capacity_floor() {
@@ -1523,7 +1761,7 @@ mod tests {
     fn fsync_parent_dir_uses_the_real_journal_directory() {
         let dir = tempfile::tempdir().unwrap();
         LAST_FSYNC_PARENT_DIR.with(|last| last.borrow_mut().take());
-        fsync_parent_dir(&dir.path().join("replay.cache"));
+        fsync_parent_dir(&dir.path().join("replay.cache"), None).unwrap();
         let synced = LAST_FSYNC_PARENT_DIR.with(|last| last.borrow().clone());
         assert_eq!(synced.as_deref(), Some(dir.path()));
     }

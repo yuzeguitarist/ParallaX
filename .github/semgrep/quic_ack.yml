@@ -1,0 +1,205 @@
+rules:
+  - id: parallax-quic-ack-schedule-after-admission
+    languages: [rust]
+    severity: ERROR
+    message: ACK scheduling is a trusted receive effect and must follow authenticated global replay admission.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'self.schedule_ack(...)'
+      - pattern-not-inside: |
+          if !self.spaces[space].recv.insert(header.packet_number()) { return Ok(()); }
+          ...
+
+  - id: parallax-quic-ack-no-direct-receive-write
+    languages: [rust]
+    severity: ERROR
+    message: Receive scheduling must use the single frame-classified scheduler; canonical later code does not excuse duplicate writes.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.spaces[$SPACE].ack_pending = ...'
+          - pattern: 'self.spaces[$SPACE].ack_eliciting_count = ...'
+          - pattern: 'self.spaces[$SPACE].ack_deadline = ...'
+
+  - id: parallax-quic-ack-bounded-earliest-schedule
+    languages: [rust]
+    severity: ERROR
+    message: Pure ACKs never arm/count/extend; eliciting debt retains the earliest deadline and saturates at two.
+    patterns:
+      - pattern: 'fn schedule_ack(...) { ... }'
+      - pattern-not: |
+          fn schedule_ack(...) {
+            if self.closed.is_some() { self.clear_ack_schedules(); return; }
+            if !ack_eliciting { return; }
+            let sp = &mut self.spaces[space];
+            sp.ack_pending = true;
+            sp.ack_eliciting_count = ack_count_after_packet(sp.ack_eliciting_count, ack_eliciting, immediate);
+            let deadline = if sp.ack_eliciting_count >= 2 { now } else { now + MAX_ACK_DELAY };
+            sp.ack_deadline = Some(sp.ack_deadline.map_or(deadline, |old| old.min(deadline)));
+          }
+
+  - id: parallax-quic-ack-count-and-due
+    languages: [rust]
+    severity: ERROR
+    message: The shipping count/due helpers retain no-ACK-of-ACK, second-packet release, and bounded tail release.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: 'fn ack_count_after_packet(...) { ... }'
+              - pattern-not: |
+                  fn ack_count_after_packet(...) {
+                    if !ack_eliciting { return count; }
+                    if immediate { 2 } else { count.saturating_add(1).min(2) }
+                  }
+          - patterns:
+              - pattern: 'fn ack_count_due(...) { ... }'
+              - pattern-not: 'fn ack_count_due(...) { count >= 2 || (count != 0 && expired) }'
+
+  - id: parallax-quic-ack-sendable-timer
+    languages: [rust]
+    severity: ERROR
+    message: An unavailable key or blocked amplification budget cannot arm an expired ACK wakeup loop.
+    patterns:
+      - pattern: 'fn pending_data_ack_deadline(...) { ... }'
+      - pattern-not: |
+          fn pending_data_ack_deadline(...) {
+            let sp = &self.spaces[SPACE_DATA];
+            if self.closed.is_some() || !sp.ack_pending || sp.keys.is_none() || sp.discarded || (!self.peer_addr_validated && self.anti_amp_sent.saturating_add(MAX_DATAGRAM as u64) > self.anti_amp_recv.saturating_mul(3)) { return None; }
+            sp.ack_deadline
+          }
+
+  - id: parallax-quic-ack-timeout-connected
+    languages: [rust]
+    severity: ERROR
+    message: The actual next-timeout calculation must include sendable ACK debt alongside existing timers.
+    patterns:
+      - pattern: 'fn next_timeout(...) { ... }'
+      - pattern-not: |
+          fn next_timeout(...) {
+            ...
+            if let Some(ack) = self.pending_data_ack_deadline() { earliest(ack); }
+            ...
+          }
+
+  - id: parallax-quic-ack-poll-before-congestion
+    languages: [rust]
+    severity: ERROR
+    message: ACK readiness must gate the actual builder, before the unchanged congestion and pacing gates.
+    patterns:
+      - pattern: 'fn poll_transmit_inner(...) { ... }'
+      - pattern-not: |
+          fn poll_transmit_inner(...) {
+            ...
+            for space in [SPACE_INITIAL, SPACE_HANDSHAKE, SPACE_DATA] {
+              if self.spaces[space].keys.is_some() && self.ack_ready_for_space(space, now) {
+                ...
+                let ack = self.build_ack_packet(space, now);
+                ...
+                return Some(ack);
+              }
+            }
+            let probing = self.probe_pending > 0;
+            ...
+          }
+
+  - id: parallax-quic-ack-readiness-predicate
+    languages: [rust]
+    severity: ERROR
+    message: Readiness preserves ACK debt, immediate non-Application/pre-confirmation policy, and the confirmed 1-RTT count/deadline gate.
+    patterns:
+      - pattern: 'fn ack_ready_for_space(...) { ... }'
+      - pattern-not: |
+          fn ack_ready_for_space(...) {
+            let sp = &self.spaces[space];
+            sp.ack_pending && (space != SPACE_DATA || !self.handshake_confirmed || ack_count_due(sp.ack_eliciting_count, sp.ack_deadline.is_some_and(|deadline| now >= deadline)))
+          }
+
+  - id: parallax-quic-ack-readiness-no-early-return
+    languages: [rust]
+    severity: ERROR
+    message: Readiness has one canonical result; other return paths cannot bypass delayed ACK (Rust tail expressions are normalized as returns by Semgrep).
+    patterns:
+      - pattern-inside: 'fn ack_ready_for_space(...) { ... }'
+      - pattern: 'return $VALUE;'
+      - pattern-not-inside: 'sp.ack_deadline.is_some_and(|deadline| now >= deadline)'
+      - pattern-not: 'return sp.ack_pending && (space != SPACE_DATA || !self.handshake_confirmed || ack_count_due(sp.ack_eliciting_count, sp.ack_deadline.is_some_and(|deadline| now >= deadline)));'
+
+  - id: parallax-quic-ack-legacy-immediate-policy
+    languages: [rust]
+    severity: ERROR
+    message: Only confirmed 1-RTT is delayed; key changes, gaps/reorder and fresh CE retain immediate feedback.
+    patterns:
+      - pattern: 'fn process_packet(...) { ... }'
+      - pattern-not: |
+          fn process_packet(...) {
+            ...
+            let immediate_ack = pspace != PacketSpace::OneRtt || !self.handshake_confirmed || read_generation == Some(ReadGeneration::Next) || largest.is_some_and(|largest| header.packet_number() != largest + 1) || ecn == EcnCodepoint::Ce;
+            ...
+            self.schedule_ack(space, ack_eliciting, immediate_ack, now);
+            self.prevalidate_peer_transport_params()?;
+            self.pump_write();
+            self.apply_authenticated_peer_ack_params()?;
+            self.maybe_queue_handshake_done();
+            Ok(())
+          }
+
+  - id: parallax-quic-ack-no-timer-seal-or-probe
+    languages: [rust]
+    severity: ERROR
+    message: ACK scheduling/readiness must retain only fixed metadata and cannot seal, reserve a PN, cache a frame or trigger a PTO probe.
+    patterns:
+      - pattern-either:
+          - pattern-inside: 'fn schedule_ack(...) { ... }'
+          - pattern-inside: 'fn pending_data_ack_deadline(...) { ... }'
+          - pattern-inside: 'fn ack_ready_for_space(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.allocate_packet_number(...)'
+          - pattern: 'seal_packet(...)'
+          - pattern: 'self.build_ack_packet(...)'
+          - pattern: 'self.queue_probe(...)'
+          - pattern: 'self.pto_count = ...'
+          - pattern: 'self.ping_pending = ...'
+          - pattern: 'Frame::Ack(...)'
+
+  - id: parallax-quic-ack-retain-largest-stamp
+    languages: [rust]
+    severity: ERROR
+    message: Sent ACKs do not erase the receive timestamp while the receive ranges still retain their largest PN.
+    patterns:
+      - pattern-inside: 'fn build_ack_packet(...) { ... }'
+      - pattern: 'self.spaces[$SPACE].largest_recv_time = ...'
+
+  - id: parallax-quic-ack-builder-fresh-current-key
+    languages: [rust]
+    severity: ERROR
+    message: Each due ACK reserves one protected PN and is recorded as non-eliciting after current-key sealing; only scheduler debt is cleared.
+    patterns:
+      - pattern: 'fn build_ack_packet(...) { ... }'
+      - pattern-not: |
+          fn build_ack_packet(...) {
+            let pn = self.allocate_packet_number(space);
+            ...
+            let header = self.make_header(space, pn, pn_len);
+            let datagram = { ... };
+            self.spaces[space].ack_pending = false;
+            self.spaces[space].ack_eliciting_count = 0;
+            self.spaces[space].ack_deadline = None;
+            if space == SPACE_DATA { self.key_phase.update_ack_pending = false; }
+            self.record_sent(space, pn, datagram.len(), false, SentContent::default(), now);
+            datagram
+          }
+
+  - id: parallax-quic-ack-wire-delay
+    languages: [rust]
+    severity: ERROR
+    message: Wire ACK delay reports real elapsed time using default exponent 3 and a legal QUIC varint, independently of the 25ms local scheduler.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: 'fn encoded_ack_delay(...) { ... }'
+              - pattern-not: 'fn encoded_ack_delay(...) { ((elapsed.as_micros() >> ACK_DELAY_EXPONENT).min((1u128 << 62) - 1)) as u64 }'
+          - patterns:
+              - pattern-inside: 'fn build_ack_packet(...) { ... }'
+              - pattern-either:
+                  - pattern: '$DURATION.min(MAX_ACK_DELAY)'
+                  - pattern: 'self.spaces[$SPACE].largest_recv_time = None'

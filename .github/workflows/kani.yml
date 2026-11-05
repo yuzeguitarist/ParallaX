@@ -1,32 +1,62 @@
 name: kani
 
 # Nightly Kani (bounded model checker) formal proofs over the most
-# safety-critical pure-logic invariants: the per-epoch counter-nonce is injective
-# in the sequence number (no AEAD nonce reuse -- the catastrophic-failure guard),
-# and the padding-length parser never panics on attacker-controlled input. These
-# are EXHAUSTIVE proofs over the input space, complementing the sampled property
-# tests and the Miri UB lane. Kani builds its own toolchain + CBMC, so beyond the
-# weekly baseline it runs on PRs/pushes only when one of the two proof-carrying
-# files changes (path-filtered below), not on every push.
+# safety-critical scoped invariants: counter-nonce injectivity, outbound
+# AEAD budgets, disjoint batch reservations, permanent failure state, and
+# padding-length and TLS KeyUpdate parser safety, the client mux activation clock,
+# QUIC replay, key-phase admission / ACK gates, protected PN allocation,
+# exhausted-key close state, mux tail / record planning bounds, peer ACK
+# decoding / canonical parameter parsing, SHAKE cache clearing, and sequential
+# Open receipt publication claims. These
+# are exhaustive within each harness's stated bounds and assumptions,
+# complementing sampled property tests and the Miri UB lane. Kani builds its
+# own toolchain + CBMC, so beyond the
+# weekly baseline it runs on PRs/pushes only when proof-carrying
+# files change (path-filtered below), not on every push.
 
 on:
-  # Narrow path-filtered gate: only the two files that carry #[kani::proof]
-  # harnesses (nonce injectivity in crypto/session.rs, the padding-length parser
-  # in traffic.rs). Kani installs CBMC + its own toolchain (tens of minutes), so
+  # Narrow path-filtered gate: files that carry #[kani::proof] harnesses.
+  # Kani installs CBMC + its own toolchain (tens of minutes), so
   # keep this tight to avoid long runs on unrelated changes; the weekly schedule
   # covers dependency drift.
   pull_request:
     branches: [main, master]
     paths:
       - 'src/crypto/session.rs'
+      - 'src/crypto/replay.rs'
+      - 'src/crypto/mldsa/fips202.rs'
+      - 'src/protocol/data.rs'
+      - 'src/protocol/command.rs'
       - 'src/traffic.rs'
+      - 'src/client/runtime.rs'
+      - 'src/tls/safari26.rs'
+      - 'src/tls/quic/**'
+      - 'src/transport/udp/quic/conn.rs'
+      - 'src/transport/udp/quic/spaces.rs'
+      - 'src/transport/udp/quic/transport_params.rs'
+      - 'src/handshake/server.rs'
+      - 'src/config.rs'
       - '.github/workflows/kani.yml'
+      - '.github/scripts/run_kani_shard.py'
   push:
     branches: [main, master]
     paths:
       - 'src/crypto/session.rs'
+      - 'src/crypto/replay.rs'
+      - 'src/crypto/mldsa/fips202.rs'
+      - 'src/protocol/data.rs'
+      - 'src/protocol/command.rs'
       - 'src/traffic.rs'
+      - 'src/client/runtime.rs'
+      - 'src/tls/safari26.rs'
+      - 'src/tls/quic/**'
+      - 'src/transport/udp/quic/conn.rs'
+      - 'src/transport/udp/quic/spaces.rs'
+      - 'src/transport/udp/quic/transport_params.rs'
+      - 'src/handshake/server.rs'
+      - 'src/config.rs'
       - '.github/workflows/kani.yml'
+      - '.github/scripts/run_kani_shard.py'
   schedule:
     - cron: '41 4 * * 1' # Mondays 04:41 UTC (offset from the miri lane)
   workflow_dispatch:
@@ -48,9 +78,15 @@ env:
 
 jobs:
   kani:
-    name: kani (nonce-injectivity + padding-parser proofs)
+    name: kani (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Enumerate and partition all 70 compiler-discovered harnesses. Independent
+    # modules avoid a single cold hosted run exceeding the two-hour budget.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["crypto-buffers", "crypto-session", "mux", "records-tls", "quic-conn", "quic-params"]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,16 +100,25 @@ jobs:
       - name: Cache cargo registry and target/
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: parallax-kani
+          shared-key: parallax-kani-${{ matrix.shard }}
 
       - name: Install Kani
         run: |
           cargo install --locked kani-verifier --version "$KANI_VERSION"
           cargo kani setup
 
-      # Runs every #[kani::proof] harness in the crate (nonce injectivity in
-      # crypto::session, padding-parser panic-freedom in traffic). `cargo kani`
+      # ACK-delay arithmetic harnesses select Z3 explicitly; Kani setup does
+      # not install this external solver. Log the runner's packaged version.
+      - name: Install Z3
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y z3
+          z3 --version
+
+      # Runs every #[kani::proof] harness in exactly one shard. `cargo kani`
       # does NOT accept --locked (it errors "unexpected argument"); the committed
       # Cargo.lock is used by default, so the run stays reproducible.
-      - name: cargo kani (all proof harnesses)
-        run: cargo kani
+      - name: Verify complete inventory and run assigned proof harnesses
+        env:
+          KANI_SHARD: ${{ matrix.shard }}
+        run: python3 .github/scripts/run_kani_shard.py "$KANI_SHARD"

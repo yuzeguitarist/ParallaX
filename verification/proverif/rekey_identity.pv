@@ -1,0 +1,139 @@
+(* ParallaX authenticated PQ rekey / pinned-server identity slice.
+   See README.md for source mapping, assumptions, omissions and query meanings.
+   Epoch-0 protection and PSK are exposed deliberately; post-rekey identity
+   signatures are also made public. No honest-client authentication is claimed. *)
+
+free network: channel.
+
+type exponent.
+type group.
+type kem_secret.
+type kem_public.
+type kem_coins.
+type kem_ciphertext.
+type signing_secret.
+type verification_key.
+type traffic_key.
+type epoch.
+type suite.
+
+const generator: group [data].
+const initial_epoch: epoch [data].
+const aes256gcm: suite [data].
+const chacha20poly1305: suite [data].
+const identity_context: bitstring [data].
+const identity_label: bitstring [data].
+const client_direction_aad: bitstring [data].
+free server_static_pin: bitstring.
+free exposed_psk: bitstring.
+free application_secret: bitstring [private].
+
+(* Explicit attacker-owned key material, in addition to network control. *)
+free attacker_exponent: exponent.
+free attacker_kem_secret: kem_secret.
+free attacker_kem_coins: kem_coins.
+free attacker_signing_secret: signing_secret.
+
+fun exp(group, exponent): group.
+equation forall x: exponent, y: exponent;
+  exp(exp(generator, x), y) = exp(exp(generator, y), x).
+
+fun kem_public_key(kem_secret): kem_public.
+fun encapsulate(kem_public, kem_coins): kem_ciphertext.
+fun kem_shared(kem_public, kem_coins): bitstring.
+reduc forall k: kem_secret, r: kem_coins;
+  decapsulate(encapsulate(kem_public_key(k), r), k) = kem_shared(kem_public_key(k), r).
+
+fun public_identity(signing_secret): verification_key.
+fun sign_identity(bitstring, signing_secret, bitstring): bitstring.
+reduc forall m: bitstring, k: signing_secret, context: bitstring;
+  checked_identity(sign_identity(m, k, context), public_identity(k), context) = m.
+reduc forall m: bitstring, k: signing_secret, context: bitstring;
+  signature_message(sign_identity(m, k, context)) = m.
+
+(* Injective parseable encodings of PX1Q, PX1K and the fixed identity message.
+   binding abstracts the domain-separated, length-delimited SHA-256 input. *)
+fun request(group, kem_public): bitstring [data].
+fun response(group, kem_ciphertext, suite): bitstring [data].
+fun binding(bitstring, bitstring): bitstring.
+fun identity_message(bitstring, epoch, bitstring, bitstring, bitstring): bitstring [data].
+fun next_epoch(epoch): epoch.
+
+(* Public epoch-0 state is a deterministic function of the assumed initial
+   context. These are perfect one-way KDFs, not computational HKDF proofs. *)
+fun exposed_epoch0_chain(bitstring): bitstring.
+fun sandwich_chain(bitstring, group, bitstring, bitstring): bitstring.
+fun client_key(bitstring, epoch, bitstring): traffic_key.
+fun seal_client_data(bitstring, traffic_key, suite, bitstring): bitstring.
+reduc forall m: bitstring, k: traffic_key, s: suite, aad: bitstring;
+  open_client_data(seal_client_data(m, k, s, aad), k, s, aad) = m.
+
+event server_signed(verification_key, bitstring, bitstring, bitstring, bitstring, epoch).
+event client_accepted(verification_key, bitstring, bitstring, bitstring, bitstring, epoch).
+event server_derived(verification_key, bitstring, bitstring, bitstring, bitstring, epoch, traffic_key).
+event client_derived(verification_key, bitstring, bitstring, bitstring, bitstring, epoch, traffic_key).
+event acceptance_reached.
+
+query identity: verification_key, pin: bitstring, transcript: bitstring,
+      req: bitstring, resp: bitstring, e: epoch;
+  inj-event(client_accepted(identity, pin, transcript, req, resp, e)) ==>
+  inj-event(server_signed(identity, pin, transcript, req, resp, e)).
+
+query identity: verification_key, pin: bitstring, transcript: bitstring,
+      req: bitstring, resp: bitstring, e: epoch, key: traffic_key;
+  inj-event(client_derived(identity, pin, transcript, req, resp, e, key)) ==>
+  inj-event(server_derived(identity, pin, transcript, req, resp, e, key)).
+
+query attacker(application_secret).
+(* This reachability query must be FALSE: acceptance is possible, so the
+   security correspondences are not accepted merely because the client stops. *)
+query event(acceptance_reached).
+
+let client(identity_public: verification_key) =
+  in(network, prior_epoch: epoch);
+  new transcript: bitstring;
+  new client_exponent: exponent;
+  new client_kem_secret: kem_secret;
+  let client_request = request(exp(generator, client_exponent), kem_public_key(client_kem_secret)) in
+  let e = next_epoch(prior_epoch) in
+  out(network, (transcript, client_request, prior_epoch, aes256gcm));
+  in(network, (server_response: bitstring, signature: bitstring));
+  let response(server_dh: group, ciphertext: kem_ciphertext, selected: suite) = server_response in
+  if selected = aes256gcm || selected = chacha20poly1305 then
+  let pq_secret = decapsulate(ciphertext, client_kem_secret) in
+  let chain = sandwich_chain(exposed_epoch0_chain(transcript),
+      exp(server_dh, client_exponent), pq_secret, exposed_psk) in
+  let key = client_key(chain, e, transcript) in
+  let expected_binding = binding(client_request, server_response) in
+  let expected_message = identity_message(identity_label, e, transcript, server_static_pin, expected_binding) in
+  let verified_message = checked_identity(signature, identity_public, identity_context) in
+  if verified_message = expected_message then
+  event client_accepted(identity_public, server_static_pin, transcript, client_request, server_response, e);
+  event client_derived(identity_public, server_static_pin, transcript, client_request, server_response, e, key);
+  event acceptance_reached;
+  out(network, seal_client_data(application_secret, key, selected, client_direction_aad)).
+
+let server(identity_secret: signing_secret) =
+  (* Initial context and hardware suite selection are overapproximated by
+     attacker-chosen public inputs; actual TLS establishment is outside scope. *)
+  in(network, (transcript: bitstring, client_request: bitstring, prior_epoch: epoch, selected: suite));
+  if selected = aes256gcm || selected = chacha20poly1305 then
+  let request(client_dh: group, client_kem: kem_public) = client_request in
+  new server_exponent: exponent;
+  new coins: kem_coins;
+  let ciphertext = encapsulate(client_kem, coins) in
+  let server_response = response(exp(generator, server_exponent), ciphertext, selected) in
+  let e = next_epoch(prior_epoch) in
+  let chain = sandwich_chain(exposed_epoch0_chain(transcript),
+      exp(client_dh, server_exponent), kem_shared(client_kem, coins), exposed_psk) in
+  let key = client_key(chain, e, transcript) in
+  let signed_binding = binding(client_request, server_response) in
+  let message = identity_message(identity_label, e, transcript, server_static_pin, signed_binding) in
+  event server_derived(public_identity(identity_secret), server_static_pin, transcript, client_request, server_response, e, key);
+  event server_signed(public_identity(identity_secret), server_static_pin, transcript, client_request, server_response, e);
+  out(network, (server_response, sign_identity(message, identity_secret, identity_context))).
+
+process
+  new identity_secret: signing_secret;
+  out(network, public_identity(identity_secret));
+  ((!client(public_identity(identity_secret))) | (!server(identity_secret)))

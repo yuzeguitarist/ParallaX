@@ -1,0 +1,87 @@
+# Complete AST scopes; the checker pins full source spans and rejects duplicates.
+rules:
+  - id: observe-mux-receipt-claim
+    languages: [rust]
+    severity: INFO
+    message: Shipping first-publication claim.
+    pattern: 'fn claim_mux_publication(...) { ... }'
+  - id: observe-mux-receipt-register
+    languages: [rust]
+    severity: INFO
+    message: Absolute deadline and shared-state construction.
+    patterns:
+      - pattern-inside: 'impl ServerMuxDownlink { ... }'
+      - pattern: 'async fn register(...) { ... }'
+  - id: observe-mux-receipt-send
+    languages: [rust]
+    severity: INFO
+    message: All ordinary frames publish after reservation regardless of claim result.
+    patterns:
+      - pattern-inside: 'impl ServerMuxStreamTx { ... }'
+      - pattern: 'async fn send(...) { ... }'
+  - id: observe-mux-receipt-fallback
+    languages: [rust]
+    severity: INFO
+    message: At most one fallback publication after reservation.
+    pattern: 'async fn send_receipt_if_unanswered(...) { ... }'
+  - id: observe-mux-receipt-drive
+    languages: [rust]
+    severity: INFO
+    message: Concurrent complete operation and bounded receipt in one supervisor.
+    pattern: 'async fn with_mux_open_receipt(...) { ... }'
+  - id: observe-mux-receipt-upstream
+    languages: [rust]
+    severity: INFO
+    message: Complete production upstream including connection and both relay directions.
+    pattern: 'async fn server_mux_upstream_task(...) { ... }'
+  - id: observe-mux-receipt-stream
+    languages: [rust]
+    severity: INFO
+    message: Shared per-incarnation state and copied absolute deadline.
+    pattern: 'struct ServerMuxStreamTx { stream_id: $ID, frames: $FRAMES, wake: $WAKE, first_publication: $FIRST, receipt_deadline: $TIME }'
+  - id: observe-mux-receipt-stream-impl
+    languages: [rust]
+    severity: INFO
+    message: Complete inherent and Drop implementations; additional Clone implementations cannot replace sharing.
+    pattern: 'impl ServerMuxStreamTx { ... }'
+  - id: observe-mux-receipt-budget
+    languages: [rust]
+    severity: INFO
+    message: Shared original client suspect budget, including const/static shadows.
+    pattern-either:
+      - pattern: 'const MUX_CARRIER_SUSPECT_AFTER: $TYPE = $VALUE;'
+      - pattern: 'static MUX_CARRIER_SUSPECT_AFTER: $TYPE = $VALUE;'
+  - id: observe-mux-receipt-dead
+    languages: [rust]
+    severity: INFO
+    message: Original client dead-carrier budget.
+    pattern-either:
+      - pattern: 'const MUX_CARRIER_DEAD_AFTER: $TYPE = $VALUE;'
+      - pattern: 'static MUX_CARRIER_DEAD_AFTER: $TYPE = $VALUE;'
+  - id: observe-mux-receipt-watchdog
+    languages: [rust]
+    severity: INFO
+    message: Client continues to use the unchanged liveness budgets.
+    pattern: 'const MUX_CARRIER_WATCHDOG: $TYPE = $VALUE;'
+  - id: observe-mux-receipt-import
+    languages: [rust]
+    severity: INFO
+    message: Both peers reference the shared command-layer constant.
+    pattern: 'use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;'
+  - id: observe-mux-receipt-client-loop
+    languages: [rust]
+    severity: INFO
+    message: Any authenticated Data/Fin/Reset already acknowledges the Open.
+    patterns:
+      - pattern-inside: 'async fn client_mux_reader_loop(...) { ... }'
+      - pattern: 'while !frames.is_empty() { ... }'
+  - id: observe-mux-receipt-constructor
+    languages: [rust]
+    severity: INFO
+    message: Every explicit stream-state construction has a reviewed owner.
+    pattern: 'ServerMuxStreamTx { stream_id: $ID, frames: $FRAMES, wake: $WAKE, first_publication: $FIRST, receipt_deadline: $TIME }'
+  - id: observe-mux-receipt-test-owner
+    languages: [rust]
+    severity: INFO
+    message: The one existing test-only stream construction.
+    pattern: 'async fn mux_tail_test_reader(...) { ... }'

@@ -1,0 +1,257 @@
+rules:
+  - id: parallax-quic-decoded-frame-matrix
+    languages: [rust]
+    severity: ERROR
+    message: Decoded frame admission must use the original packet level, receiver role, and actual wire codepoint; strict 0-RTT policy includes verified erratum 7365.
+    patterns:
+      - pattern: 'fn frame_permitted(...) { ... }'
+      - pattern-not: |
+          fn frame_permitted(...) {
+            if side == Side::Server && matches!(frame_type, 0x07 | 0x1e) { return false; }
+            match space {
+              PacketSpace::Initial | PacketSpace::Handshake => { matches!(frame_type, 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x1c) }
+              PacketSpace::ZeroRtt => { !matches!(frame_type, 0x02 | 0x03 | 0x06 | 0x07 | 0x19 | 0x1b | 0x1e) }
+              PacketSpace::OneRtt => true,
+            }
+          }
+
+  - id: parallax-quic-frame-admission-before-dispatch
+    languages: [rust]
+    severity: ERROR
+    message: Decode the actual frame type, then close terminally before returning an admission error, before any dispatch of that frame.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern: 'while let Some(frame) = frames.next() { ... }'
+      - pattern-not: |
+          while let Some(frame) = frames.next() {
+            let frame_type = frames.last_frame_type();
+            let frame = frame.map_err(|e| { transport_error(0x07, frame_type, format!("frame decode failed: {e:?}")) })?;
+            if !frame_permitted(pspace, self.side, frame_type) {
+              self.close_transport(0x0a, frame_type, b"frame not permitted");
+              return Err(transport_error(0x0a, frame_type, "frame not permitted"));
+            }
+            $DISPATCH
+          }
+
+  - id: parallax-quic-frame-admission-no-item-shadow
+    languages: [rust]
+    severity: ERROR
+    message: Local const/static items must not shadow the reviewed frame admission predicate.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'const frame_permitted: $TYPE = $VALUE;'
+          - pattern: 'static frame_permitted: $TYPE = $VALUE;'
+          - pattern: 'static mut frame_permitted: $TYPE = $VALUE;'
+
+  - id: parallax-quic-frame-admission-no-input-mutation
+    languages: [rust]
+    severity: ERROR
+    message: Canonical frame admission cannot excuse a separate mutation of its immutable inputs or a reversal of the terminal close.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'pspace = ...'
+          - pattern: 'frame_type = ...'
+          - pattern: 'frame = ...'
+          - pattern: 'frames = ...'
+          - pattern: 'self.side = ...'
+          - pattern: '&mut self.side'
+          - pattern: '&mut self.closed'
+          - pattern: '&mut pspace'
+          - pattern: '&mut frame_type'
+          - pattern: 'self.closed.take(...)'
+          - pattern: 'self.closed.replace(...)'
+          - pattern: 'self.closed.insert(...)'
+          - pattern: 'std::mem::take(&mut self.closed)'
+      # Pinned Rust AST also represents `frame_type: ...` struct fields as
+      # assignments. The complete iteration pin still covers these error nodes.
+      - pattern-not-inside: 'QuicTlsError::Transport { error_code: $CODE, frame_type: $TYPE, reason: $REASON }'
+
+  - id: parallax-quic-reject-client-zero-rtt
+    languages: [rust]
+    severity: ERROR
+    message: Clients must discard inbound 0-RTT before key lookup, decryption, or packet-derived state (RFC 9001 section 5.6).
+    patterns:
+      - pattern: 'fn process_packet(...) { ... }'
+      - pattern-not: |
+          fn process_packet(...) {
+            let pspace = match packet::first_packet_space(pkt) {
+              Some(s) => s,
+              None => return Ok(()),
+            };
+            if self.side == Side::Client && pspace == PacketSpace::ZeroRtt { return Ok(()); }
+            ...
+            let space = space_index(pspace);
+            ...
+          }
+
+  - id: parallax-quic-authenticated-dedup-before-state
+    languages: [rust]
+    severity: ERROR
+    message: Packet authentication and new-PN insertion must precede idle/CID/ECN/ACK/stream state commits.
+    patterns:
+      - pattern: 'fn process_packet(...) { ... }'
+      - pattern-not: |
+          fn process_packet(...) {
+            ...
+            let (header, range) = match opened {
+              Ok(v) => v,
+              Err(_) => { ... }
+            };
+            ...
+            if !self.spaces[space].recv.insert(header.packet_number()) { return Ok(()); }
+            ...
+            self.last_recv_time = Some(now);
+            if let Some((dcid, keys)) = pending_initial {
+              self.initial_dcid = dcid;
+              self.spaces[SPACE_INITIAL].keys = Some(keys);
+            }
+            if let Some((_, scid)) = long_cids {
+              if !self.peer_cid_adopted {
+                self.dcid = scid;
+                self.peer_cid_adopted = true;
+              }
+            }
+            self.spaces[space].recv_ecn.record(ecn);
+            ...
+          }
+
+  - id: parallax-quic-exhausted-key-is-silent
+    languages: [rust]
+    severity: ERROR
+    message: Exhaustion must preserve existing close reasons and cancel all protected close output, including an already queued close.
+    patterns:
+      - pattern: 'fn close_on_exhausted_data_key(...) { ... }'
+      - pattern-not: |
+          fn close_on_exhausted_data_key(...) {
+            if sealed < limit { return; }
+            if closed.is_none() { *closed = Some(CloseReason::LocalApp(0, ...)); }
+            *close_pending = None;
+          }
+
+  - id: parallax-quic-no-early-receive-state-write
+    languages: [rust]
+    severity: ERROR
+    message: Protected receive-state writes must be in the statement suffix after authenticated open and replay admission; a later correct commit block does not excuse an earlier duplicate write.
+    patterns:
+      - pattern-inside: 'fn process_packet(...) { ... }'
+      - pattern-either:
+          - pattern: 'self.last_recv_time = ...'
+          - pattern: 'self.initial_dcid = ...'
+          - pattern: 'self.dcid = ...'
+          - pattern: 'self.peer_cid_adopted = ...'
+          - pattern: 'self.peer_addr_validated = ...'
+          - pattern: 'self.zero_rtt_keys = ...'
+          - pattern: 'self.spaces[$SPACE].keys = ...'
+          - pattern: 'self.spaces[$SPACE].recv = ...'
+          - pattern: 'self.spaces[$SPACE].recv.insert(...)'
+          - pattern: 'self.spaces[$SPACE].recv_ecn = ...'
+          - pattern: 'self.spaces[$SPACE].recv_ecn.record(...)'
+          - pattern: 'self.spaces[$SPACE].recv_ecn.$FIELD = ...'
+          - pattern: 'self.spaces[$SPACE].recv_ecn.$FIELD += ...'
+          - pattern: 'self.spaces[$SPACE].ack_pending = ...'
+          - pattern: 'self.spaces[$SPACE].largest_recv_time = ...'
+          - pattern: 'self.recv_stream(...)'
+          - pattern: 'self.recv_crypto(...)'
+          - pattern: 'self.discard_space(...)'
+      # This is a statement-SEQUENCE suffix, deliberately not a containing
+      # function/block: its matched range starts at authenticated admission, so
+      # preceding writes cannot hide behind a correct block later in the function.
+      # The companion rule requires this exact gate to follow the authenticated
+      # open. Do not include the preceding `match opened`: writes in its failed-
+      # authentication branch must remain outside the admitted statement suffix.
+      # Failed-AEAD accounting remains allowed; it is not protected peer activity.
+      - pattern-not-inside: |
+          if !self.spaces[space].recv.insert(header.packet_number()) { return Ok(()); }
+          ...
+
+  - id: parallax-quic-budget-gates-closed-connections
+    languages: [rust]
+    severity: ERROR
+    message: The confidentiality gate must run even if the connection already has a pending local close.
+    patterns:
+      - pattern: 'fn enforce_aead_confidentiality_limit(...) { ... }'
+      - pattern-not: |
+          fn enforce_aead_confidentiality_limit(...) {
+            let limit = self.spaces[SPACE_DATA].keys.as_ref().map(|k| k.local.packet.confidentiality_limit());
+            if let Some(limit) = limit {
+              close_on_exhausted_data_key(self.data_packets_sealed, limit, &mut self.closed, &mut self.close_pending);
+            }
+          }
+      - pattern-not: |
+          fn enforce_aead_confidentiality_limit(...) {
+            if self.spaces[SPACE_DATA].keys.is_none() { ... }
+            let limit = self.spaces[SPACE_DATA].keys.as_ref().map(|k| k.local.packet.confidentiality_limit());
+            if let Some(limit) = limit {
+              close_on_exhausted_data_key(self.data_packets_sealed, limit, &mut self.closed, &mut self.close_pending);
+            }
+          }
+
+  - id: parallax-quic-close-builder-budget
+    languages: [rust]
+    severity: ERROR
+    message: The close builder itself must enforce the budget before reading pending output or allocating a PN.
+    patterns:
+      - pattern: 'fn build_close_packet(...) { ... }'
+      - pattern-not: |
+          fn build_close_packet(...) {
+            self.enforce_aead_confidentiality_limit();
+            let (code, frame_type, reason) = self.close_pending.clone()?;
+            ...
+          }
+      - pattern-not: |
+          fn build_close_packet(...) {
+            self.enforce_aead_confidentiality_limit();
+            self.enforce_aead_integrity_limit();
+            let (code, frame_type, reason) = self.close_pending.clone()?;
+            ...
+          }
+
+  - id: parallax-quic-transmit-budget
+    languages: [rust]
+    severity: ERROR
+    message: The transmit dispatcher must enforce the confidentiality budget before closing or active packet builders.
+    patterns:
+      - pattern: 'fn poll_transmit_inner(...) { ... }'
+      - pattern-not: |
+          fn poll_transmit_inner(...) {
+            self.enforce_aead_confidentiality_limit();
+            self.enforce_aead_integrity_limit();
+            ...
+          }
+      - pattern-not: |
+          fn poll_transmit_inner(...) {
+            if self.closed.is_none() { self.maybe_update_send_key(now); }
+            self.enforce_aead_confidentiality_limit();
+            self.enforce_aead_integrity_limit();
+            ...
+          }
+
+  - id: parallax-quic-sealed-data-accounting
+    languages: [rust]
+    severity: ERROR
+    message: Every sealed Application Data-space packet, including a close packet, must consume the recorded packet budget.
+    patterns:
+      - pattern: 'fn record_sent(...) { ... }'
+      - pattern-not: |
+          fn record_sent(...) {
+            ...
+            if space == SPACE_DATA {
+              self.data_packets_sealed = self.data_packets_sealed.saturating_add(1);
+            }
+            ...
+          }
+      - pattern-not: |
+          fn record_sent(...) {
+            ...
+            if space == SPACE_DATA {
+              if self.spaces[SPACE_DATA].keys.is_some() {
+                self.data_packets_sealed = self.data_packets_sealed.saturating_add(1);
+                ...
+              } else {
+                self.zero_rtt_packets_sealed = self.zero_rtt_packets_sealed.saturating_add(1);
+              }
+            }
+            ...
+          }

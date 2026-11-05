@@ -267,6 +267,11 @@ authorized_sni = ["cloudflare.com"]
 strict_tls13 = true
 ```
 
+The server's replay cache requires durable writes. On Unix, its filesystem must
+support syncing both the cache file and its parent directory; an I/O or sync
+failure rejects the authenticated handshake. Choose a writable local filesystem
+with those guarantees rather than a mount that cannot persist directory changes.
+
 Minimal generated client shape:
 
 ```toml
