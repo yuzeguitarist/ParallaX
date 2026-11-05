@@ -28,8 +28,9 @@
 //! Driving a SOCKS5 app through the tunnel to a loopback echo target:
 //!   (a) the full authenticated handshake completes — Safari26 camouflage TLS
 //!       (spliced client<->origin through the ParallaX server) -> PQ rekey (PX1Q)
-//!       -> ML-DSA server-identity verify — because the SOCKS relay only comes up
-//!       after every one of those stages succeeds;
+//!       -> ML-DSA server-identity verify — because the target payload only
+//!       round-trips after every one of those stages succeeds (the local SOCKS
+//!       success reply is optimistic and is not proof of authentication);
 //!   (b) client->target bytes arrive unchanged, and
 //!   (c) target->client bytes arrive unchanged, for a >= 256 KiB position-encoded
 //!       payload that spans many 16 KiB TLS records and multiple 256 KiB relay
@@ -37,13 +38,17 @@
 //!   (d) teardown is a clean FIN, not a RST: after the app half-closes, its read
 //!       side observes a graceful EOF (`read_to_end` returns `Ok`), which a RST
 //!       would surface as a `ConnectionReset` error instead.
+//! Both the direct path and a first-byte-gated path retain these assertions.
+//! The gate waits for an observed speculative origin pre-dial before releasing
+//! ClientHello bytes, so this also covers slow/instrumented client preparation.
 //!
 //! Live-socket test: `#[ignore]`d and run serially, matching the repo's loopback
 //! convention (`requires loopback TCP sockets`). Run with:
-//!   cargo test --test e2e_tunnel_roundtrip -- --ignored --test-threads=1
+//!   cargo test --locked --test e2e_tunnel_roundtrip -- --ignored --test-threads=1
 
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::net::SocketAddr;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,7 +60,8 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use parallax::client::runtime::handle_local_connection;
@@ -76,6 +82,20 @@ const SNI: &str = "example.com";
 /// At least 256 KiB so the payload spans many 16 KiB TLS records and more than
 /// one 256 KiB relay read in each direction. 1 MiB gives comfortable headroom.
 const PAYLOAD_LEN: usize = 1024 * 1024;
+const ORIGIN_BUDGET: Duration = Duration::from_secs(30);
+type FixtureTasks = JoinSet<&'static str>;
+
+#[derive(Debug)]
+struct OriginReport {
+    empty_predials: usize,
+    tls_handshakes: usize,
+}
+
+#[derive(Debug)]
+enum OriginConnection {
+    EmptyPredial,
+    TlsComplete,
+}
 
 // ---------------------------------------------------------------------------
 // Throwaway PKI: a CA trusted via SSL_CERT_FILE + an example.com leaf the
@@ -154,51 +174,102 @@ fn install_trust_root(ca_cert_pem: &str) -> tempfile::NamedTempFile {
 /// to this origin for the camouflage TLS handshake, and the client verifies this
 /// origin's certificate against `SNI` using the trust root installed above.
 ///
-/// It completes the handshake, then drains whatever the client's spliced
-/// post-handshake camouflage bytes are (with a short idle bound) so it reaches a
-/// graceful close rather than RST-ing on unread data.
-async fn spawn_camouflage_origin(pki: &CamouflagePki) -> (SocketAddr, JoinHandle<()>) {
+/// A slow first client byte permits one speculative origin TCP connection which
+/// the authenticated path closes without sending TLS bytes. Accept at most that
+/// empty spare and one real TLS connection. An EOF after a TLS byte must fail
+/// until the handshake completes.
+/// After TLS completes, drain to the ParallaX server's EOF, with an overall bound
+/// instead of closing the origin while an instrumented client is still working.
+async fn spawn_camouflage_origin(
+    pki: &CamouflagePki,
+    tasks: &mut FixtureTasks,
+) -> (
+    SocketAddr,
+    oneshot::Receiver<()>,
+    oneshot::Receiver<OriginReport>,
+) {
     let server_config = rustls_server_config(pki);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut server =
-            rustls::ServerConnection::new(server_config).expect("rustls server connection");
-        let mut buf = [0_u8; 8192];
-
-        while server.is_handshaking() {
-            flush_rustls_server(&mut server, &mut stream).await;
-            let n = stream.read(&mut buf).await.unwrap();
-            assert!(n > 0, "camouflage origin saw EOF mid-handshake");
-            let mut cursor = Cursor::new(&buf[..n]);
-            server.read_tls(&mut cursor).unwrap();
-            server.process_new_packets().unwrap();
-        }
-        flush_rustls_server(&mut server, &mut stream).await;
-
-        // Drain the spliced client camouflage traffic until it goes quiet, so the
-        // origin never RSTs on unread bytes. Once the ParallaX server detects the
-        // client's PX1Q it stops splicing to us, so this naturally idles out.
-        loop {
-            match timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                Ok(Ok(_)) => {}
+    let (first_accepted, accepted) = oneshot::channel();
+    let (completed, report) = oneshot::channel();
+    tasks.spawn(async move {
+        let report = timeout(ORIGIN_BUDGET, async move {
+            let mut first_accepted = Some(first_accepted);
+            let mut empty_predials = 0;
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                if let Some(accepted) = first_accepted.take() {
+                    let _ = accepted.send(());
+                }
+                match serve_origin_connection(stream, Arc::clone(&server_config))
+                    .await
+                    .expect("camouflage origin TLS/transport failure")
+                {
+                    OriginConnection::EmptyPredial => empty_predials += 1,
+                    OriginConnection::TlsComplete => {
+                        return OriginReport {
+                            empty_predials,
+                            tls_handshakes: 1,
+                        };
+                    }
+                }
             }
-        }
+            panic!("origin did not complete TLS after its bounded pre-dial allowance");
+        })
+        .await
+        .expect("camouflage origin fixture exceeded its overall deadline");
+        completed.send(report).unwrap();
+        "origin"
     });
-    (addr, task)
+    (addr, accepted, report)
 }
 
-async fn flush_rustls_server(server: &mut rustls::ServerConnection, stream: &mut TcpStream) {
+async fn serve_origin_connection(
+    mut stream: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+) -> io::Result<OriginConnection> {
+    let mut first = [0_u8; 1];
+    if stream.read(&mut first).await? == 0 {
+        return Ok(OriginConnection::EmptyPredial);
+    }
+    let mut server = rustls::ServerConnection::new(config).map_err(io::Error::other)?;
+    server.read_tls(&mut Cursor::new(&first))?;
+    server.process_new_packets().map_err(io::Error::other)?;
+    let mut buf = [0_u8; 8192];
+    while server.is_handshaking() {
+        flush_rustls_server(&mut server, &mut stream).await?;
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "camouflage origin saw EOF mid-handshake",
+            ));
+        }
+        server.read_tls(&mut Cursor::new(&buf[..n]))?;
+        server.process_new_packets().map_err(io::Error::other)?;
+    }
+    flush_rustls_server(&mut server, &mut stream).await?;
+    // Do not convert a timeout or reset into a successful origin completion.
+    // The enclosing fixture deadline bounds a server that never closes.
+    while stream.read(&mut buf).await? != 0 {}
+    stream.shutdown().await?;
+    Ok(OriginConnection::TlsComplete)
+}
+
+async fn flush_rustls_server(
+    server: &mut rustls::ServerConnection,
+    stream: &mut TcpStream,
+) -> io::Result<()> {
     while server.wants_write() {
         let mut out = Vec::new();
-        server.write_tls(&mut out).unwrap();
+        server.write_tls(&mut out)?;
         if out.is_empty() {
             break;
         }
-        stream.write_all(&out).await.unwrap();
+        stream.write_all(&out).await?;
     }
+    Ok(())
 }
 
 fn rustls_server_config(pki: &CamouflagePki) -> Arc<rustls::ServerConfig> {
@@ -220,10 +291,10 @@ fn rustls_server_config(pki: &CamouflagePki) -> Arc<rustls::ServerConfig> {
 /// A loopback echo target: reads and echoes every byte until EOF, then returns
 /// (dropping its stream, which FINs the read side). This is the destination the
 /// SOCKS app talks to through the tunnel.
-async fn spawn_echo_target() -> (SocketAddr, JoinHandle<()>) {
+async fn spawn_echo_target(tasks: &mut FixtureTasks) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
+    tasks.spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut buf = vec![0_u8; 64 * 1024];
         loop {
@@ -236,8 +307,9 @@ async fn spawn_echo_target() -> (SocketAddr, JoinHandle<()>) {
         // The app half-closes first; after echoing everything we FIN back so the
         // app's read side sees a clean EOF (asserted below), not a RST.
         stream.shutdown().await.unwrap();
+        "target"
     });
-    (addr, task)
+    addr
 }
 
 // ---------------------------------------------------------------------------
@@ -276,10 +348,10 @@ fn server_config(
 
 /// Bind the REAL ParallaX server on loopback and serve one accepted connection
 /// through `handle_connection` (the production entry point).
-async fn spawn_parallax_server(config: ServerConfig) -> (SocketAddr, JoinHandle<()>) {
+async fn spawn_parallax_server(config: ServerConfig, tasks: &mut FixtureTasks) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
+    tasks.spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         server::handle_connection(
             stream,
@@ -290,8 +362,9 @@ async fn spawn_parallax_server(config: ServerConfig) -> (SocketAddr, JoinHandle<
         )
         .await
         .unwrap();
+        "server"
     });
-    (addr, task)
+    addr
 }
 
 /// Bind the REAL ParallaX client SOCKS5 listener on loopback and serve one
@@ -301,7 +374,8 @@ async fn spawn_local_client(
     parallax_addr: SocketAddr,
     server_keys: &X25519KeyPair,
     server_identity_keys: &MlDsaKeyPair,
-) -> (SocketAddr, JoinHandle<()>) {
+    tasks: &mut FixtureTasks,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let client_config = ClientConfig {
@@ -314,7 +388,7 @@ async fn spawn_local_client(
     };
     let server_public_key = server_keys.public;
     let server_identity_public_key = server_identity_keys.public.clone();
-    let task = tokio::spawn(async move {
+    tasks.spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         handle_local_connection(
             stream,
@@ -327,8 +401,34 @@ async fn spawn_local_client(
         )
         .await
         .unwrap();
+        "client"
     });
-    (addr, task)
+    addr
+}
+
+/// Connect to the real ParallaX server, withholding all client bytes until its
+/// production pre-dial has actually reached the origin. This forces the race
+/// boundary without assuming a wall-clock delay is long enough on a busy host.
+async fn spawn_first_byte_gate(
+    server_addr: SocketAddr,
+    origin_accepted: oneshot::Receiver<()>,
+    tasks: &mut FixtureTasks,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tasks.spawn(async move {
+        let (mut client, _) = listener.accept().await.unwrap();
+        let mut server = TcpStream::connect(server_addr).await.unwrap();
+        timeout(Duration::from_secs(10), origin_accepted)
+            .await
+            .expect("production origin pre-dial did not occur before any client byte")
+            .expect("origin accept observer disappeared");
+        tokio::io::copy_bidirectional(&mut client, &mut server)
+            .await
+            .expect("first-byte proxy must relay both directions without transport errors");
+        "first-byte proxy"
+    });
+    addr
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +436,8 @@ async fn spawn_local_client(
 // ---------------------------------------------------------------------------
 
 /// Complete the SOCKS5 no-auth negotiation + CONNECT to `target_addr` against the
-/// client's local listener, returning the connected app socket (tunnelled).
+/// client's local listener. The success reply is optimistic; the payload
+/// round-trip below, not this reply, proves the authenticated tunnel works.
 async fn connect_socks_target(local_addr: SocketAddr, target_addr: SocketAddr) -> TcpStream {
     let mut app = TcpStream::connect(local_addr).await.unwrap();
     app.write_all(&[5, 1, 0]).await.unwrap();
@@ -377,17 +478,43 @@ fn position_encoded_payload(len: usize) -> Vec<u8> {
 
 /// Full authenticated tunnel round-trip with a large bidirectional payload and a
 /// clean FIN teardown, exercising the client's real webpki cert verification.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "requires loopback TCP sockets"]
-async fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
-    // Mint the throwaway PKI and trust its CA BEFORE any handshake so the client's
-    // production cert verification accepts the loopback origin.
+fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
+    // Install one shared CA before starting workers. native_roots() is cached,
+    // so the direct and delayed scenarios must use this same PKI.
     let pki = generate_camouflage_pki();
     let _ca_guard = install_trust_root(&pki.ca_cert_pem);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut tasks = FixtureTasks::new();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            timeout(Duration::from_secs(180), async {
+                origin_rejects_mid_handshake_eof(&pki).await;
+                run_roundtrip(&pki, false, &mut tasks).await;
+                run_roundtrip(&pki, true, &mut tasks).await;
+            })
+            .await
+            .expect("end-to-end fixtures exceeded their overall deadline");
+        });
+    }));
+    // Keep the runtime alive while aborting AND awaiting all fixture tasks on
+    // failure. Dropping a JoinHandle alone would detach a lingering listener.
+    runtime.block_on(tasks.shutdown());
+    if let Err(panic) = result {
+        resume_unwind(panic);
+    }
+}
 
+async fn run_roundtrip(pki: &CamouflagePki, force_predial: bool, tasks: &mut FixtureTasks) {
+    assert!(tasks.is_empty(), "previous fixture tasks must be joined");
     // Loopback camouflage origin + echo target.
-    let (fallback_addr, origin_task) = spawn_camouflage_origin(&pki).await;
-    let (target_addr, target_task) = spawn_echo_target().await;
+    let (fallback_addr, origin_accepted, origin_report) = spawn_camouflage_origin(pki, tasks).await;
+    let target_addr = spawn_echo_target(tasks).await;
 
     // Freshly generated server keys: X25519 static (session) + ML-DSA identity.
     let server_keys = X25519KeyPair::generate();
@@ -403,13 +530,17 @@ async fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
         &server_identity_keys,
         replay_cache_path,
     );
-    let (parallax_addr, server_task) = spawn_parallax_server(config).await;
-    let (local_addr, client_task) =
-        spawn_local_client(parallax_addr, &server_keys, &server_identity_keys).await;
+    let parallax_addr = spawn_parallax_server(config, tasks).await;
+    let upstream = if force_predial {
+        spawn_first_byte_gate(parallax_addr, origin_accepted, tasks).await
+    } else {
+        drop(origin_accepted);
+        parallax_addr
+    };
+    let local_addr = spawn_local_client(upstream, &server_keys, &server_identity_keys, tasks).await;
 
-    // Drive a SOCKS5 app through the tunnel to the echo target. Reaching an
-    // accepted SOCKS CONNECT already proves the full authenticated handshake
-    // (Safari26 camouflage -> PQ rekey -> ML-DSA identity verify) completed.
+    // SOCKS success is sent optimistically. Only the authenticated payload
+    // exchange below proves Safari26 TLS, PQ rekey and identity verification.
     let app = connect_socks_target(local_addr, target_addr).await;
     let (mut app_read, mut app_write) = app.into_split();
 
@@ -453,16 +584,62 @@ async fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
     );
     drop(app_read);
 
-    // Both real runtimes must return cleanly (Ok), proving no error teardown.
-    wait_for_task("client", client_task).await;
-    wait_for_task("server", server_task).await;
-    wait_for_task("target", target_task).await;
-    origin_task.abort();
+    // Every real runtime, origin and optional proxy must finish successfully.
+    // In particular, do not abort the origin and hide its TLS/EOF outcome.
+    wait_for_tasks(tasks, force_predial).await;
+    let report = origin_report
+        .await
+        .expect("origin did not report successful TLS completion");
+    assert_eq!(report.tls_handshakes, 1);
+    assert!(report.empty_predials <= 1);
+    if force_predial {
+        assert_eq!(
+            report.empty_predials, 1,
+            "first-byte gate did not exercise the empty pre-dial"
+        );
+    }
+    eprintln!(
+        "{}: empty_predials={}, completed_tls={}, payload_bytes={PAYLOAD_LEN}",
+        if force_predial { "gated" } else { "direct" },
+        report.empty_predials,
+        report.tls_handshakes,
+    );
 }
 
-async fn wait_for_task(name: &str, task: JoinHandle<()>) {
-    timeout(Duration::from_secs(10), task)
+async fn wait_for_tasks(tasks: &mut FixtureTasks, has_proxy: bool) {
+    let mut completed = timeout(Duration::from_secs(10), async {
+        let mut completed = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            completed.push(result.expect("end-to-end fixture task failed"));
+        }
+        completed
+    })
+    .await
+    .expect("end-to-end fixture tasks did not finish");
+    let mut expected = vec!["client", "origin", "server", "target"];
+    if has_proxy {
+        expected.push("first-byte proxy");
+    }
+    completed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(completed, expected, "every fixture task must be joined");
+}
+
+async fn origin_rejects_mid_handshake_eof(pki: &CamouflagePki) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
         .await
-        .unwrap_or_else(|_| panic!("{name} task timed out"))
-        .unwrap_or_else(|err| panic!("{name} task failed: {err:?}"));
+        .unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    peer.write_all(&[0x16]).await.unwrap();
+    peer.shutdown().await.unwrap();
+    let error = timeout(
+        Duration::from_secs(5),
+        serve_origin_connection(stream, rustls_server_config(pki)),
+    )
+    .await
+    .expect("partial-TLS EOF control timed out")
+    .expect_err("an EOF after any TLS byte must not be treated as an empty pre-dial");
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(error.to_string(), "camouflage origin saw EOF mid-handshake");
 }
