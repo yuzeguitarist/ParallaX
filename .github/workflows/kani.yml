@@ -37,6 +37,7 @@ on:
       - 'src/handshake/server.rs'
       - 'src/config.rs'
       - '.github/workflows/kani.yml'
+      - '.github/scripts/run_kani_shard.py'
   push:
     branches: [main, master]
     paths:
@@ -55,6 +56,7 @@ on:
       - 'src/handshake/server.rs'
       - 'src/config.rs'
       - '.github/workflows/kani.yml'
+      - '.github/scripts/run_kani_shard.py'
   schedule:
     - cron: '41 4 * * 1' # Mondays 04:41 UTC (offset from the miri lane)
   workflow_dispatch:
@@ -76,10 +78,14 @@ env:
 
 jobs:
   kani:
-    name: kani (nonce, budget, reservation, failure, parser, activation proofs)
+    name: kani (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # The complete 67-harness warm local run took about 47 minutes. Include
-    # cold Kani setup and slower runners; protocol timeouts are unchanged.
+    # Enumerate and partition all 70 compiler-discovered harnesses. Independent
+    # modules avoid a single cold hosted run exceeding the two-hour budget.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["crypto-buffers", "crypto-session", "mux", "records-tls", "quic-conn", "quic-params"]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,7 +100,7 @@ jobs:
       - name: Cache cargo registry and target/
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: parallax-kani
+          shared-key: parallax-kani-${{ matrix.shard }}
 
       - name: Install Kani
         run: |
@@ -109,8 +115,10 @@ jobs:
           sudo apt-get install --no-install-recommends -y z3
           z3 --version
 
-      # Runs every #[kani::proof] harness in the crate. `cargo kani`
+      # Runs every #[kani::proof] harness in exactly one shard. `cargo kani`
       # does NOT accept --locked (it errors "unexpected argument"); the committed
       # Cargo.lock is used by default, so the run stays reproducible.
-      - name: cargo kani (all proof harnesses)
-        run: cargo kani
+      - name: Verify complete inventory and run assigned proof harnesses
+        env:
+          KANI_SHARD: ${{ matrix.shard }}
+        run: python3 .github/scripts/run_kani_shard.py "$KANI_SHARD"

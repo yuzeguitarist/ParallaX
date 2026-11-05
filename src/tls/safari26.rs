@@ -1863,6 +1863,10 @@ mod post_handshake_proofs {
     use super::*;
 
     #[kani::proof]
+    // Eight input bytes cannot contain the minimum 14-byte ticket body, so
+    // its extension loop is unreachable. Keep unwinding assertions enabled
+    // to verify that bound instead of expanding the unreachable BTreeSet.
+    #[kani::unwind(1)]
     fn bounded_prefix_parser_never_consumes_unavailable_bytes() {
         let bytes: [u8; 8] = kani::any();
         let len: usize = kani::any();
@@ -1876,7 +1880,11 @@ mod post_handshake_proofs {
                 }
                 PostHandshakeMessage::KeyUpdate { request_update } => {
                     assert_eq!(len, 5);
-                    assert_eq!(&bytes[..4], &[HANDSHAKE_KEY_UPDATE, 0, 0, 1]);
+                    // Compare every header byte without a loop in memcmp.
+                    assert_eq!(bytes[0], HANDSHAKE_KEY_UPDATE);
+                    assert_eq!(bytes[1], 0);
+                    assert_eq!(bytes[2], 0);
+                    assert_eq!(bytes[3], 1);
                     assert_eq!(bytes[4], u8::from(request_update));
                 }
             }
