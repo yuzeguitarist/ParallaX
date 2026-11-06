@@ -185,6 +185,27 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(all(value["missing_audit_count"] == 1 for value in report["workspaces"].values()))
         self.assertTrue(all(value["exit_code"] == 255 for value in report["workspaces"].values()))
 
+    def test_delta_rejects_new_missing_audit(self):
+        debt = {"schema": 1, "not_an_exemption": True, "workspaces": {
+            name: {"missing": [{"name": "existing", "version": "1.0.0",
+                                "missing_criteria": ["safe-to-run"]}]}
+            for name in DEP.WORKSPACES
+        }}
+        def run(args, **kwargs):
+            if args[:2] == ["git", "show"]:
+                return subprocess.CompletedProcess(args, 0, json.dumps(debt), "")
+            if "--version" in args:
+                return subprocess.CompletedProcess(args, 0, "cargo-vet 0.10.3\n", "")
+            if args[:2] == ["cargo", "fetch"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 255, json.dumps({"failures": [
+                {"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]},
+                {"name": "new-dependency", "version": "2.0.0", "missing_criteria": ["safe-to-run"]},
+            ]}), "")
+        with patch.object(DEP.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(ValueError, "new unaudited dependencies"):
+                DEP.check_delta(self.root, None, "a" * 40)
+
 
 if __name__ == "__main__":
     unittest.main()

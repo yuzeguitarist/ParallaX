@@ -216,9 +216,45 @@ def check(root, protected, executable, report_path):
     return 1 if failed else 0
 
 
+def check_delta(root, executable, base):
+    require(base, "Delta check requires --base")
+    snapshot = subprocess.run(["git", "show", f"{base}:supply-chain/audit-debt.json"],
+                              cwd=root, text=True, capture_output=True)
+    require(snapshot.returncode == 0, "Base audit-debt snapshot is missing")
+    debt = json.loads(snapshot.stdout)
+    require(debt.get("schema") == 1 and debt.get("not_an_exemption") is True,
+            "Invalid base audit-debt snapshot")
+    tool = [str(executable.resolve()), "vet"] if executable else ["cargo", "vet"]
+    environment = {**os.environ, "CARGO": "cargo"}
+    version = subprocess.run(tool + ["--version"], cwd=root, env=environment,
+                             text=True, capture_output=True, check=True).stdout.strip()
+    require(version == "cargo-vet 0.10.3", "Install cargo-vet 0.10.3 with --locked")
+    for workspace, (manifest, store, _, _) in WORKSPACES.items():
+        fetch = subprocess.run(["cargo", "fetch", "--locked", "--manifest-path", manifest],
+                               cwd=root, env=environment, text=True, capture_output=True)
+        require(fetch.returncode == 0, f"{workspace}: cargo fetch failed: {fetch.stderr}")
+        vet = subprocess.run(tool + [
+            "--manifest-path", manifest, "--store-path", store, "--locked", "--frozen",
+            "--no-minimize-exemptions", "--no-registry-suggestions", "--output-format", "json",
+        ], cwd=root, env=environment, text=True, capture_output=True)
+        try:
+            result = json.loads(vet.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{workspace}: invalid cargo-vet JSON") from error
+        missing = result.get("failures", [])
+        require(vet.returncode == 0 or missing, f"{workspace}: cargo-vet failed: {vet.stderr}")
+        previous = debt.get("workspaces", {}).get(workspace, {}).get("missing", [])
+        key = lambda item: (item.get("name"), item.get("version"),
+                            tuple(sorted(item.get("missing_criteria", []))))
+        added = sorted(set(map(key, missing)) - set(map(key, previous)))
+        require(not added, f"{workspace}: new unaudited dependencies: {added}")
+        print(f"{workspace}: no new audit debt", flush=True)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("policy", "check"))
+    parser.add_argument("command", choices=("policy", "check", "check-delta"))
     parser.add_argument("--base")
     parser.add_argument("--vet-bin", type=Path)
     parser.add_argument("--report", type=Path, default=Path("target/security/dependency-report.json"))
@@ -228,8 +264,10 @@ def main():
         if args.command == "policy":
             print("Dependency policy valid: four workspaces under audit policy, one verified std-only workspace, zero exemptions.")
             return 0
+        if args.command == "check-delta":
+            return check_delta(ROOT, args.vet_bin, args.base)
         return check(ROOT, protected, args.vet_bin, args.report.resolve())
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    except (ValueError, OSError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         print(f"Dependency assurance failed: {error}", file=sys.stderr)
         return 2
 
