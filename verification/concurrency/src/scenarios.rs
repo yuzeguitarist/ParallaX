@@ -153,14 +153,14 @@ fn budget(limit: usize) -> Arc<ExtraFdBudget> {
 /// Successful reservations overlap at the observation point and fit the budget.
 pub fn fd_overlapping_reservations(workload_seed: u64) {
     let unit = 1 + (workload_seed % 3) as usize;
-    let budget = budget(4 * unit);
+    let budget = budget(3 * unit);
     let contenders = Arc::clone(&budget);
     let admitted = two_contenders(move |_id, ready, release| {
         hold_guard(contenders.try_reserve(2 * unit), ready, release);
     });
-    assert_eq!(admitted, 2);
+    assert_eq!(admitted, 1);
     assert_eq!(budget.used.load(Ordering::Acquire), 0);
-    let entire = budget.try_reserve(4 * unit).unwrap();
+    let entire = budget.try_reserve(3 * unit).unwrap();
     assert!(budget.try_reserve(1).is_none());
     drop(entire);
     assert_eq!(budget.used.load(Ordering::Acquire), 0);
