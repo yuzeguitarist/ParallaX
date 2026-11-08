@@ -1,0 +1,19 @@
+.cargo/mutants.toml
+  s_565db6d08f4440::t_f1fc388205a10d 86-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9e2fea640e39fe00cd6cd104b80eb24117a70b48",
+  "prompts": {},
+  "sessions": {
+    "s_565db6d08f4440": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b9d8-5d31-7033-8e06-91b2c213599f",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
