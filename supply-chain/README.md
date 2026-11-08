@@ -2,7 +2,7 @@
 
 This project uses cargo-vet **0.10.3**, exact registry checksums, immutable upstream audit snapshots, and a project-specific policy guard for every Cargo workspace. The strict audit gate is intentionally **failing** until missing reviews are completed. There are **zero exemptions** and no publisher/wildcard trust. Passing the policy tests does not mean the dependency graph is audited.
 
-**合并政策（2026-11-05，按维护者指示调整）：** 缺少第三方代码的源码审查记录不再阻止 PR 合并。严格源码审计改为定期或手动运行，缺记录时仍如实失败并保留报告；正式发布仍必须通过全部严格审计。PR 继续执行依赖策略检查、发布保护测试、三平台打包及其他代码测试和安全扫描。此调整不代表这些依赖已完成审计，也不增加审计豁免或自动信任。
+**合并政策（2026-11-05）：** PR 和 push 必须通过增量 cargo-vet 检查，不得引入新的源码审计缺口。已有审计债务由定期或手动的严格审计如实报告；正式发布仍必须通过全部严格审计。增量基线不授予审计豁免或自动信任。
 
 An initial proposal to grandfather the existing graph with broad exact-version exemptions was rejected by automatic approval review because that would grant audit criteria without source review. The implemented fallback grants no such criteria. `audit-debt.json` inventories missing reviews only; it is never loaded as an authorization or used to turn a cargo-vet failure into success.
 
