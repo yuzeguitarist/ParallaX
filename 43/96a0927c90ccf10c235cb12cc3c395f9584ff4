@@ -1,0 +1,23 @@
+.cargo/mutants.toml
+  s_565db6d08f4440::t_0ebb6d9499d4e2 11-13,78
+.config/nextest.toml
+  s_565db6d08f4440::t_f76ce1fda2c2f8 1-6
+.github/workflows/nightly-mutants.yml
+  s_565db6d08f4440::t_471fc0d8726f09 113,116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4396a0927c90ccf10c235cb12cc3c395f9584ff4",
+  "prompts": {},
+  "sessions": {
+    "s_565db6d08f4440": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b9d8-5d31-7033-8e06-91b2c213599f",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
