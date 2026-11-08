@@ -49,7 +49,7 @@ The same ten case functions run with all three backends:
 | `source_mapped_alias` | IPv4 and its IPv4-mapped IPv6 spelling share one live admission slot; the slot is reusable after both contenders finish |
 | `source_ipv6_aggregate` | Two distinct /64s compete for the last slot in one /48; the aggregate releases all permits and does not block a different /48 |
 | `source_unwind_releases` | Another caller retries until admission succeeds before joining the unwinding owner; zero-cap sources reject admission |
-| `fd_overlapping_reservations` | Both `2 * unit` reservations succeed and remain live at the observation point within a `4 * unit` budget; final usage is zero |
+| `fd_overlapping_reservations` | Exactly one of two overlapping `2 * unit` reservations succeeds within a `3 * unit` budget; final usage is zero and the full budget is reusable |
 | `fd_unwind_releases` | Another caller retries until a reservation succeeds before joining the unwinding owner; release occurs exactly once |
 | `fd_overflow_and_zero` | `usize::MAX` overflow rejects; zero-sized reservations do not disturb accounting |
 | `pool_concurrent_order` | Two submitters receive only their own results in input order; every job runs once; dropping the first owner's reference does not shut down the remaining caller |
