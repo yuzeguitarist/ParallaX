@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -185,26 +186,96 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(all(value["missing_audit_count"] == 1 for value in report["workspaces"].values()))
         self.assertTrue(all(value["exit_code"] == 255 for value in report["workspaces"].values()))
 
-    def test_delta_rejects_new_missing_audit(self):
+    def run_delta(self, previous, missing, conclusion="fail (vetting)", returncode=255,
+                  output=None):
         debt = {"schema": 1, "not_an_exemption": True, "workspaces": {
-            name: {"missing": [{"name": "existing", "version": "1.0.0",
-                                "missing_criteria": ["safe-to-run"]}]}
-            for name in DEP.WORKSPACES
+            name: {"missing": previous} for name in DEP.WORKSPACES
         }}
         def run(args, **kwargs):
             if args[:2] == ["git", "show"]:
+                self.assertEqual(args[2], f"{'a' * 40}:supply-chain/audit-debt.json")
                 return subprocess.CompletedProcess(args, 0, json.dumps(debt), "")
             if "--version" in args:
                 return subprocess.CompletedProcess(args, 0, "cargo-vet 0.10.3\n", "")
             if args[:2] == ["cargo", "fetch"]:
+                self.assertIn("--locked", args)
                 return subprocess.CompletedProcess(args, 0, "", "")
-            return subprocess.CompletedProcess(args, 255, json.dumps({"failures": [
-                {"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]},
-                {"name": "new-dependency", "version": "2.0.0", "missing_criteria": ["safe-to-run"]},
-            ]}), "")
+            self.assertIn("--locked", args)
+            self.assertIn("--frozen", args)
+            self.assertIn("--no-minimize-exemptions", args)
+            result = {"conclusion": conclusion, "failures": missing}
+            return subprocess.CompletedProcess(args, returncode,
+                                               json.dumps(result) if output is None else output, "")
         with patch.object(DEP.subprocess, "run", side_effect=run):
-            with self.assertRaisesRegex(ValueError, "new unaudited dependencies"):
-                DEP.check_delta(self.root, None, "a" * 40)
+            return DEP.check_delta(self.root, None, "a" * 40)
+
+    def test_delta_allows_existing_or_resolved_debt(self):
+        previous = [{"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
+        self.assertEqual(self.run_delta(previous, previous), 0)
+        self.assertEqual(self.run_delta(previous, [], "success", 0), 0)
+
+    def test_delta_allows_reduced_criteria(self):
+        previous = [{"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-deploy"]}]
+        missing = [{"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
+        self.assertEqual(self.run_delta(previous, missing), 0)
+
+    def test_delta_rejects_new_missing_audit(self):
+        previous = [{"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
+        for name, version, criterion in (("new-dependency", "1.0.0", "safe-to-run"),
+                                         ("existing", "2.0.0", "safe-to-run"),
+                                         ("existing", "1.0.0", "safe-to-deploy")):
+            missing = [{"name": name, "version": version, "missing_criteria": [criterion]}]
+            with self.subTest(name=name, version=version, criterion=criterion):
+                with self.assertRaisesRegex(ValueError, "new unaudited dependencies"):
+                    self.run_delta(previous, missing)
+
+    def test_delta_uses_trusted_base_ledger(self):
+        missing = [{"name": "new-dependency", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
+        # A same-change ledger replacement cannot grandfather the new debt.
+        path = self.root / "supply-chain/audit-debt.json"
+        path.write_text(json.dumps({"schema": 1, "not_an_exemption": True, "workspaces": {
+            name: {"missing": missing} for name in DEP.WORKSPACES
+        }}))
+        with self.assertRaisesRegex(ValueError, "new unaudited dependencies"):
+            self.run_delta([], missing)
+
+    def test_delta_rejects_cargo_vet_errors_even_with_existing_failures(self):
+        previous = [{"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
+        for conclusion, returncode in (("fail (violation)", 255), ("success", 1),
+                                       ("fail (vetting)", 0), ("fail (vetting)", -9)):
+            with self.subTest(conclusion=conclusion, returncode=returncode):
+                with self.assertRaisesRegex(ValueError, "cargo-vet failed"):
+                    self.run_delta(previous, previous, conclusion, returncode)
+
+    def test_delta_rejects_malformed_cargo_vet_results(self):
+        for output in ("invalid JSON", "[]", "{}", '{"conclusion":"success","failures":{}}',
+                       '{"conclusion":"fail (vetting)","failures":[{}]}'):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                self.run_delta([], [], output=output)
+
+    def test_delta_workflow_resolves_only_new_branch_push_base(self):
+        workflow = (ROOT / ".github/workflows/dependency-assurance.yml").read_text()
+        step = workflow.split("      - name: Reject audit debt introduced by this change\n", 1)[1]
+        lines = step.split("        run: |\n", 1)[1].splitlines(keepends=True)
+        end = next((index for index, line in enumerate(lines)
+                    if line.strip() and not line.startswith("          ")), len(lines))
+        script = textwrap.dedent("".join(lines[:end]))
+        base = self.commit_base()
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", base],
+                       cwd=self.root, check=True)
+        subprocess.run(["git", "-c", "user.name=Policy Test", "-c", "user.email=test@example.invalid",
+                        "commit", "--allow-empty", "-qm", "head", "--no-gpg-sign"],
+                       cwd=self.root, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
+        for event, supplied, expected in (("new branch push", "0" * 40, base),
+                                          ("normal push", base, base), ("pull request", head, head)):
+            with self.subTest(event=event):
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c",
+                    "python3() { printf '%s\\n' \"$@\"; }\n" + script], cwd=self.root,
+                    env={**os.environ, "BASE_SHA": supplied, "DEFAULT_BRANCH": "main"},
+                    capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.splitlines(),
+                                 ["scripts/security/dependencies.py", "check-delta", "--base", expected])
 
 
 if __name__ == "__main__":

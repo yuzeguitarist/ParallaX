@@ -216,13 +216,34 @@ def check(root, protected, executable, report_path):
     return 1 if failed else 0
 
 
+def missing_audit_keys(entries):
+    require(isinstance(entries, list), "Invalid missing-audit list")
+    keys = set()
+    for item in entries:
+        require(isinstance(item, dict) and isinstance(item.get("name"), str)
+                and isinstance(item.get("version"), str), "Invalid missing-audit package")
+        criteria = item.get("missing_criteria")
+        require(isinstance(criteria, list) and criteria and all(
+            isinstance(criterion, str) and criterion in CRITERIA for criterion in criteria),
+            "Invalid missing-audit criteria")
+        for criterion in criteria:
+            keys.add((item["name"], item["version"], criterion))
+        # safe-to-deploy includes safe-to-run, so reducing a requirement is not
+        # new debt even when cargo-vet reports only the weaker criterion.
+        if "safe-to-deploy" in criteria:
+            keys.add((item["name"], item["version"], "safe-to-run"))
+    return keys
+
+
 def check_delta(root, executable, base):
     require(base, "Delta check requires --base")
     snapshot = subprocess.run(["git", "show", f"{base}:supply-chain/audit-debt.json"],
                               cwd=root, text=True, capture_output=True)
     require(snapshot.returncode == 0, "Base audit-debt snapshot is missing")
     debt = json.loads(snapshot.stdout)
-    require(debt.get("schema") == 1 and debt.get("not_an_exemption") is True,
+    require(isinstance(debt, dict) and debt.get("schema") == 1
+            and debt.get("not_an_exemption") is True
+            and isinstance(debt.get("workspaces"), dict),
             "Invalid base audit-debt snapshot")
     tool = [str(executable.resolve()), "vet"] if executable else ["cargo", "vet"]
     environment = {**os.environ, "CARGO": "cargo"}
@@ -241,12 +262,14 @@ def check_delta(root, executable, base):
             result = json.loads(vet.stdout)
         except json.JSONDecodeError as error:
             raise ValueError(f"{workspace}: invalid cargo-vet JSON") from error
+        require(isinstance(result, dict), f"{workspace}: invalid cargo-vet result")
         missing = result.get("failures", [])
-        require(vet.returncode == 0 or missing, f"{workspace}: cargo-vet failed: {vet.stderr}")
-        previous = debt.get("workspaces", {}).get(workspace, {}).get("missing", [])
-        key = lambda item: (item.get("name"), item.get("version"),
-                            tuple(sorted(item.get("missing_criteria", []))))
-        added = sorted(set(map(key, missing)) - set(map(key, previous)))
+        require((vet.returncode == 0 and result.get("conclusion") == "success" and not missing)
+                or (vet.returncode > 0 and result.get("conclusion") == "fail (vetting)" and missing),
+                f"{workspace}: cargo-vet failed: {vet.stderr}")
+        previous = debt["workspaces"].get(workspace, {})
+        require(isinstance(previous, dict), "Invalid base workspace audit debt")
+        added = sorted(missing_audit_keys(missing) - missing_audit_keys(previous.get("missing", [])))
         require(not added, f"{workspace}: new unaudited dependencies: {added}")
         print(f"{workspace}: no new audit debt", flush=True)
     return 0
