@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256, Sha384};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use super::{
     record::{
@@ -1792,7 +1792,7 @@ fn parse_post_handshake_message(
     if bytes.len() < 4 {
         return Ok(None);
     }
-    let len = ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | bytes[3] as usize;
+    let len = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]) as usize;
     if len > MAX_POST_HANDSHAKE_MESSAGE {
         return Err("post-handshake message length exceeds maximum");
     }
@@ -2113,14 +2113,8 @@ struct RecordCipher {
     suite: TlsCipherSuite,
     // Camouflage AEAD key, scrubbed on drop (see `Tls13Keys`).
     key: Zeroizing<Vec<u8>>,
-    iv: [u8; TLS13_IV_LEN],
+    iv: Zeroizing<[u8; TLS13_IV_LEN]>,
     seq: u64,
-}
-
-impl Drop for RecordCipher {
-    fn drop(&mut self) {
-        self.iv.zeroize();
-    }
 }
 
 impl RecordCipher {
@@ -2128,7 +2122,7 @@ impl RecordCipher {
         Self {
             suite,
             key: Zeroizing::new(vec![0_u8; suite.key_len()]),
-            iv: [0_u8; TLS13_IV_LEN],
+            iv: Zeroizing::new([0_u8; TLS13_IV_LEN]),
             seq: 0,
         }
     }
@@ -2140,7 +2134,7 @@ impl RecordCipher {
         // (the [u8; 12] copy lives on in `self.iv`, which is wiped with the cipher).
         let iv_vec =
             Zeroizing::new(suite.hkdf_expand_label(traffic_secret, "iv", &[], TLS13_IV_LEN)?);
-        let mut iv = [0_u8; TLS13_IV_LEN];
+        let mut iv = Zeroizing::new([0_u8; TLS13_IV_LEN]);
         iv.copy_from_slice(&iv_vec);
         Ok(Self {
             suite,
@@ -2256,7 +2250,7 @@ impl RecordCipher {
     }
 
     fn nonce(&self) -> [u8; TLS13_IV_LEN] {
-        let mut nonce = self.iv;
+        let mut nonce = *self.iv;
         let seq = self.seq.to_be_bytes();
         for (dst, src) in nonce[4..].iter_mut().zip(seq) {
             *dst ^= src;
@@ -3419,6 +3413,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn post_handshake_buffer_accepts_exact_cap_and_rejects_one_extra_byte() {
+        // Two complete tickets, each within the message cap, fill the aggregate cap.
+        let mut messages = post_handshake_ticket(&[], &vec![0; 65_523], &[]);
+        messages.extend_from_slice(&post_handshake_ticket(&[], &vec![0; 16_623], &[]));
+        assert_eq!(messages.len(), POST_HANDSHAKE_BUFFER_LIMIT);
+
+        let mut session = test_session();
+        let (mut stream, _peer) = loopback().await;
+        let mut keys = app_keys();
+        session
+            .pending_post_handshake
+            .extend_from_slice(&messages[..3]);
+        let pending = session.pending_post_handshake.clone();
+        let mut oversized = messages[3..].to_vec();
+        oversized.push(0);
+        assert!(matches!(
+            session
+                .process_post_handshake_record(&mut stream, &mut keys, &oversized)
+                .await,
+            Err(Safari26TlsError::Handshake(ref message))
+                if message == "empty or oversized post-handshake fragment"
+        ));
+        assert_eq!(session.pending_post_handshake, pending);
+
+        session
+            .process_post_handshake_record(&mut stream, &mut keys, &messages[3..])
+            .await
+            .unwrap();
+        session.ensure_post_handshake_boundary().unwrap();
+    }
+
     #[test]
     fn post_handshake_ticket_rejects_malformed_body_and_extensions() {
         let valid = post_handshake_ticket(&[], b"ticket", &[]);
@@ -3709,11 +3735,12 @@ mod tests {
                     );
                 }
             };
-            let (opened, ()) = tokio::join!(
+            let (opened, exchanged) = tokio::join!(
                 session.open_http2_connection(&mut stream, &mut keys),
-                exchange
+                timeout(Duration::from_secs(5), exchange)
             );
             opened.unwrap();
+            exchanged.expect("peer must receive KeyUpdate and SETTINGS acknowledgements");
             session.ensure_post_handshake_boundary().unwrap();
         }
     }
@@ -3743,10 +3770,13 @@ mod tests {
         );
         peer_keys.update_server_application_keys().unwrap();
         let mut response = Vec::new();
-        TlsRecordReader::new(&mut peer)
-            .read_record_into(&mut response)
-            .await
-            .unwrap();
+        timeout(
+            Duration::from_secs(5),
+            TlsRecordReader::new(&mut peer).read_record_into(&mut response),
+        )
+        .await
+        .expect("ready KeyUpdate must receive a response before the opening flight")
+        .unwrap();
         assert_eq!(
             peer_keys
                 .client_application
@@ -3757,10 +3787,13 @@ mod tests {
         );
         peer_keys.update_client_application_keys().unwrap();
         let exchange = async {
-            TlsRecordReader::new(&mut peer)
-                .read_record_into(&mut response)
-                .await
-                .unwrap();
+            timeout(
+                Duration::from_secs(5),
+                TlsRecordReader::new(&mut peer).read_record_into(&mut response),
+            )
+            .await
+            .expect("HTTP/2 opening flight must follow the KeyUpdate response")
+            .unwrap();
             assert!(peer_keys
                 .client_application
                 .decrypt_record(&response)
@@ -3930,6 +3963,9 @@ mod tests {
                 if !close {
                     assert!(matches!(err, Safari26TlsError::Handshake(ref message)
                         if message == "post-handshake drain timed out mid-record"));
+                } else {
+                    assert!(matches!(err, Safari26TlsError::Io(ref err)
+                        if err.kind() == std::io::ErrorKind::UnexpectedEof));
                 }
             }
         }
@@ -4378,6 +4414,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn await_http2_settings_ack_rejects_transport_close_mid_record() {
+        let record = tls_record(TLS_RECORD_APPLICATION_DATA, &[0; 20]);
+        for split in [2, 7] {
+            let mut session = test_session();
+            let (mut stream, mut peer) = loopback().await;
+            let mut keys = app_keys();
+            peer.write_all(&record[..split]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let err = session
+                .await_http2_settings_ack(&mut stream, &mut keys)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Safari26TlsError::Io(ref err)
+                if err.kind() == std::io::ErrorKind::UnexpectedEof));
+        }
+    }
+
+    #[tokio::test]
     async fn await_http2_settings_ack_propagates_non_clean_read_error() {
         let mut session = test_session();
         let (mut stream, mut peer) = loopback().await;
@@ -4649,8 +4703,11 @@ mod tests {
         // The `* 1024` / `* 1024` factors define memory bounds; a `*`->`+` or `*`->`/`
         // mutation would silently shrink them. Pin the exact values.
         assert_eq!(H2_FRAME_BUFFER_LIMIT, 64 * 1024);
+        assert_eq!(MAX_POST_HANDSHAKE_MESSAGE, 65_536);
+        assert_eq!(POST_HANDSHAKE_BUFFER_LIMIT, 82_180);
         assert_eq!(MAX_DECOMPRESSED_CERT_CHAIN, 256 * 1024);
         assert_eq!(MAX_ENCRYPTED_HANDSHAKE_MESSAGE, 512 * 1024);
+        assert_eq!(MAX_SERVER_FLIGHT_DECRYPTED_BYTES, 576 * 1024);
     }
 
     // ---- push_u24 ----
@@ -5501,9 +5558,18 @@ mod tests {
     // ---- RecordCipher ----
 
     #[test]
+    fn record_cipher_keeps_key_and_iv_in_zeroizing_storage() {
+        fn requires_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let cipher = RecordCipher::new(TlsCipherSuite::Aes128GcmSha256, &[5_u8; 32]).unwrap();
+        requires_zeroize_on_drop(&cipher.key);
+        requires_zeroize_on_drop(&cipher.iv);
+    }
+
+    #[test]
     fn record_cipher_nonce_xors_sequence_into_iv() {
         let mut cipher = RecordCipher::zero(TlsCipherSuite::Aes128GcmSha256);
-        cipher.iv = [0xff; TLS13_IV_LEN];
+        *cipher.iv = [0xff; TLS13_IV_LEN];
         cipher.seq = 0x01;
         let nonce = cipher.nonce();
         // The high 4 bytes are never XORed; replacing the whole nonce with
@@ -6434,6 +6500,7 @@ mod tests {
         let (mut client, peer) = loopback().await;
         let mut keys = app_keys();
         drop(peer);
+        client.readable().await.unwrap();
         assert_eq!(
             session
                 .drain_post_handshake(&mut client, &mut keys)
@@ -6441,6 +6508,30 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn clean_close_classification_rejects_other_io_errors() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(is_clean_close(&std::io::Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+            ErrorKind::PermissionDenied,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::Other,
+        ] {
+            assert!(!is_clean_close(&std::io::Error::from(kind)), "{kind:?}");
+        }
     }
 
     #[tokio::test]

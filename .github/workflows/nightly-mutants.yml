@@ -38,9 +38,9 @@ on:
           - protocol
           - transport
       shard_index:
-        description: 'Shard index for this run (0-based; ignored when module=nightly)'
+        description: 'Shard index (0-based); auto rotates nightly or selects 0 for module sweeps'
         type: string
-        default: '0'
+        default: 'auto'
       shard_total:
         # Default 8 keeps each shard well under the 75-min job cap. The nightly is
         # tuned to ~60 mutants/shard; a large module (crypto ~440, protocol ~890,
@@ -63,7 +63,7 @@ permissions:
 # For the scheduled nightly the inputs are empty, so the group collapses back to
 # the per-ref behaviour (re-dispatch supersedes an in-flight nightly).
 concurrency:
-  group: nightly-mutants-${{ github.ref }}-${{ github.event.inputs.module || 'nightly' }}-${{ github.event.inputs.shard_index || '0' }}-${{ github.event.inputs.shard_total || '8' }}
+  group: nightly-mutants-${{ github.ref }}-${{ github.event.inputs.module || 'nightly' }}-${{ github.event.inputs.shard_index || 'auto' }}-${{ github.event.inputs.shard_total || '8' }}
   cancel-in-progress: true
 
 env:
@@ -147,12 +147,19 @@ jobs:
         # below overrides the config's examine_globs (CLI wins).
         env:
           MUT_MODULE: ${{ github.event.inputs.module || 'nightly' }}
-          MUT_SHARD_INDEX: ${{ github.event.inputs.shard_index || '0' }}
+          MUT_SHARD_INDEX: ${{ github.event.inputs.shard_index || 'auto' }}
           MUT_SHARD_TOTAL: ${{ github.event.inputs.shard_total || '8' }}
         run: |
           ulimit -v 12582912   # 12 GiB address-space cap per process
           if [ "$MUT_MODULE" = "nightly" ]; then
-            shard=$(( 10#$(date -u +%j) % 8 ))
+            if [ "$MUT_SHARD_INDEX" = "auto" ]; then
+              shard=$(( 10#$(date -u +%j) % 8 ))
+            elif [[ "$MUT_SHARD_INDEX" =~ ^[0-7]$ ]]; then
+              shard=$MUT_SHARD_INDEX
+            else
+              echo "nightly shard_index must be auto or 0..7" >&2
+              exit 1
+            fi
             echo "MUT_SHARD=$shard" >> "$GITHUB_ENV"
             echo "Testing mutation shard $shard/8 (rotates daily; full surface every 8 days)"
             cargo mutants \
@@ -163,6 +170,9 @@ jobs:
               -f src/tls/safari26.rs \
               -f src/crypto/auth.rs
           else
+            if [ "$MUT_SHARD_INDEX" = "auto" ]; then
+              MUT_SHARD_INDEX=0
+            fi
             echo "MUT_SHARD=${MUT_MODULE}-${MUT_SHARD_INDEX}of${MUT_SHARD_TOTAL}" >> "$GITHUB_ENV"
             echo "Sweeping module src/${MUT_MODULE}/** shard ${MUT_SHARD_INDEX}/${MUT_SHARD_TOTAL}"
             cargo mutants \

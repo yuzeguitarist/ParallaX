@@ -47,12 +47,10 @@ exclude_globs = [
 # Mutating their assertions under the ordinary test runner always reports MISSED.
 exclude_re = ["post_handshake_proofs::"]
 
-# Match the repo-wide `--locked` convention (CI always builds/tests `--locked`):
-# pass it to every Cargo invocation the mutation run makes (build + test).
-additional_cargo_args = ["--locked"]
-
-# Per-mutant TEST SCOPE: run only the fast, hang-free, byte-level oracles that
+# Per-mutant BUILD + TEST SCOPE: run only the fast, hang-free, byte-level oracles that
 # actually assert the ClientHello fingerprint shape and the handshake auth/MAC.
+# Target selection must reach both phases: setting additional_cargo_test_args
+# alone still rebuilds every unrelated integration-test binary for each mutant.
 #
 # WHY this exists: a mutation in these two files makes the live-network /
 # liveness tests (chaos_liveness, prober_loop, no_timeout_ratchet,
@@ -72,7 +70,8 @@ additional_cargo_args = ["--locked"]
 #   gfw_simulator, gfw_sim_provenance  in-memory censor sim over the real CH
 # (Verified: the auth.rs survivors are identical with and without the excluded
 # tests, i.e. they were never the ones killing these mutants.)
-additional_cargo_test_args = [
+additional_cargo_args = [
+    "--locked",
     "--lib",
     "--test=safari_parity_baseline",
     "--test=safari_h2_parity_baseline",

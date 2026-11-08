@@ -6,8 +6,8 @@ name: mutants-report
 #
 # Fires after each nightly-mutants run, downloads that run's mutants-out-shard-N
 # artifact, and rewrites that shard's section of the rolling issue via
-# .github/scripts/mutants_issue.py. Closes the issue when no reported shard has
-# survivors; (re)opens it when any do. Non-gating: failures here never affect a PR.
+# .github/scripts/mutants_issue.py. Closes only after all eight complete shards
+# have no survivors or unresolved timeouts. Non-gating: never affects a PR.
 #
 # workflow_run is the only way for nightly-mutants' GITHUB_TOKEN to start this
 # file. The job allowlists the two triggers nightly-mutants actually has
@@ -86,4 +86,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ART_DIR: ${{ steps.dl.outputs.dir }}
           RUN_HTML: ${{ github.event.workflow_run.html_url }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: python3 .github/scripts/mutants_issue.py
