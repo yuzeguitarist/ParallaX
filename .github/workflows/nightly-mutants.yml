@@ -84,13 +84,10 @@ jobs:
   mutants:
     name: cargo-mutants (indistinguishability/crypto surface)
     runs-on: ubuntu-latest
-    # One rolling shard per night (see the run step): ~60 mutants at ~50s each on
-    # the 4-vCPU runner -- the per-mutant cost is the lib REBUILD (~40s), not the
-    # scoped test (~8s). One-at-a-time (in-place) a shard finishes in ~25-50 min,
-    # so this cap is a backstop. We shard because the full 479-mutant suite needs
-    # ~6h here -- over GitHub's 6h job limit, and what made this job SIGKILL at
-    # timeout-minutes every night before sharding.
-    timeout-minutes: 75
+    # A shard now contains up to 76 mutants. Serialized test processes preserve
+    # the memory bound, but a full TLS shard can exceed the former 75-minute cap.
+    # Leave room for every selected mutation to finish and report its outcome.
+    timeout-minutes: 120
     # NON-GATING: this report must never fail a PR or the nightly schedule.
     continue-on-error: true
     steps:
