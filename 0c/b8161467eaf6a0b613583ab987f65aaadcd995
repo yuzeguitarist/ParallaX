@@ -1,0 +1,33 @@
+.github/scripts/test_dependency_policy.py
+  s_41db5faf9464df::t_51e32ef9895442 11,189-190,192,196,201,203-208,210-278
+.github/workflows/dependency-assurance.yml
+  s_565db6d08f4440::t_abd0a674363071 95-100,112
+.github/workflows/release.yml
+  s_565db6d08f4440::t_bbfdda5268750c 106
+scripts/security/dependencies.py
+  s_41db5faf9464df::t_e5bfd6da256ceb 219-237,244-246,265,267-272
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0cb8161467eaf6a0b613583ab987f65aaadcd995",
+  "prompts": {},
+  "sessions": {
+    "s_41db5faf9464df": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b9db-003c-7df0-860d-852f97ad7d34",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_565db6d08f4440": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b9d8-5d31-7033-8e06-91b2c213599f",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
