@@ -1,0 +1,33 @@
+.cargo/mutants.toml
+  s_90e5a8ee83a441::t_76c27d5352445f 50,52-53,73-74
+.github/scripts/mutants_issue.py
+  s_90e5a8ee83a441::t_145304dc696723 11,18,29,45,49-87,91-92,100-102,112-113,123-126,141-146,172,176-178,184,194-199,204
+.github/scripts/test_mutants_issue.py
+  s_90e5a8ee83a441::t_f631362d93cfd6 18-20,22-23,31,39-68,75-148
+.github/semgrep/tls_drain.rs
+  s_90e5a8ee83a441::t_86b716771358fe 49
+.github/semgrep/tls_drain.yml
+  s_90e5a8ee83a441::t_30cf626a212e56 72
+.github/workflows/mutants-report.yml
+  s_90e5a8ee83a441::t_6b319cc0cfc3b1 9-10,89
+.github/workflows/nightly-mutants.yml
+  s_90e5a8ee83a441::t_6df03220149c4d 41,43,66,150,155-162,173-175
+src/tls/safari26.rs
+  s_90e5a8ee83a441::t_5c408582901071 31,1795,2116,2125,2137,2253,3416-3447,3738,3740,3743,3773-3779,3790-3796,3966-3968,4416-4433,4706-4707,4710,5560-5568,5572,6503,6513-6536
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1533f140756fee3156bdfe7c54d8acefc56e0069",
+  "prompts": {},
+  "sessions": {
+    "s_90e5a8ee83a441": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b9d8-ebd3-70d2-abbe-a87234d648ff",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
