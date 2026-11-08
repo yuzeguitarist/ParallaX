@@ -1,0 +1,19 @@
+.github/workflows/nightly-mutants.yml
+  s_565db6d08f4440::t_100bf935ce4f21 87-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b77f3762cd520af5e7ab787982df11feb6996b9f",
+  "prompts": {},
+  "sessions": {
+    "s_565db6d08f4440": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b9d8-5d31-7033-8e06-91b2c213599f",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
