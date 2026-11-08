@@ -8,6 +8,9 @@
 # cargo-mutants reads its config ONLY from `.cargo/mutants.toml` (repo root is
 # NOT a config location), which is exactly where this file lives — so both the
 # nightly job and a plain local `cargo mutants` consume it.
+# Requires cargo-nextest: synchronous non-advancing mutants must fail as
+# individual test processes rather than hang the entire libtest command.
+test_tool = "nextest"
 #
 # How to read survivors:
 #   - Run locally with:  cargo mutants   (loads this config) — or let the nightly
@@ -72,6 +75,7 @@ exclude_re = ["post_handshake_proofs::"]
 # tests, i.e. they were never the ones killing these mutants.)
 additional_cargo_args = [
     "--locked",
+    "--profile=mutants",
     "--lib",
     "--test=safari_parity_baseline",
     "--test=safari_h2_parity_baseline",

@@ -110,10 +110,10 @@ jobs:
           # Nightly mutation builds are unusual; never write back to the shared cache.
           save-if: false
 
-      - name: Install cargo-mutants
+      - name: Install mutation test tools
         uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
-          tool: cargo-mutants@27.1.0
+          tool: cargo-mutants@27.1.0,cargo-nextest@0.9.151
 
       - name: Run cargo-mutants (scoped, one rolling shard)
         # WHY sharded: on the 4-vCPU runner each mutant costs ~50s (a ~40s lib

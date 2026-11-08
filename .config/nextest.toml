@@ -1,0 +1,6 @@
+# Mutation tests keep the same oracles but isolate each test in its own process.
+# Kill a synchronous infinite-loop mutant before cargo-mutants' outer timeout;
+# nextest reports that individual timeout as a failed test, never as a pass.
+[profile.mutants]
+fail-fast = { max-fail = 1, terminate = "immediate" }
+slow-timeout = { period = "10s", terminate-after = 3, grace-period = "1s", on-timeout = "fail" }
