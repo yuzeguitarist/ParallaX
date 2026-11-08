@@ -1,0 +1,25 @@
+.github/workflows/dependency-assurance.yml
+  s_cea083aeff016a::t_58e815aca5b8a7 86
+.github/workflows/release.yml
+  s_cea083aeff016a::t_dda481e6385218 106
+verification/concurrency/README.md
+  s_cea083aeff016a::t_0f19fdb5c44e67 52
+verification/concurrency/src/scenarios.rs
+  s_cea083aeff016a::t_0b2453072783a5 153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c24a2a48ab51e7a92cc9391f384ed84976bc8e0f",
+  "prompts": {},
+  "sessions": {
+    "s_cea083aeff016a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1b9da-170f-7f53-8408-344f10d6105a",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
