@@ -75,7 +75,6 @@ exclude_re = ["post_handshake_proofs::"]
 # tests, i.e. they were never the ones killing these mutants.)
 additional_cargo_args = [
     "--locked",
-    "--profile=mutants",
     "--lib",
     "--test=safari_parity_baseline",
     "--test=safari_h2_parity_baseline",
@@ -83,6 +82,10 @@ additional_cargo_args = [
     "--test=gfw_simulator",
     "--test=gfw_sim_provenance",
 ]
+
+# This is a nextest runtime profile, not a Cargo build profile. Keep it out of
+# build/check arguments so `cargo mutants --check` still uses the Cargo profile.
+additional_cargo_test_args = ["--profile=mutants"]
 
 # Bound each mutant's test run relative to the baseline so the nightly job stays
 # within its timeout-minutes budget even if a mutant still induces a near-hang.
