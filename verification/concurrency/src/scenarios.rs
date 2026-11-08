@@ -150,7 +150,7 @@ fn budget(limit: usize) -> Arc<ExtraFdBudget> {
     })
 }
 
-/// Successful reservations overlap at the observation point and fit the budget.
+/// Overlapping contenders cannot both reserve more than the available budget.
 pub fn fd_overlapping_reservations(workload_seed: u64) {
     let unit = 1 + (workload_seed % 3) as usize;
     let budget = budget(3 * unit);
