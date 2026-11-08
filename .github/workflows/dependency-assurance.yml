@@ -73,6 +73,32 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  audit-delta:
+    name: reject new cargo-vet audit debt
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+    needs: policy-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.96.0'
+      - name: Install pinned cargo-vet
+        run: cargo install --locked --version 0.10.3 cargo-vet
+      - name: Reject audit debt introduced by this change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            BASE_SHA="$(git rev-parse "refs/remotes/origin/$DEFAULT_BRANCH^{commit}")"
+          fi
+          python3 scripts/security/dependencies.py check-delta --base "$BASE_SHA"
+
   release-smoke:
     name: package smoke ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
