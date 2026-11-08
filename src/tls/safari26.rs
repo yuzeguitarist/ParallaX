@@ -4052,6 +4052,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_post_handshake_buffers_only_negotiated_h2_application_data() {
+        for (content_type, alpn) in [
+            (TLS_RECORD_APPLICATION_DATA, None),
+            (TLS_RECORD_CHANGE_CIPHER_SPEC, Some(b"h2".to_vec())),
+        ] {
+            let mut session = test_session();
+            let (mut stream, mut peer) = loopback().await;
+            let mut keys = app_keys();
+            keys.negotiated_alpn = alpn;
+            let mut peer_keys = app_keys();
+            let record = peer_keys
+                .server_application
+                .encrypt_record(content_type, b"not an HTTP/2 preface")
+                .unwrap();
+            peer.write_all(&record).await.unwrap();
+            drop(peer);
+            stream.readable().await.unwrap();
+            assert_eq!(
+                session
+                    .drain_post_handshake(&mut stream, &mut keys)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(session.pending_http2_plaintext.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn drain_post_handshake_preserves_h2_frame_split_across_phases() {
         assert_early_h2_settings_are_acked(Some(5)).await;
         assert_early_h2_settings_are_acked(Some(12)).await;
