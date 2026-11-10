@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -237,39 +238,45 @@ def missing_audit_keys(entries):
 
 def check_delta(root, executable, base):
     require(base, "Delta check requires --base")
-    snapshot = subprocess.run(["git", "show", f"{base}:supply-chain/audit-debt.json"],
-                              cwd=root, text=True, capture_output=True)
-    require(snapshot.returncode == 0, "Base audit-debt snapshot is missing")
-    debt = json.loads(snapshot.stdout)
-    require(isinstance(debt, dict) and debt.get("schema") == 1
-            and debt.get("not_an_exemption") is True
-            and isinstance(debt.get("workspaces"), dict),
-            "Invalid base audit-debt snapshot")
     tool = [str(executable.resolve()), "vet"] if executable else ["cargo", "vet"]
     environment = {**os.environ, "CARGO": "cargo"}
     version = subprocess.run(tool + ["--version"], cwd=root, env=environment,
                              text=True, capture_output=True, check=True).stdout.strip()
     require(version == "cargo-vet 0.10.3", "Install cargo-vet 0.10.3 with --locked")
-    for workspace, (manifest, store, _, _) in WORKSPACES.items():
-        fetch = subprocess.run(["cargo", "fetch", "--locked", "--manifest-path", manifest],
-                               cwd=root, env=environment, text=True, capture_output=True)
-        require(fetch.returncode == 0, f"{workspace}: cargo fetch failed: {fetch.stderr}")
-        vet = subprocess.run(tool + [
-            "--manifest-path", manifest, "--store-path", store, "--locked", "--frozen",
-            "--no-minimize-exemptions", "--no-registry-suggestions", "--output-format", "json",
-        ], cwd=root, env=environment, text=True, capture_output=True)
+    def failures(checkout):
+        result = {}
+        for workspace, (manifest, store, _, _) in WORKSPACES.items():
+            fetch = subprocess.run(["cargo", "fetch", "--locked", "--manifest-path", manifest],
+                                   cwd=checkout, env=environment, text=True, capture_output=True)
+            require(fetch.returncode == 0, f"{workspace}: cargo fetch failed: {fetch.stderr}")
+            vet = subprocess.run(tool + [
+                "--manifest-path", manifest, "--store-path", store, "--locked", "--frozen",
+                "--no-minimize-exemptions", "--no-registry-suggestions", "--output-format", "json",
+            ], cwd=checkout, env=environment, text=True, capture_output=True)
+            try:
+                output = json.loads(vet.stdout)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{workspace}: invalid cargo-vet JSON") from error
+            require(isinstance(output, dict), f"{workspace}: invalid cargo-vet result")
+            missing = output.get("failures", [])
+            require((vet.returncode == 0 and output.get("conclusion") == "success" and not missing)
+                    or (vet.returncode > 0 and output.get("conclusion") == "fail (vetting)" and missing),
+                    f"{workspace}: cargo-vet failed: {vet.stderr}")
+            result[workspace] = missing_audit_keys(missing)
+        return result
+
+    with tempfile.TemporaryDirectory() as directory:
+        checkout = Path(directory) / "base"
+        subprocess.run(["git", "worktree", "add", "--detach", str(checkout), base],
+                       cwd=root, check=True, capture_output=True)
         try:
-            result = json.loads(vet.stdout)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"{workspace}: invalid cargo-vet JSON") from error
-        require(isinstance(result, dict), f"{workspace}: invalid cargo-vet result")
-        missing = result.get("failures", [])
-        require((vet.returncode == 0 and result.get("conclusion") == "success" and not missing)
-                or (vet.returncode > 0 and result.get("conclusion") == "fail (vetting)" and missing),
-                f"{workspace}: cargo-vet failed: {vet.stderr}")
-        previous = debt["workspaces"].get(workspace, {})
-        require(isinstance(previous, dict), "Invalid base workspace audit debt")
-        added = sorted(missing_audit_keys(missing) - missing_audit_keys(previous.get("missing", [])))
+            previous = failures(checkout)
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(checkout)],
+                           cwd=root, check=True, capture_output=True)
+    current = failures(root)
+    for workspace in WORKSPACES:
+        added = sorted(current[workspace] - previous[workspace])
         require(not added, f"{workspace}: new unaudited dependencies: {added}")
         print(f"{workspace}: no new audit debt", flush=True)
     return 0

@@ -188,13 +188,9 @@ class PolicyTests(unittest.TestCase):
 
     def run_delta(self, previous, missing, conclusion="fail (vetting)", returncode=255,
                   output=None):
-        debt = {"schema": 1, "not_an_exemption": True, "workspaces": {
-            name: {"missing": previous} for name in DEP.WORKSPACES
-        }}
         def run(args, **kwargs):
-            if args[:2] == ["git", "show"]:
-                self.assertEqual(args[2], f"{'a' * 40}:supply-chain/audit-debt.json")
-                return subprocess.CompletedProcess(args, 0, json.dumps(debt), "")
+            if args[:2] == ["git", "worktree"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
             if "--version" in args:
                 return subprocess.CompletedProcess(args, 0, "cargo-vet 0.10.3\n", "")
             if args[:2] == ["cargo", "fetch"]:
@@ -203,9 +199,16 @@ class PolicyTests(unittest.TestCase):
             self.assertIn("--locked", args)
             self.assertIn("--frozen", args)
             self.assertIn("--no-minimize-exemptions", args)
-            result = {"conclusion": conclusion, "failures": missing}
-            return subprocess.CompletedProcess(args, returncode,
-                                               json.dumps(result) if output is None else output, "")
+            base_checkout = Path(kwargs["cwd"]) != self.root
+            failures = previous if base_checkout else missing
+            result = {"conclusion": "fail (vetting)" if failures else "success",
+                      "failures": failures}
+            code = 255 if failures else 0
+            if not base_checkout:
+                result = {"conclusion": conclusion, "failures": missing}
+                code = returncode
+            return subprocess.CompletedProcess(args, code,
+                                               json.dumps(result) if output is None or base_checkout else output, "")
         with patch.object(DEP.subprocess, "run", side_effect=run):
             return DEP.check_delta(self.root, None, "a" * 40)
 
@@ -229,9 +232,10 @@ class PolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "new unaudited dependencies"):
                     self.run_delta(previous, missing)
 
-    def test_delta_uses_trusted_base_ledger(self):
+    def test_delta_ignores_poisoned_debt_ledger(self):
         missing = [{"name": "new-dependency", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
-        # A same-change ledger replacement cannot grandfather the new debt.
+        # The reporting ledger cannot grandfather debt, even if an earlier
+        # accepted change planted a matching entry in the base revision.
         path = self.root / "supply-chain/audit-debt.json"
         path.write_text(json.dumps({"schema": 1, "not_an_exemption": True, "workspaces": {
             name: {"missing": missing} for name in DEP.WORKSPACES
