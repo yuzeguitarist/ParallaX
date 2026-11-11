@@ -93,7 +93,7 @@ class PolicyTests(unittest.TestCase):
     def commit_base(self):
         subprocess.run(["git", "add", "."], cwd=self.root, check=True)
         subprocess.run(["git", "-c", "user.name=Policy Test", "-c", "user.email=test@example.invalid",
-                        "commit", "-qm", "base", "--no-gpg-sign"], cwd=self.root, check=True)
+                        "commit", "--allow-empty", "-qm", "base", "--no-gpg-sign"], cwd=self.root, check=True)
         return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
 
     def test_base_snapshot_cannot_change_with_its_current_digest(self):
@@ -187,14 +187,13 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(all(value["exit_code"] == 255 for value in report["workspaces"].values()))
 
     def run_delta(self, previous, missing, conclusion="fail (vetting)", returncode=255,
-                  output=None):
-        debt = {"schema": 1, "not_an_exemption": True, "workspaces": {
-            name: {"missing": previous} for name in DEP.WORKSPACES
-        }}
+                  output=None, base_error=False):
+        base = self.commit_base()
+        real_run = subprocess.run
+        scanned = []
         def run(args, **kwargs):
-            if args[:2] == ["git", "show"]:
-                self.assertEqual(args[2], f"{'a' * 40}:supply-chain/audit-debt.json")
-                return subprocess.CompletedProcess(args, 0, json.dumps(debt), "")
+            if args[0] == "git":
+                return real_run(args, **kwargs)
             if "--version" in args:
                 return subprocess.CompletedProcess(args, 0, "cargo-vet 0.10.3\n", "")
             if args[:2] == ["cargo", "fetch"]:
@@ -203,11 +202,25 @@ class PolicyTests(unittest.TestCase):
             self.assertIn("--locked", args)
             self.assertIn("--frozen", args)
             self.assertIn("--no-minimize-exemptions", args)
+            is_base = kwargs["cwd"] != self.root
+            scanned.append((is_base, args[args.index("--manifest-path") + 1]))
+            if is_base:
+                if base_error:
+                    return subprocess.CompletedProcess(args, 1, "invalid base result", "")
+                return subprocess.CompletedProcess(args, 255 if previous else 0, json.dumps({
+                    "conclusion": "fail (vetting)" if previous else "success", "failures": previous,
+                }), "")
             result = {"conclusion": conclusion, "failures": missing}
             return subprocess.CompletedProcess(args, returncode,
                                                json.dumps(result) if output is None else output, "")
         with patch.object(DEP.subprocess, "run", side_effect=run):
-            return DEP.check_delta(self.root, None, "a" * 40)
+            result = DEP.check_delta(self.root, None, base)
+        self.assertEqual(scanned, [(is_base, entry[0]) for is_base in (True, False)
+                                   for entry in DEP.WORKSPACES.values()])
+        worktrees = subprocess.check_output(["git", "worktree", "list", "--porcelain"],
+                                           cwd=self.root, text=True)
+        self.assertEqual(worktrees.count("worktree "), 1)
+        return result
 
     def test_delta_allows_existing_or_resolved_debt(self):
         previous = [{"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
@@ -229,15 +242,34 @@ class PolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "new unaudited dependencies"):
                     self.run_delta(previous, missing)
 
-    def test_delta_uses_trusted_base_ledger(self):
+    def test_delta_rejects_ledger_poisoned_in_previous_commit(self):
         missing = [{"name": "new-dependency", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
-        # A same-change ledger replacement cannot grandfather the new debt.
+        # run_delta commits this poisoned ledger BEFORE scanning the base.
         path = self.root / "supply-chain/audit-debt.json"
         path.write_text(json.dumps({"schema": 1, "not_an_exemption": True, "workspaces": {
             name: {"missing": missing} for name in DEP.WORKSPACES
         }}))
         with self.assertRaisesRegex(ValueError, "new unaudited dependencies"):
             self.run_delta([], missing)
+
+    def test_delta_rejects_removed_audit_or_reintroduced_dependency(self):
+        missing = [{"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]
+        # An old inventory can outlive a completed audit or a removed package.
+        # Neither can grandfather a later audit removal or package reintroduction.
+        path = self.root / "supply-chain/audit-debt.json"
+        path.write_text(json.dumps({"schema": 1, "not_an_exemption": True, "workspaces": {
+            name: {"missing": missing} for name in DEP.WORKSPACES
+        }}))
+        self.assertEqual(self.run_delta(missing, [], "success", 0), 0)
+        with self.assertRaisesRegex(ValueError, "new unaudited dependencies"):
+            self.run_delta([], missing)
+
+    def test_delta_fails_closed_on_base_error_and_removes_worktree(self):
+        with self.assertRaisesRegex(ValueError, "invalid cargo-vet JSON"):
+            self.run_delta([], [], base_error=True)
+        worktrees = subprocess.check_output(["git", "worktree", "list", "--porcelain"],
+                                           cwd=self.root, text=True)
+        self.assertEqual(worktrees.count("worktree "), 1)
 
     def test_delta_rejects_cargo_vet_errors_even_with_existing_failures(self):
         previous = [{"name": "existing", "version": "1.0.0", "missing_criteria": ["safe-to-run"]}]

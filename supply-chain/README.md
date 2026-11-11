@@ -4,7 +4,7 @@ This project uses cargo-vet **0.10.3**, exact registry checksums, immutable upst
 
 **合并政策（2026-11-05）：** PR 和 push 必须通过增量 cargo-vet 检查，不得引入新的源码审计缺口。已有审计债务由定期或手动的严格审计如实报告；正式发布仍必须通过全部严格审计。增量基线不授予审计豁免或自动信任。
 
-An initial proposal to grandfather the existing graph with broad exact-version exemptions was rejected by automatic approval review because that would grant audit criteria without source review. The implemented fallback grants no such criteria. `audit-debt.json` inventories missing reviews only; it is never loaded as an authorization or used to turn a cargo-vet failure into success.
+An initial proposal to grandfather the existing graph with broad exact-version exemptions was rejected by automatic approval review because that would grant audit criteria without source review. The implemented fallback grants no such criteria. `audit-debt.json` inventories missing reviews only; it is never loaded as an authorization or used to turn a cargo-vet failure into success. The delta gate runs frozen cargo-vet against both a temporary detached checkout of the exact base commit and the current checkout, and rejects any newly missing package/version/criterion tuple. Stale or poisoned inventory entries cannot grandfather future debt; a base scan error fails the gate.
 
 ## Scope and current debt
 
