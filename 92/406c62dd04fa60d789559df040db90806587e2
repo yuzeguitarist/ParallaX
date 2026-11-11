@@ -1,0 +1,23 @@
+.github/scripts/test_dependency_policy.py
+  s_b906ea2f88d3cf::t_79a07079411a24 96,190-193,195-196,205-212,217-223,245,247-258,263,267-273
+scripts/security/dependencies.py
+  s_b906ea2f88d3cf::t_bc7ba3a871487e 15,239-242,260-287
+supply-chain/README.md
+  s_b906ea2f88d3cf::t_e6b7bce6430ab2 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "92406c62dd04fa60d789559df040db90806587e2",
+  "prompts": {},
+  "sessions": {
+    "s_b906ea2f88d3cf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c858-b396-7ab2-9b8f-315459b8ce86",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
