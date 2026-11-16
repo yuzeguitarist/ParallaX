@@ -1,0 +1,33 @@
+src/crypto/mldsa/packing.rs
+  s_0acd2adb357b18::t_02bcc973ecd2a4 31,33,44,46,79,81,85,87,91,93,123,125,129,131,135,137,152,154,164-165,168,202,204,387,397-398
+src/crypto/mldsa/poly.rs
+  s_0acd2adb357b18::t_e9ae543bce448a 226,233-234,856,859,879,881,958,961,983-984
+src/crypto/mldsa/polyvec.rs
+  s_0acd2adb357b18::t_6291c194f5e835 288-289,606-607
+.github/workflows/e2e-gfw-lab.yml
+  s_33fa5e090d7cd5::t_8ba2e732ab74a1 219-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5696622d1f5d2ac06a6c68ec59b751104cebe226",
+  "prompts": {},
+  "sessions": {
+    "s_0acd2adb357b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99c6c6d0-06d8-4e35-98e1-0e7efa510d42",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_33fa5e090d7cd5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e4c0-8b72-7f81-85ba-7287db6d6e95",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
