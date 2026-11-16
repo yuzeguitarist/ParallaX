@@ -190,6 +190,7 @@ impl TransportParameters {
 
     /// Serialize the server's transport parameters (RFC 9000 §18) in ascending id
     /// order. Includes `initial_max_streams_bidi` (the client's encoder omits it).
+    /// ACK delay parameters are omitted only when they match the RFC defaults.
     pub fn encode_server(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(56);
         put_param(&mut out, TP_INITIAL_MAX_DATA, self.initial_max_data);
@@ -218,6 +219,16 @@ impl TransportParameters {
             TP_INITIAL_MAX_STREAMS_UNI,
             self.initial_max_streams_uni,
         );
+        if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+            put_param(
+                &mut out,
+                TP_ACK_DELAY_EXPONENT,
+                self.ack_delay_exponent as u64,
+            );
+        }
+        if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        }
         put_param(
             &mut out,
             TP_ACTIVE_CONNECTION_ID_LIMIT,
@@ -620,6 +631,40 @@ mod tests {
         );
         assert_eq!(tp.initial_max_streams_uni, 8);
         assert_eq!(tp.initial_src_cid, scid, "server SCID echoed in 0x0f");
+    }
+
+    #[test]
+    fn server_encoding_roundtrips_fuzz_issue_231() {
+        // Minimized input from #231 (base64: CwJ0Ww==): max_ack_delay = 13403 ms.
+        let tp = TransportParameters::read(&[0x0b, 0x02, 0x74, 0x5b]).unwrap();
+        assert_eq!(tp.max_ack_delay_ms, 13_403);
+        assert_eq!(TransportParameters::read(&tp.encode_server()).unwrap(), tp);
+    }
+
+    #[test]
+    fn server_encoding_preserves_ack_parameters() {
+        for exponent in [0, DEFAULT_ACK_DELAY_EXPONENT, 20] {
+            for max_delay in [0, DEFAULT_MAX_ACK_DELAY_MS, 63, 64, (1 << 14) - 1] {
+                let mut tp = TransportParameters::server(&[0xab, 0xcd]);
+                tp.ack_delay_exponent = exponent;
+                tp.max_ack_delay_ms = max_delay;
+                let encoded = tp.encode_server();
+                assert_eq!(TransportParameters::read(&encoded).unwrap(), tp);
+                let ids: Vec<u64> = decode_pairs(&encoded)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                assert_eq!(
+                    ids.contains(&TP_ACK_DELAY_EXPONENT),
+                    exponent != DEFAULT_ACK_DELAY_EXPONENT
+                );
+                assert_eq!(
+                    ids.contains(&TP_MAX_ACK_DELAY),
+                    max_delay != DEFAULT_MAX_ACK_DELAY_MS
+                );
+                assert!(ids.windows(2).all(|ids| ids[0] < ids[1]));
+            }
+        }
     }
 
     #[test]
