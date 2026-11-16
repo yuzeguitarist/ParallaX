@@ -248,6 +248,11 @@ const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_
 /// two ends must share a unit), and the forward's final read is capped at the
 /// remaining budget so this end can never overshoot what the client tolerates.
 const PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
+/// Keep room inside the shared ceiling to finish one origin record at cutover.
+const PRE_PQ_ORIGIN_RECORD_RESERVE: usize =
+    TLS_HEADER_LEN + crate::tls::record::MAX_TLS_RECORD_PAYLOAD + 256;
+const PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT: usize =
+    PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT - PRE_PQ_ORIGIN_RECORD_RESERVE;
 /// Ceiling on download frames one mux connection may hold queued toward the
 /// client, summed over its substreams: each substream gets an equal share (see
 /// [`server_mux_downlink`]), so the per-connection memory bound is the one the
@@ -2537,6 +2542,54 @@ where
         .map_err(HandshakeServerError::Io)
 }
 
+/// Tracks framing without buffering or re-segmenting the origin byte pump.
+#[derive(Default)]
+struct PrePqOriginBoundary {
+    header: [u8; TLS_HEADER_LEN],
+    header_pos: usize,
+    payload_remaining: usize,
+}
+
+impl PrePqOriginBoundary {
+    fn pending_bytes(&self) -> usize {
+        if self.payload_remaining > 0 {
+            self.payload_remaining
+        } else if self.header_pos > 0 {
+            TLS_HEADER_LEN - self.header_pos
+        } else {
+            0
+        }
+    }
+
+    fn advance(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            if self.payload_remaining > 0 {
+                let consumed = self.payload_remaining.min(bytes.len());
+                self.payload_remaining -= consumed;
+                bytes = &bytes[consumed..];
+                if self.payload_remaining == 0 {
+                    self.header_pos = 0;
+                }
+            } else {
+                let consumed = (TLS_HEADER_LEN - self.header_pos).min(bytes.len());
+                self.header[self.header_pos..self.header_pos + consumed]
+                    .copy_from_slice(&bytes[..consumed]);
+                self.header_pos += consumed;
+                bytes = &bytes[consumed..];
+                if self.header_pos == TLS_HEADER_LEN {
+                    self.payload_remaining = parse_header(&self.header)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                        .payload_len;
+                    if self.payload_remaining == 0 {
+                        self.header_pos = 0;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_authenticated_data_mode(
     mut handshake: AuthenticatedHandshake,
@@ -2593,6 +2646,7 @@ async fn run_authenticated_data_mode(
     let mut client_camouflage_records_before_pq = 0usize;
     let mut client_camouflage_bytes_before_pq = 0usize;
     let mut fallback_bytes_before_pq = 0usize;
+    let mut origin_boundary = PrePqOriginBoundary::default();
     // The camouflage origin can finish its side (TLS `close_notify` + FIN) before
     // the authenticated client's PX1Q reaches us — a real origin closes a
     // completed HTTP/2 GET whenever it likes, and on a high-RTT link the client's
@@ -2756,6 +2810,38 @@ async fn run_authenticated_data_mode(
                                 &mut fallback_write,
                             )
                             .await;
+                            return Ok(());
+                        }
+                        // PX1K is a new TLS record: first finish only the record
+                        // whose prefix the raw origin pump already forwarded.
+                        // The reserved headroom keeps this inside the unchanged
+                        // client/server camouflage byte ceiling.
+                        let finish_origin_record = async {
+                            while origin_boundary.pending_bytes() > 0 {
+                                let needed = origin_boundary.pending_bytes();
+                                if needed > PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT.saturating_sub(fallback_bytes_before_pq) {
+                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                        "camouflage byte budget exhausted inside origin record"));
+                                }
+                                let n = timeout_at(pre_pq_deadline,
+                                    fallback_records.get_mut().read(&mut fallback_relay_buf[..needed]))
+                                    .await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
+                                        "pre-PQ origin record completion timed out"))??;
+                                if n == 0 {
+                                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                                        "origin closed inside a camouflage record"));
+                                }
+                                origin_boundary.advance(&fallback_relay_buf[..n])?;
+                                timeout_at(pre_pq_deadline, client_write.write_all(&fallback_relay_buf[..n]))
+                                    .await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
+                                        "pre-PQ origin record forward timed out"))??;
+                                fallback_bytes_before_pq += n;
+                            }
+                            Ok::<(), io::Error>(())
+                        }.await;
+                        if let Err(err) = finish_origin_record {
+                            tracing::debug!(cid, error = %err, "incomplete origin record at PQ cutover; graceful teardown");
+                            graceful_close_pre_pq(client_records, client_write, fallback_records, fallback_write).await;
                             return Ok(());
                         }
                         let server_ephemeral = X25519KeyPair::generate();
@@ -3508,15 +3594,15 @@ async fn run_authenticated_data_mode(
             // any already-buffered bytes first, so nothing the record path left
             // behind is lost (we never read records off this half again in pre-PQ).
             // The cap is byte-oriented to match (see PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT),
-            // and each read is capped at the remaining budget so the forward can never
-            // overshoot the client's equal residual byte budget mid-read.
+            // leaving one maximum-record reserve inside the shared ceiling so a
+            // record already started can finish before PX1K replaces the origin.
             read = fallback_records.get_mut().read({
-                let remaining = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
+                let remaining = PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT
                     .saturating_sub(fallback_bytes_before_pq)
                     .min(fallback_relay_buf.len());
                 &mut fallback_relay_buf[..remaining]
             }),
-                if fallback_open && fallback_bytes_before_pq < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT => {
+                if fallback_open && fallback_bytes_before_pq < PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT => {
                 let n = match read {
                     // Origin half-closed (FIN) or reset before PX1Q arrived. This is
                     // expected camouflage debris, not a failure: a real origin closes
@@ -3559,8 +3645,8 @@ async fn run_authenticated_data_mode(
                         forwarded_bytes = n,
                         "forwarding fallback camouflage bytes before ParallaX PQ rekey"
                     );
-                } else if before < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
-                    && fallback_bytes_before_pq >= PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
+                } else if before < PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT
+                    && fallback_bytes_before_pq >= PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT
                 {
                     tracing::warn!(
                         cid,
@@ -3569,6 +3655,7 @@ async fn run_authenticated_data_mode(
                         fallback_bytes_before_pq,
                         client_residual_byte_budget = CLIENT_RESIDUAL_CAMOUFLAGE_BYTE_BUDGET,
                         pre_pq_forward_byte_limit = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT,
+                        stream_pause_byte_limit = PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT,
                         "pre-PQ fallback camouflage forward byte limit reached; pausing fallback \
                          reads until ParallaX PQ rekey"
                     );
@@ -3576,7 +3663,13 @@ async fn run_authenticated_data_mode(
                 match timeout_at(pre_pq_deadline, client_write.write_all(&fallback_relay_buf[..n]))
                     .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        if let Err(err) = origin_boundary.advance(&fallback_relay_buf[..n]) {
+                            tracing::debug!(cid, error = %err, "invalid origin record before PQ cutover; graceful teardown");
+                            graceful_close_pre_pq(client_records, client_write, fallback_records, fallback_write).await;
+                            return Ok(());
+                        }
+                    }
                     Ok(Err(err)) if is_write_peer_close(&err) => {
                         // The client closed; the fallback origin is still live, so
                         // drain->FIN both halves instead of a bare drop (RST tell),
@@ -9270,6 +9363,240 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_pq_cutover_finishes_fragmented_origin_record_before_px1k() {
+        for (prefix_len, payload_len, truncate) in [
+            (2, 64, false),
+            (TLS_HEADER_LEN + 7, 64, false),
+            (TLS_HEADER_LEN + 64, 64, false),
+            (
+                PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT,
+                crate::tls::record::MAX_TLS_RECORD_PAYLOAD + 256,
+                false,
+            ),
+            (TLS_HEADER_LEN + 7, 64, true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (client, _) = listener.accept().await.unwrap();
+            let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fallback = TcpStream::connect(origin_listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            let cache = Arc::new(Mutex::new(ReplayCache::new(8)));
+            let admissions = Arc::new(Semaphore::new(1));
+            let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
+            let entry = ReplayEntry {
+                timestamp: current_unix_timestamp().unwrap(),
+                nonce: [17; 8],
+                transcript_fingerprint: [18; 32],
+            };
+            let keys = expand_epoch_keys([3; 32], 0, [4; 32], [5; 32]).unwrap();
+            let traffic = TrafficConfig::default();
+            let mut data_session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+            let identity_keys = identity::keypair();
+            let identity_secret = Arc::new(crate::process_hardening::MaskedSecret::new(
+                &identity_keys.secret,
+            ));
+            let handshake = AuthenticatedHandshake {
+                client,
+                fallback,
+                client_hello: AuthenticatedHello {
+                    sni: "example.com".into(),
+                    x25519_key_share: [2; 32],
+                    timestamp: entry.timestamp,
+                    nonce: entry.nonce,
+                    transcript_fingerprint: entry.transcript_fingerprint,
+                },
+                server_hello: ServerHello {
+                    record_len: 0,
+                    random: [0; 32],
+                    session_id_range: 0..0,
+                    tls13_selected: true,
+                },
+                session_keys: keys,
+                server_public_key: [6; 32],
+            };
+            let pending = PendingReplayEntry {
+                cache: Arc::clone(&cache),
+                entry: entry.clone(),
+                source: None,
+                reserved: false,
+                admission: Some(Arc::clone(&admission)),
+            };
+            let relay = tokio::spawn(async move {
+                run_authenticated_data_mode(
+                    handshake,
+                    None,
+                    &[],
+                    identity_secret,
+                    PSK,
+                    traffic,
+                    &UdpConfig::default(),
+                    Some(pending),
+                    1,
+                    Some(admission),
+                )
+                .await
+            });
+
+            let mut camouflage_record = vec![0x17, 3, 3];
+            camouflage_record.extend_from_slice(&(payload_len as u16).to_be_bytes());
+            camouflage_record.resize(TLS_HEADER_LEN + payload_len, 0xa5);
+            let camouflage = camouflage_record.repeat(if prefix_len > camouflage_record.len() {
+                64
+            } else {
+                1
+            });
+            let offset = prefix_len % camouflage_record.len();
+            let tail_len = if offset == 0 {
+                0
+            } else {
+                camouflage_record.len() - offset
+            };
+            let boundary = prefix_len + tail_len;
+            assert!(boundary <= PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT);
+            let mut forwarded = vec![0; prefix_len];
+            let (sent, received) = timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    origin.write_all(&camouflage[..prefix_len]),
+                    peer.read_exact(&mut forwarded)
+                )
+            })
+            .await
+            .unwrap();
+            sent.unwrap();
+            received.unwrap();
+            assert_eq!(forwarded, camouflage[..prefix_len]);
+
+            let (pq_record, pending_rekey) = data_session
+                .build_pq_rekey_record(&mut StdRng::seed_from_u64(91))
+                .unwrap();
+            peer.write_all(&pq_record).await.unwrap();
+            // Replay commit proves the server consumed the complete data proof.
+            // The origin remainder stays unavailable until then, making the cutover
+            // occur inside an already-forwarded TLS record without scheduler races.
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let committed = {
+                        let mut cache = cache.lock().unwrap();
+                        let unseen = cache.reserve_pending(&entry, entry.timestamp);
+                        if unseen {
+                            cache.release_pending(&entry.transcript_fingerprint);
+                        }
+                        !unseen
+                    };
+                    if committed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("server did not consume the valid PX1Q proof");
+            if truncate {
+                origin.shutdown().await.unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    timeout(Duration::from_secs(5), peer.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0,
+                    "truncated origin record must close gracefully without emitting PX1K"
+                );
+                peer.shutdown().await.unwrap();
+                timeout(Duration::from_secs(5), relay)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(admissions.available_permits(), 1);
+                continue;
+            }
+            origin.write_all(&camouflage[prefix_len..]).await.unwrap();
+            let mut remainder = vec![0; tail_len];
+            timeout(Duration::from_secs(5), peer.read_exact(&mut remainder))
+                .await
+                .unwrap()
+                .unwrap();
+            if remainder != camouflage[prefix_len..boundary] {
+                relay.abort();
+                let _ = relay.await;
+                assert_eq!(
+                    remainder,
+                    camouflage[prefix_len..boundary],
+                    "PX1K must not replace the unfinished origin TLS record's payload"
+                );
+                return;
+            }
+            let first_record = timeout(Duration::from_secs(5), read_record(&mut peer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                first_record, camouflage_record,
+                "cutover must not forward the next origin record"
+            );
+            {
+                let mut records = std::io::Cursor::new(first_record).chain(&mut peer);
+                timeout(
+                    Duration::from_secs(5),
+                    crate::client::runtime::apply_server_key_exchange_after_residuals(
+                        &mut records,
+                        &mut data_session,
+                        &pending_rekey,
+                        PSK,
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            let mut proof = Vec::new();
+            loop {
+                let record = timeout(Duration::from_secs(5), read_record(&mut peer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let chunk = data_session.open_server_identity_chunk(&record).unwrap();
+                assert_eq!(chunk.offset as usize, proof.len());
+                proof.extend_from_slice(&chunk.bytes);
+                if proof.len() == chunk.total_len as usize {
+                    break;
+                }
+            }
+            data_session
+                .verify_server_identity_payload(&proof, &identity_keys.public, &[6; 32])
+                .unwrap();
+            origin.shutdown().await.unwrap();
+            drop(origin);
+            relay.abort();
+            let _ = relay.await;
+            timeout(Duration::from_secs(5), async {
+                while admissions.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("origin cleanup must release authenticated admission");
+        }
+    }
+
+    #[test]
+    fn pre_pq_origin_boundary_rejects_oversized_tail_header() {
+        let mut boundary = PrePqOriginBoundary::default();
+        boundary.advance(&[0x17, 3]).unwrap();
+        assert_eq!(boundary.pending_bytes(), 3);
+        assert_eq!(
+            boundary.advance(&[3, 0xff, 0xff]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]

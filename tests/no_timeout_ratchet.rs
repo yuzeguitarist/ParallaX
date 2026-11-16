@@ -323,8 +323,8 @@ fn combined_inbound_read_census_is_pinned() {
         server.iter().filter(|s| s.timed).count() + runtime.iter().filter(|s| s.timed).count();
     let untimed = total - timed;
 
-    // Total inbound-read call sites across both production files today: 27
-    // (server) + 13 (runtime) = 40. This catches a *removed* read site too,
+    // Total inbound-read call sites across both production files today: 28
+    // (server) + 13 (runtime) = 41. This catches a *removed* read site too,
     // which would otherwise slip past the per-file untimed-only assertions.
     // (+2 server vs the mux-over-QUIC baseline of 28: the speed QUIC-run request
     // read and the speed QUIC-run TCP DONE read — both TIMED. +5 for the
@@ -345,11 +345,14 @@ fn combined_inbound_read_census_is_pinned() {
     // (+1 server vs 39: the old timed first-record collector read is replaced by
     // client/origin select reads. Their shared absolute deadline is pinned by
     // `first_record_inspection_deadline_is_pinned`, independent of WINDOW.)
-    const EXPECTED_TOTAL_SITES: usize = 40;
-    // Timed sites: 13 (server) + 3 (runtime) = 16. The three existing TCP mux
+    // (+1 server vs 40: completing an already-started origin record before PQ
+    // cutover reads under the existing absolute pre-PQ deadline. The untimed
+    // baselines remain unchanged.)
+    const EXPECTED_TOTAL_SITES: usize = 41;
+    // Timed sites: 14 (server) + 3 (runtime) = 17. The three existing TCP mux
     // reads moved from per-read timeouts to shared idle watchdogs, not new reads;
     // `mux_structural_idle_bounds_are_pinned` guards their enclosing boundaries.
-    const EXPECTED_TIMED_SITES: usize = 16;
+    const EXPECTED_TIMED_SITES: usize = 17;
 
     assert_eq!(
         total, EXPECTED_TOTAL_SITES,
