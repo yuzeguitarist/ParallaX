@@ -284,13 +284,27 @@ rules:
   - id: parallax-peer-ack-fixed-local-wire-contract
     languages: [rust]
     severity: ERROR
-    message: Reading peer ACK parameters must not change the existing local Safari/server advertised default ACK contract.
-    patterns:
-      - pattern-either:
+    message: Omit Safari ACK parameters and emit server ACK parameters only under their matching non-default guards.
+    pattern-either:
+      - patterns:
           - pattern-inside: 'fn encode_safari_client_from(...) { ... }'
+          - pattern-either:
+              - pattern: 'put_param($OUT, TP_ACK_DELAY_EXPONENT, ...)'
+              - pattern: 'put_param($OUT, TP_MAX_ACK_DELAY, ...)'
+              - pattern: 'put_param($OUT, 0x0a, ...)'
+              - pattern: 'put_param($OUT, 0x0b, ...)'
+      - patterns:
           - pattern-inside: 'fn encode_server(...) { ... }'
-      - pattern-either:
-          - pattern: 'put_param($OUT, TP_ACK_DELAY_EXPONENT, ...)'
-          - pattern: 'put_param($OUT, TP_MAX_ACK_DELAY, ...)'
-          - pattern: 'put_param($OUT, 0x0a, ...)'
-          - pattern: 'put_param($OUT, 0x0b, ...)'
+          - pattern-either:
+              - pattern: 'put_param($OUT, TP_ACK_DELAY_EXPONENT, ...)'
+              - pattern: 'put_param($OUT, TP_MAX_ACK_DELAY, ...)'
+              - pattern: 'put_param($OUT, 0x0a, ...)'
+              - pattern: 'put_param($OUT, 0x0b, ...)'
+          - pattern-not-inside: |
+              if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+                put_param($OUT, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
+              }
+          - pattern-not-inside: |
+              if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+                put_param($OUT, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+              }

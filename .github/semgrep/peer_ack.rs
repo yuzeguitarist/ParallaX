@@ -254,3 +254,54 @@ fn encode_server(&self) {
     // ruleid: parallax-peer-ack-fixed-local-wire-contract
     put_param(&mut out, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
 }
+mod server_ack_parameters {
+    fn encode_server(&self) {
+        if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+            // ok: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
+        }
+        if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+            // ok: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        }
+        // A valid guarded call must not excuse another, unguarded call.
+        // ruleid: parallax-peer-ack-fixed-local-wire-contract
+        put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        if self.ack_delay_exponent == DEFAULT_ACK_DELAY_EXPONENT {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
+        }
+        if self.max_ack_delay_ms == DEFAULT_MAX_ACK_DELAY_MS {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        }
+        if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
+        }
+        if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        }
+        if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_ACK_DELAY_EXPONENT, self.max_ack_delay_ms);
+        }
+        if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.ack_delay_exponent as u64);
+        }
+    }
+}
+mod safari_ack_parameters {
+    fn encode_safari_client_from(&self, start: usize) {
+        if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
+        }
+        if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        }
+    }
+}
