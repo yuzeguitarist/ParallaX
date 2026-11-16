@@ -1489,6 +1489,7 @@ impl Connection {
     /// the peer reset before sending a byte (a cancelled HTTP/3 request stream,
     /// which Safari opens and cancels ahead of its real request) carries nothing to
     /// serve, so it is skipped rather than handed to the application.
+    #[cfg(test)]
     pub fn accept_bi(&mut self) -> Option<u64> {
         self.accept_bi_with_progress().0
     }
