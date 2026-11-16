@@ -79,10 +79,23 @@ class MutantsIssueTests(unittest.TestCase):
         with patch.object(report, "SHA", "0123456789abcdef"), patch.object(report, "RUN_ID", 123), patch.object(report, "RUN_ATTEMPT", 2):
             entry = self.read_artifact([{"name": name} for name in names], self.artifact(names, summaries))
         self.assertEqual(entry["missed"], ["survivor"])
+        self.assertEqual(entry["timed_out"], ["timed out"])
         self.assertEqual([entry[k] for k in ("caught", "missed_total", "unviable", "timeout")], [1, 1, 1, 1])
         self.assertTrue(entry["complete"])
         self.assertEqual(entry["sha"], "0123456789abcdef")
         self.assertEqual((entry["run_id"], entry["run_attempt"]), (123, 2))
+
+    def test_full_result_is_available_to_autofix_while_issue_storage_is_capped(self):
+        names = tuple(f"survivor {i}" for i in range(report.PER_SHARD_CAP + 1))
+        entry = self.read_artifact([{"name": name} for name in names],
+                                   self.artifact(names, ("MissedMutant",) * len(names)))
+        self.assertEqual(entry["missed"], list(names))
+        body, _ = self.run_report({}, entry)
+        stored = json.loads(report.STATE_RE.search(body).group(1))["0"]
+        self.assertEqual(stored["missed"], list(names[:report.PER_SHARD_CAP]))
+        self.assertEqual(stored["missed_total"], len(names))
+        self.assertIn("... and 1 more (see the run artifact)", body)
+        self.assertEqual(entry["missed"], list(names))
 
     def test_partial_empty_failed_or_inconsistent_artifacts_cannot_replace_state(self):
         selected = [{"name": "first"}]
@@ -113,7 +126,8 @@ class MutantsIssueTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.read_artifact(expected, outcomes)
         with patch.object(report, "ART", "mutants-out-shard-0"), patch.object(report, "read_result", side_effect=FileNotFoundError), patch.object(report, "gh") as gh:
-            report.main()
+            with self.assertRaisesRegex(RuntimeError, "unverified shard artifact"):
+                report.main()
             gh.assert_not_called()
 
     def test_closure_requires_all_eight_complete_shards_at_one_nonempty_commit(self):
@@ -151,6 +165,16 @@ class MutantsIssueTests(unittest.TestCase):
     def test_already_closed_clean_issue_does_not_receive_daily_closure_comment(self):
         _, calls = self.run_report({str(i): self.entry() for i in range(8)}, self.entry(), issue_state="CLOSED")
         self.assertFalse(any(call[:2] == ("issue", "close") for call in calls))
+
+    def test_timeout_identity_change_reopens_but_same_timeout_does_not(self):
+        previous = self.entry(timeout=1, timed_out=["first timeout"])
+        for name in ("first timeout", "different timeout"):
+            with self.subTest(name=name):
+                incoming = self.entry(timeout=1, timed_out=[name])
+                body, calls = self.run_report({"0": previous}, incoming, issue_state="CLOSED")
+                self.assertEqual(any(call[:2] == ("issue", "reopen") for call in calls),
+                                 name != "first timeout")
+                self.assertIn("unresolved timeouts: 1", body)
 
     def test_unchanged_survivor_on_newer_run_does_not_reopen_closed_issue(self):
         previous = self.entry(run_id=123, missed=["survivor"], missed_total=1)

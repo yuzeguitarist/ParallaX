@@ -78,6 +78,7 @@ def read_result():
     if sum(counts.values()) != len(expected) or any(result[k] != n for k, n in counts.items()):
         raise ValueError("mutant outcome summaries are inconsistent")
     missed = [o["scenario"]["Mutant"]["name"] for o in mutants if o["summary"] == "MissedMutant"]
+    timed_out = [o["scenario"]["Mutant"]["name"] for o in mutants if o["summary"] == "Timeout"]
     return {
         "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%MZ"),
         "run": RUN,
@@ -85,8 +86,9 @@ def read_result():
         "run_id": RUN_ID,
         "run_attempt": RUN_ATTEMPT,
         "complete": True,
-        "missed": missed[:PER_SHARD_CAP],
+        "missed": missed,
         "missed_total": counts.pop("missed"),
+        "timed_out": timed_out,
         **counts,
     }
 
@@ -145,8 +147,7 @@ def main():
     try:
         entry = read_result()
     except (OSError, ValueError, KeyError, TypeError) as error:
-        print(f"unverified shard artifact ({error}); preserving the previous report")
-        return
+        raise RuntimeError(f"unverified shard artifact ({error}); preserving the previous report") from error
     missed = entry["missed"]
 
     res = gh("issue", "list", "--repo", REPO, "--state", "all", "--label", LABEL,
@@ -181,9 +182,12 @@ def main():
     # before we overwrite state[shard] with tonight's entry.
     prev_missed = set(previous.get("missed", []))
     new_survivors = [x for x in missed if x not in prev_missed]
-    new_timeouts = max(0, entry["timeout"] - previous.get("timeout", 0))
+    if "timed_out" in previous:
+        new_timeouts = len(set(entry.get("timed_out", [])) - set(previous["timed_out"]))
+    else:
+        new_timeouts = max(0, entry["timeout"] - previous.get("timeout", 0))
 
-    state[str(shard)] = entry
+    state[str(shard)] = {**entry, "missed": missed[:PER_SHARD_CAP]}
     total = sum(v.get("missed_total", len(v.get("missed", []))) for v in state.values())
     timeouts = sum(v["timeout"] for v in state.values())
     clean = (len(state) == NSHARDS and total == 0 and timeouts == 0 and
