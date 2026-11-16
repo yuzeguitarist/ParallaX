@@ -1,0 +1,33 @@
+.github/scripts/check_tls_drain.py
+  s_33fa5e090d7cd5::t_d52fa59fb029fe 2,81-88,163-164,166-189,220
+.github/semgrep/tls_drain.rs
+  s_7cfc41dac628c8::t_7865027156df33 13,40,144-149,153-246,276
+.github/semgrep/tls_drain.yml
+  s_7cfc41dac628c8::t_a7cbdef6344480 5,14,33,194-199,224,235,240-305
+src/transport/udp/quic/conn.rs
+  s_33fa5e090d7cd5::t_dc10d637da17f6 489-503
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "25894778cb3d4ae1f506c405d7c987acc5e01757",
+  "prompts": {},
+  "sessions": {
+    "s_33fa5e090d7cd5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e4c0-8b72-7f81-85ba-7287db6d6e95",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_7cfc41dac628c8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e4c1-ea65-7b22-bcf9-639731ef23cc",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
