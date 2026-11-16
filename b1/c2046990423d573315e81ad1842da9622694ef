@@ -1,0 +1,29 @@
+.github/semgrep/mux_receipt_canonical.rs
+  s_7cfc41dac628c8::t_ded9c2397213c4 150-162
+.github/semgrep/peer_ack_observe.yml
+  s_8e7bb23c3b37d3::t_aeb048db0021eb 385-386
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b1c2046990423d573315e81ad1842da9622694ef",
+  "prompts": {},
+  "sessions": {
+    "s_7cfc41dac628c8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e4c1-ea65-7b22-bcf9-639731ef23cc",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_8e7bb23c3b37d3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e4c1-966e-7362-bbd5-00255f0b6b1a",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
