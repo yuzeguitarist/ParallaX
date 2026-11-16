@@ -291,6 +291,20 @@ mod server_ack_parameters {
             // ruleid: parallax-peer-ack-fixed-local-wire-contract
             put_param(&mut out, TP_MAX_ACK_DELAY, self.ack_delay_exponent as u64);
         }
+        if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+            // ok: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
+        } else {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
+        }
+        if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+            // ok: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        } else {
+            // ruleid: parallax-peer-ack-fixed-local-wire-contract
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        }
     }
 }
 mod safari_ack_parameters {

@@ -300,11 +300,24 @@ rules:
               - pattern: 'put_param($OUT, TP_MAX_ACK_DELAY, ...)'
               - pattern: 'put_param($OUT, 0x0a, ...)'
               - pattern: 'put_param($OUT, 0x0b, ...)'
-          - pattern-not-inside: |
-              if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
-                put_param($OUT, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64);
-              }
-          - pattern-not-inside: |
-              if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
-                put_param($OUT, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
-              }
+          # Exclude only the guarded call's span, never the whole if/else.
+          - pattern-not:
+              patterns:
+                - pattern: |
+                    if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+                      $CALL;
+                    }
+                - metavariable-pattern:
+                    metavariable: $CALL
+                    pattern: 'put_param($OUT, TP_ACK_DELAY_EXPONENT, self.ack_delay_exponent as u64)'
+                - focus-metavariable: $CALL
+          - pattern-not:
+              patterns:
+                - pattern: |
+                    if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+                      $CALL;
+                    }
+                - metavariable-pattern:
+                    metavariable: $CALL
+                    pattern: 'put_param($OUT, TP_MAX_ACK_DELAY, self.max_ack_delay_ms)'
+                - focus-metavariable: $CALL
