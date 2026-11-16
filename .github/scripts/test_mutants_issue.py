@@ -192,6 +192,16 @@ class MutantsIssueTests(unittest.TestCase):
                 self.assertIsNone(body)
                 self.assertEqual([call[:2] for call in calls], [("issue", "list")])
 
+    def test_unchanged_survivors_beyond_storage_cap_do_not_reopen(self):
+        missed = [f"survivor {i}" for i in range(report.PER_SHARD_CAP + 1)]
+        previous = self.entry(run_id=123, missed=missed, missed_total=len(missed))
+        body, _ = self.run_report({}, previous)
+        stored = json.loads(report.STATE_RE.search(body).group(1))
+        incoming = {**previous, "run_id": 124}
+        body, calls = self.run_report(stored, incoming, issue_state="CLOSED")
+        self.assertIsNotNone(body)
+        self.assertFalse(any(call[:2] == ("issue", "reopen") for call in calls))
+
     def test_newer_run_or_attempt_and_legacy_replacement_can_update(self):
         for previous, incoming in ((self.entry(run_id=123, run_attempt=2), self.entry(run_id=123, run_attempt=3)),
                                    (self.entry(run_id=123, run_attempt=9), self.entry(run_id=124)),

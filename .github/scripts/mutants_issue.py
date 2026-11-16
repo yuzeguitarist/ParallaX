@@ -148,7 +148,7 @@ def main():
         entry = read_result()
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise RuntimeError(f"unverified shard artifact ({error}); preserving the previous report") from error
-    missed = entry["missed"]
+    missed = entry["missed"][:PER_SHARD_CAP]
 
     res = gh("issue", "list", "--repo", REPO, "--state", "all", "--label", LABEL,
              "--json", "number,title,state,body", "--limit", "30")
@@ -187,7 +187,7 @@ def main():
     else:
         new_timeouts = max(0, entry["timeout"] - previous.get("timeout", 0))
 
-    state[str(shard)] = {**entry, "missed": missed[:PER_SHARD_CAP]}
+    state[str(shard)] = {**entry, "missed": missed}
     total = sum(v.get("missed_total", len(v.get("missed", []))) for v in state.values())
     timeouts = sum(v["timeout"] for v in state.values())
     clean = (len(state) == NSHARDS and total == 0 and timeouts == 0 and
