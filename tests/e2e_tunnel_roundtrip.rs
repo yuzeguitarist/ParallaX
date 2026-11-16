@@ -189,10 +189,10 @@ fn install_trust_root(ca_cert_pem: &str) -> tempfile::NamedTempFile {
 /// to this origin for the camouflage TLS handshake, and the client verifies this
 /// origin's certificate against `SNI` using the trust root installed above.
 ///
-/// A slow first client byte permits one speculative origin TCP connection which
-/// the authenticated path closes without sending TLS bytes. Accept at most that
-/// empty spare and one real TLS connection. An EOF after a TLS byte must fail
-/// until the handshake completes.
+/// A slow first client byte opens one speculative origin TCP connection, which
+/// the authenticated path reuses for TLS. Accept at most two connections so a
+/// regression that discards an empty spare is reported and rejected below.
+/// An EOF after a TLS byte must fail until the handshake completes.
 /// After TLS completes, drain to the ParallaX server's EOF, with an overall bound
 /// instead of closing the origin while an instrumented client is still working.
 async fn spawn_camouflage_origin(
@@ -230,7 +230,7 @@ async fn spawn_camouflage_origin(
                     }
                 }
             }
-            panic!("origin did not complete TLS after its bounded pre-dial allowance");
+            panic!("origin did not complete TLS within its bounded connection allowance");
         })
         .await
         .expect("camouflage origin fixture exceeded its overall deadline");
@@ -621,13 +621,10 @@ async fn run_roundtrip(pki: &CamouflagePki, force_predial: bool, tasks: &mut Fix
         .await
         .expect("origin did not report successful TLS completion");
     assert_eq!(report.tls_handshakes, 1);
-    assert!(report.empty_predials <= 1);
-    if force_predial {
-        assert_eq!(
-            report.empty_predials, 1,
-            "first-byte gate did not exercise the empty pre-dial"
-        );
-    }
+    assert_eq!(
+        report.empty_predials, 0,
+        "the single origin connection must carry TLS, including when the first-byte gate forces a pre-dial"
+    );
     eprintln!(
         "{}: empty_predials={}, completed_tls={}, payload_bytes={PAYLOAD_LEN}",
         if force_predial { "gated" } else { "direct" },

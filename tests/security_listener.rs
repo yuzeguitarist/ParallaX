@@ -55,6 +55,7 @@ const REPLAY_TERMINAL: Duration = Duration::from_secs(75);
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 type WireCapture = Arc<Mutex<Vec<u8>>>;
 const REJECTED: &str = "closing on replayed ClientHello after data proof";
+const ENTERED_PRE_PQ: &str = "authenticated pre-data mode started; waiting for client PQ rekey";
 const AT_CAPACITY: &str = "replay cache at capacity with fresh entries";
 const SOURCE_SHED: &str = "per-source connection limit reached; cap-shedding to origin";
 
@@ -641,8 +642,9 @@ async fn listener_replay_case(pki: &Pki, case: ReplayCase) {
         .unwrap()
         .unwrap();
     // Setup only: derive the identity of this *live* client's captured hello.
-    // The real child independently authenticates it, completes PQ proof and
-    // consults its durable cache. The client's ephemerals remain alive.
+    // The real child independently authenticates it and checks the durable cache
+    // before the pre-PQ bridge. Fresh/full cases also reach the data-proof check.
+    // The client's ephemerals remain alive.
     let InboundDecision::Authenticated(authenticated) =
         server::decide_inbound(&hello, &*keys.psk, &[SNI.to_owned()], &keys.session.private)
             .unwrap()
@@ -698,18 +700,26 @@ async fn listener_replay_case(pki: &Pki, case: ReplayCase) {
         assert!(timeout(STEP, client_done).await.unwrap().unwrap());
         assert_eq!(target_accepts.load(Ordering::SeqCst), 1);
     } else {
-        // This marker proves the valid client reached the post-PQ decision; it
-        // is not proof of rejection. Continue until independent upstream EOF.
-        child.wait_for(REJECTED).await;
         if matches!(case, ReplayCase::Full) {
+            // Capacity is decided after data proof. This marker is not proof of
+            // rejection; continue until independent upstream EOF below.
+            child.wait_for(REJECTED).await;
             assert!(child.log_count(AT_CAPACITY) > 0);
         } else {
+            // A committed duplicate must splice directly to the real origin,
+            // without entering the pre-PQ bridge or waiting for its data proof.
+            wait_accepts(&origin_accepts, 1).await;
             assert_eq!(child.log_count(AT_CAPACITY), 0);
         }
         assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
-        let rejected_wire = timeout(REPLAY_TERMINAL, terminal)
+        let terminal_budget = if matches!(case, ReplayCase::Full) {
+            REPLAY_TERMINAL
+        } else {
+            STEP
+        };
+        let rejected_wire = timeout(terminal_budget, terminal)
             .await
-            .expect("server did not close within the full replay rejection budget")
+            .expect("server did not close within the replay-case terminal budget")
             .expect("independent rejection tap failed")
             .expect("server rejection was not a clean upstream EOF");
         assert_eq!(origin_accepts.load(Ordering::SeqCst), 1);
@@ -721,6 +731,23 @@ async fn listener_replay_case(pki: &Pki, case: ReplayCase) {
             origin_wire.lock().unwrap().starts_with(&rejected_wire),
             "{case:?}: rejected server emitted an authenticated continuation",
         );
+        if matches!(case, ReplayCase::Duplicate) {
+            assert_eq!(
+                child.log_count(ENTERED_PRE_PQ),
+                0,
+                "a committed duplicate must never enter the pre-PQ bridge"
+            );
+            assert_eq!(
+                child.log_count(REJECTED),
+                0,
+                "a committed duplicate must be rejected before data proof"
+            );
+            assert_eq!(
+                *origin_wire.lock().unwrap(),
+                rejected_wire,
+                "early replay fallback must relay the complete origin response before its FIN"
+            );
+        }
         assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
         // SOCKS success is optimistic (sent before upstream establishment), and
         // the client has its own 15s timeout. Neither is a rejection oracle.
