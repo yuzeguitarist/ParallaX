@@ -1,0 +1,19 @@
+src/transport/udp/quic/splice.rs
+  s_33fa5e090d7cd5::t_01a4410cdb1659 235-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3dcb9712dfcae8dbffcf64aec7770f30f3892886",
+  "prompts": {},
+  "sessions": {
+    "s_33fa5e090d7cd5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e4c0-8b72-7f81-85ba-7287db6d6e95",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
