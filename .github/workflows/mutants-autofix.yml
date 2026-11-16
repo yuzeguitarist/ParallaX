@@ -72,7 +72,17 @@ jobs:
             echo "found=0" >> "$GITHUB_OUTPUT"; exit 0
           fi
           d=$(find art -maxdepth 1 -type d -name 'mutants-out-shard-*' | head -1)
-          if [ -z "$d" ] || [ ! -s "$d/missed.txt" ]; then
+          if [ -z "$d" ]; then
+            echo "no shard artifact; nothing to fix"
+            echo "found=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Use the reporter's baseline/completion/inventory checks. A partial
+          # missed.txt is not evidence for starting another repair PR.
+          if ! survivors=$(ART_DIR="$d" python3 -c 'import sys; sys.path.insert(0, ".github/scripts"); import mutants_issue; print("\n".join(mutants_issue.read_result()["missed"]))'); then
+            echo "unverified shard artifact; nothing to fix"
+            echo "found=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "$survivors" ]; then
             echo "no survivors this shard; nothing to fix"
             echo "found=0" >> "$GITHUB_OUTPUT"; exit 0
           fi
@@ -109,7 +119,7 @@ jobs:
             echo "  test(mutants): kill survivors in shard $shard/8"
             echo ""
             echo "Surviving mutants (file:line:col: mutation in function):"
-            cat "$d/missed.txt"
+            printf '%s\n' "$survivors"
             echo "$eof"
           } >> "$GITHUB_OUTPUT"
 

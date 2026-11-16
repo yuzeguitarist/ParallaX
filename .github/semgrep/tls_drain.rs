@@ -46,7 +46,7 @@ async fn await_http2_settings_ack() {
 // ok: parallax-tls-key-update-framing
 fn parse_post_handshake_message(bytes: &[u8]) -> Result<Option<PostHandshakeMessage>, &'static str> {
     if bytes.len() < 4 { return Ok(None); }
-    let len = ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | bytes[3] as usize;
+    let len = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]) as usize;
     if len > MAX_POST_HANDSHAKE_MESSAGE { return Err("oversized"); }
     let total = 4 + len;
     match bytes[0] {
