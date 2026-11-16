@@ -241,14 +241,20 @@ push_status() {
   ensure_status_clone || return 0
   gc_status_clone
 
-  local i base tree commit
+  # Shared tag trees may contain symlinks at our filename or its ancestors.
+  # Build outside that checkout and stage the blob directly into the index.
+  local heartbeat i base tree commit blob
+  heartbeat="$(mktemp "$STATE/.heartbeat.XXXXXX")" || return 1
+  build_json "$heartbeat"
+  blob="$(git -C "$WT" hash-object -w -- "$heartbeat")" || { rm -f "$heartbeat"; return 1; }
+  rm -f "$heartbeat"
   for i in 1 2 3; do
     # Force-sync the local tag ref to the remote tag (it is force-updated every
     # tick, so a plain fetch would refuse the non-fast-forward tag move).
     git -C "$WT" fetch -f origin "$REF:$REF" -q 2>/dev/null || true
     if git -C "$WT" show-ref --verify --quiet "$REF" 2>/dev/null; then
       base="$(git -C "$WT" rev-parse "$REF" 2>/dev/null || true)"
-      git -C "$WT" reset --hard "$REF" -q 2>/dev/null || true
+      git -C "$WT" read-tree "$REF" 2>/dev/null || continue
     else
       # Tag absent (first publish ever): build from an empty index.
       base=""
@@ -256,8 +262,7 @@ push_status() {
       git -C "$WT" clean -fdq 2>/dev/null || true
     fi
 
-    build_json "$WT/$REL"
-    git -C "$WT" add "$REL" 2>/dev/null || true
+    git -C "$WT" update-index --add --cacheinfo "100644,$blob,$REL" 2>/dev/null || continue
     # Our file is byte-identical to the fetched tip (no new heartbeat) -> done.
     if [ -n "$base" ] && git -C "$WT" diff --cached --quiet "$base" -- 2>/dev/null; then
       return 0

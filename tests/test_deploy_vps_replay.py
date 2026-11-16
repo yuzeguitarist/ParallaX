@@ -19,19 +19,17 @@ import unittest
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/deploy-vps.sh"
 CACHE = "var/lib/parallax/replay-parallax.cache"
 SUFFIXES = ("", ".0rtt", ".marker")
-# Captured from the previous heredoc builders, evaluated in the same Bash with
-# reference-only padding to select its tempfile backend, then removing padding.
-# Seal-enabled snapshots include the legacy-bundle resolution copy; removing
-# only its five emitted lines reproduces the historical snapshots byte-for-byte.
+# Exact payload snapshots include the protected seal staging and cleanup paths.
+# All option combinations must retain their reviewed emitted shell content.
 PAYLOAD_SHA256 = {
-    ("0", "0", "none"): "bc973151a7195f6f95e5d615ebc9df4a21a970150ceb09647e14cf27066f4719",
-    ("0", "0", "polar-cloud"): "8fe2688f438307b0e35c45a5d09b3d6826bc9c5a5a4831afb696f1b549aa5efb",
-    ("0", "1", "none"): "1c030a794f8255481d64eb507070238725c47e0dec771901a8d4be146f9abe24",
-    ("0", "1", "polar-cloud"): "cc0781046ddba2aece9fa75002e8bfdef09bc204f6933f453ebab6484e3e2535",
-    ("1", "0", "none"): "3569bf8c486f5f4a080c4d80280618be04947e276e63446ba9b2127091bdf091",
-    ("1", "0", "polar-cloud"): "6b705ac4760c691926263864197d925941e5b49b2d90e31260b83a13de937c86",
-    ("1", "1", "none"): "7cf7144f87a6359aad0494fdfb192908ee38e8979a8b03d2a05b0f2d2e744d70",
-    ("1", "1", "polar-cloud"): "1d4743b4531d6627215bac40d1c32f95f75d8e68f42117cfdc1e1815ce0726dc",
+    ("0", "0", "none"): "508830bfeda310ab3e9337d8bf13dcfa4e3d94091f1c2e60046dc5525bd66d26",
+    ("0", "0", "polar-cloud"): "983fdc8025a28b1baff64df366128f8351114d89ff8827d0eb8e4741e91e7b1b",
+    ("0", "1", "none"): "9802d4789736ce28846ff4039f8fd5784bd08515992819c9cd7384da19558c73",
+    ("0", "1", "polar-cloud"): "7f63a327f1992302190e42e8252e12c599be0c5abf452b6d8f695ecb76f7c15e",
+    ("1", "0", "none"): "8a27aa4953405dbeee48382455451990d7cf0f2e3f62106798e047776f9c6cf7",
+    ("1", "0", "polar-cloud"): "01300e7810cf65f1233cd67eb3c5f001cdf4e9a9df4a4653d4f914d72741ad2f",
+    ("1", "1", "none"): "1e634cd06f2f963052e8cbda3f69c36b47d0b82420ec7c617283516de9e74e33",
+    ("1", "1", "polar-cloud"): "74ce73d4adb4107d14960d5552506ef10b8937c536bcf36fe991016b97c2b025",
 }
 
 

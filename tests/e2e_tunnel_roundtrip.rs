@@ -342,6 +342,7 @@ fn server_config(
         listen: "127.0.0.1:0".parse().unwrap(),
         fallback_addr: fallback_addr.to_string(),
         data_target: Some(target_addr.to_string()),
+        nat64_prefixes: vec![],
         private_key: STANDARD.encode(server_keys.private).into(),
         identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
         replay_cache_path,

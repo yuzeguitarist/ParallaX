@@ -122,6 +122,17 @@ impl<R> TlsRecordReader<R> {
         self.reader
     }
 
+    /// Recover every byte consumed from an unfinished record before switching
+    /// to a transparent byte relay. The returned reader retains its own buffer.
+    pub fn into_pending_parts(self) -> (R, Vec<u8>) {
+        let pending = if self.payload_len.is_some() {
+            self.record.to_vec()
+        } else {
+            self.header[..self.header_pos].to_vec()
+        };
+        (self.reader, pending)
+    }
+
     /// Mutable access to the underlying reader, for a caller that must interleave
     /// a raw write on the same stream between record reads while holding this
     /// long-lived reader. Bytes already buffered in the reader are preserved.
@@ -258,6 +269,26 @@ pub fn log_record_read(cid: u64, direction: &'static str, task_name: &'static st
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn invalid_header_handoff_preserves_all_unread_wire_bytes() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let wire = [0x17, 3, 3, 0xff, 0xff, 1, 2, 3];
+        writer.write_all(&wire).await.unwrap();
+        let mut records = TlsRecordReader::buffered(reader);
+        assert_eq!(
+            records
+                .read_record_into(&mut Vec::new())
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let (mut buffered, mut prefix) = records.into_pending_parts();
+        let mut tail = [0; 3];
+        buffered.read_exact(&mut tail).await.unwrap();
+        prefix.extend_from_slice(&tail);
+        assert_eq!(prefix, wire);
+    }
     use tokio::io::AsyncWriteExt;
 
     use super::*;

@@ -19,6 +19,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+static SPLICE_MEMORY_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(256)));
+
+struct SpliceReservation {
+    _fds: crate::transport::fd_budget::ExtraFdReservation<'static>,
+    _memory: OwnedSemaphorePermit,
+}
 
 /// Receive-buffer size for the origin→client pump: the largest possible UDP
 /// datagram payload (65535 minus the 8-byte UDP header), mirroring
@@ -41,6 +50,7 @@ pub(crate) struct SpliceFlow {
     /// first forwarded datagram.
     send_sock: std::net::UdpSocket,
     pump: tokio::task::JoinHandle<()>,
+    _fds: Arc<SpliceReservation>,
 }
 
 impl Drop for SpliceFlow {
@@ -67,6 +77,27 @@ impl SpliceFlow {
         origin: SocketAddr,
         first: &[u8],
     ) -> std::io::Result<SpliceFlow> {
+        let fds = crate::transport::tcp::try_reserve_extra_fds(2)?.ok_or_else(|| {
+            std::io::Error::other("UDP origin splice descriptor budget exhausted")
+        })?;
+        Self::open_reserved(listen, client, origin, first, fds)
+    }
+
+    fn open_reserved(
+        listen: Arc<UdpSocket>,
+        client: SocketAddr,
+        origin: SocketAddr,
+        first: &[u8],
+        fds: crate::transport::fd_budget::ExtraFdReservation<'static>,
+    ) -> std::io::Result<Self> {
+        let memory = SPLICE_MEMORY_SLOTS
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| std::io::Error::other("UDP origin splice memory budget exhausted"))?;
+        let fds = Arc::new(SpliceReservation {
+            _fds: fds,
+            _memory: memory,
+        });
         let recv_std = std::net::UdpSocket::bind(upstream_bind_for(origin))?;
         recv_std.connect(origin)?;
         allow_fragmentation(&recv_std, origin.is_ipv6());
@@ -77,8 +108,16 @@ impl SpliceFlow {
         // Verbatim: exact bytes, single datagram, no coalesce/split/reframe.
         send_sock.send(first)?;
         let to_origin = Arc::new(UdpSocket::from_std(recv_std)?);
-        let pump = tokio::spawn(pump_origin_to_client(to_origin, listen, client));
-        Ok(SpliceFlow { send_sock, pump })
+        let pump_fds = fds.clone();
+        let pump = tokio::spawn(async move {
+            pump_origin_to_client(to_origin, listen, client).await;
+            drop(pump_fds);
+        });
+        Ok(SpliceFlow {
+            send_sock,
+            pump,
+            _fds: fds,
+        })
     }
 
     /// Forward a subsequent client→origin datagram verbatim (non-blocking). A
@@ -189,6 +228,43 @@ fn upstream_bind_for(origin: SocketAddr) -> SocketAddr {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn descriptor_reservation_outlives_abort_until_socket_task_is_dropped() {
+        use crate::concurrency::atomic::{AtomicUsize, Ordering};
+        let budget = Box::leak(Box::new(crate::transport::fd_budget::ExtraFdBudget {
+            limit: 2,
+            used: AtomicUsize::new(0),
+        }));
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let flow = SpliceFlow::open_reserved(
+            listen.clone(),
+            listen.local_addr().unwrap(),
+            origin.local_addr().unwrap(),
+            b"first",
+            budget.try_reserve(2).unwrap(),
+        )
+        .unwrap();
+        assert!(budget.try_reserve(1).is_none());
+        drop(flow);
+        assert_eq!(
+            budget.used.load(Ordering::Acquire),
+            2,
+            "abort has not yet dropped the receive task"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.used.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            budget.try_reserve(2).is_some(),
+            "cancellation closes sockets and returns their permits"
+        );
+    }
 
     #[test]
     fn non_loopback_origins_keep_wildcard_binding() {

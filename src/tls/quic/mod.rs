@@ -256,6 +256,11 @@ pub(crate) trait TlsSession: Send {
     fn client_hello_processed(&self) -> bool {
         false
     }
+    fn authorize_client_hello(&mut self) -> Result<(), QuicTlsError> {
+        Err(QuicTlsError::Protocol(
+            "not a deferred server handshake".into(),
+        ))
+    }
 }
 
 impl TlsSession for ClientHandshake {
@@ -328,6 +333,9 @@ impl TlsSession for ServerHandshake {
     }
     fn client_hello_processed(&self) -> bool {
         ServerHandshake::client_hello_processed(self)
+    }
+    fn authorize_client_hello(&mut self) -> Result<(), QuicTlsError> {
+        ServerHandshake::authorize_client_hello(self)
     }
 }
 

@@ -4122,10 +4122,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--jar",
         type=Path,
-        default=Path("/tmp/tla2tools.jar"),
-        help="path to tla2tools.jar (tlc and all)",
+        help="explicit trusted path to tla2tools.jar (required for tlc and all)",
     )
     args = parser.parse_args(argv)
+    if args.command in ("tlc", "all") and args.jar is None:
+        parser.error("tlc and all require --jar with an explicitly selected trusted jar")
     try:
         if args.command == "emit":
             for path in emit_files():

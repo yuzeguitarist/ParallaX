@@ -16,7 +16,7 @@ Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
 Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # crash-push.sh reads /etc/plxfuzz/{node-id,pat,repo,pinned-commit,campaign-tag}
 # and the shard table itself; the PAT is never passed as an argument.
-ExecStart=/var/lib/plxfuzz/bin/crash-push.sh %i
+ExecStart=/usr/local/lib/plxfuzz/crash-push.sh %i
 # crash-push.sh always exits 0 (best-effort): a transient gh/git failure must
 # never escalate; the artifact is left in place and retried on the next failure.
 # Cap a hung tmin/reproduce so the oneshot is reaped rather than wedging.

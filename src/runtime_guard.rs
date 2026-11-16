@@ -184,12 +184,12 @@ pub struct RuntimeGuard {
 
 impl RuntimeGuard {
     pub fn acquire_client(config: &Config) -> Result<Self, RuntimeGuardError> {
-        let dir = default_state_dir();
+        let dir = default_state_dir()?;
         Self::acquire_client_in_dir(config, &dir)
     }
 
     pub fn acquire_speed(config: &Config) -> Result<Self, RuntimeGuardError> {
-        let dir = default_state_dir();
+        let dir = default_state_dir()?;
         Self::acquire_speed_in_dir(config, &dir)
     }
 
@@ -381,9 +381,8 @@ fn ensure_state_dir(dir: &Path) -> io::Result<()> {
         use rustix::fs::{mkdirat, Mode, CWD};
         use rustix::io::Errno;
 
-        // The state dir path (/tmp/parallax-<euid>/runtime) is predictable, so on
-        // a shared host an attacker can plant either component. Validate the
-        // parent before creating anything inside it, then keep creation, opening,
+        // Validate the private parent before creating anything inside it, then
+        // keep creation, opening,
         // and chmod anchored to verified directory handles so path swaps cannot
         // redirect chmod to a symlink target before we reject it.
         let parent_path = dir
@@ -448,16 +447,44 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     }
 }
 
-fn default_state_dir() -> PathBuf {
+fn default_state_dir() -> io::Result<PathBuf> {
     #[cfg(unix)]
     {
-        let uid = rustix::process::geteuid().as_raw();
-        PathBuf::from(format!("/tmp/parallax-{uid}/runtime"))
+        state_dir_for(
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .as_deref()
+                .map(Path::new),
+            std::env::var_os("HOME").as_deref().map(Path::new),
+        )
     }
     #[cfg(not(unix))]
     {
-        std::env::temp_dir().join("parallax").join("runtime")
+        Ok(std::env::temp_dir().join("parallax").join("runtime"))
     }
+}
+
+#[cfg(unix)]
+fn state_dir_for(runtime: Option<&Path>, home: Option<&Path>) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let owned_base = |path: &Path| {
+        path.is_absolute()
+            && fs::symlink_metadata(path).is_ok_and(|meta| {
+                meta.is_dir()
+                    && meta.uid() == rustix::process::geteuid().as_raw()
+                    && meta.permissions().mode() & 0o022 == 0
+            })
+    };
+    if let Some(runtime) = runtime.filter(|path| owned_base(path)) {
+        return Ok(runtime.join("parallax/runtime"));
+    }
+    if let Some(home) = home.filter(|path| owned_base(path)) {
+        return Ok(home.join(".local/state/parallax/runtime"));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "runtime guard needs an owned, non-writable-by-others XDG_RUNTIME_DIR or HOME",
+    ))
 }
 
 #[cfg(unix)]
@@ -548,13 +575,37 @@ mod tests {
     /// `tempfile::tempdir()` places its root directly in the system temp dir, which
     /// on Linux is the root-owned, world-writable `/tmp` — and `ensure_state_dir`
     /// (correctly) refuses a parent it does not own. Production never sees that
-    /// shape: `default_state_dir()` is `/tmp/parallax-<euid>/runtime`, whose parent
+    /// shape: `default_state_dir()` uses a private per-user namespace, whose parent
     /// `create_dir_all` creates and therefore owns. Tests nest one level down to
     /// reproduce the production shape instead of weakening the check.
     fn state_dir(tmp: &tempfile::TempDir) -> PathBuf {
         let dir = tmp.path().join("runtime");
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_registry_uses_private_user_namespace() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let runtime = tmp.path().join("session");
+        fs::create_dir(&runtime).unwrap();
+        assert_eq!(
+            state_dir_for(Some(&runtime), Some(&home)).unwrap(),
+            runtime.join("parallax/runtime")
+        );
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777)).unwrap();
+        let fallback = state_dir_for(Some(&runtime), Some(&home)).unwrap();
+        assert_eq!(fallback, home.join(".local/state/parallax/runtime"));
+        ensure_state_dir(&fallback).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&home, &link).unwrap();
+        assert!(state_dir_for(Some(&link), None).is_err());
+        assert!(state_dir_for(None, Some(Path::new("relative"))).is_err());
+        assert!(state_dir_for(None, None).is_err());
     }
 
     fn config(server_addr: &str) -> Config {

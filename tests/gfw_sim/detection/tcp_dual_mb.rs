@@ -147,10 +147,18 @@ impl DualMiddlebox {
                         state.mbra_decision = Some(decision.clone());
                         return decision;
                     }
-                    Err(_) => {
+                    Err(ClientHelloParseError::NotHandshake(_)) => {
                         let decision = DualMbDecision::Allow;
                         state.mbra_decision = Some(decision.clone());
                         state.stage = MbrStage::Resolved;
+                        return decision;
+                    }
+                    Err(err) => {
+                        let decision = DualMbDecision::Suspicious {
+                            reason: format!("malformed ClientHello ({err})"),
+                        };
+                        state.mbra_decision = Some(decision.clone());
+                        state.stage = MbrStage::AwaitingServerHello;
                         return decision;
                     }
                 };
@@ -299,6 +307,12 @@ impl DualMiddlebox {
             Some(s) => s,
             None => return DualMbDecision::Allow,
         };
+        if matches!(&state.mbra_decision, Some(DualMbDecision::Suspicious { reason }) if reason.starts_with("malformed ClientHello"))
+        {
+            state.mbra_decision = Some(DualMbDecision::BlockFingerprint {
+                fingerprint_summary: "MB-R malformed ClientHello".to_owned(),
+            });
+        }
         state.stage = MbrStage::Resolved;
         state.mbra_decision.clone().unwrap_or(DualMbDecision::Allow)
     }
@@ -345,6 +359,25 @@ pub fn looks_like_clienthello(record_start: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_client_hello_remains_for_mbr_backup_detection() {
+        let mut mb = DualMiddlebox::default();
+        let flow = test_flow();
+        assert!(matches!(
+            mb.on_client_record(flow, &[0x16, 3, 3, 0, 4, 2, 0, 0, 0]),
+            DualMbDecision::Suspicious { .. }
+        ));
+        assert_eq!(
+            mb.state_for(&flow).unwrap().stage,
+            MbrStage::AwaitingServerHello
+        );
+        mb.on_server_hello(flow, &[]);
+        mb.on_change_cipher_spec(flow);
+        assert!(matches!(
+            mb.on_first_app_data(flow),
+            DualMbDecision::BlockFingerprint { .. }
+        ));
+    }
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;

@@ -33,7 +33,7 @@ FUZZ_USER="plxfuzz"
 ETC=/etc/plxfuzz
 HOME_DIR=/var/lib/plxfuzz
 SRC="$HOME_DIR/src"
-BIN="$HOME_DIR/bin"
+BIN=/usr/local/lib/plxfuzz
 LOGS="$HOME_DIR/logs"
 REPO_URL="https://github.com/${REPO}.git"
 
@@ -111,8 +111,16 @@ fi
 # the next oneshot plx-status run picks up the new group automatically.
 usermod -aG systemd-journal "$FUZZ_USER" 2>/dev/null \
   || warn "could not add $FUZZ_USER to systemd-journal; exec/s will read 0"
-install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0700 "$HOME_DIR"
-install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$BIN" "$LOGS"
+# The home entry is below root-owned /var/lib. Never dereference an entry the
+# service user can replace while root is changing ownership or permissions.
+[ ! -L "$HOME_DIR" ] || die "service home must not be a symlink"
+if [ ! -e "$HOME_DIR" ]; then
+  install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0700 "$HOME_DIR" || die "create home failed"
+fi
+[ -d "$HOME_DIR" ] && [ "$(stat -c %u "$HOME_DIR")" = "$(id -u "$FUZZ_USER")" ] \
+  || die "service home must be an owned directory"
+sudo -u "$FUZZ_USER" -- chmod 0700 "$HOME_DIR" || die "secure home failed"
+sudo -u "$FUZZ_USER" -- mkdir -p "$LOGS" || die "create logs failed"
 
 # ---------------------------------------------------------------------------
 # 3. rustup + pinned nightly + cargo-fuzz (installed AS the plxfuzz user so the
@@ -232,35 +240,47 @@ esac
 #    sibling's shard-table / suppressions probe path resolves on the box.
 # ---------------------------------------------------------------------------
 log "[8/11] install scripts to $BIN"
-# Local execution uses the package beside this bootstrap. Under curl | bash,
-# resolve the requested operator revision once and extract the whole package
-# from that commit. The old campaign pin must not reinstall vulnerable scripts.
-_self="${BASH_SOURCE[0]:-$0}"
-SELF_DIR="$(cd "$(dirname "$_self")" 2>/dev/null && pwd || true)"
-PKG_DIR="$SELF_DIR"
-if [ ! -f "$_self" ] || [ ! -d "$PKG_DIR/bin" ] || [ ! -f "$PKG_DIR/lib/shard-table.sh" ]; then
+# Root consumes operator code only from a fresh private clone of the configured
+# HTTPS repository. Never adopt CWD or archive from the service-owned clone.
   OPS_REV="${PLXFUZZ_OPS_COMMIT:-main}"
-  retry 3 10 as_fuzz git -C "$SRC" fetch origin "$OPS_REV" \
+  PKG_TMP="$(mktemp -d /var/tmp/plxfuzz-ops.XXXXXX)" || die "could not create operator package directory"
+  trap 'rm -rf "$PKG_TMP"' EXIT
+  OPS_GIT="$PKG_TMP/repository"
+  # No inherited Git configuration, helper, template, URL rewrite or HOME from
+  # the fuzz user is allowed to influence privileged operator installation.
+  root_git() {
+    env -i PATH=/usr/bin:/bin HOME="$PKG_TMP" GH_TOKEN="$GH_TOKEN" \
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+      git -c credential.helper= -c 'credential.helper=!/usr/bin/gh auth git-credential' "$@"
+  }
+  root_git init -q --template= "$OPS_GIT" || die "could not initialize operator repository"
+  retry 3 10 root_git -C "$OPS_GIT" fetch --depth 1 "$REPO_URL" "$OPS_REV" \
     || die "could not fetch operator revision $OPS_REV"
-  OPS_COMMIT="$(as_fuzz git -C "$SRC" rev-parse 'FETCH_HEAD^{commit}')" \
+  OPS_COMMIT="$(root_git -C "$OPS_GIT" rev-parse 'FETCH_HEAD^{commit}')" \
     || die "could not resolve operator revision"
   log "installing operator scripts at $OPS_COMMIT (fuzz pin=$PINNED_COMMIT)"
-  PKG_TMP="$(mktemp -d)" || die "could not create operator package directory"
-  trap 'rm -rf "$PKG_TMP"' EXIT
-  # Root opens the private output file; the fuzz user only writes stdout.
+  # Materialize the complete archive before extracting trusted operator code.
   # Complete the archive first: tar may stop before consuming trailing padding.
-  as_fuzz git -C "$SRC" archive "$OPS_COMMIT" ops/fuzz-cluster \
+  root_git -C "$OPS_GIT" archive "$OPS_COMMIT" ops/fuzz-cluster \
     > "$PKG_TMP/operator.tar" || die "could not archive operator scripts"
   tar -xf "$PKG_TMP/operator.tar" -C "$PKG_TMP" \
     || die "could not extract operator scripts"
   PKG_DIR="$PKG_TMP/ops/fuzz-cluster"
-fi
 
-install -d -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$BIN" "$BIN/lib" "$BIN/config"
-install -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0755 "$PKG_DIR"/bin/*.sh "$BIN/"
-install -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0644 "$PKG_DIR"/lib/*.sh "$BIN/lib/"
+for directory in "$BIN" "$BIN/lib" "$BIN/config"; do
+  [ ! -L "$directory" ] || die "operator package directory must not be a symlink"
+  if [ -e "$directory" ]; then
+    directory_mode="$(stat -c %a "$directory")" || die "could not inspect operator directory"
+    [ -d "$directory" ] && [ "$(stat -c %u "$directory")" = 0 ] \
+      && [ "$((8#$directory_mode & 8#022))" -eq 0 ] \
+      || die "operator directory must be root-owned and not writable by other users"
+  fi
+done
+install -d -o root -g root -m 0755 "$BIN" "$BIN/lib" "$BIN/config"
+install -o root -g root -m 0755 "$PKG_DIR"/bin/*.sh "$BIN/"
+install -o root -g root -m 0644 "$PKG_DIR"/lib/*.sh "$BIN/lib/"
 if compgen -G "$PKG_DIR/config/*" >/dev/null 2>&1; then
-  install -o "$FUZZ_USER" -g "$FUZZ_USER" -m 0644 "$PKG_DIR"/config/* "$BIN/config/" 2>/dev/null || true
+  install -o root -g root -m 0644 "$PKG_DIR"/config/* "$BIN/config/" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------

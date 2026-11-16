@@ -1526,11 +1526,9 @@ impl MuxFrame {
     }
 
     pub fn encoded_len(payload_len: usize) -> Result<usize, MuxFrameError> {
-        // Enforce the u32 wire limit BEFORE any caller uses this to size an
-        // allocation (e.g. `encode_borrowed`'s `Vec::with_capacity`). Checking
-        // only usize overflow here would let a payload in (u32::MAX, usize::MAX]
-        // trigger a multi-gigabyte reservation before the limit is checked.
-        if payload_len > u32::MAX as usize {
+        // Every frame fits in one data record. Enforce this before allocation
+        // and during decode, including when several records were batch-opened.
+        if payload_len > Self::max_payload_len(crate::protocol::data::max_plaintext_len(0)) {
             return Err(MuxFrameError::PayloadTooLong);
         }
         MUX_FRAME_FIXED_LEN
@@ -1559,9 +1557,7 @@ impl MuxFrame {
         out: &mut Vec<u8>,
     ) -> Result<(), MuxFrameError> {
         validate_mux_stream(kind, stream_id)?;
-        if payload.len() > u32::MAX as usize {
-            return Err(MuxFrameError::PayloadTooLong);
-        }
+        Self::encoded_len(payload.len())?;
 
         out.extend_from_slice(MUX_FRAME_MAGIC);
         out.extend_from_slice(&stream_id.to_be_bytes());
@@ -3145,17 +3141,33 @@ mod tests {
     }
 
     #[test]
-    fn mux_encoded_len_rejects_payload_over_u32_before_allocating() {
-        // The u32 wire-limit check must live in encoded_len so callers that size
-        // an allocation from it (encode_borrowed's Vec::with_capacity) reject an
-        // oversized payload instead of attempting a multi-gigabyte reservation.
-        let over = (u32::MAX as usize) + 1;
+    fn mux_encoded_len_rejects_payload_over_record_before_allocating() {
+        let max = MuxFrame::max_payload_len(crate::protocol::data::max_plaintext_len(0));
         assert_eq!(
-            MuxFrame::encoded_len(over).unwrap_err(),
+            MuxFrame::encoded_len(max + 1).unwrap_err(),
             MuxFrameError::PayloadTooLong
         );
-        // A payload at the limit still computes a length.
-        assert!(MuxFrame::encoded_len(u32::MAX as usize).is_ok());
+        assert!(MuxFrame::encoded_len(max).is_ok());
+        assert_eq!(
+            MuxFrame::encoded_len(u32::MAX as usize).unwrap_err(),
+            MuxFrameError::PayloadTooLong
+        );
+    }
+
+    #[test]
+    fn mux_decode_rejects_cross_record_payload_for_every_frame_kind() {
+        let max = MuxFrame::max_payload_len(crate::protocol::data::max_plaintext_len(0));
+        for kind in [MuxFrameKind::Open, MuxFrameKind::Data, MuxFrameKind::Cover] {
+            let stream_id = if kind == MuxFrameKind::Cover { 0 } else { 1 };
+            let mut encoded = MuxFrame::encode_borrowed(stream_id, kind, &vec![0; max]).unwrap();
+            assert_eq!(MuxFrame::decode_ref(&encoded).unwrap().payload.len(), max);
+            encoded[9..13].copy_from_slice(&((max + 1) as u32).to_be_bytes());
+            encoded.push(0);
+            assert_eq!(
+                MuxFrame::decode_ref_prefix(&encoded).unwrap_err(),
+                MuxFrameError::PayloadTooLong
+            );
+        }
     }
 
     #[test]

@@ -38,9 +38,8 @@ pub(crate) trait LegReader: Send {
     ) -> impl Future<Output = Option<io::Result<()>>> + Send;
 
     /// Whether a read error marks a clean end-of-leg under THIS transport's
-    /// teardown convention. TCP (the default): a peer FIN (`UnexpectedEof`), a
-    /// RST (`ConnectionReset`, the proxy's own graceful-close convention — see
-    /// `transport::tcp`), or a `BrokenPipe` are all treated as a clean close.
+    /// teardown convention. A peer FIN (`UnexpectedEof`) or `BrokenPipe` is a
+    /// clean close; a TCP RST or QUIC RESET_STREAM is a truncation.
     /// The QUIC leg OVERRIDES this: on a `quinn::RecvStream` a clean stream
     /// finish surfaces as `UnexpectedEof`, whereas `ConnectionReset` means the
     /// peer sent `RESET_STREAM` — a mid-transfer TRUNCATION of the relay that
@@ -48,9 +47,7 @@ pub(crate) trait LegReader: Send {
     fn is_clean_close(&self, err: &io::Error) -> bool {
         matches!(
             err.kind(),
-            io::ErrorKind::UnexpectedEof
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::BrokenPipe
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
         )
     }
 }
@@ -402,6 +399,13 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn tcp_leg_preserves_reset_as_an_error_and_fin_as_clean_close() {
+        let reader = TcpLegReader::buffered(tokio::io::duplex(64).0);
+        assert!(!reader.is_clean_close(&io::Error::from(io::ErrorKind::ConnectionReset)));
+        assert!(reader.is_clean_close(&io::Error::from(io::ErrorKind::UnexpectedEof)));
+    }
 
     // These functional cases transfer several MiB through the real QUIC stack.
     // Bound both halves together while allowing fully instrumented std/native
@@ -1046,12 +1050,11 @@ mod tests {
         // No over-correction: a genuine clean finish stays clean on the H3 leg.
         assert!(reader.is_clean_close(&io::Error::from(io::ErrorKind::UnexpectedEof)));
 
-        // The TCP leg is unchanged: a RST is still a conventional clean half-close,
-        // proving the QUIC truncation override is transport-scoped (probe-resistance).
+        // TCP RST and QUIC RESET_STREAM both indicate truncated data.
         let tcp = TcpLegReader::buffered(tokio::io::duplex(64).0);
         assert!(
-            tcp.is_clean_close(&io::Error::from(io::ErrorKind::ConnectionReset)),
-            "TCP leg must keep treating ConnectionReset as a clean half-close",
+            !tcp.is_clean_close(&io::Error::from(io::ErrorKind::ConnectionReset)),
+            "TCP resets must not become successful EOF",
         );
 
         let _ = opener.await;

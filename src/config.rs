@@ -1,6 +1,6 @@
 use std::{
     fmt, fs,
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -64,8 +64,10 @@ pub enum ConfigError {
     SecretRead { field: &'static str },
     #[error("{field}: failed to open the sealed secret (wrong host key, tampered bundle, or missing entry)")]
     SecretSeal { field: &'static str },
-    #[error("{field}: cannot open the sealed secret because the host keyfile is missing or has insecure permissions; set $PARALLAX_HOST_KEY_FILE (or place the keyfile at /var/lib/parallax/host.key) to the host key used by `plx seal`")]
+    #[error("{field}: cannot open the sealed secret because the host keyfile is missing; set $PARALLAX_HOST_KEY_FILE (or place the keyfile at /var/lib/parallax/host.key) to the host key used by `plx seal`")]
     SecretHostKey { field: &'static str },
+    #[error("{field}: the host keyfile has insecure permissions or ownership")]
+    SecretHostKeyPermissions { field: &'static str },
     #[error(
         "crypto.psk appears to have low entropy; a server refuses to start with a \
          guessable PSK. Generate a CSPRNG key with `plx init` or \
@@ -142,7 +144,7 @@ pub enum ConfigError {
 
 impl ConfigError {
     /// True when secret resolution failed *because the source is unavailable* on
-    /// this host (missing/insecure host key, or a missing sidecar file / env var /
+    /// this host (missing host key, or a missing sidecar file / env var /
     /// bundle entry) — as opposed to a malformed reference. `plx check` treats
     /// these as "cannot decrypt here" and degrades to a structure-only check.
     fn is_secret_unavailable(&self) -> bool {
@@ -401,9 +403,11 @@ impl SecretRef {
                         // (e.g. `plx seal --host-key <custom>` not mirrored in the
                         // runtime env); surface that distinctly from a real
                         // decrypt failure so the operator looks in the right place.
-                        crate::secret_store::SealError::HostKeyMissing { .. }
-                        | crate::secret_store::SealError::HostKeyPermissions { .. } => {
+                        crate::secret_store::SealError::HostKeyMissing { .. } => {
                             ConfigError::SecretHostKey { field }
+                        }
+                        crate::secret_store::SealError::HostKeyPermissions { .. } => {
+                            ConfigError::SecretHostKeyPermissions { field }
                         }
                         _ => ConfigError::SecretSeal { field },
                     }
@@ -483,6 +487,58 @@ pub struct ClientConfig {
     pub accept_language: Option<String>,
 }
 
+/// An operator's RFC 6052 network-specific translator prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nat64Prefix {
+    network: Ipv6Addr,
+    length: u8,
+}
+
+impl std::str::FromStr for Nat64Prefix {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (network, length) = value.split_once('/').ok_or("expected IPv6 CIDR")?;
+        let network: Ipv6Addr = network.parse().map_err(|_| "invalid IPv6 prefix")?;
+        let length: u8 = length.parse().map_err(|_| "invalid prefix length")?;
+        if !matches!(length, 32 | 40 | 48 | 56 | 64 | 96) {
+            return Err("NAT64 prefix length must be 32, 40, 48, 56, 64 or 96");
+        }
+        if u128::from(network) & (u128::MAX >> length) != 0 {
+            return Err("NAT64 prefix must have zero host bits");
+        }
+        Ok(Self { network, length })
+    }
+}
+
+impl<'de> Deserialize<'de> for Nat64Prefix {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(de::Error::custom)
+    }
+}
+
+impl Nat64Prefix {
+    pub(crate) fn embedded_ipv4(self, address: Ipv6Addr) -> Option<Ipv4Addr> {
+        let mask = u128::MAX << (128 - self.length);
+        if u128::from(address) & mask != u128::from(self.network) {
+            return None;
+        }
+        // RFC 6052 section 2.2 reserves bits 64..71 (the u octet).
+        let bytes = address.octets();
+        let mut offset = usize::from(self.length / 8);
+        let mut embedded = [0; 4];
+        for byte in &mut embedded {
+            if offset == 8 {
+                offset += 1;
+            }
+            *byte = bytes[offset];
+            offset += 1;
+        }
+        Some(Ipv4Addr::from(embedded))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -490,6 +546,10 @@ pub struct ServerConfig {
     pub fallback_addr: String,
     #[serde(default)]
     pub data_target: Option<String>,
+    /// Every network-specific NAT64 prefix routed by this server's network.
+    /// Built-in 64:ff9b::/96 and 64:ff9b:1::/48 remain screened automatically.
+    #[serde(default)]
+    pub nat64_prefixes: Vec<Nat64Prefix>,
     pub private_key: SecretSource,
     pub identity_secret_key: SecretSource,
     #[serde(default = "default_replay_cache_path")]
@@ -1035,7 +1095,7 @@ impl Config {
             }
         };
         add(self.crypto.psk.file_reference_path());
-        if let Some(server) = &self.server {
+        if let Some(server) = self.server.as_ref().filter(|_| self.mode == Mode::Server) {
             add(server.private_key.file_reference_path());
             add(server.identity_secret_key.file_reference_path());
         }
@@ -3988,5 +4048,26 @@ server_identity_public_key = "{identity}"
                 field: "crypto.psk"
             })
         ));
+    }
+    #[test]
+    fn nat64_prefix_requires_canonical_rfc6052_cidr() {
+        for invalid in [
+            "2606:4700::",
+            "10.0.0.0/32",
+            "2606:4700::/0",
+            "2606:4700::/72",
+            "2606:4700::1/96",
+            "2606:4700::/129",
+            "2606:4700::/64/96",
+        ] {
+            assert!(invalid.parse::<Nat64Prefix>().is_err(), "{invalid}");
+        }
+        #[derive(Deserialize)]
+        struct Prefixes {
+            nat64_prefixes: Vec<Nat64Prefix>,
+        }
+        assert!(toml::from_str::<Prefixes>("nat64_prefixes = ['2606:4700::1/96']").is_err());
+        let prefixes: Prefixes = toml::from_str("nat64_prefixes = ['2606:4700::/96']").unwrap();
+        assert_eq!(prefixes.nat64_prefixes.len(), 1);
     }
 }
