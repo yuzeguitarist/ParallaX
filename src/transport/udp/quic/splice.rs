@@ -232,10 +232,12 @@ mod tests {
     #[tokio::test]
     async fn descriptor_reservation_outlives_abort_until_socket_task_is_dropped() {
         use crate::concurrency::atomic::{AtomicUsize, Ordering};
-        let budget = Box::leak(Box::new(crate::transport::fd_budget::ExtraFdBudget {
-            limit: 2,
-            used: AtomicUsize::new(0),
-        }));
+        static BUDGET: crate::transport::fd_budget::ExtraFdBudget =
+            crate::transport::fd_budget::ExtraFdBudget {
+                limit: 2,
+                used: AtomicUsize::new(0),
+            };
+        let budget = &BUDGET;
         let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let flow = SpliceFlow::open_reserved(
