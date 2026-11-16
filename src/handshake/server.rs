@@ -3745,18 +3745,19 @@ fn validate_public_target_addrs_with_nat64(
     nat64_prefixes: &[Nat64Prefix],
 ) -> Result<(), HandshakeServerError> {
     for addr in addrs {
-        if is_denied_outbound_ip(addr.ip())
-            || matches!(addr.ip(), IpAddr::V6(ip) if nat64_prefixes.iter().any(|prefix| {
-                prefix.embedded_ipv4(ip).is_some_and(is_denied_outbound_ipv4)
-            }))
-        {
+        if is_denied_outbound_ip_with_nat64(addr.ip(), nat64_prefixes) {
             return Err(HandshakeServerError::OutboundTargetDenied);
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn is_denied_outbound_ip(ip: IpAddr) -> bool {
+    is_denied_outbound_ip_with_nat64(ip, &[])
+}
+
+fn is_denied_outbound_ip_with_nat64(ip: IpAddr, nat64_prefixes: &[Nat64Prefix]) -> bool {
     match ip {
         IpAddr::V4(ip) => is_denied_outbound_ipv4(ip),
         IpAddr::V6(ip) => {
@@ -3764,10 +3765,10 @@ fn is_denied_outbound_ip(ip: IpAddr) -> bool {
             // v4-compatible (::a.b.c.d) embeddings, so an embedded private/special
             // IPv4 is screened by the IPv4 policy. (::1 maps to 0.0.0.1, which the
             // IPv4 policy denies via the octets[0]==0 rule.)
-            if let Some(mapped) = ip.to_ipv4() {
-                return is_denied_outbound_ipv4(mapped);
+            if ip.to_ipv4().is_some_and(is_denied_outbound_ipv4) {
+                return true;
             }
-            ip.is_loopback()
+            if ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || is_ipv6_unique_local(ip)
@@ -3776,7 +3777,21 @@ fn is_denied_outbound_ip(ip: IpAddr) -> bool {
                 || is_ipv6_documentation(ip)
                 || is_ipv6_teredo(ip)
                 || is_ipv6_6to4(ip)
-                || is_ipv6_nat64(ip)
+            {
+                return true;
+            }
+            let mut explicit_match = false;
+            for prefix in nat64_prefixes {
+                if let Some(embedded) = prefix.embedded_ipv4(ip) {
+                    explicit_match = true;
+                    if is_denied_outbound_ipv4(embedded) {
+                        return true;
+                    }
+                }
+            }
+            // A configured translator determines its embedding layout. Do not
+            // decode the same address again using an implicit aggregate layout.
+            !explicit_match && is_ipv6_nat64(ip)
         }
     }
 }
@@ -3832,6 +3847,10 @@ fn is_ipv6_6to4(ip: Ipv6Addr) -> bool {
 ///
 ///   * RFC 6052 well-known prefix `64:ff9b::/96`, and
 ///   * RFC 8215 local-use prefix `64:ff9b:1::/48`.
+///
+/// These are fallback layout defaults. A configured matching translator prefix
+/// supplies its actual layout; the local-use /48 aggregate alone does not define
+/// the embedded IPv4 location for every more-specific translator.
 ///
 /// For an address in EITHER prefix, the embedded IPv4 is extracted with the
 /// per-prefix-length layout of RFC 6052 §2.2 and re-screened through
@@ -11094,6 +11113,11 @@ mod tests {
                 "2606:4700:1234:5678:9abc:def0:a00:1",
                 "2606:4700:1234:5678:9abc:def0:5db8:d822",
             ),
+            (
+                "64:ff9b:1:fffe::/96",
+                "64:ff9b:1:fffe::a00:1",
+                "64:ff9b:1:fffe::5db8:d822",
+            ),
         ];
         for (prefix, private, public) in cases {
             let prefix: Nat64Prefix = prefix.parse().unwrap();
@@ -11114,6 +11138,51 @@ mod tests {
             );
             validate_public_target_addrs_with_nat64(&[public], &[prefix]).unwrap();
             assert_eq!(prefix.embedded_ipv4("2607:4700::1".parse().unwrap()), None);
+        }
+    }
+
+    #[test]
+    fn configured_nat64_prefix_preserves_native_and_embedded_denials() {
+        let prefix: Nat64Prefix = "64:ff9b:1:fffe::/96".parse().unwrap();
+        for denied in [
+            "10.0.0.1:443",
+            "168.63.129.16:443",
+            "[::ffff:10.0.0.1]:443",
+            "[::ffff:168.63.129.16]:443",
+            "[64:ff9b:1:fffe::a9fe:a9fe]:443",
+            "[64:ff9b:1:fffe::a83f:8110]:443",
+        ] {
+            let address = denied.parse().unwrap();
+            assert!(
+                validate_public_target_addrs_with_nat64(&[address], &[prefix]).is_err(),
+                "{denied}"
+            );
+        }
+        // A configured public IPv4 embedding cannot override a native IPv6
+        // exclusion, even when that configured prefix matches exactly.
+        for (prefix, address) in [
+            ("fd00::/96", "fd00::5db8:d822"),
+            ("fe80::/96", "fe80::5db8:d822"),
+            ("fec0::/96", "fec0::5db8:d822"),
+        ] {
+            let prefix: Nat64Prefix = prefix.parse().unwrap();
+            let address = address.parse().unwrap();
+            assert_eq!(
+                prefix.embedded_ipv4(address),
+                Some(Ipv4Addr::new(93, 184, 216, 34))
+            );
+            assert!(validate_public_target_addrs_with_nat64(
+                &[SocketAddr::new(IpAddr::V6(address), 443)],
+                &[prefix]
+            )
+            .is_err());
+        }
+        // All explicit matching layouts retain their denials. Only an implicit
+        // built-in layout yields to the operator's configured interpretation.
+        let broad: Nat64Prefix = "64:ff9b:1::/48".parse().unwrap();
+        let public = "[64:ff9b:1:fffe::5db8:d822]:443".parse().unwrap();
+        for prefixes in [[prefix, broad], [broad, prefix]] {
+            assert!(validate_public_target_addrs_with_nat64(&[public], &prefixes).is_err());
         }
     }
 

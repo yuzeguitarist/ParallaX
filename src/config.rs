@@ -546,8 +546,8 @@ pub struct ServerConfig {
     pub fallback_addr: String,
     #[serde(default)]
     pub data_target: Option<String>,
-    /// Every network-specific NAT64 prefix routed by this server's network.
-    /// Built-in 64:ff9b::/96 and 64:ff9b:1::/48 remain screened automatically.
+    /// Every routed translator prefix, including more-specific prefixes inside
+    /// 64:ff9b:1::/48. Explicit matches supersede the built-in layout defaults.
     #[serde(default)]
     pub nat64_prefixes: Vec<Nat64Prefix>,
     pub private_key: SecretSource,
