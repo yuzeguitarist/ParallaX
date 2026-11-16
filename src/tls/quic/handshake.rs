@@ -832,6 +832,12 @@ impl ClientHandshake {
         // which always runs first.
         let parsed =
             parse_encrypted_extensions_body(body, &self.config.alpn_protocols, self.psk_accepted)?;
+        if parsed.early_data && self.retry_suite.is_some() {
+            return Err(QuicTlsError::alert(
+                ALERT_ILLEGAL_PARAMETER,
+                "early_data after HelloRetryRequest",
+            ));
+        }
         self.alpn = parsed.alpn;
         self.peer_transport_params = parsed.transport_params;
         self.early_data_accepted = parsed.early_data;
@@ -2476,6 +2482,27 @@ mod tests {
             .read_handshake(&msg(HANDSHAKE_ENCRYPTED_EXTENSIONS, &ee))
             .unwrap_err();
         assert_eq!(err.alert_description(), Some(ALERT_UNSUPPORTED_EXTENSION));
+    }
+
+    #[test]
+    fn hrr_forbids_early_data_even_when_the_psk_is_accepted() {
+        let alpn = alpn_ext_body(b"h3");
+        let ee = encrypted_extensions(&[
+            (EXT_ALPN, alpn.as_slice()),
+            (EXT_QUIC_TRANSPORT_PARAMETERS, &[0x0f, 0x00][..]),
+            (EXT_EARLY_DATA, &[][..]),
+        ]);
+        let mut hs = handshake();
+        hs.psk_accepted = true;
+        hs.handle_encrypted_extensions(&ee).unwrap();
+        assert!(hs.is_early_data_accepted());
+
+        let mut hs = handshake();
+        hs.psk_accepted = true;
+        hs.retry_suite = Some(CipherSuite::Aes128GcmSha256);
+        let error = hs.handle_encrypted_extensions(&ee).unwrap_err();
+        assert_eq!(error.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+        assert!(!hs.is_early_data_accepted());
     }
 
     #[test]

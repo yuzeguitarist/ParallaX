@@ -486,15 +486,21 @@ struct ReceiveReservation {
 
 impl ReceiveReservation {
     fn reserve(&mut self, bytes: usize) -> bool {
-        if self
-            .shared
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes)
-                    .filter(|next| *next <= ENDPOINT_REASSEMBLY_BUDGET)
-            })
-            .is_err()
-        {
-            return false;
+        let mut used = self.shared.load(Ordering::Acquire);
+        loop {
+            let Some(next) = used
+                .checked_add(bytes)
+                .filter(|next| *next <= ENDPOINT_REASSEMBLY_BUDGET)
+            else {
+                return false;
+            };
+            match self
+                .shared
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
         }
         self.used += bytes;
         true

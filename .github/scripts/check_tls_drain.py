@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce reviewed ready-only drain and post-handshake TLS message Rust AST.
+"""Enforce the H2 opening, ready-only drain and post-handshake TLS Rust AST.
 
 This is a blocking syntactic regression check, not a TLS protocol proof. A real
 TLS origin regression withholds post-Finished records until the client opening.
@@ -78,6 +78,14 @@ def mutations(semgrep):
     h2_start = source.index("    async fn await_http2_settings_ack(")
     h2_end = source.index("    async fn process_http2_frames(", h2_start)
     h2 = source[h2_start:h2_end]
+    opening_start = source.index("    async fn open_http2_connection(")
+    opening_end = source.index("    async fn write_application_data(", opening_start)
+    opening = source[opening_start:opening_end]
+    drain_call = "        let observed = self.drain_post_handshake(stream, keys).await?;\n"
+    early_drain = replace_once(opening, drain_call, "")
+    early_drain = replace_once(early_drain,
+        "        self.write_application_data(stream, keys, &flight).await?;",
+        drain_call + "        self.write_application_data(stream, keys, &flight).await?;")
     update_start = source.index("fn update_application_traffic_keys(")
     update_end = source.index("fn finished_verify_data(", update_start)
     update = source[update_start:update_end]
@@ -152,9 +160,33 @@ def mutations(semgrep):
             "self.pending_post_handshake.drain(..consumed);", "self.pending_post_handshake.clear();"),
             "parallax-tls-post-handshake-buffer"),
         "unchecked_handoff.rs": (source, replace_once(source,
-            "        self.open_http2_connection(stream, &mut keys).await?;\n        self.ensure_post_handshake_boundary()?;",
-            "        self.open_http2_connection(stream, &mut keys).await?;"),
+            "            let post_handshake_records = self.open_http2_connection(stream, keys).await?;\n            self.ensure_post_handshake_boundary()?;",
+            "            let post_handshake_records = self.open_http2_connection(stream, keys).await?;"),
             "parallax-tls-post-handshake-handoff"),
+        "drain_before_opening.rs": (opening, early_drain,
+            "parallax-tls-opening-before-drain"),
+        "complete_drains_before_opening.rs": (source, replace_once(source,
+            "            let post_handshake_records = self.open_http2_connection(stream, keys).await?;",
+            "            self.drain_post_handshake(stream, keys).await?;\n            let post_handshake_records = self.open_http2_connection(stream, keys).await?;"),
+            "parallax-tls-opening-before-drain"),
+        "short_drain_completion.rs": (source[start:handler_start],
+            replace_once(source[start:handler_start],
+                "TLS_RECORD_COMPLETION_TIMEOUT", "H2_SETTINGS_ACK_TIMEOUT"),
+            "parallax-tls-ready-drain"),
+        "short_h2_completion.rs": (h2, replace_once(h2,
+            "TLS_RECORD_COMPLETION_TIMEOUT", "H2_SETTINGS_ACK_TIMEOUT"),
+            "parallax-tls-settings-record-completion"),
+        "discarded_h2_record_prefix.rs": (h2, replace_once(h2,
+            "record_deadline,\n                        reader.read_record_into(&mut record),",
+            "record_deadline,\n                        TlsRecordReader::new(&mut *stream).read_record_into(&mut record),"),
+            "parallax-tls-settings-record-completion"),
+        "partial_h2_eof_ok.rs": (h2, replace_once(h2,
+            "is_clean_close(&err) && reader.at_record_boundary()", "is_clean_close(&err)"),
+            "parallax-tls-settings-record-completion"),
+        "short_record_completion_constant.rs": (source, replace_once(source,
+            "const TLS_RECORD_COMPLETION_TIMEOUT: Duration = Duration::from_secs(20);",
+            "const TLS_RECORD_COMPLETION_TIMEOUT: Duration = Duration::from_millis(180);"),
+            "parallax-tls-record-completion-timeout"),
         "ordinary_secret_storage.rs": (source, replace_once(source,
             "    server_application_secret: Zeroizing<Vec<u8>>,", "    server_application_secret: Vec<u8>,"),
             "parallax-tls-application-secrets-zeroizing"),
@@ -185,7 +217,7 @@ def main():
     print(result.stdout.strip())
     scan(args.semgrep, ROOT / "src/tls/safari26.rs", require_clean=True)
     mutations(args.semgrep)
-    print("TLS ready-only drain AST rules: passed (source, fixtures, mutations)")
+    print("TLS opening and ready-only drain AST rules: passed (source, fixtures, mutations)")
 
 
 if __name__ == "__main__":
