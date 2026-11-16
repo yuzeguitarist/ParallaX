@@ -223,15 +223,15 @@ impl Poly {
         if b > (Q - 1) / 8 {
             return true;
         }
-        for i in 0..N {
+        for &coefficient in self.coeffs.iter() {
             // Branchless absolute value of the centered representative. The sign
             // mask `a >> 31` is fed through `black_box` so the optimizer cannot
             // prove it equals `a < 0` and lower the abs to a data-dependent
             // branch (constant-time defense-in-depth, plan §5). `black_box` is a
             // value-level identity, so the computed `t` — and thus every byte of
             // the ACVP output — is unchanged.
-            let mut t = core::hint::black_box(self.coeffs[i] >> 31);
-            t = self.coeffs[i].wrapping_sub(t & self.coeffs[i].wrapping_mul(2));
+            let mut t = core::hint::black_box(coefficient >> 31);
+            t = coefficient.wrapping_sub(t & coefficient.wrapping_mul(2));
             if t >= b {
                 return true;
             }
@@ -853,10 +853,10 @@ mod tests {
         let hi = (1i64 << 31) - (1i64 << 22) - 1; // reduce32 precondition upper bound
         for _ in 0..1000 {
             let mut p = Poly::zero();
-            for i in 0..N {
+            for coefficient in p.coeffs.iter_mut() {
                 // In [i32::MIN, hi], the documented reduce32 input range.
                 let range = (hi - i32::MIN as i64) as u64;
-                p.coeffs[i] = (i32::MIN as i64 + (rng.next_u64() % (range + 1)) as i64) as i32;
+                *coefficient = (i32::MIN as i64 + (rng.next_u64() % (range + 1)) as i64) as i32;
             }
             let orig = p.coeffs;
             p.reduce();
@@ -876,9 +876,9 @@ mod tests {
         let bound = 1i32 << (31 - D); // 2^{31-D} = 2^18
         for _ in 0..1000 {
             let mut p = Poly::zero();
-            for i in 0..N {
+            for coefficient in p.coeffs.iter_mut() {
                 // Centered in (-2^{31-D}, 2^{31-D}).
-                p.coeffs[i] = (rng.next_u64() % (2 * bound as u64)) as i32 - bound;
+                *coefficient = (rng.next_u64() % (2 * bound as u64)) as i32 - bound;
             }
             let orig = p.coeffs;
             p.shiftl();
@@ -955,10 +955,10 @@ mod tests {
         for &b in &bounds {
             for _ in 0..2000 {
                 let mut p = Poly::zero();
-                for i in 0..N {
+                for coefficient in p.coeffs.iter_mut() {
                     // Range a touch wider than b so both branches fire often.
                     let span = (b as i64).saturating_mul(2).max(4) as u64;
-                    p.coeffs[i] = (rng.next_u64() % (2 * span + 1)) as i32 - span as i32;
+                    *coefficient = (rng.next_u64() % (2 * span + 1)) as i32 - span as i32;
                 }
                 assert_eq!(
                     p.chknorm(b),
@@ -980,8 +980,8 @@ mod tests {
     fn rounding_wrappers_match_per_coeff() {
         let mut rng = Lcg(0x0011_2233_4455_6677);
         let mut p = Poly::zero();
-        for i in 0..N {
-            p.coeffs[i] = rng.coeff_modq();
+        for coefficient in p.coeffs.iter_mut() {
+            *coefficient = rng.coeff_modq();
         }
         let (mut h1, mut l1) = (Poly::zero(), Poly::zero());
         p.power2round(&mut h1, &mut l1);

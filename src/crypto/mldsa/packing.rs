@@ -28,9 +28,9 @@ use super::polyvec::{Polyveck, Polyvecl};
 pub fn pack_pk(pk: &mut [u8; PUBLICKEYBYTES], rho: &[u8; SEEDBYTES], t1: &Polyveck) {
     pk[..SEEDBYTES].copy_from_slice(rho);
 
-    for i in 0..K {
+    for (i, p) in t1.vec.iter().enumerate() {
         let off = SEEDBYTES + i * POLYT1_PACKEDBYTES;
-        t1.vec[i].polyt1_pack(&mut pk[off..off + POLYT1_PACKEDBYTES]);
+        p.polyt1_pack(&mut pk[off..off + POLYT1_PACKEDBYTES]);
     }
 }
 
@@ -41,9 +41,9 @@ pub fn pack_pk(pk: &mut [u8; PUBLICKEYBYTES], rho: &[u8; SEEDBYTES], t1: &Polyve
 pub fn unpack_pk(rho: &mut [u8; SEEDBYTES], t1: &mut Polyveck, pk: &[u8; PUBLICKEYBYTES]) {
     rho.copy_from_slice(&pk[..SEEDBYTES]);
 
-    for i in 0..K {
+    for (i, p) in t1.vec.iter_mut().enumerate() {
         let off = SEEDBYTES + i * POLYT1_PACKEDBYTES;
-        t1.vec[i].polyt1_unpack(&pk[off..off + POLYT1_PACKEDBYTES]);
+        p.polyt1_unpack(&pk[off..off + POLYT1_PACKEDBYTES]);
     }
 }
 
@@ -76,21 +76,21 @@ pub fn pack_sk(
     sk[off..off + TRBYTES].copy_from_slice(tr);
     off += TRBYTES;
 
-    for i in 0..L {
+    for (i, p) in s1.vec.iter().enumerate() {
         let o = off + i * POLYETA_PACKEDBYTES;
-        s1.vec[i].polyeta_pack(&mut sk[o..o + POLYETA_PACKEDBYTES]);
+        p.polyeta_pack(&mut sk[o..o + POLYETA_PACKEDBYTES]);
     }
     off += L * POLYETA_PACKEDBYTES;
 
-    for i in 0..K {
+    for (i, p) in s2.vec.iter().enumerate() {
         let o = off + i * POLYETA_PACKEDBYTES;
-        s2.vec[i].polyeta_pack(&mut sk[o..o + POLYETA_PACKEDBYTES]);
+        p.polyeta_pack(&mut sk[o..o + POLYETA_PACKEDBYTES]);
     }
     off += K * POLYETA_PACKEDBYTES;
 
-    for i in 0..K {
+    for (i, p) in t0.vec.iter().enumerate() {
         let o = off + i * POLYT0_PACKEDBYTES;
-        t0.vec[i].polyt0_pack(&mut sk[o..o + POLYT0_PACKEDBYTES]);
+        p.polyt0_pack(&mut sk[o..o + POLYT0_PACKEDBYTES]);
     }
 }
 
@@ -120,21 +120,21 @@ pub fn unpack_sk(
     tr.copy_from_slice(&sk[off..off + TRBYTES]);
     off += TRBYTES;
 
-    for i in 0..L {
+    for (i, p) in s1.vec.iter_mut().enumerate() {
         let o = off + i * POLYETA_PACKEDBYTES;
-        s1.vec[i].polyeta_unpack(&sk[o..o + POLYETA_PACKEDBYTES]);
+        p.polyeta_unpack(&sk[o..o + POLYETA_PACKEDBYTES]);
     }
     off += L * POLYETA_PACKEDBYTES;
 
-    for i in 0..K {
+    for (i, p) in s2.vec.iter_mut().enumerate() {
         let o = off + i * POLYETA_PACKEDBYTES;
-        s2.vec[i].polyeta_unpack(&sk[o..o + POLYETA_PACKEDBYTES]);
+        p.polyeta_unpack(&sk[o..o + POLYETA_PACKEDBYTES]);
     }
     off += K * POLYETA_PACKEDBYTES;
 
-    for i in 0..K {
+    for (i, p) in t0.vec.iter_mut().enumerate() {
         let o = off + i * POLYT0_PACKEDBYTES;
-        t0.vec[i].polyt0_unpack(&sk[o..o + POLYT0_PACKEDBYTES]);
+        p.polyt0_unpack(&sk[o..o + POLYT0_PACKEDBYTES]);
     }
 }
 
@@ -149,9 +149,9 @@ pub fn unpack_sk(
 pub fn pack_sig(sig: &mut [u8; SIGNBYTES], c: &[u8; CTILDEBYTES], z: &Polyvecl, h: &Polyveck) {
     sig[..CTILDEBYTES].copy_from_slice(c);
 
-    for i in 0..L {
+    for (i, p) in z.vec.iter().enumerate() {
         let off = CTILDEBYTES + i * POLYZ_PACKEDBYTES;
-        z.vec[i].polyz_pack(&mut sig[off..off + POLYZ_PACKEDBYTES]);
+        p.polyz_pack(&mut sig[off..off + POLYZ_PACKEDBYTES]);
     }
 
     // Encode h into the trailing OMEGA + K bytes.
@@ -162,10 +162,10 @@ pub fn pack_sig(sig: &mut [u8; SIGNBYTES], c: &[u8; CTILDEBYTES], z: &Polyvecl, 
 
     let mut k = 0usize;
     for i in 0..K {
-        for j in 0..super::params::N {
+        for (j, &coefficient) in h.vec[i].coeffs.iter().enumerate() {
             // Hint `h` is public signature output, so the branch on a nonzero
             // coefficient is sanctioned (plan §5).
-            if h.vec[i].coeffs[j] != 0 {
+            if coefficient != 0 {
                 hint[k] = j as u8;
                 k += 1;
             }
@@ -199,9 +199,9 @@ pub fn unpack_sig(
 ) -> Result<(), ()> {
     c.copy_from_slice(&sig[..CTILDEBYTES]);
 
-    for i in 0..L {
+    for (i, p) in z.vec.iter_mut().enumerate() {
         let off = CTILDEBYTES + i * POLYZ_PACKEDBYTES;
-        z.vec[i].polyz_unpack(&sig[off..off + POLYZ_PACKEDBYTES]);
+        p.polyz_unpack(&sig[off..off + POLYZ_PACKEDBYTES]);
     }
 
     // Decode h from the trailing OMEGA + K bytes.
@@ -384,7 +384,7 @@ mod tests {
         assert!(total <= OMEGA);
         let mut h = Polyveck::zero();
         let mut remaining = total;
-        for i in 0..K {
+        for p in h.vec.iter_mut() {
             if remaining == 0 {
                 break;
             }
@@ -394,8 +394,8 @@ mod tests {
             let mut chosen = 0;
             let mut idx = (rng.next_u32() as usize) % (N - OMEGA);
             while chosen < here && idx < N {
-                if h.vec[i].coeffs[idx] == 0 {
-                    h.vec[i].coeffs[idx] = 1;
+                if p.coeffs[idx] == 0 {
+                    p.coeffs[idx] = 1;
                     chosen += 1;
                 }
                 idx += 1 + (rng.next_u32() as usize % 3);
