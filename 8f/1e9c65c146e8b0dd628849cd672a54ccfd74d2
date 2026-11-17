@@ -1,0 +1,55 @@
+scripts/verification/test_security_catalog.py
+  s_57bb08606d14ce::t_feb95990072d04 1-105
+src/transport/udp/quic/conn.rs
+  s_57bb08606d14ce::t_59e29dc2346c0f 3601-3606,5907-6077
+src/transport/udp/quic/endpoint.rs
+  s_57bb08606d14ce::t_39a9514f694bf7 2317-2424
+tests/privacy_validation.rs
+  s_57bb08606d14ce::t_0000ad95028e3e 1-108
+tests/protocol_e2e.rs
+  s_57bb08606d14ce::t_78e6d9c54cb62e 124-141,153-199,207,306-315,333-335,473-480,485-495,677-727,749-760,784-786,972-1019
+verification/SECURITY-VALIDATION.md
+  s_57bb08606d14ce::t_35acfdef372ebc 1-186
+verification/security_catalog.json
+  s_57bb08606d14ce::t_af271c46d9cc93 1-679
+tests/crypto_validation.rs
+  s_370c0dc2ddb340::t_3110aed2734d17 1-374
+verification/proverif/README.md
+  s_2b39ef01b4cd16::t_b2a33cee177582 87-92,142-190
+verification/proverif/compromise.py
+  s_2b39ef01b4cd16::t_1650e81a82aaa4 1-175
+verification/proverif/test_compromise.py
+  s_2b39ef01b4cd16::t_1f9c99389b5953 1-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8f1e9c65c146e8b0dd628849cd672a54ccfd74d2",
+  "prompts": {},
+  "sessions": {
+    "s_2b39ef01b4cd16": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e84e-f002-7012-b9af-3e78a5331c90",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_370c0dc2ddb340": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e84f-3e1b-7de3-a12b-c95dd281a82f",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_57bb08606d14ce": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a8490d18-3816-461a-b2a5-c800a81aace1",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
