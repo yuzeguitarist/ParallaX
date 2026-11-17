@@ -4553,13 +4553,12 @@ mod tests {
             peer.write_all(&record).await.unwrap();
             drop(peer);
             stream.readable().await.unwrap();
-            assert_eq!(
-                session
-                    .drain_post_handshake(&mut stream, &mut keys)
-                    .await
-                    .unwrap(),
-                1
-            );
+            let result = session.drain_post_handshake(&mut stream, &mut keys).await;
+            if content_type == TLS_RECORD_CHANGE_CIPHER_SPEC {
+                assert_eq!(fatal_alert_description(&result.unwrap_err()), Some(10));
+            } else {
+                assert_eq!(result.unwrap(), 1);
+            }
             assert!(session.pending_http2_plaintext.is_empty());
         }
     }
