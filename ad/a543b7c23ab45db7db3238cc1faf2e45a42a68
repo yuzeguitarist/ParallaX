@@ -1,0 +1,19 @@
+src/protocol/data.rs
+  s_0acd2adb357b18::t_25b1a212926560 1027-1032,1043,1046,1226-1258,1268,1275-1294,1296,1304,1310,1320-1325,1344-1345,1353,1356,1359-1363,1366-1370,1377,1381-1385,1387,2718-2841,2924-2976
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ada543b7c23ab45db7db3238cc1faf2e45a42a68",
+  "prompts": {},
+  "sessions": {
+    "s_0acd2adb357b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99c6c6d0-06d8-4e35-98e1-0e7efa510d42",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
