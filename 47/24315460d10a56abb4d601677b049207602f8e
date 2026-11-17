@@ -1,0 +1,33 @@
+.github/semgrep/crypto.rs
+  s_e64425ec86f0f2::t_c734f5a5bf710c 221-245
+.github/semgrep/crypto.yml
+  s_e64425ec86f0f2::t_41461886f4bd97 208-216
+scripts/verification/protocol_contracts.py
+  s_9933477e512b07::t_9a4cb108209e56 123-154,168-170
+scripts/verification/test_protocol_contracts.py
+  s_9933477e512b07::t_b7423d2bbd368c 160-184,194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4724315460d10a56abb4d601677b049207602f8e",
+  "prompts": {},
+  "sessions": {
+    "s_9933477e512b07": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e8a9-8586-75a1-9cc0-261a35fa638b",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_e64425ec86f0f2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e89c-e917-7b03-8857-dd926451617e",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
