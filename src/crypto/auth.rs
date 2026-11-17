@@ -810,6 +810,25 @@ mod tests {
     }
 
     #[test]
+    fn os_rng_auth_nonce_smoke_keeps_live_timestamps_and_distinct_nonces() {
+        let before = current_unix_timestamp().unwrap();
+        let mut timestamps = Vec::new();
+        let mut nonces = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let tail = build_auth_tail(&mut rand::rngs::OsRng).unwrap();
+            let (timestamp, nonce) = auth_tail_timestamp_nonce(&tail);
+            timestamps.push(timestamp);
+            assert!(nonces.insert(nonce), "OS-backed auth nonce repeated");
+        }
+        let after = current_unix_timestamp().unwrap();
+        assert!(timestamps
+            .into_iter()
+            .all(|timestamp| (before..=after).contains(&timestamp)));
+        // A bounded uniqueness/clock smoke test cannot establish OS entropy
+        // quality and does not exercise an unavailable OS-RNG failure seam.
+    }
+
+    #[test]
     fn derived_auth_key_is_nonconstant_and_binds_the_shared_secret() {
         // Kills `derive_auth_key_from_shared -> Ok([0;32])` / `Ok([1;32])`: the key is
         // neither constant nor independent of the X25519 shared secret.

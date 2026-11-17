@@ -9,6 +9,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/security/**'
+      - 'scripts/verification/**'
+      - 'verification/protocol_contracts.json'
+      - 'verification/security_catalog.json'
+      - 'SPEC.md'
       - 'verification/concurrency/**'
       - '.github/scripts/test_security_*.py'
       - '.github/workflows/security-assurance.yml'
@@ -20,6 +24,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/security/**'
+      - 'scripts/verification/**'
+      - 'verification/protocol_contracts.json'
+      - 'verification/security_catalog.json'
+      - 'SPEC.md'
       - 'verification/concurrency/**'
       - '.github/scripts/test_security_*.py'
       - '.github/workflows/security-assurance.yml'
@@ -66,7 +74,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; explicit toolchain below
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
@@ -74,18 +82,92 @@ jobs:
         run: |
           python3 -m unittest discover -s .github/scripts -p 'test_security_*.py'
           python3 scripts/security/test_tsan_runtime.py
+          python3 -m unittest discover -s scripts/verification -p 'test_*.py'
+          python3 scripts/verification/check_spec.py
+          python3 scripts/verification/protocol_contracts.py --check
+          python3 scripts/verification/security_catalog.py --check
+          python3 scripts/security/test_timing.py
       - name: Check isolated workspace formatting
         if: matrix.suite == 'std' || matrix.suite == 'loom' || matrix.suite == 'shuttle'
         run: cargo fmt --manifest-path verification/concurrency/Cargo.toml -- --check
       - name: Execute bounded project suite
         env:
           SUITE: ${{ matrix.suite }}
+          PARALLAX_PROP_SEED: ${{ github.run_id }}
+          PARALLAX_PROP_CASES: ${{ github.event_name == 'schedule' && '1024' || '256' }}
         run: python3 scripts/security/assurance.py "$SUITE"
+      - name: Require executed evidence for every protocol contract
+        if: matrix.suite == 'protocol'
+        run: python3 scripts/verification/protocol_contracts.py --check --evidence target/security/assurance/protocol/report.json
+      - name: Record security categories and their remaining boundaries
+        if: matrix.suite == 'protocol'
+        run: >-
+          python3 scripts/verification/security_catalog.py
+          --evidence target/security/assurance/protocol/report.json
+          --output target/security/assurance/protocol/security-catalog.json
       - name: Retain selected tests, bounds and reproduction logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: assurance-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/security/assurance/${{ matrix.suite }}/
+          if-no-files-found: error
+          retention-days: 10
+
+  public-route:
+    name: isolated public-address proxy routing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; explicit toolchain below
+        with:
+          toolchain: stable
+      - name: Test ClientChosen routing with no fixed-target override or Internet traffic
+        env:
+          CARGO_BUILD_JOBS: '4'
+        run: python3 scripts/verification/public_route.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: public-route-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/security/public-route/
+          if-no-files-found: error
+          retention-days: 10
+
+  protocol-coverage:
+    name: instrumented protocol coverage evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; explicit toolchain below
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - name: Install pinned coverage driver
+        run: cargo install --locked --version 0.8.7 cargo-llvm-cov
+      - name: Execute all tests, including serial network and binary cases
+        env:
+          CARGO_BUILD_JOBS: '4'
+          PARALLAX_PROP_SEED: ${{ github.run_id }}
+          PARALLAX_PROP_CASES: '256'
+        run: cargo llvm-cov --locked --lib --bins --tests --no-report -- --include-ignored --test-threads=1 --quiet
+      - name: Export raw coverage and uncovered source lines
+        run: |
+          mkdir -p target/security/protocol-coverage
+          cargo llvm-cov report --locked --json --output-path target/security/protocol-coverage/coverage.json
+          cargo llvm-cov report --locked --text --show-missing-lines --output-path target/security/protocol-coverage/coverage.txt
+          cargo llvm-cov report --locked --html --output-dir target/security/protocol-coverage/html
+      - name: Retain coverage for review without claiming complete proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: protocol-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/security/protocol-coverage/
           if-no-files-found: error
           retention-days: 10

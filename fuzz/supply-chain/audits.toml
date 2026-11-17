@@ -1,4 +1,48 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.rustix]]
+who = "Mohammed Rami Benhamida <bloop.dex@gmail.com>"
+criteria = "safe-to-deploy"
+version = "1.1.4"
+notes = """
+Inherited exact-version statement, not a source audit performed by ParallaX.
+Source: https://github.com/bloopdex/vaultline/blob/bb98cf1eefa3ac33a5a045e5242746b24225ef07/supply-chain/audits.toml
+Introduction: https://github.com/bloopdex/vaultline/commit/b829f2bac986c4d9d8d0ff71b257e1da87d10da6
+The original notes describe a structural review of runtime capabilities, syscall
+and FFI unsafe boundaries, build-time configuration detection and licensing.
+They do not declare a feature or platform restriction. The source is an
+attributed public audit statement, not proof of review depth or a purely human
+review process; consult the immutable source for its original wording.
+"""
+
+[[audits.rustix]]
+who = "David Mulder <dmulder@samba.org>"
+criteria = "safe-to-deploy"
+delta = "1.1.4 -> 1.1.5"
+notes = """
+Inherited version-specific delta statement; the upstream record has no notes.
+Source: https://github.com/himmelblau-idm/himmelblau/blob/200969d274af233c2accc3ac7ef06d658ce7f9d3/supply-chain/audits.toml
+Introduction: https://github.com/himmelblau-idm/himmelblau/commit/f93836f76b90a42723afb55117ea5a6aa4a0a670
+The named project maintainer published this standard-criteria decision. No
+feature or platform restriction is declared. This preserves that attribution;
+it does not assert that ParallaX performed this audit or verified a purely
+human review process.
+"""
+
+[[audits.rustix]]
+who = "tentacles <32138582+ph1losof@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.5 -> 1.1.6"
+notes = """
+Inherited version-specific delta statement, with the original review reasoning
+retained here as a summary rather than a new ParallaX certification.
+Source: https://github.com/merkur-sh/merkur/blob/009df98f029561b200d7808ce26c239495065a73/supply-chain/audits.toml
+Introduction: https://github.com/merkur-sh/merkur/commit/7fbce05e9474555352e4be8b6f8394584447288b
+The source covers the RUSTSEC-2026-0486 xattr fix and size-query APIs, ancillary
+message bounds, controlling-terminal arguments, 32-bit uid/gid syscalls, IPv6
+option levels, Apple allocation semantics, initialized-padding wrappers and the
+bitflags minimum. It reports no added dependency, build script or process/network
+capability in the delta. No feature or platform restriction is declared; the
+immutable source retains the original notes and attribution.
+"""

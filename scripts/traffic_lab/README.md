@@ -231,3 +231,105 @@ mapping, the private shuffle seed, and a hash binding it to the exact public
 artifact. The oracle is created with mode 0600. Random ordering is reproducible
 from the withheld seed, which is not given to the analyst. The challenge remains
 a pilot when the corpus is small, unmatched, or lacks independent holdouts.
+
+## Site identification and two-vantage correlation
+
+`privacy.py` supplies two additional experiments. They consume actual capture
+artifacts; no field corpus is bundled and no real-world resistance result is
+implied by the machinery tests. Reports say `evaluated` or
+`insufficient_evidence`, never security PASS. Missing, invalid or insufficient
+input produces a retained failure report and exit status 2. Output files are
+created exclusively. Both modes reuse the existing bounded TLS-record extractor
+and record artifact, manifest, extractor and analyzer hashes.
+
+```sh
+python3 -B scripts/traffic_lab/privacy.py websites sites.json --seed 20261117 --output sites-report.json
+python3 -B scripts/traffic_lab/privacy.py correlate pairs.json --bin-ms 50 --max-lag-ms 250 --output pairs-report.json
+python3 -B -m unittest discover -s scripts/traffic_lab -p 'test_privacy.py' -v
+```
+
+Website input uses `schema: "parallax-website-corpus-v1"`, explicit `purpose`
+(`measurement` or `machinery_control`), `workload_scope` (`controlled_fetch`,
+`rendered_visit` or `synthetic_control`) and a `captures` array. Synthetic inputs
+must use `machinery_control`. Each capture has the existing `path`, `format`,
+`sha256`, `server_port` where applicable, `capture_id`, `capture_group`, `site`,
+`implementation`, `vantage`, `workload`, ISO `day` and `network` fields, plus
+`complete: true`. Paths including symlinks must resolve inside the manifest's
+directory. Duplicate IDs or artifact hashes cannot supply independent evidence.
+
+There must be 2..32 known site classes, at least six independent complete
+sessions per site and one observation per `capture_group`. A session must never
+be split into windows or reused under a new group. The corpus uses one
+implementation and one capture vantage, with identical workload/day/network
+counts for every site class. These checks limit obvious collection confounding;
+the independent collection and completion assertions still need review. PCAP
+inputs enforce the extractor's TCP FIN/reassembly requirements. TSV completion
+is only a collector attestation because the format has no transport FIN evidence.
+
+The fixed multiclass nearest-centroid baseline stratifies by known site and
+holds out whole session groups using the recorded seed, with 60% rounded down
+for training and the rest for testing. All scaling and centroids use training
+data only. Features are the existing observable TLS record counts, lengths,
+direction runs and timing statistics; metadata and site names are not inputs.
+Reports include held-out accuracy, macro/per-site accuracy, confusion matrix,
+uniform-chance and majority baselines, group membership and an accuracy interval
+assuming independent sessions. This is closed-set site identification, not
+unknown-site discovery or proof of resistance to stronger classifiers. A
+session holdout does not establish cross-day/network generalization; controlled
+fetches do not establish full rendered-website behavior.
+
+Correlation input uses `schema: "parallax-correlation-corpus-v1"`, `purpose`,
+distinct declared `ingress_vantage` and `egress_vantage`,
+`direction_convention: "initiator_to_responder"` and a `pairs` array. For example:
+
+```json
+{
+  "schema": "parallax-correlation-corpus-v1",
+  "purpose": "measurement",
+  "ingress_vantage": "client-to-proxy observation",
+  "egress_vantage": "proxy-to-origin observation",
+  "direction_convention": "initiator_to_responder",
+  "pairs": [{
+    "pair_id": "trial-01",
+    "capture_group": "independent-session-01",
+    "workload": "matched-https-visit",
+    "day": "2026-11-17",
+    "network": "matched-path-cohort",
+    "ingress": {
+      "capture_id": "in-01", "path": "in-01.tsv", "format": "record_tsv",
+      "sha256": "ARTIFACT_SHA256", "complete": true
+    },
+    "egress": {
+      "capture_id": "out-01", "path": "out-01.tsv", "format": "record_tsv",
+      "sha256": "ARTIFACT_SHA256", "complete": true
+    }
+  }]
+}
+```
+
+Supply 2..64 independent pairs, each with different IDs/groups and globally
+unique artifacts. All candidates must have matching workload/day/network
+metadata. The pairing is ground truth used only to evaluate rank, not a score
+feature. Each observation needs eight application records, both directions and
+8..512 time bins. Both vantages must map direction 0 to the same initiator's
+upload; `server_port` controls direction extraction for each PCAP/Safari TSV.
+
+The detector sums TLS-record payload bytes per direction/bin and ranks all
+candidate egresses by the maximum centered Pearson score over the declared
+bounded lag scan. It requires at least 75% overlapping bins and at least eight
+bins at each lag. Lag is limited to 32 bins; the total pair/bin/lag product is
+bounded. Relative first-application-record origins are normalized by the
+extractor, so the reported lag is an alignment offset, not a network latency
+measurement. Shorter complete traces are zero-padded to the cohort duration.
+Constant traces provide no correlation evidence. Reports include true-match
+scores, best impostor scores, midranks, reciprocal midranks and top-1/top-3 credit
+with honest fractional ties. Identical candidate patterns give chance top-1,
+rather than using input order to manufacture successful matches. These are
+observed cohort ranking metrics, not confidence bounds for a deployed attacker.
+
+The extractor omits IP headers, retransmissions and non-TLS traffic; it is not a
+general packet-level two-vantage detector. Capture provenance, true pair labels
+and completeness require collection review. The tests include informative site
+signals, constant/uninformative features, shuffled site/pair labels, train-only
+scaling, lag limits, tied candidates, bad hashes, duplicate artifacts, escaped
+paths and insufficient data. They validate experiment machinery only.

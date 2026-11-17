@@ -44,6 +44,17 @@ class AssuranceControls(unittest.TestCase):
             self.assertIn("--release", command)
             self.assertEqual(command[-4:], ["--features", kind, "--test", kind])
 
+    def test_security_targets_include_ignored_live_probes_and_production_doctests(self):
+        plan = {name: (command, runtime) for name, command, runtime in assurance.selections("protocol")}
+        for name in ("crypto_validation", "privacy_validation", "gfw_simulator", "ja4_census_oracle"):
+            self.assertIn(name, plan)
+        for name in ("distinguisher_battery", "prober_loop"):
+            self.assertEqual(plan[name][1], ["--include-ignored"])
+        self.assertEqual(plan["production_api"][0], ["cargo", "test", "--locked", "--doc"])
+        self.assertEqual(assurance.selected_tests(
+            "src/crypto/session.rs - crypto::session::SessionKeys (line 70): test\n"),
+            ["src/crypto/session.rs - crypto::session::SessionKeys (line 70)"])
+
     def test_native_backend_is_selected_without_model_features(self):
         command = assurance.selections("std")[0][1]
         self.assertIn("verification/concurrency/Cargo.toml", command)

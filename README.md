@@ -354,6 +354,11 @@ models, Linux ASan/TSan/LSan workloads, protocol differential and fault tests,
 and real-listener admission/replay checks. They run in dedicated Actions jobs
 and retain their test selections, bounds and diagnostics.
 
+The [protocol verification matrix](./verification/PROTOCOL.md) maps the complete
+protocol lifecycle to formal models, binary E2E, generated property tests and
+independent differential oracles, with commands, replay seeds and explicit
+coverage limits. All four layers run in pull-request CI.
+
 See the [threat model](./docs/security/threat-model.md),
 [dependency source-audit policy and open audit debt](./supply-chain/README.md),
 and [release SBOM/provenance verification](./supply-chain/RELEASE-VERIFICATION.md).

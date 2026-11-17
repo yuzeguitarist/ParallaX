@@ -3024,6 +3024,24 @@ impl Connection {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_handshake_crypto(&self) -> &[u8] {
+        &self.spaces[SPACE_HANDSHAKE].crypto_send
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_handshake_packet(&mut self, offset: u64, data: &[u8]) -> Vec<u8> {
+        let pn = self.allocate_packet_number(SPACE_HANDSHAKE);
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(SPACE_HANDSHAKE, pn, pn_len);
+        let keys = self.spaces[SPACE_HANDSHAKE].keys.as_ref().unwrap();
+        seal_packet(
+            &keys.local,
+            header,
+            &[Frame::Crypto { offset, data }, Frame::Padding(3)],
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_cancelled_stream_waits_for_accept(&self, id: u64) -> bool {
         self.streams.get(&id).is_some_and(|s| {
             s.reset_acked && s.recv_reset.is_some() && s.recv_high == 0 && !s.recv_released
@@ -3613,6 +3631,12 @@ impl Connection {
         }
         let space = space_index(pspace);
         if self.spaces[space].discarded {
+            return Ok(());
+        }
+        // A known four-tuple still cannot change the connection's QUIC version.
+        // The version is plaintext AAD, so reject unsupported long headers before
+        // deriving keys, decrypting or committing authenticated receive state.
+        if pkt[0] & 0x80 != 0 && pkt.get(1..5) != Some(self.version.to_be_bytes().as_slice()) {
             return Ok(());
         }
 
@@ -5896,6 +5920,177 @@ mod tests {
             client.handshake_confirmed,
             "client confirms on receiving HANDSHAKE_DONE"
         );
+    }
+
+    #[test]
+    fn authenticated_wrong_version_packets_do_not_commit_and_v1_recovers() {
+        for receiving_client in [false, true] {
+            let mut client = Connection::new_client(
+                client_config(),
+                "example.com",
+                ConnectionId::new(&[0xb1; 8]),
+                ConnectionId::new(&[]),
+            )
+            .unwrap();
+            let mut server = Connection::new_server(
+                Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+                &server_key(),
+                vec![b"h3".to_vec()],
+                server_tp(),
+                ConnectionId::new(&[0xb2; 4]),
+            )
+            .unwrap();
+            let now = Instant::now();
+            while let Some(datagram) = client.poll_transmit(now) {
+                server.handle_datagram(&datagram, now).unwrap();
+            }
+            let (sender, receiver) = if receiving_client {
+                (&mut server, &mut client)
+            } else {
+                (&mut client, &mut server)
+            };
+            let pn = sender.allocate_packet_number(SPACE_INITIAL);
+            let header = sender.make_header(SPACE_INITIAL, pn, 1);
+            let mut wrong_header = header.clone();
+            let Header::Long { version, .. } = &mut wrong_header else {
+                panic!("Initial requires a long header");
+            };
+            *version = 0x0a0a_0a0a;
+            let keys = sender.spaces[SPACE_INITIAL].keys.as_ref().unwrap();
+            let frames = [Frame::Ping, Frame::Padding(1200)];
+            let wrong = seal_packet(&keys.local, wrong_header, &frames);
+            let good = seal_packet(&keys.local, header, &frames);
+            // The unsupported version is authenticated as part of AAD. A mere
+            // flipped version byte would fail AEAD and miss this admission gate.
+            let mut opened = wrong.clone();
+            let (decoded, _) = open_packet(
+                &keys.local,
+                &mut opened,
+                receiver.scid.len(),
+                receiver.spaces[SPACE_INITIAL].recv.largest(),
+            )
+            .unwrap();
+            assert!(matches!(
+                decoded,
+                Header::Long {
+                    version: 0x0a0a_0a0a,
+                    ..
+                }
+            ));
+            let before_pn = receiver.spaces[SPACE_INITIAL].recv.to_ack(0);
+            let before_idle = receiver.last_recv_time;
+            let before_cid = receiver.dcid;
+            let before_ecn = receiver.spaces[SPACE_INITIAL].recv_ecn;
+            receiver
+                .handle_datagram_ecn(&wrong, EcnCodepoint::Ce, now + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(receiver.spaces[SPACE_INITIAL].recv.to_ack(0), before_pn);
+            assert_eq!(receiver.last_recv_time, before_idle);
+            assert_eq!(receiver.dcid, before_cid);
+            let after_ecn = receiver.spaces[SPACE_INITIAL].recv_ecn;
+            assert_eq!(
+                (after_ecn.ect0, after_ecn.ect1, after_ecn.ce),
+                (before_ecn.ect0, before_ecn.ect1, before_ecn.ce)
+            );
+            assert!(!receiver.is_closed());
+            sender.record_sent(
+                SPACE_INITIAL,
+                pn,
+                good.len(),
+                true,
+                SentContent::default(),
+                now,
+            );
+            receiver
+                .handle_datagram(&good, now + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(receiver.spaces[SPACE_INITIAL].recv.largest(), Some(pn));
+            drive_at(&mut client, &mut server, now + Duration::from_secs(2));
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+        }
+    }
+
+    #[test]
+    fn valid_zero_rtt_does_not_validate_address_or_lift_amplification_limit() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let mut client = Connection::new_client_resumption(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0xb3; 8]),
+            ConnectionId::new(&[]),
+            &ticket,
+            1_001_000,
+        )
+        .unwrap();
+        let mut server = Connection::new_server_with_stek(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xb4; 4]),
+            Some(stek),
+        )
+        .unwrap();
+        let early = b"authenticated early stream is not address validation";
+        client.send_stream(RELAY_STREAM_ID, early);
+        let now = Instant::now();
+        let mut received = 0;
+        let mut saw_early = false;
+        while let Some(datagram) = client.poll_transmit(now) {
+            saw_early |= packet::first_packet_space(&datagram) == Some(PacketSpace::ZeroRtt);
+            received += datagram.len() as u64;
+            server.handle_datagram(&datagram, now).unwrap();
+            assert!(!server.peer_addr_validated);
+        }
+        assert!(saw_early && server.zero_rtt_keys_installed());
+        assert_eq!(server.read_stream(RELAY_STREAM_ID), early);
+        assert!(server.is_handshaking());
+        assert_eq!(server.anti_amp_recv, received);
+
+        // A valid PSK lets the server encrypt application output, but its holder
+        // can replay an old early-data flight from a spoofed source. Force enough
+        // genuine output to hit the address budget before any Handshake reply.
+        let response = vec![0x6d; 24 * 1024];
+        server.send_stream(RELAY_STREAM_ID, &response);
+        let mut sent = 0;
+        while let Some(datagram) = server.poll_transmit(now) {
+            sent += datagram.len() as u64;
+            client.handle_datagram(&datagram, now).unwrap();
+        }
+        assert!(!server.peer_addr_validated);
+        assert!(sent <= 3 * received);
+        assert_eq!(server.anti_amp_sent, sent);
+        assert!(server.streams[&RELAY_STREAM_ID].send_off < response.len() as u64);
+        assert!(
+            server.anti_amp_sent + MAX_DATAGRAM as u64 > 3 * server.anti_amp_recv,
+            "the anti-amplification budget, not just pacing, must stop output"
+        );
+
+        // Deliver the real client's pending Handshake flight, then permit ACKs
+        // and data in both directions. The former address budget must no longer
+        // cap the rest of the response.
+        for _ in 0..32 {
+            let mut moved = false;
+            while let Some(datagram) = client.poll_transmit(now) {
+                server.handle_datagram(&datagram, now).unwrap();
+                moved = true;
+            }
+            while let Some(datagram) = server.poll_transmit(now) {
+                sent += datagram.len() as u64;
+                client.handle_datagram(&datagram, now).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        assert!(server.peer_addr_validated);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert!(
+            sent > 3 * received,
+            "Handshake validation lifts the earlier bound"
+        );
+        assert_eq!(client.read_stream(RELAY_STREAM_ID), response);
     }
 
     /// RFC 9000 §8.1 anti-amplification (findings #203/#216): before the client's

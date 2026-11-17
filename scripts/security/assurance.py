@@ -25,10 +25,18 @@ KINDS = ("protocol", "listener", "std", "loom", "shuttle")
 
 def selections(kind: str, replay_test: str | None = None) -> list[tuple[str, list[str], list[str]]]:
     if kind == "protocol":
-        return [(name, ["cargo", "test", "--locked", "--test", name], [])
+        return [(name, ["cargo", "test", "--locked", "--test", name],
+                 ["--include-ignored"] if name in ("distinguisher_battery", "prober_loop") else [])
                 for name in ("security_protocol_differential", "security_fault_injection",
+                             "protocol_differential", "protocol_properties", "protocol_carrier",
+                             "crypto_validation", "privacy_validation", "distinguisher_battery",
+                             "ja4_census_oracle", "gfw_simulator", "prober_loop",
                              "security_plaintext_allocation",
-                             "mldsa_differential", "mldsa_acvp")]
+                             "mldsa_differential", "mldsa_acvp")] + [
+            ("protocol_library", ["cargo", "test", "--locked", "--lib"], ["--include-ignored"]),
+            ("protocol_e2e", ["cargo", "test", "--locked", "--test", "protocol_e2e"], ["--ignored"]),
+            ("security_listener", ["cargo", "test", "--locked", "--test", "security_listener"], ["--ignored"]),
+            ("production_api", ["cargo", "test", "--locked", "--doc"], [])]
     if kind == "listener":
         return [("security_listener", ["cargo", "test", "--locked", "--test",
                                       "security_listener"], ["--ignored"])]
@@ -41,7 +49,9 @@ def selections(kind: str, replay_test: str | None = None) -> list[tuple[str, lis
 
 
 def selected_tests(output: str) -> list[str]:
-    return re.findall(r"^([A-Za-z_][A-Za-z0-9_:]*): test$", output, re.MULTILINE)
+    return re.findall(
+        r"^([A-Za-z_][A-Za-z0-9_:]*|src/[A-Za-z0-9_/]+\.rs - "
+        r"[A-Za-z_][A-Za-z0-9_:]* \(line [1-9][0-9]*\)): test$", output, re.MULTILINE)
 
 
 def checked_summary(output: str, expected: int) -> dict[str, int]:
@@ -109,6 +119,9 @@ def main() -> int:
                 "PARALLAX_SHUTTLE_SEED": "20260828",
                 "PARALLAX_SHUTTLE_ITERATIONS": "200",
                 "PARALLAX_MODEL_WORKLOAD_SEED": "0" if args.kind == "loom" else "257"}
+    if args.kind == "protocol":
+        defaults.update({"PARALLAX_PROP_SEED": "0x504c585f50524f50",
+                         "PARALLAX_PROP_CASES": "256"})
     for key, value in defaults.items():
         env.setdefault(key, value)
     report = {"schema_version": 1, "kind": args.kind, "status": "running",

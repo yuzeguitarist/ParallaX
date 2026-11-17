@@ -25,7 +25,7 @@ class FormalModelTests(unittest.TestCase):
         self.assertEqual(
             names,
             {
-                "ParallaXSession": 63,
+                "ParallaXSession": 114,
                 "ParallaXQuic": 260,
                 "ParallaXZeroRtt": 456,
                 "ParallaXReplay": 26,
@@ -35,6 +35,10 @@ class FormalModelTests(unittest.TestCase):
                 "ParallaXClose": 21,
                 "ParallaXBbr": 56,
                 "ParallaXPacket": 14,
+                "ParallaXRecords": 176,
+                "ParallaXFragments": 23,
+                "ParallaXMux": 17762,
+                "ParallaXIdentityChunks": 5464,
             },
         )
         for machine in plx_formal.machines():
@@ -119,6 +123,46 @@ class FormalModelTests(unittest.TestCase):
         self.assertIn("AcceptsAtMostOnce", message)
         self.assertIn("SecondAccept", message)
 
+    def test_session_distinguishes_early_pending_splice_and_late_commit_close(self):
+        machine = plx_formal.session_machine()
+        cases = (
+            ("EarlyStaleSplice", lambda a: replace(a, assign={**a.assign, "phase": '"epoch0"',
+                                                             "keys": "TRUE", "usable": "TRUE"}),
+             "PendingRefusalSplicesWithoutKeys"),
+            ("InstallEpoch0", lambda a: replace(a, guard='phase = "authed"'), "EpochZeroRequiresAdmission"),
+            ("ReplayStale", lambda a: replace(a, assign={**a.assign, "how": '"splice"'}), "ReplayClosesBeforeRekey"),
+            ("ReplayMissingCache", lambda a: replace(a, assign={**a.assign, "how": '"splice"'}), "ReplayClosesBeforeRekey"),
+            ("RekeyOk", lambda a: replace(a, guard=a.guard.replace('admission = "reserved"', 'admission = "missing"')),
+             "BindingMeansRekeyedEpoch"),
+        )
+        for name, change, invariant in cases:
+            with self.subTest(action=name):
+                actions = tuple(change(a) if a.name == name else a for a in machine.actions)
+                self.assertNotEqual(actions, machine.actions)
+                with self.assertRaises(plx_formal.FormalError) as caught:
+                    plx_formal.check_machine(replace(machine, actions=actions))
+                self.assertIn(invariant, str(caught.exception))
+
+    def test_pending_admission_correspondence_detects_removed_reservation_and_refusal(self):
+        cases = (
+            ("cache.reserve_pending(&entry, now)", "unchecked_pending_admission()", "early pending admission refuses"),
+            ("if !fresh {", "if false {", "missing if !fresh"),
+        )
+        for before, after, message in cases:
+            with self.subTest(anchor=before), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for relative in plx_formal.CORRESPOND_FILES:
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text((plx_formal.ROOT / relative).read_text())
+                target = root / "src/handshake/server.rs"
+                source = target.read_text()
+                self.assertIn(before, source)
+                target.write_text(source.replace(before, after))
+                with self.assertRaises(plx_formal.FormalError) as caught:
+                    plx_formal.correspond(root)
+                self.assertIn(message, str(caught.exception))
+
     def test_formula_parses_implication_and_membership(self):
         compiled = plx_formal.formula(
             'app => (phase = "app" /\\ epoch \\in {0, 1} /\\ ~binding)'
@@ -132,6 +176,158 @@ class FormalModelTests(unittest.TestCase):
         self.assertFalse(
             compiled.holds({"app": True, "phase": "app", "epoch": 1, "binding": True})
         )
+
+    def test_record_failure_cannot_roll_back_or_clear_poison(self):
+        machine = plx_formal.records_machine()
+        cases = (
+            (plx_formal.act("RollbackReservation", 'phase = "failed" /\\ next # 0', next="0"),
+             "ReservationIsNeverRolledBack"),
+            (plx_formal.act("RollbackAllCounterCopies", 'phase = "failed" /\\ next # 0',
+                           next="0", high="0", base="0", prior_end="0"),
+             "ReservationIsNeverRolledBack"),
+            (plx_formal.act("RollbackPublishedCounters", 'phase = "ready" /\\ next # 0',
+                           next="0", high="0", base="0", prior_end="0"),
+             "ReservationIsNeverRolledBack"),
+            (plx_formal.act("ReviveAfterFailure", 'phase = "failed" /\\ poisoned', poisoned="FALSE"),
+             "FailedBatchPoisonsPermanently"),
+            (plx_formal.act("PublishBeforeSibling", 'phase = "reserved" /\\ remaining = 1',
+                           phase='"ready"', published="TRUE"),
+             "PublishOnlyWholeSuccess"),
+        )
+        for bad_action, invariant in cases:
+            with self.subTest(action=bad_action.name), self.assertRaises(plx_formal.FormalError) as caught:
+                plx_formal.check_machine(replace(machine, actions=machine.actions + (bad_action,)))
+            self.assertIn(invariant, str(caught.exception))
+            self.assertIn(bad_action.name, str(caught.exception))
+
+    def test_record_reservation_history_survives_fresh_key_reset(self):
+        machine = plx_formal.records_machine()
+        rekey = next(action for action in machine.actions if action.name == "FreshKeyRekey")
+        self.assertEqual(rekey.assign["next"], "0")
+        for action in machine.actions:
+            for epoch in (0, 1):
+                ledger = f"reserved{epoch}"
+                if ledger in action.assign:
+                    self.assertIn(action.name, (f"Reserve1Epoch{epoch}", f"Reserve2Epoch{epoch}"))
+                    self.assertIn(action.assign[ledger], (f"{ledger} + 1", f"{ledger} + 2"))
+        report = plx_formal.check_machine(machine)
+        self.assertIn("FreshKeyCanReuseSequence", report.witness_names)
+        self.assertIn("RekeyKeepsPoison", report.witness_names)
+
+    def test_fragment_completion_requires_all_bytes_and_clears_latch(self):
+        machine = plx_formal.fragments_machine()
+        cases = (
+            (plx_formal.act("EmitPrefix", 'total = 3 /\\ cursor = 1 /\\ ~stopped',
+                           total="0", cursor="0", frames="frames + 1", emitted="TRUE",
+                           outcome='"complete"'),
+             "EmitOnlyCompleteFrame"),
+            (plx_formal.act("KeepOldLatch", "emitted /\\ ~stopped /\\ total = 0", total="1"),
+             "CompletionClearsLatch"),
+        )
+        for bad_action, invariant in cases:
+            with self.subTest(action=bad_action.name), self.assertRaises(plx_formal.FormalError) as caught:
+                plx_formal.check_machine(replace(machine, actions=machine.actions + (bad_action,)))
+            self.assertIn(invariant, str(caught.exception))
+            self.assertIn(bad_action.name, str(caught.exception))
+
+    def test_new_correspondence_contracts_detect_poison_and_latch_removal(self):
+        cases = (
+            ("src/crypto/session.rs", "self.next = 0;",
+             "self.next = 0; self.poisoned = false;", "without clearing poison"),
+            ("src/protocol/command.rs", "self.expected_total = None;",
+             "/* completion latch reset removed */", "clears state before emission"),
+        )
+        for relative, before, after, message in cases:
+            with self.subTest(file=relative), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for source_path in plx_formal.CORRESPOND_FILES:
+                    target = root / source_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text((plx_formal.ROOT / source_path).read_text())
+                target = root / relative
+                source = target.read_text()
+                self.assertEqual(source.count(before), 1)
+                target.write_text(source.replace(before, after, 1))
+                with self.assertRaises(plx_formal.FormalError) as caught:
+                    plx_formal.correspond(root)
+                self.assertIn(message, str(caught.exception))
+
+    def test_mux_contracts_reject_early_release_cross_stream_abort_and_fin_bypass(self):
+        machine = plx_formal.mux_machine()
+        cases = (
+            ("Fin0", lambda a: replace(a, assign={**a.assign, "charged0": "FALSE"}), "MuxOwnership0"),
+            ("Reset0", lambda a: replace(a, assign={**a.assign, "task0": '"none"', "charged0": "FALSE",
+                                                   "up0": "FALSE", "down0": "FALSE"}), "MuxResetKeepsSlotUntilExit0"),
+            ("Reset0", lambda a: replace(a, assign={**a.assign, "task1": '"none"', "charged1": "FALSE",
+                                                   "upload1": "FALSE", "up1": "FALSE", "down1": "FALSE"}), "MuxLocalEventsPreserveSibling"),
+            ("DataDelivered0", lambda a: replace(a, guard=a.guard.replace("upload0 /\\ up0", "~upload0 /\\ up0")),
+             "MuxDataRequiresUploadRoute0"),
+            ("Open1", lambda a: replace(a, guard=a.guard.replace("capacity = 2 \\/ ~charged0", "capacity = 1 /\\ charged0")),
+             "MuxCapacityCountsBothHalves"),
+        )
+        for prefix, change, invariant in cases:
+            with self.subTest(action=prefix, invariant=invariant):
+                actions = tuple(change(a) if a.name.startswith(prefix) else a for a in machine.actions)
+                self.assertNotEqual(actions, machine.actions)
+                with self.assertRaises(plx_formal.FormalError) as caught:
+                    plx_formal.check_machine(replace(machine, actions=actions))
+                self.assertIn(invariant, str(caught.exception))
+
+    def test_identity_caller_rejects_gap_partial_cap_deadline_and_signature_bypasses(self):
+        machine = plx_formal.identity_chunks_machine()
+        cases = (
+            ("IdentityPartial", {"phase": '"assembled"'}, "IdentityPartialCannotVerify"),
+            ("IdentityWrongOffset", {"phase": '"completion"', "before_cursor": "cursor", "cursor": "incoming_end"},
+             "IdentityAppendRequiresValidatedMetadata"),
+            ("IdentityCapReject", {"phase": '"offset"', "total": "incoming_total"}, "IdentityBufferNeverExceedsCap"),
+            ("IdentityChangedTotal", {"phase": '"offset"'}, "IdentityAppendRequiresValidatedMetadata"),
+            ("IdentityEstablishmentTimeout", {"connect_sent": "TRUE"}, "IdentityFailureBlocksConnect"),
+            ("IdentityBadSignature", {"phase": '"connect"', "connect_sent": "TRUE"}, "IdentityConnectWaitsForVerification"),
+        )
+        for name, assign, invariant in cases:
+            with self.subTest(action=name):
+                actions = tuple(replace(a, assign={**a.assign, **assign}) if a.name == name else a
+                                for a in machine.actions)
+                with self.assertRaises(plx_formal.FormalError) as caught:
+                    plx_formal.check_machine(replace(machine, actions=actions))
+                self.assertIn(invariant, str(caught.exception))
+
+    def test_mux_carrier_teardown_waits_for_aborted_supervisors(self):
+        machine = plx_formal.mux_machine()
+        actions = tuple(replace(a, assign={**a.assign, "phase": '"closed"'})
+                        if a.name == "CarrierTeardown" else a for a in machine.actions)
+        with self.assertRaises(plx_formal.FormalError) as caught:
+            plx_formal.check_machine(replace(machine, actions=actions))
+        self.assertIn("MuxTeardownReleasesAllSlots", str(caught.exception))
+
+    def test_snapshot_assignments_read_pre_step_fields(self):
+        copy = plx_formal._compile_rhs("source", {"source": 0, "destination": 1})
+        self.assertEqual(copy(("relaying", "none")), "relaying")
+        self.assertEqual(copy((False, True)), False)
+        with self.assertRaises(plx_formal.FormalError):
+            plx_formal._compile_rhs("unknown_field", {"source": 0})
+
+    def test_mux_and_px1i_correspondence_detect_live_slot_and_parser_gate_removal(self):
+        cases = (
+            ("src/handshake/server.rs", "streams.tasks.get(&frame.stream_id)",
+             "streams.tasks.remove(&frame.stream_id)", "without releasing the task slot early"),
+            ("src/client/runtime.rs", "chunk.offset as usize != assembled.len()",
+             "false", "PX1I caller authenticates"),
+        )
+        for relative, before, after, message in cases:
+            with self.subTest(file=relative), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for source_path in plx_formal.CORRESPOND_FILES:
+                    target = root / source_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text((plx_formal.ROOT / source_path).read_text())
+                target = root / relative
+                source = target.read_text()
+                self.assertEqual(source.count(before), 1)
+                target.write_text(source.replace(before, after, 1))
+                with self.assertRaises(plx_formal.FormalError) as caught:
+                    plx_formal.correspond(root)
+                self.assertIn(message, str(caught.exception))
 
     def test_readme_names_every_invariant(self):
         text = (plx_formal.FORMAL / "README.md").read_text()
@@ -213,13 +409,56 @@ class FormalModelTests(unittest.TestCase):
 
 
 EXPECTED_INVARIANTS = {
+    "ParallaXMux": {
+        "MuxCapacityCountsBothHalves": "capacity = 1 => ~(charged0 /\\ charged1)",
+        "MuxLocalEventsPreserveSibling": 'event # "teardown" => ((focus = 0 => (task1 = before_task1 /\\ upload1 = before_upload1 /\\ up1 = before_up1 /\\ down1 = before_down1 /\\ charged1 = before_charged1)) /\\ (focus = 1 => (task0 = before_task0 /\\ upload0 = before_upload0 /\\ up0 = before_up0 /\\ down0 = before_down0 /\\ charged0 = before_charged0)))',
+        "MuxRejectedOpenAndCoverAreInert": 'event \\in {"DuplicateOpen", "CapacityReject", "Cover"} => (task0 = before_task0 /\\ upload0 = before_upload0 /\\ up0 = before_up0 /\\ down0 = before_down0 /\\ charged0 = before_charged0 /\\ task1 = before_task1 /\\ upload1 = before_upload1 /\\ up1 = before_up1 /\\ down1 = before_down1 /\\ charged1 = before_charged1)',
+        "MuxTeardownReleasesAllSlots": 'phase = "closed" => (~charged0 /\\ ~charged1 /\\ ~up0 /\\ ~up1 /\\ ~down0 /\\ ~down1)',
+        "MuxOwnership0": '(charged0 => task0 # "none") /\\ (task0 # "none" => charged0) /\\ (upload0 => charged0)',
+        "MuxLiveHalfKeepsSlot0": "(up0 \\/ down0) => charged0",
+        "MuxFinIsHalfClose0": 'event = "Fin" /\\ focus = 0 => (~upload0 /\\ charged0 /\\ task0 = before_task0 /\\ up0 = before_up0 /\\ down0 = before_down0)',
+        "MuxDataRequiresUploadRoute0": 'event = "DataDelivered" /\\ focus = 0 => (upload0 /\\ up0 /\\ charged0)',
+        "MuxResetKeepsSlotUntilExit0": 'event = "Reset" /\\ focus = 0 => (task0 = "cancelling" /\\ charged0 /\\ ~upload0)',
+        "MuxOwnership1": '(charged1 => task1 # "none") /\\ (task1 # "none" => charged1) /\\ (upload1 => charged1)',
+        "MuxLiveHalfKeepsSlot1": "(up1 \\/ down1) => charged1",
+        "MuxFinIsHalfClose1": 'event = "Fin" /\\ focus = 1 => (~upload1 /\\ charged1 /\\ task1 = before_task1 /\\ up1 = before_up1 /\\ down1 = before_down1)',
+        "MuxDataRequiresUploadRoute1": 'event = "DataDelivered" /\\ focus = 1 => (upload1 /\\ up1 /\\ charged1)',
+        "MuxResetKeepsSlotUntilExit1": 'event = "Reset" /\\ focus = 1 => (task1 = "cancelling" /\\ charged1 /\\ ~upload1)',
+    },
+    "ParallaXIdentityChunks": {
+        "IdentityBufferNeverExceedsCap": "cursor \\in {0, 1, 2, 3} /\\ total \\in {0, 1, 2, 3} /\\ ~(total < cursor)",
+        "IdentityAppendRequiresValidatedMetadata": 'phase = "completion" => (total = incoming_total /\\ incoming_offset = before_cursor /\\ cursor = incoming_end /\\ incoming_len # 0 /\\ incoming_offset < cursor /\\ ~(total < cursor))',
+        "IdentityPartialCannotVerify": 'phase \\in {"assembled", "verified", "connect"} => (total # 0 /\\ cursor = total)',
+        "IdentityVerificationNeedsWholeBoundPayload": "verified => (binding /\\ total # 0 /\\ cursor = total)",
+        "IdentityFailureBlocksConnect": 'phase = "failed" => ~connect_sent',
+        "IdentityConnectWaitsForVerification": 'connect_sent => (phase = "connect" /\\ verified /\\ binding /\\ cursor = total /\\ total # 0)',
+    },
+    "ParallaXRecords": {
+        "ReservedRangesNeverOverlap": 'phase = "reserved" => (base = prior_end /\\ base < next /\\ next = high)',
+        "ReservationIsNeverRolledBack": "next = high /\\ (epoch = 0 => next = reserved0) /\\ (epoch = 1 => next = reserved1)",
+        "FailedBatchPoisonsPermanently": "failed => poisoned",
+        "PoisonedCannotDispatch": 'poisoned => (phase # "reserved" /\\ ~published)',
+        "PublishOnlyWholeSuccess": 'published => (phase = "ready" /\\ remaining = 0 /\\ ~poisoned /\\ ~failed)',
+        "RecordWindowIsBounded": "next \\in {0, 1, 2, 3} /\\ epoch \\in {0, 1} /\\ reserved0 \\in {0, 1, 2, 3} /\\ reserved1 \\in {0, 1, 2, 3}",
+    },
+    "ParallaXFragments": {
+        "FragmentsStayWithinTotal": '(total = 0 => cursor = 0) /\\ (total # 0 => (cursor < total /\\ total \\in {1, 2, 3}))',
+        "EmitOnlyCompleteFrame": 'emitted => (outcome = "complete" /\\ last_size = last_total /\\ last_total # 0 /\\ frames # 0)',
+        "CompletionClearsLatch": 'outcome = "complete" => (total = 0 /\\ cursor = 0)',
+        "RejectedChunkEmitsNothing": 'outcome = "error" => (stopped /\\ ~emitted)',
+        "PartialChunkEmitsNothing": 'outcome = "partial" => (~emitted /\\ total # 0 /\\ cursor # 0)',
+        "FrameCountIsBounded": "frames \\in {0, 1, 2}",
+    },
     "ParallaXSession": {
         "AppOnlyAfterIdentity": 'app => (phase = "app" /\\ binding /\\ epoch = 1 /\\ usable /\\ keys)',
         "VerifiedImpliesBinding": 'phase \\in {"verified", "app"} => (binding /\\ epoch = 1 /\\ keys /\\ usable)',
         "RekeyedImpliesFreshCommit": 'phase = "rekeyed" => (replay = "inserted" /\\ binding /\\ epoch = 1 /\\ usable)',
-        "ReplayClosesBeforeRekey": 'replay \\in {"replayed", "stale", "full"} => (phase = "rejected" /\\ epoch = 0 /\\ ~binding /\\ ~app /\\ ~usable)',
-        "IdleAndReconnectAreFresh": 'phase = "idle" => (epoch = 0 /\\ ~binding /\\ ~keys /\\ ~usable /\\ ~app /\\ udp = "none" /\\ replay = "none" /\\ how = "none")',
-        "AuthedHasNoKeys": 'phase = "authed" => (epoch = 0 /\\ ~keys /\\ ~usable /\\ ~binding /\\ how = "none")',
+        "ReplayClosesBeforeRekey": 'replay \\in {"replayed", "stale", "full", "source_quota", "missing"} => (phase = "rejected" /\\ epoch = 0 /\\ keys /\\ ~binding /\\ ~app /\\ ~usable /\\ how # "splice")',
+        "PendingRefusalSplicesWithoutKeys": 'admission \\in {"stale", "committed_nonce", "committed_transcript", "duplicate_pending", "pending_full", "busy"} => (phase = "failed" /\\ how = "splice" /\\ epoch = 0 /\\ ~keys /\\ ~usable /\\ ~binding /\\ ~app)',
+        "EpochZeroRequiresAdmission": 'keys => admission \\in {"reserved", "missing"}',
+        "AdmittedStillHasNoKeys": 'phase = "admitted" => (admission \\in {"reserved", "missing"} /\\ epoch = 0 /\\ ~keys /\\ ~usable /\\ ~binding)',
+        "IdleAndReconnectAreFresh": 'phase = "idle" => (epoch = 0 /\\ ~binding /\\ ~keys /\\ ~usable /\\ ~app /\\ udp = "none" /\\ admission = "none" /\\ replay = "none" /\\ how = "none")',
+        "AuthedHasNoKeys": 'phase = "authed" => (epoch = 0 /\\ ~keys /\\ ~usable /\\ ~binding /\\ admission = "none" /\\ how = "none")',
         "PostAuthDegenerateDoesNotSplice": 'how = "degen" => (phase = "failed" /\\ ~keys /\\ ~usable /\\ epoch = 0 /\\ ~binding /\\ ~app)',
         "RekeyDegenerateStaysAtEpochZero": 'how = "rekey_degen" => (phase = "failed" /\\ epoch = 0 /\\ keys /\\ ~usable /\\ ~binding /\\ ~app /\\ replay = "inserted")',
         "SpliceIsTheInboundReject": 'how = "splice" => (phase = "failed" /\\ ~keys /\\ epoch = 0 /\\ ~binding)',
@@ -228,8 +467,8 @@ EXPECTED_INVARIANTS = {
         "UdpDeclineStaysOnApp": 'udp = "tcp_only" => (phase = "app" /\\ app /\\ usable)',
         "UsableKeysImplyAuth": '(usable => keys) /\\ (keys => (phase # "idle"))',
         "EpochIsZeroOrOne": "epoch \\in {0, 1}",
-        "RejectedOnlyAfterReplay": 'phase = "rejected" => replay \\in {"replayed", "stale", "full"}',
-        "BindingMeansRekeyedEpoch": 'binding => (epoch = 1 /\\ replay = "inserted" /\\ phase \\in {"rekeyed", "verified", "app", "closed", "failed"})',
+        "RejectedOnlyAfterReplay": 'phase = "rejected" => replay \\in {"replayed", "stale", "full", "source_quota", "missing"}',
+        "BindingMeansRekeyedEpoch": 'binding => (epoch = 1 /\\ admission = "reserved" /\\ replay = "inserted" /\\ phase \\in {"rekeyed", "verified", "app", "closed", "failed"})',
         "AttemptInBounds": "attempt \\in {0, 1, 2}",
     },
     "ParallaXQuic": {
