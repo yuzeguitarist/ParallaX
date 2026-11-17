@@ -1310,6 +1310,10 @@ impl Connection {
         self.tls.is_handshaking()
     }
 
+    pub(super) fn is_client(&self) -> bool {
+        self.side == Side::Client
+    }
+
     /// Take a resumption ticket received on this connection via a post-handshake
     /// NewSessionTicket (client only; the server returns `None`). `now_ms` stamps
     /// the ticket-age epoch.
@@ -3021,6 +3025,24 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn test_data_packet(&mut self, frames: &[Frame]) -> Vec<u8> {
         self.seal_data_packet(frames, true, SentContent::default(), Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_handshake_crypto(&self) -> &[u8] {
+        &self.spaces[SPACE_HANDSHAKE].crypto_send
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_handshake_packet(&mut self, offset: u64, data: &[u8]) -> Vec<u8> {
+        let pn = self.allocate_packet_number(SPACE_HANDSHAKE);
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(SPACE_HANDSHAKE, pn, pn_len);
+        let keys = self.spaces[SPACE_HANDSHAKE].keys.as_ref().unwrap();
+        seal_packet(
+            &keys.local,
+            header,
+            &[Frame::Crypto { offset, data }, Frame::Padding(3)],
+        )
     }
 
     #[cfg(test)]

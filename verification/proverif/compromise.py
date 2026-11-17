@@ -131,7 +131,8 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="run-", dir=args.output_dir))
     report = {"status": "running", "started_at_utc": datetime.now(timezone.utc).isoformat(),
-              "scope": "completed phase-zero identity/rekey sessions; ideal cryptography"}
+              "scope": "completed phase-zero identity/rekey sessions; ideal cryptography",
+              "runner_sha256": identity.sha256(Path(__file__).read_bytes())}
     print(f"Compromise-model artifacts: {directory}", flush=True)
     try:
         report["source_commit"] = subprocess.check_output(
@@ -144,9 +145,11 @@ def main():
         if resolved is None:
             raise ValueError("Verifier executable cannot be located")
         executable = Path(resolved)
-        version = subprocess.run(
+        version_result = subprocess.run(
             [str(executable), "-help"], capture_output=True, text=True, check=True, timeout=30
-        ).stdout.splitlines()[0]
+        )
+        (directory / "verifier-version.log").write_text(version_result.stdout + version_result.stderr)
+        version = version_result.stdout.splitlines()[0] if version_result.stdout else ""
         if not version.startswith(f"Proverif {identity.TOOL_VERSION}."):
             raise ValueError(f"Unexpected verifier version: {version}")
         report["verifier"] = {"version": version,

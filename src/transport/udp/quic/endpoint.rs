@@ -990,10 +990,11 @@ impl Driver {
             if let Some(error) = core
                 .handle_datagram_ecn(data, ecn, now)
                 .err()
-                .filter(|_| !core.is_handshaking())
+                .filter(|_| core.is_client() || !core.is_handshaking())
             {
-                // Only authenticated packet processing reports errors. Pending
-                // marker/origin-splice decisions below retain their silent path.
+                // Authenticated packet processing can fail before the outgoing
+                // client's TLS handshake completes. Such errors are terminal;
+                // pending server marker/origin-splice decisions stay silent.
                 let (code, frame_type) = match &error {
                     QuicTlsError::Transport {
                         error_code,
@@ -2957,6 +2958,125 @@ mod tests {
         })
         .await
         .expect("authenticated error must reach the peer over UDP")
+    }
+
+    #[tokio::test]
+    async fn malformed_server_certificate_closes_before_a_later_valid_flight() {
+        use super::super::transport_params::TransportParameters;
+
+        for malformed in [false, true] {
+            let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = peer_socket.local_addr().unwrap();
+            let mut driver = test_driver(None).await;
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            driver.on_connect(ConnectRequest {
+                addr: peer,
+                server_name: "example.com".to_owned(),
+                config: client_config(),
+                ticket: None,
+                now_ms: 0,
+                dcid: None,
+                reply,
+            });
+            let client = receive.await.unwrap().unwrap();
+            let config = server_config();
+            let scid = ConnectionId::new(&[0xaa, 0xbb, 0xcc, 1]);
+            let mut server = Core::new_server(
+                config.cert_chain.clone(),
+                &config.signing_key_pkcs8,
+                config.alpn_protocols.clone(),
+                TransportParameters::server(scid.as_slice()).encode_server(),
+                scid,
+            )
+            .unwrap();
+            let now = Instant::now();
+            while let Some(datagram) = client.core.lock().unwrap().poll_transmit(now) {
+                server.handle_datagram(&datagram, now).unwrap();
+            }
+            let flight = server.test_handshake_crypto().to_vec();
+            assert_eq!(flight[0], 8, "EncryptedExtensions starts the flight");
+            let ee_len = 4
+                + ((usize::from(flight[1]) << 16)
+                    | (usize::from(flight[2]) << 8)
+                    | usize::from(flight[3]));
+            assert_eq!(flight[ee_len], 11, "Certificate follows extensions");
+            // Deliver only ServerHello from the normal server output. The saved
+            // Handshake flight is sent below as separately sealed CRYPTO packets.
+            loop {
+                let datagram = server.poll_transmit(now).expect("server Initial flight");
+                if first_packet_space(&datagram) == Some(PacketSpace::Handshake) {
+                    break;
+                }
+                let initial_len = super::super::packet::long_packet_len(&datagram).unwrap();
+                driver.on_datagram(&datagram[..initial_len], peer, 0);
+                if initial_len < datagram.len() {
+                    break;
+                }
+            }
+            assert!(client.is_handshaking());
+            // A packet that fails authentication must remain a harmless drop.
+            let mut corrupt = server.test_handshake_packet(0, &flight[..ee_len]);
+            *corrupt.last_mut().unwrap() ^= 1;
+            driver.on_datagram(&corrupt, peer, 0);
+            assert!(!client.is_closed());
+            let extensions = server.test_handshake_packet(0, &flight[..ee_len]);
+            driver.on_datagram(&extensions, peer, 0);
+            assert!(client.is_handshaking() && !client.is_closed());
+            let mut offset = ee_len as u64;
+            if malformed {
+                // A server Certificate must have an empty request context.
+                let invalid_certificate = [11, 0, 0, 5, 1, 0x7f, 0, 0, 0];
+                let invalid = server.test_handshake_packet(offset, &invalid_certificate);
+                driver.on_datagram(&invalid, peer, 0);
+                assert!(matches!(
+                    client.core.lock().unwrap().close_reason(),
+                    Some(CloseReason::LocalTransport(0x132, 0x06, _))
+                ));
+                offset += invalid_certificate.len() as u64;
+            }
+            let remaining = server.test_handshake_packet(offset, &flight[ee_len..]);
+            driver.on_datagram(&remaining, peer, 0);
+            let handle = Connection {
+                shared: client.clone(),
+            };
+            let established =
+                tokio::time::timeout(Duration::from_secs(2), handle.wait_established())
+                    .await
+                    .expect("the application handshake waiter must resolve");
+            if !malformed {
+                assert!(!client.is_handshaking() && !client.is_closed());
+                assert!(established.is_ok());
+                continue;
+            }
+            assert!(matches!(established, Err(ConnectError::ConnectionClosed)));
+            assert!(
+                client.is_handshaking(),
+                "the later flight cannot complete TLS"
+            );
+            assert!(matches!(
+                client.core.lock().unwrap().close_reason(),
+                Some(CloseReason::LocalTransport(0x132, 0x06, _))
+            ));
+            driver.flush().await;
+            let mut datagram = [0; MAX_UDP_PAYLOAD];
+            let received = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let (size, _) = peer_socket.recv_from(&mut datagram).await.unwrap();
+                    server
+                        .handle_datagram(&datagram[..size], Instant::now())
+                        .unwrap();
+                    if let Some(reason) = server.close_reason() {
+                        break reason.clone();
+                    }
+                }
+            })
+            .await
+            .expect("fatal TLS decode_error reaches the peer over UDP");
+            assert!(matches!(
+                received,
+                CloseReason::PeerTransport(0x132, 0x06, _)
+            ));
+        }
     }
 
     #[tokio::test]

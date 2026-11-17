@@ -5,7 +5,7 @@
 \*
 \* Safety claims (states and steps that must be unreachable):
 \*   ReservedRangesNeverOverlap: new reservations begin after every earlier reservation in this key epoch
-\*   ReservationIsNeverRolledBack: the next sequence stays at the consumed high-water mark
+\*   ReservationIsNeverRolledBack: the next sequence matches an independent per-key reservation history
 \*   FailedBatchPoisonsPermanently: worker failure remains poisoned even across a rekey
 \*   PoisonedCannotDispatch: a poisoned codec cannot reserve or publish a later batch
 \*   PublishOnlyWholeSuccess: only a complete successful batch publishes ciphertext
@@ -14,9 +14,9 @@
 ---- MODULE ParallaXRecords ----
 EXTENDS Integers
 
-VARIABLES phase, epoch, next, high, base, prior_end, remaining, poisoned, failed, published
+VARIABLES phase, epoch, next, high, base, prior_end, remaining, poisoned, failed, published, reserved0, reserved1
 
-vars == << phase, epoch, next, high, base, prior_end, remaining, poisoned, failed, published >>
+vars == << phase, epoch, next, high, base, prior_end, remaining, poisoned, failed, published, reserved0, reserved1 >>
 
 Init ==
   /\ phase = "ready"
@@ -29,44 +29,72 @@ Init ==
   /\ poisoned = FALSE
   /\ failed = FALSE
   /\ published = FALSE
+  /\ reserved0 = 0
+  /\ reserved1 = 0
 
-Reserve1 ==
-  /\ (phase = "ready" /\ ~poisoned /\ next < 3)
+Reserve1Epoch0 ==
+  /\ (phase = "ready" /\ ~poisoned /\ next < 3 /\ epoch = 0)
   /\ phase' = "reserved"
   /\ next' = next + 1
   /\ high' = next + 1
   /\ base' = next + 0
-  /\ prior_end' = high + 0
+  /\ prior_end' = reserved0 + 0
   /\ remaining' = 1
   /\ published' = FALSE
-  /\ UNCHANGED << epoch, poisoned, failed >>
+  /\ reserved0' = reserved0 + 1
+  /\ UNCHANGED << epoch, poisoned, failed, reserved1 >>
 
-Reserve2 ==
-  /\ (phase = "ready" /\ ~poisoned /\ next < 2)
+Reserve1Epoch1 ==
+  /\ (phase = "ready" /\ ~poisoned /\ next < 3 /\ epoch = 1)
+  /\ phase' = "reserved"
+  /\ next' = next + 1
+  /\ high' = next + 1
+  /\ base' = next + 0
+  /\ prior_end' = reserved1 + 0
+  /\ remaining' = 1
+  /\ published' = FALSE
+  /\ reserved1' = reserved1 + 1
+  /\ UNCHANGED << epoch, poisoned, failed, reserved0 >>
+
+Reserve2Epoch0 ==
+  /\ (phase = "ready" /\ ~poisoned /\ next < 2 /\ epoch = 0)
   /\ phase' = "reserved"
   /\ next' = next + 2
   /\ high' = next + 2
   /\ base' = next + 0
-  /\ prior_end' = high + 0
+  /\ prior_end' = reserved0 + 0
   /\ remaining' = 2
   /\ published' = FALSE
-  /\ UNCHANGED << epoch, poisoned, failed >>
+  /\ reserved0' = reserved0 + 2
+  /\ UNCHANGED << epoch, poisoned, failed, reserved1 >>
+
+Reserve2Epoch1 ==
+  /\ (phase = "ready" /\ ~poisoned /\ next < 2 /\ epoch = 1)
+  /\ phase' = "reserved"
+  /\ next' = next + 2
+  /\ high' = next + 2
+  /\ base' = next + 0
+  /\ prior_end' = reserved1 + 0
+  /\ remaining' = 2
+  /\ published' = FALSE
+  /\ reserved1' = reserved1 + 2
+  /\ UNCHANGED << epoch, poisoned, failed, reserved0 >>
 
 CollectFirstSuccess ==
   /\ (phase = "reserved" /\ remaining = 2)
   /\ remaining' = 1
-  /\ UNCHANGED << phase, epoch, next, high, base, prior_end, poisoned, failed, published >>
+  /\ UNCHANGED << phase, epoch, next, high, base, prior_end, poisoned, failed, published, reserved0, reserved1 >>
 
 CollectLastSuccess ==
   /\ (phase = "reserved" /\ remaining = 1)
   /\ remaining' = 0
-  /\ UNCHANGED << phase, epoch, next, high, base, prior_end, poisoned, failed, published >>
+  /\ UNCHANGED << phase, epoch, next, high, base, prior_end, poisoned, failed, published, reserved0, reserved1 >>
 
 PublishWholeBatch ==
   /\ (phase = "reserved" /\ remaining = 0)
   /\ phase' = "ready"
   /\ published' = TRUE
-  /\ UNCHANGED << epoch, next, high, base, prior_end, remaining, poisoned, failed >>
+  /\ UNCHANGED << epoch, next, high, base, prior_end, remaining, poisoned, failed, reserved0, reserved1 >>
 
 WorkerFailure ==
   /\ (phase = "reserved" /\ remaining # 0)
@@ -75,7 +103,7 @@ WorkerFailure ==
   /\ poisoned' = TRUE
   /\ failed' = TRUE
   /\ published' = FALSE
-  /\ UNCHANGED << epoch, next, high, base, prior_end >>
+  /\ UNCHANGED << epoch, next, high, base, prior_end, reserved0, reserved1 >>
 
 FreshKeyRekey ==
   /\ (phase \in {"ready", "failed"} /\ epoch = 0)
@@ -87,17 +115,19 @@ FreshKeyRekey ==
   /\ prior_end' = 0
   /\ remaining' = 0
   /\ published' = FALSE
-  /\ UNCHANGED << poisoned, failed >>
+  /\ UNCHANGED << poisoned, failed, reserved0, reserved1 >>
 
 CloseRecords ==
   /\ (phase # "closed" /\ phase # "reserved")
   /\ phase' = "closed"
   /\ published' = FALSE
-  /\ UNCHANGED << epoch, next, high, base, prior_end, remaining, poisoned, failed >>
+  /\ UNCHANGED << epoch, next, high, base, prior_end, remaining, poisoned, failed, reserved0, reserved1 >>
 
 Next ==
-  \/ Reserve1
-  \/ Reserve2
+  \/ Reserve1Epoch0
+  \/ Reserve1Epoch1
+  \/ Reserve2Epoch0
+  \/ Reserve2Epoch1
   \/ CollectFirstSuccess
   \/ CollectLastSuccess
   \/ PublishWholeBatch
@@ -111,9 +141,9 @@ Spec == Init /\ [][Next]_vars
 ReservedRangesNeverOverlap ==
   phase = "reserved" => (base = prior_end /\ base < next /\ next = high)
 
-\* the next sequence stays at the consumed high-water mark
+\* the next sequence matches an independent per-key reservation history
 ReservationIsNeverRolledBack ==
-  next = high
+  next = high /\ (epoch = 0 => next = reserved0) /\ (epoch = 1 => next = reserved1)
 
 \* worker failure remains poisoned even across a rekey
 FailedBatchPoisonsPermanently ==
@@ -129,6 +159,6 @@ PublishOnlyWholeSuccess ==
 
 \* the abstract counter has three sequences and two independent key epochs
 RecordWindowIsBounded ==
-  next \in {0, 1, 2, 3} /\ epoch \in {0, 1}
+  next \in {0, 1, 2, 3} /\ epoch \in {0, 1} /\ reserved0 \in {0, 1, 2, 3} /\ reserved1 \in {0, 1, 2, 3}
 
 ====

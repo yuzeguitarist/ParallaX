@@ -120,6 +120,88 @@ def rust_index(text: str, prefix: str) -> tuple[set[str], set[str], set[str]]:
     return functions, constants, tests
 
 
+def production_index(text: str) -> tuple[set[str], set[str]]:
+    """Index lexical production definitions, including their concrete impl owner.
+
+    This is a reference guard, not a Rust parser or a refinement proof. Test-only
+    items and trait declarations cannot stand in for a production implementation.
+    """
+    code = rust_code(text)
+    attributed = re.compile(
+        r"(?P<attrs>(?:#\[[^\]]*\]\s*)+)(?:pub(?:\([^)]*\))?\s+)?"
+        r"(?:async\s+)?(?P<item>mod|fn|const|static|struct|enum|impl|trait)\b")
+    masked = list(code)
+    for match in attributed.finditer(code):
+        attrs = match["attrs"]
+        test_only = re.search(r"#\[\s*(?:tokio::)?test\s*(?:\(|\])", attrs) or re.search(
+            r"#\[\s*cfg\s*\(\s*(?:test\s*\)|all\s*\([^()]*\btest\b)", attrs)
+        if not test_only:
+            continue
+        # Find the item's body or terminator, ignoring delimiters in its type
+        # and parameter list; the body then owns all nested brace scopes.
+        nesting = 0
+        end = match.end()
+        while end < len(code):
+            char = code[end]
+            if char in "([":
+                nesting += 1
+            elif char in ")]":
+                nesting -= 1
+            elif nesting == 0 and char in "{;":
+                end += 1
+                if char == "{":
+                    depth = 1
+                    while end < len(code) and depth:
+                        depth += (code[end] == "{") - (code[end] == "}")
+                        end += 1
+                break
+            end += 1
+        masked[match.start():end] = ["\n" if char == "\n" else " "
+                                   for char in code[match.start():end]]
+    code = "".join(masked)
+    tokens = re.compile(
+        r"^[ \t]*impl\b(?P<impl>[^{};]*)\{|"
+        r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?trait\b[^{};]*\{|"
+        r"\bfn\s+(?P<function>[A-Za-z_]\w*)\s*(?=[<(])|"
+        r"\bconst\s+(?P<constant>[A-Za-z_]\w*)\s*:|"
+        r"(?P<open>\{)|(?P<close>\})", re.MULTILINE)
+    scopes: list[tuple[int, str | None, bool]] = []
+    functions, constants = set(), set()
+    depth = 0
+    for match in tokens.finditer(code):
+        if match["impl"] is not None:
+            header = match["impl"].strip()
+            if header.startswith("<"):
+                level = 0
+                for index, char in enumerate(header):
+                    level += (char == "<") - (char == ">")
+                    if level == 0:
+                        header = header[index + 1:].strip()
+                        break
+            header = re.split(r"\bwhere\b", header, maxsplit=1)[0]
+            target = re.split(r"\bfor\b", header)[-1].strip()
+            owner = re.match(r"(?:[A-Za-z_]\w*::)*([A-Za-z_]\w*)", target)
+            depth += 1
+            scopes.append((depth, owner[1] if owner else None, False))
+        elif match["function"] or match["constant"]:
+            if not any(trait for _, _, trait in scopes):
+                name = match["function"] or match["constant"]
+                symbols = functions if match["function"] else constants
+                symbols.add(name)
+                if scopes and scopes[-1][1] and scopes[-1][0] == depth:
+                    symbols.add(f"{scopes[-1][1]}::{name}")
+        elif match["open"]:
+            depth += 1
+        elif match["close"]:
+            if scopes and scopes[-1][0] == depth:
+                scopes.pop()
+            depth -= 1
+        else:
+            depth += 1
+            scopes.append((depth, None, True))
+    return functions, constants
+
+
 def validate_ledger(document: dict, root: Path = ROOT) -> list[dict]:
     require(document.get("schema_version") == 1 and bool(document.get("scope")),
             "invalid protocol ledger schema/scope")
@@ -137,7 +219,9 @@ def validate_ledger(document: dict, root: Path = ROOT) -> list[dict]:
             path = relative_file(root, name)
             parts = Path(name).with_suffix("").parts
             prefix = "::".join(parts[1:-1] if parts[-1] in ("mod", "lib") else parts[1:]) if parts[0] == "src" else ""
-            cache[name] = rust_index(path.read_text(), prefix)
+            text = path.read_text()
+            functions, constants = production_index(text)
+            cache[name] = functions, constants, rust_index(text, prefix)[2]
         return cache[name]
 
     for contract in contracts:

@@ -109,6 +109,71 @@ mod tests {
         self.assertFalse({"fake", "also_fake"} & functions)
         self.assertIn("LIMIT", constants)
 
+    def test_production_symbols_exclude_test_scopes_and_trait_defaults(self):
+        source = '''
+const LIMIT: usize = 3;
+trait LegReader {
+    fn is_clean_close(&self) -> bool { true }
+}
+impl<R> AsyncRead for H3DataFrameReader<R>
+where R: AsyncRead {
+    fn poll_read(&mut self) {}
+}
+impl LegReader for H3DataFrameLegReader {
+    fn is_clean_close(&self) -> bool { false }
+    fn outer() { fn nested_helper() {} }
+}
+#[cfg(test)]
+mod tests {
+    impl AsyncRead for TestReader {
+        fn poll_read(&mut self) {}
+    }
+    fn is_clean_close() {}
+    const TEST_LIMIT: usize = 4;
+}
+#[cfg(all(unix, test))]
+fn test_platform_helper() {}
+#[test]
+fn standalone_test() {}
+#[cfg(not(test))]
+fn production_only() {}
+'''
+        functions, constants = contracts.production_index(source)
+        self.assertTrue({"H3DataFrameReader::poll_read", "H3DataFrameLegReader::is_clean_close",
+                         "production_only"} <= functions)
+        self.assertFalse({"TestReader::poll_read", "H3DataFrameLegReader::nested_helper",
+                          "test_platform_helper", "standalone_test"} & functions)
+        self.assertEqual(constants, {"LIMIT"})
+        for original in ("fn poll_read(&mut self) {}",
+                         "fn is_clean_close(&self) -> bool { false }"):
+            changed = source.replace(original, "", 1)
+            functions, _ = contracts.production_index(changed)
+            missing = ("H3DataFrameReader::poll_read" if "poll_read" in original
+                       else "H3DataFrameLegReader::is_clean_close")
+            with self.subTest(missing=missing):
+                self.assertNotIn(missing, functions)
+                self.assertNotIn(missing.split("::")[-1], functions)
+                # The test helper/default still exists, but cannot satisfy the
+                # removed concrete production implementation's reference.
+                self.assertIn(missing.split("::")[-1], contracts.rust_index(changed, "")[0])
+
+    def test_ledger_rejects_removed_h3_implementations_despite_surviving_helpers(self):
+        original_file = contracts.relative_file
+        source = (ROOT / "src/transport/leg.rs").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory) / "leg.rs"
+            for symbol in ("poll_read", "is_clean_close"):
+                start = source.index("impl<R> AsyncRead for H3DataFrameReader<R>" if symbol == "poll_read"
+                                     else "impl LegReader for H3DataFrameLegReader")
+                changed = source[:start] + source[start:].replace(f"fn {symbol}(", f"fn removed_{symbol}(", 1)
+                fixture.write_text(changed)
+                self.assertIn(symbol, contracts.rust_index(changed, "transport::leg")[0])
+                with self.subTest(symbol=symbol), \
+                        mock.patch.object(contracts, "relative_file", side_effect=lambda root, name:
+                                          fixture if name == "src/transport/leg.rs" else original_file(root, name)), \
+                        self.assertRaisesRegex(ValueError, "missing production symbol"):
+                    contracts.validate_ledger(self.document)
+
     def test_complete_matching_evidence_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             path, _ = self.fixture(directory)

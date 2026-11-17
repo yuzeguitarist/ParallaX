@@ -3000,17 +3000,22 @@ def records_machine() -> Machine:
     The small counter is an abstraction of the checked u64 counter, whose
     arithmetic and real AES retirement bound are proved separately by Kani.
     Rekey assumes a fresh key/nonce namespace; key derivation is not proved here.
+    reserved0/reserved1 are independent ghost ledgers of consumed prefix lengths:
+    reservation events increment them, and rekey never erases either history.
     No worker result is published until every result has succeeded.
     """
     actions = []
     for count in (1, 2):
-        actions.append(act(
-            f"Reserve{count}",
-            f'phase = "ready" /\\ ~poisoned /\\ next < {4 - count}',
-            phase='"reserved"', base="next + 0", prior_end="high + 0",
-            next=f"next + {count}", high=f"next + {count}",
-            remaining=str(count), published="FALSE",
-        ))
+        for epoch in (0, 1):
+            ledger = f"reserved{epoch}"
+            actions.append(act(
+                f"Reserve{count}Epoch{epoch}",
+                f'phase = "ready" /\\ ~poisoned /\\ next < {4 - count} /\\ epoch = {epoch}',
+                phase='"reserved"', base="next + 0", prior_end=f"{ledger} + 0",
+                next=f"next + {count}", high=f"next + {count}",
+                remaining=str(count), published="FALSE",
+                **{ledger: f"{ledger} + {count}"},
+            ))
     actions.extend((
         act("CollectFirstSuccess", 'phase = "reserved" /\\ remaining = 2', remaining="1"),
         act("CollectLastSuccess", 'phase = "reserved" /\\ remaining = 1', remaining="0"),
@@ -3027,17 +3032,17 @@ def records_machine() -> Machine:
     return Machine(
         name="ParallaXRecords",
         blurb="Bounded batch nonce reservation, publication, failure poison, and fresh-key rekey.",
-        fields=("phase", "epoch", "next", "high", "base", "prior_end", "remaining", "poisoned", "failed", "published"),
+        fields=("phase", "epoch", "next", "high", "base", "prior_end", "remaining", "poisoned", "failed", "published", "reserved0", "reserved1"),
         defaults={"phase": "ready", "epoch": 0, "next": 0, "high": 0,
                   "base": 0, "prior_end": 0, "remaining": 0, "poisoned": False,
-                  "failed": False, "published": False},
+                  "failed": False, "published": False, "reserved0": 0, "reserved1": 0},
         initials=(),
         actions=tuple(actions),
         invariants=(
             claim("ReservedRangesNeverOverlap", "new reservations begin after every earlier reservation in this key epoch",
                   'phase = "reserved" => (base = prior_end /\\ base < next /\\ next = high)'),
-            claim("ReservationIsNeverRolledBack", "the next sequence stays at the consumed high-water mark",
-                  "next = high"),
+            claim("ReservationIsNeverRolledBack", "the next sequence matches an independent per-key reservation history",
+                  "next = high /\\ (epoch = 0 => next = reserved0) /\\ (epoch = 1 => next = reserved1)"),
             claim("FailedBatchPoisonsPermanently", "worker failure remains poisoned even across a rekey",
                   "failed => poisoned"),
             claim("PoisonedCannotDispatch", "a poisoned codec cannot reserve or publish a later batch",
@@ -3045,13 +3050,15 @@ def records_machine() -> Machine:
             claim("PublishOnlyWholeSuccess", "only a complete successful batch publishes ciphertext",
                   'published => (phase = "ready" /\\ remaining = 0 /\\ ~poisoned /\\ ~failed)'),
             claim("RecordWindowIsBounded", "the abstract counter has three sequences and two independent key epochs",
-                  "next \\in {0, 1, 2, 3} /\\ epoch \\in {0, 1}"),
+                  "next \\in {0, 1, 2, 3} /\\ epoch \\in {0, 1} /\\ reserved0 \\in {0, 1, 2, 3} /\\ reserved1 \\in {0, 1, 2, 3}"),
         ),
         witnesses=(
             claim("BatchCanPublish", "successful batches publish after reservation", "published"),
             claim("CounterCanRetire", "the abstract nonce window can be exhausted", 'next = 3 /\\ phase = "ready"'),
             claim("RekeyKeepsPoison", "rekey cannot revive a failed codec", 'epoch = 1 /\\ failed /\\ poisoned /\\ phase = "ready"'),
             claim("FreshEpochCanPublish", "a live codec can publish in a fresh key epoch", "epoch = 1 /\\ published"),
+            claim("FreshKeyCanReuseSequence", "both fresh key namespaces can consume sequence zero without erasing earlier reservations",
+                  "epoch = 1 /\\ published /\\ reserved0 # 0 /\\ reserved1 # 0"),
             claim("PartialWorkerSuccessIsBuffered", "one result can succeed while its sibling remains unpublished",
                   'phase = "reserved" /\\ next = 2 /\\ base = 0 /\\ remaining = 1 /\\ ~published'),
         ),

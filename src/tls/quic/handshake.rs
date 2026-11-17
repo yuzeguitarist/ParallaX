@@ -126,6 +126,7 @@ pub struct ClientHandshake {
     // Inbound.
     inbound: Vec<u8>,
     read_state: ReadState,
+    failed_alert: Option<u8>,
     notified_handshake_data: bool,
 
     // Negotiated state.
@@ -343,6 +344,7 @@ impl ClientHandshake {
             handshake_complete: false,
             inbound: Vec::new(),
             read_state: ReadState::ServerHello,
+            failed_alert: None,
             notified_handshake_data: false,
             suite: None,
             schedule: None,
@@ -402,6 +404,9 @@ impl ClientHandshake {
     /// Append outgoing CRYPTO bytes to `out`; return a [`KeyChange`] when crossing
     /// into the next packet-number space (Handshake, then 1-RTT), else `None`.
     pub fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
+        if self.failed_alert.is_some() {
+            return None;
+        }
         if self.reject_0rtt {
             self.reject_0rtt = false;
             return Some(KeyChange::RejectZeroRtt);
@@ -512,6 +517,26 @@ impl ClientHandshake {
     /// Feed reassembled CRYPTO-stream bytes. Returns `Ok(true)` the first time
     /// handshake data (ALPN / completion) becomes available, else `Ok(false)`.
     pub fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
+        if let Some(description) = self.failed_alert {
+            return Err(QuicTlsError::alert(
+                description,
+                "TLS session already failed",
+            ));
+        }
+        let result = self.read_handshake_inner(data);
+        if let Err(error) = &result {
+            self.failed_alert = Some(error.alert_description().unwrap_or(80));
+            self.inbound.clear();
+            self.pending_0rtt_keys = None;
+            self.pending_handshake_keys = None;
+            self.pending_client_finished = None;
+            self.pending_1rtt_keys = None;
+            self.pending_session_ticket = None;
+        }
+        result
+    }
+
+    fn read_handshake_inner(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
         self.inbound.extend_from_slice(data);
         let mut newly_ready = false;
         loop {
@@ -1378,10 +1403,10 @@ fn parse_selected_alpn(data: &[u8]) -> Result<&[u8], QuicTlsError> {
     let mut l = Cursor::new(list);
     let proto = l.vec_u8()?;
     // RFC 7301 §3.2: the server selects exactly one protocol.
-    if l.remaining() != 0 {
+    if proto.is_empty() || l.remaining() != 0 {
         return Err(QuicTlsError::alert(
             ALERT_DECODE_ERROR,
-            "ALPN list carried more than one protocol",
+            "server ALPN must select exactly one non-empty protocol",
         ));
     }
     Ok(proto)
@@ -1390,7 +1415,12 @@ fn parse_selected_alpn(data: &[u8]) -> Result<&[u8], QuicTlsError> {
 /// Parse a TLS 1.3 Certificate message body into the DER chain.
 fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
     let mut c = Cursor::new(body);
-    let _request_context = c.vec_u8()?;
+    if !c.vec_u8()?.is_empty() {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "non-empty certificate_request_context in server Certificate",
+        ));
+    }
     let list = c.vec_u24()?;
     if c.remaining() != 0 {
         return Err(QuicTlsError::alert(
@@ -1402,12 +1432,18 @@ fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
     let mut certs = Vec::new();
     while l.remaining() > 0 {
         let cert = l.vec_u24()?;
+        if cert.is_empty() {
+            return Err(QuicTlsError::alert(
+                ALERT_DECODE_ERROR,
+                "empty certificate entry",
+            ));
+        }
         certs.push(cert.to_vec());
         let _extensions = l.vec_u16()?;
     }
     if certs.is_empty() {
         return Err(QuicTlsError::alert(
-            ALERT_BAD_CERTIFICATE,
+            ALERT_DECODE_ERROR,
             "empty certificate chain",
         ));
     }
@@ -2894,6 +2930,61 @@ mod tests {
             assert_eq!(client.transcript, transcript, "{label}");
             assert_client_has_no_application_flight(&mut client);
         }
+    }
+
+    #[test]
+    fn review_server_certificate_rejects_context_and_empty_chain_before_state_commit() {
+        let (_, _, remaining) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+        let valid = &remaining[0][4..];
+        let mut with_context = vec![1, 0x61];
+        with_context.extend_from_slice(&valid[1..]);
+        let mut long_context = vec![255];
+        long_context.extend_from_slice(&[0x62; 255]);
+        long_context.extend_from_slice(&valid[1..]);
+        for body in [
+            with_context,
+            long_context,
+            vec![0, 0, 0, 0],
+            vec![0, 0, 0, 5, 0, 0, 0, 0, 0],
+        ] {
+            for compressed in [false, true] {
+                let (mut client, _, remaining) =
+                    client_before_server_message(HANDSHAKE_CERTIFICATE);
+                let transcript = client.transcript.clone();
+                let message = if compressed {
+                    msg(
+                        HANDSHAKE_COMPRESSED_CERTIFICATE,
+                        &compressed_certificate_body(1, body.len(), &zlib_bytes(&body)),
+                    )
+                } else {
+                    msg(HANDSHAKE_CERTIFICATE, &body)
+                };
+                let error = client
+                    .read_handshake(&message)
+                    .expect_err("invalid Certificate cannot advance the real client");
+                assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+                assert_eq!(client.read_state, ReadState::Certificate);
+                assert!(client.server_certs.is_empty());
+                assert_eq!(client.transcript, transcript);
+                assert_client_has_no_application_flight(&mut client);
+                for valid_message in remaining {
+                    let error = client
+                        .read_handshake(&valid_message)
+                        .expect_err("a later valid flight cannot revive failed TLS");
+                    assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+                    assert_eq!(client.transcript, transcript);
+                    assert_client_has_no_application_flight(&mut client);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_server_alpn_name_must_not_be_empty() {
+        let error =
+            parse_selected_alpn(&[0, 1, 0]).expect_err("RFC 7301 protocol names are nonempty");
+        assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+        assert_eq!(parse_selected_alpn(&[0, 3, 2, b'h', b'3']).unwrap(), b"h3");
     }
 
     #[test]

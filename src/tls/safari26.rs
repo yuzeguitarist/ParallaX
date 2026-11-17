@@ -2684,14 +2684,28 @@ fn parse_encrypted_extensions(body: &[u8], keys: &mut Tls13Keys) -> Result<(), S
 fn parse_selected_alpn(data: &[u8]) -> Result<&[u8], Safari26TlsError> {
     let mut c = TlsCursor::new(data);
     let list = c.vec_u16()?;
+    if c.remaining() != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "trailing bytes after ALPN protocol list".to_owned(),
+        ));
+    }
     let mut l = TlsCursor::new(list);
     let proto = l.vec_u8()?;
+    if proto.is_empty() || l.remaining() != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "server ALPN must select exactly one non-empty protocol".to_owned(),
+        ));
+    }
     Ok(proto)
 }
 
 fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari26TlsError> {
     let mut c = TlsCursor::new(body);
-    let _request_context = c.vec_u8()?;
+    if !c.vec_u8()?.is_empty() {
+        return Err(Safari26TlsError::Handshake(
+            "non-empty certificate_request_context in server Certificate".to_owned(),
+        ));
+    }
     let list = c.vec_u24()?;
     if c.remaining() != 0 {
         return Err(Safari26TlsError::Handshake(
@@ -2702,8 +2716,18 @@ fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari26TlsError>
     let mut certs = Vec::new();
     while l.remaining() > 0 {
         let cert = l.vec_u24()?;
+        if cert.is_empty() {
+            return Err(Safari26TlsError::Handshake(
+                "empty certificate entry".to_owned(),
+            ));
+        }
         certs.push(cert.to_vec());
         let _extensions = l.vec_u16()?;
+    }
+    if certs.is_empty() {
+        return Err(Safari26TlsError::Handshake(
+            "empty server certificate chain".to_owned(),
+        ));
     }
     Ok(certs)
 }
@@ -2774,6 +2798,11 @@ fn verify_certificate_verify(
     let mut c = TlsCursor::new(body);
     let scheme = c.u16()?;
     let signature = c.vec_u16()?;
+    if c.remaining() != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "trailing bytes after CertificateVerify signature".to_owned(),
+        ));
+    }
     let alg = certificate_verify_algorithm(scheme)?;
     let cert_der = CertificateDer::from(leaf.as_slice());
     let cert = webpki::EndEntityCert::try_from(&cert_der)
@@ -4766,6 +4795,10 @@ mod tests {
         ])
         .await
         .unwrap();
+
+        // Synchronize real socket readiness before arming a paused-clock timer.
+        // Otherwise automatic time advancement can win before the OS read event.
+        stream.readable().await.unwrap();
 
         let err = session
             .await_http2_settings_ack(&mut stream, &mut keys)
@@ -7456,6 +7489,129 @@ mod tests {
             assert_eq!(flight.certificates, vec![leaf]);
             assert!(wire.is_empty());
             assert_eq!(transcript.bytes(), expected_transcript);
+        }
+    }
+
+    #[test]
+    fn review_server_alpn_requires_exact_nonempty_selection() {
+        for data in [
+            vec![0, 3, 2, b'h', b'2', 0xff],
+            vec![0, 6, 2, b'h', b'2', 2, b'h', b'3'],
+            vec![0, 0],
+            vec![0, 1, 0],
+            vec![0, 3, 2, b'h'],
+        ] {
+            let mut extension = EXT_ALPN.to_be_bytes().to_vec();
+            push_vec_u16(&mut extension, &data).unwrap();
+            let mut keys = app_keys();
+            let error = parse_encrypted_extensions(&u16_len_prefixed(&extension), &mut keys)
+                .expect_err("malformed server ALPN must fail at its parsing boundary");
+            assert_eq!(fatal_alert_description(&error), Some(50), "{data:?}");
+            assert!(keys.negotiated_alpn.is_none());
+        }
+        for selected in [b"h2".as_slice(), b"http/1.1".as_slice()] {
+            assert_eq!(
+                parse_selected_alpn(&alpn_selection(selected)).unwrap(),
+                selected
+            );
+        }
+    }
+
+    fn assert_rejected_server_certificate_body(body: &[u8]) {
+        for compressed in [false, true] {
+            let ee = handshake_message(HANDSHAKE_ENCRYPTED_EXTENSIONS, &[0, 0]);
+            let certificate = if compressed {
+                handshake_message(
+                    HANDSHAKE_COMPRESSED_CERTIFICATE,
+                    &build_compressed_cert_body(body.len(), body),
+                )
+            } else {
+                handshake_message(HANDSHAKE_CERTIFICATE, body)
+            };
+            let mut wire = [ee.clone(), certificate].concat();
+            let mut flight = ServerFlight::default();
+            let mut transcript = HandshakeTranscript::new();
+            let error = process_server_handshake_messages(
+                &mut wire,
+                &mut flight,
+                &mut transcript,
+                &mut app_keys(),
+            )
+            .expect_err("invalid Certificate must fail before storing or hashing it");
+            assert_eq!(fatal_alert_description(&error), Some(50));
+            assert!(flight.certificates.is_empty());
+            assert!(!flight.certificate_verify_seen && !flight.finished);
+            assert_eq!(transcript.bytes(), ee);
+        }
+    }
+
+    #[test]
+    fn review_server_certificate_rejects_context_in_both_encodings() {
+        let valid = certificate_body(&[&[0x30, 3, 2, 1, 0]]);
+        assert!(parse_certificate_body(&valid).is_ok());
+        for context in [vec![0x61], vec![0x62; 255]] {
+            let mut body = u8_len_prefixed(&context);
+            body.extend_from_slice(&valid[1..]);
+            assert_rejected_server_certificate_body(&body);
+        }
+    }
+
+    #[test]
+    fn review_server_certificate_rejects_empty_chain_and_entries() {
+        for body in [certificate_body(&[]), certificate_body(&[&[]])] {
+            assert_rejected_server_certificate_body(&body);
+        }
+    }
+
+    #[test]
+    fn review_certificate_verify_rejects_trailing_bytes_before_state_commit() {
+        for compressed in [false, true] {
+            let (wire, _) = signed_server_flight(compressed, false);
+            let mut offset = 0;
+            for _ in 0..2 {
+                let length =
+                    u32::from_be_bytes([0, wire[offset + 1], wire[offset + 2], wire[offset + 3]])
+                        as usize;
+                offset += 4 + length;
+            }
+            assert_eq!(wire[offset], HANDSHAKE_CERTIFICATE_VERIFY);
+            let length =
+                u32::from_be_bytes([0, wire[offset + 1], wire[offset + 2], wire[offset + 3]])
+                    as usize;
+            let end = offset + 4 + length;
+            let mut valid = wire[..end].to_vec();
+            let mut flight = ServerFlight::default();
+            process_server_handshake_messages(
+                &mut valid,
+                &mut flight,
+                &mut HandshakeTranscript::new(),
+                &mut app_keys(),
+            )
+            .unwrap();
+            assert!(flight.certificate_verify_seen && !flight.finished);
+            for tail in [vec![0], vec![0xff; 17]] {
+                let mut body = wire[offset + 4..end].to_vec();
+                body.extend_from_slice(&tail);
+                // Stop at CV: a later Finished MAC mismatch must not mask a
+                // parser which accepted the signed prefix and ignored its tail.
+                let mut malformed = [
+                    wire[..offset].to_vec(),
+                    handshake_message(HANDSHAKE_CERTIFICATE_VERIFY, &body),
+                ]
+                .concat();
+                let mut transcript = HandshakeTranscript::new();
+                let mut rejected = ServerFlight::default();
+                let error = process_server_handshake_messages(
+                    &mut malformed,
+                    &mut rejected,
+                    &mut transcript,
+                    &mut app_keys(),
+                )
+                .expect_err("trailing CV input must fail before CV state is committed");
+                assert_eq!(fatal_alert_description(&error), Some(50));
+                assert!(!rejected.certificate_verify_seen && !rejected.finished);
+                assert_eq!(transcript.bytes(), &wire[..offset]);
+            }
         }
     }
 

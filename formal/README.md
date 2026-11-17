@@ -356,6 +356,9 @@ codec; ciphertext is published after all workers succeed. It explores batches
 of one or two records in a three-sequence window, across two key epochs.
 `FreshKeyRekey` assumes a new independent key/nonce namespace. The actual u64
 arithmetic and AES-GCM key-usage limit remain separate Kani properties.
+An independent per-epoch reservation history survives rekey and detects rollback
+even if all mutable counter copies are restored together. The positive
+`FreshKeyCanReuseSequence` witness permits sequence reuse only under a fresh key.
 This model does not prove AEAD security, worker scheduling, serial opening,
 or the freshness of derived key bytes.
 

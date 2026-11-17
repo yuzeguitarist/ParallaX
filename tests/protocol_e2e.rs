@@ -21,7 +21,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -40,11 +40,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
 const SNI: &str = "example.com";
 const STEP: Duration = Duration::from_secs(25);
+const TARGET_QUIET_WINDOW: Duration = Duration::from_millis(250);
 
 fn write_private(path: &Path, contents: &[u8]) {
     let mut file = OpenOptions::new()
@@ -110,6 +112,22 @@ impl Binary {
             )
         });
     }
+
+    async fn listening_addr(&mut self, marker: &str) -> SocketAddr {
+        self.wait_for(marker).await;
+        let logs = self.logs();
+        let prefix = format!("{marker} on ");
+        let address = logs
+            .lines()
+            .find_map(|line| line.split_once(&prefix))
+            .and_then(|(_, suffix)| suffix.split_whitespace().next())
+            .expect("startup log must report its actual bound address")
+            .parse::<SocketAddr>()
+            .expect("startup address must parse");
+        assert!(address.ip().is_loopback());
+        assert_ne!(address.port(), 0, "the child must report its assigned port");
+        address
+    }
 }
 
 impl Drop for Binary {
@@ -117,6 +135,73 @@ impl Drop for Binary {
         // Only these owned children are terminated; always reap, including panic.
         let _ = self.child.kill();
         self.child.wait().expect("reap the E2E child");
+    }
+}
+
+struct TargetObserver {
+    checks: mpsc::UnboundedSender<oneshot::Sender<usize>>,
+}
+
+impl TargetObserver {
+    async fn snapshot(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        self.checks
+            .send(tx)
+            .expect("target listener must stay alive");
+        timeout(STEP, rx)
+            .await
+            .expect("target observation barrier must complete")
+            .expect("target listener must acknowledge the observation")
+    }
+
+    async fn quiet_count(&self, expected: usize) -> Result<(), usize> {
+        let initial = self.snapshot().await;
+        if initial != expected {
+            return Err(initial);
+        }
+        // Keep the listener accepting during the rejection tail. The second
+        // barrier drains already-ready accepts before it samples the count.
+        sleep(TARGET_QUIET_WINDOW).await;
+        let final_count = self.snapshot().await;
+        if final_count == expected {
+            Ok(())
+        } else {
+            Err(final_count)
+        }
+    }
+
+    async fn assert_quiet(&self, expected: usize) {
+        assert_eq!(
+            self.quiet_count(expected).await,
+            Ok(()),
+            "rejection must leave the target untouched throughout the bounded observation"
+        );
+    }
+}
+
+async fn serve_target(
+    target: TcpListener,
+    accepts: Arc<AtomicUsize>,
+    mut checks: mpsc::UnboundedReceiver<oneshot::Sender<usize>>,
+) {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            accepted = target.accept() => {
+                let (mut stream, _) = accepted.unwrap();
+                accepts.fetch_add(1, Ordering::SeqCst);
+                connections.spawn(async move {
+                    let (mut read, mut write) = stream.split();
+                    tokio::io::copy(&mut read, &mut write).await.unwrap();
+                    write.shutdown().await.unwrap();
+                });
+            }
+            Some(check) = checks.recv() => {
+                let _ = check.send(accepts.load(Ordering::SeqCst));
+            }
+            Some(result) = connections.join_next() => result.unwrap(),
+        }
     }
 }
 
@@ -317,6 +402,8 @@ async fn connect_socks_request(
     let mut app = TcpStream::connect(local).await.unwrap();
     // Fragment negotiation and use the DOMAIN address form, rather than calling
     // a protocol helper. The actual SOCKS listener must parse these wire bytes.
+    // Per-byte writes may coalesce in TCP; deterministic short reads are covered
+    // separately by the generated SOCKS reader tests.
     for byte in [5, 1, 0] {
         app.write_all(&[byte]).await.unwrap();
     }
@@ -537,29 +624,9 @@ async fn scenario(case: Case) {
             }
         }
     });
-    let accepts = Arc::clone(&target_accepts);
-    fixtures.spawn(async move {
-        let mut connections = JoinSet::new();
-        loop {
-            tokio::select! {
-                accepted = target.accept() => {
-                    let (mut stream, _) = accepted.unwrap();
-                    accepts.fetch_add(1, Ordering::SeqCst);
-                    connections.spawn(async move {
-                        let (mut read, mut write) = stream.split();
-                        tokio::io::copy(&mut read, &mut write).await.unwrap();
-                        write.shutdown().await.unwrap();
-                    });
-                }
-                Some(result) = connections.join_next() => result.unwrap(),
-            }
-        }
-    });
-
-    let server_reservation = StdListener::bind("127.0.0.1:0").unwrap();
-    let server_addr = server_reservation.local_addr().unwrap();
-    let client_reservation = StdListener::bind("127.0.0.1:0").unwrap();
-    let client_addr = client_reservation.local_addr().unwrap();
+    let (checks, requests) = mpsc::unbounded_channel();
+    let observer = TargetObserver { checks };
+    fixtures.spawn(serve_target(target, Arc::clone(&target_accepts), requests));
     let session = X25519KeyPair::generate();
     let identity = identity::keypair();
     let pinned_identity = if matches!(case, Case::WrongIdentity) {
@@ -595,7 +662,7 @@ max_concurrent_streams = {traffic}
 enabled = {server_udp}
 probe_timeout_ms = 3000
 [server]
-listen = "{server_addr}"
+listen = "127.0.0.1:0"
 fallback_addr = "{origin_addr}"
 {fixed_target}
 private_key = "{}"
@@ -608,6 +675,9 @@ authorized_sni = [{allowed_sni}]
         STANDARD.encode(&identity.secret),
         toml::Value::String(dir.path().join("replay.cache").to_str().unwrap().to_owned()),
     );
+    write_private(&server_path, server_text.as_bytes());
+    let mut server = Binary::spawn("serve", &server_path, &ca_path);
+    let server_addr = server.listening_addr("ParallaX server listening").await;
     let make_client_config = |client_psk: &[u8], public: &[u8; 32], sni: &str, pin: &[u8]| {
         format!(
             r#"mode = "client"
@@ -619,7 +689,7 @@ max_concurrent_streams = {traffic}
 enabled = {client_udp}
 probe_timeout_ms = 3000
 [client]
-listen = "{client_addr}"
+listen = "127.0.0.1:0"
 server_addr = "{server_addr}"
 sni = "{sni}"
 server_public_key = "{}"
@@ -653,14 +723,11 @@ server_identity_public_key = "{}"
     } else {
         ca_path.clone()
     };
-    write_private(&server_path, server_text.as_bytes());
     write_private(&client_path, client_text.as_bytes());
-    drop(server_reservation);
-    let mut server = Binary::spawn("serve", &server_path, &ca_path);
-    server.wait_for("ParallaX server listening").await;
-    drop(client_reservation);
     let mut client = Binary::spawn("client", &client_path, &initial_ca);
-    client.wait_for("ParallaX client SOCKS5 listening").await;
+    let mut client_addr = client
+        .listening_addr("ParallaX client SOCKS5 listening")
+        .await;
 
     // Invalid SOCKS methods must be rejected locally, without opening a target.
     let mut invalid = TcpStream::connect(client_addr).await.unwrap();
@@ -672,7 +739,7 @@ server_identity_public_key = "{}"
         .unwrap();
     assert_eq!(rejected, [5, 0xff]);
     drop(invalid);
-    assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
+    observer.assert_quiet(0).await;
 
     if matches!(case, Case::ProxyUnavailable) {
         // Remove only the owned proxy server. The requested target listener is
@@ -689,12 +756,7 @@ server_identity_public_key = "{}"
                 .expect("unavailable proxy must fail within its connect deadline"),
             Ok(0) | Err(_)
         ));
-        sleep(Duration::from_millis(250)).await;
-        assert_eq!(
-            target_accepts.load(Ordering::SeqCst),
-            0,
-            "proxy failure must not dial the reachable SOCKS target directly"
-        );
+        observer.assert_quiet(0).await;
         assert!(client.child.try_wait().unwrap().is_none());
         drop(client);
         fixtures.shutdown().await;
@@ -728,14 +790,14 @@ server_identity_public_key = "{}"
     if matches!(case, Case::OriginSplice) {
         browser_tls_echo(server_addr, ca_der).await;
         server.wait_for("AuthFailed").await;
-        assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
+        observer.assert_quiet(0).await;
         assert!(!server
             .logs()
             .contains("authenticated pre-data mode started"));
     }
     if matches!(case, Case::SocksBoundaries) {
         malformed_socks(client_addr, &mut client).await;
-        assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
+        observer.assert_quiet(0).await;
         assert_eq!(
             server.logs().matches("accepted outer connection").count(),
             0
@@ -790,11 +852,7 @@ server_identity_public_key = "{}"
             };
             client.wait_for(reason).await;
         }
-        assert_eq!(
-            target_accepts.load(Ordering::SeqCst),
-            0,
-            "identity and egress checks must precede target dial"
-        );
+        observer.assert_quiet(0).await;
         if failed_then_recover {
             drop(app);
             drop(client);
@@ -804,7 +862,9 @@ server_identity_public_key = "{}"
                 make_client_config(&psk, &session.public, SNI, &identity.public).as_bytes(),
             );
             client = Binary::spawn("client", &recovered_config, &ca_path);
-            client.wait_for("ParallaX client SOCKS5 listening").await;
+            client_addr = client
+                .listening_addr("ParallaX client SOCKS5 listening")
+                .await;
             roundtrip(client_addr, target_addr, 1).await;
             assert_eq!(
                 target_accepts.load(Ordering::SeqCst),
@@ -890,6 +950,39 @@ server_identity_public_key = "{}"
         assert_eq!(target_accepts.load(Ordering::SeqCst), 2);
         println!("\nPUBLIC_ROUTE_VERIFIED {ip}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires loopback TCP sockets"]
+async fn target_observer_rejects_a_delayed_target_dial() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = target.local_addr().unwrap();
+    let (checks, requests) = mpsc::unbounded_channel();
+    let observer = TargetObserver { checks };
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let mut fixtures = JoinSet::new();
+    fixtures.spawn(serve_target(target, Arc::clone(&accepts), requests));
+    assert_eq!(observer.quiet_count(0).await, Ok(()));
+
+    let check = observer.quiet_count(0);
+    tokio::pin!(check);
+    std::future::poll_fn(|cx| {
+        assert!(check.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    // This later FIFO barrier proves the check's initial zero-count snapshot
+    // has been acknowledged before the intentionally delayed connection.
+    assert_eq!(observer.snapshot().await, 0);
+    sleep(Duration::from_millis(25)).await;
+    let mut peer = TcpStream::connect(address).await.unwrap();
+    peer.shutdown().await.unwrap();
+    assert_eq!(check.await, Err(1));
+    assert_eq!(observer.quiet_count(1).await, Ok(()));
+    fixtures.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

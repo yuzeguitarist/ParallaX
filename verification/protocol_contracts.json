@@ -67,7 +67,7 @@
     {
       "id": "tls-trust",
       "spec": "## 24. Conformance Summary",
-      "claim": "A real camouflage TLS client rejects an untrusted origin chain or mismatched SNI, then succeeds after corrected trust or SNI. Its Certificate parsers require exact outer/list consumption; the compressed parser also requires a complete, exactly consumed zlib stream before certificate verification.",
+      "claim": "A real camouflage TLS client rejects an untrusted origin chain or mismatched SNI, then succeeds after corrected trust or SNI. Its Certificate parsers require exact outer/list consumption; the compressed parser also requires a complete, exactly consumed zlib stream before certificate verification. Server Certificate contexts are empty and chains/entries nonempty; ALPN and CertificateVerify consume their complete vectors before state commits.",
       "sources": [
         {
           "file": "src/tls/safari26.rs",
@@ -110,6 +110,26 @@
           "suite": "protocol_library",
           "file": "src/tls/safari26.rs",
           "name": "tls::safari26::tests::certificate_body_requires_exact_consumption_in_raw_and_compressed_paths"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::review_server_alpn_requires_exact_nonempty_selection"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::review_server_certificate_rejects_context_in_both_encodings"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::review_server_certificate_rejects_empty_chain_and_entries"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::review_certificate_verify_rejects_trailing_bytes_before_state_commit"
         }
       ],
       "bounds": "Fresh generated CA/leaf, a wrong CA or DNS name, explicit client rejection and no target connection. Parser fixtures include valid positive controls, each one-to-four-byte checksum truncation, zlib/outer-vector trailing bytes and bytes after Certificate.certificate_list in raw and compressed paths.",
@@ -718,9 +738,14 @@
           "suite": "security_fault_injection",
           "file": "tests/security_fault_injection.rs",
           "name": "a_failed_batch_commits_no_output_invalidates_serial_input_and_poison_is_sticky"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/protocol/data.rs",
+          "name": "protocol::data::tests::parallel_seal_worker_panic_reserves_nonces_and_poisons_even_after_rekey"
         }
       ],
-      "bounds": "Injected worker/open failures and finite mixed serial/parallel batches.",
+      "bounds": "Injected worker/open failures and finite mixed serial/parallel batches. Inline and background worker panic preserve the original panic payload, output prefix, consumed range and permanent poison.",
       "external_conditions": []
     },
     {
@@ -836,9 +861,14 @@
           "suite": "protocol_e2e",
           "file": "tests/protocol_e2e.rs",
           "name": "binary_client_selected_private_target_is_denied_after_authentication"
+        },
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "target_observer_rejects_a_delayed_target_dial"
         }
       ],
-      "bounds": "One actual loopback/private target, explicit production egress-denial log and observed EOF.",
+      "bounds": "One actual private target, explicit production denial/EOF, and a FIFO observer that requires a 250ms quiet window; a delayed real target-dial canary must fail the observation.",
       "external_conditions": [
         "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
       ]
@@ -1415,7 +1445,7 @@
     {
       "id": "quic-compressed-certificate",
       "spec": "### 12.5 QUIC ClientHello (QUIC plane)",
-      "claim": "The actual QUIC client Certificate state accepts only a complete, exactly consumed zlib CompressedCertificate with matching bounded output length, preserves the compressed wire transcript and rejects malformed inputs before advancing state.",
+      "claim": "The actual QUIC client Certificate state accepts only a complete, exactly consumed zlib CompressedCertificate with matching bounded output length, preserves the compressed wire transcript and rejects malformed inputs before advancing state. Invalid server context or empty chain is terminal, including when a later valid flight arrives in separate CRYPTO packets; the client endpoint sends CRYPTO_ERROR 0x132.",
       "sources": [
         {
           "file": "src/tls/quic/handshake.rs",
@@ -1438,6 +1468,21 @@
           "suite": "protocol_library",
           "file": "src/tls/quic/handshake.rs",
           "name": "tls::quic::handshake::tests::malformed_compressed_certificates_cannot_advance_the_real_client_state"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/handshake.rs",
+          "name": "tls::quic::handshake::tests::review_server_certificate_rejects_context_and_empty_chain_before_state_commit"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/handshake.rs",
+          "name": "tls::quic::handshake::tests::review_server_alpn_name_must_not_be_empty"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/endpoint.rs",
+          "name": "transport::udp::quic::endpoint::tests::malformed_server_certificate_closes_before_a_later_valid_flight"
         }
       ],
       "bounds": "Normal and exact 256KiB inflated certificate bodies; unsupported algorithm, declared/inflated over-cap output, mismatched length, invalid zlib, truncated vector/checksum and outer/stream trailing bytes. Rejection preserves the Certificate state, empty chain and pre-message transcript.",
@@ -1452,12 +1497,12 @@
       "sources": [
         {
           "file": "src/transport/leg.rs",
-          "symbol": "poll_read",
+          "symbol": "H3DataFrameReader::poll_read",
           "kind": "fn"
         },
         {
           "file": "src/transport/leg.rs",
-          "symbol": "is_clean_close",
+          "symbol": "H3DataFrameLegReader::is_clean_close",
           "kind": "fn"
         }
       ],

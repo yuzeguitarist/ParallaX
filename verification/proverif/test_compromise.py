@@ -1,7 +1,13 @@
 import copy
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
+from unittest import mock
 
 
 SPEC = importlib.util.spec_from_file_location("compromise_check", Path(__file__).with_name("compromise.py"))
@@ -102,6 +108,30 @@ class CompromiseControls(unittest.TestCase):
         model = checker.identity.MODEL.read_text()
         with self.assertRaises(ValueError):
             list(checker.variants(model.replace(checker.SEND, "out(network, identity_label)")))
+
+    def test_runner_records_observed_verifier_bytes_version_and_its_own_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "proverif"
+            executable.write_bytes(b"fixture executable bytes")
+            banner = "Proverif 2.05. Cryptographic protocol verifier\n"
+            with mock.patch("sys.argv", ["compromise", "--output-dir", str(root / "runs")]), \
+                    mock.patch.object(checker.shutil, "which", return_value=str(executable)), \
+                    mock.patch.object(checker.subprocess, "check_output", side_effect=["a" * 40, ""]), \
+                    mock.patch.object(checker.subprocess, "run", return_value=
+                                      subprocess.CompletedProcess([], 0, banner, "")), \
+                    mock.patch.object(checker, "verify_case", return_value={"fixture": True}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                checker.main()
+            report_path, = (root / "runs").glob("run-*/verification.json")
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["verifier"], {"version": banner.strip(),
+                             "binary_sha256": checker.identity.sha256(executable.read_bytes())})
+            self.assertEqual(report["runner_sha256"], checker.identity.sha256(Path(checker.__file__).read_bytes()))
+            self.assertEqual(report["expected_verifier_source"],
+                             json.loads(checker.identity.CONTRACTS.read_text())["verifier_source"])
+            self.assertEqual(report_path.with_name("verifier-version.log").read_text(), banner)
 
 
 if __name__ == "__main__":

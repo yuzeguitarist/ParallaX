@@ -35,7 +35,7 @@ class FormalModelTests(unittest.TestCase):
                 "ParallaXClose": 21,
                 "ParallaXBbr": 56,
                 "ParallaXPacket": 14,
-                "ParallaXRecords": 70,
+                "ParallaXRecords": 176,
                 "ParallaXFragments": 23,
                 "ParallaXMux": 17762,
                 "ParallaXIdentityChunks": 5464,
@@ -182,6 +182,12 @@ class FormalModelTests(unittest.TestCase):
         cases = (
             (plx_formal.act("RollbackReservation", 'phase = "failed" /\\ next # 0', next="0"),
              "ReservationIsNeverRolledBack"),
+            (plx_formal.act("RollbackAllCounterCopies", 'phase = "failed" /\\ next # 0',
+                           next="0", high="0", base="0", prior_end="0"),
+             "ReservationIsNeverRolledBack"),
+            (plx_formal.act("RollbackPublishedCounters", 'phase = "ready" /\\ next # 0',
+                           next="0", high="0", base="0", prior_end="0"),
+             "ReservationIsNeverRolledBack"),
             (plx_formal.act("ReviveAfterFailure", 'phase = "failed" /\\ poisoned', poisoned="FALSE"),
              "FailedBatchPoisonsPermanently"),
             (plx_formal.act("PublishBeforeSibling", 'phase = "reserved" /\\ remaining = 1',
@@ -193,6 +199,20 @@ class FormalModelTests(unittest.TestCase):
                 plx_formal.check_machine(replace(machine, actions=machine.actions + (bad_action,)))
             self.assertIn(invariant, str(caught.exception))
             self.assertIn(bad_action.name, str(caught.exception))
+
+    def test_record_reservation_history_survives_fresh_key_reset(self):
+        machine = plx_formal.records_machine()
+        rekey = next(action for action in machine.actions if action.name == "FreshKeyRekey")
+        self.assertEqual(rekey.assign["next"], "0")
+        for action in machine.actions:
+            for epoch in (0, 1):
+                ledger = f"reserved{epoch}"
+                if ledger in action.assign:
+                    self.assertIn(action.name, (f"Reserve1Epoch{epoch}", f"Reserve2Epoch{epoch}"))
+                    self.assertIn(action.assign[ledger], (f"{ledger} + 1", f"{ledger} + 2"))
+        report = plx_formal.check_machine(machine)
+        self.assertIn("FreshKeyCanReuseSequence", report.witness_names)
+        self.assertIn("RekeyKeepsPoison", report.witness_names)
 
     def test_fragment_completion_requires_all_bytes_and_clears_latch(self):
         machine = plx_formal.fragments_machine()
@@ -415,11 +435,11 @@ EXPECTED_INVARIANTS = {
     },
     "ParallaXRecords": {
         "ReservedRangesNeverOverlap": 'phase = "reserved" => (base = prior_end /\\ base < next /\\ next = high)',
-        "ReservationIsNeverRolledBack": "next = high",
+        "ReservationIsNeverRolledBack": "next = high /\\ (epoch = 0 => next = reserved0) /\\ (epoch = 1 => next = reserved1)",
         "FailedBatchPoisonsPermanently": "failed => poisoned",
         "PoisonedCannotDispatch": 'poisoned => (phase # "reserved" /\\ ~published)',
         "PublishOnlyWholeSuccess": 'published => (phase = "ready" /\\ remaining = 0 /\\ ~poisoned /\\ ~failed)',
-        "RecordWindowIsBounded": "next \\in {0, 1, 2, 3} /\\ epoch \\in {0, 1}",
+        "RecordWindowIsBounded": "next \\in {0, 1, 2, 3} /\\ epoch \\in {0, 1} /\\ reserved0 \\in {0, 1, 2, 3} /\\ reserved1 \\in {0, 1, 2, 3}",
     },
     "ParallaXFragments": {
         "FragmentsStayWithinTotal": '(total = 0 => cursor = 0) /\\ (total # 0 => (cursor < total /\\ total \\in {1, 2, 3}))',

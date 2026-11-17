@@ -1022,7 +1022,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     tracing::info!(
         connection_limit,
         "ParallaX server listening on {}",
-        server.listen
+        listener.local_addr()?
     );
 
     // Eagerly build the reject-path ballast context now (one X25519 keygen +

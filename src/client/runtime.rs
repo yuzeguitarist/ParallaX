@@ -311,7 +311,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     tracing::info!(
         connection_limit,
         "ParallaX client SOCKS5 listening on {}",
-        client.listen
+        listener.local_addr()?
     );
 
     loop {

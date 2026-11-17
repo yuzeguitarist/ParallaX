@@ -140,6 +140,19 @@ def compromise_evidence(path: Path, commit: str) -> None:
     verifier = module("compromise", ROOT / "verification/proverif/compromise.py")
     report = json.loads(path.read_text())
     provenance(report, commit)
+    tool = report.get("verifier", {})
+    require(isinstance(tool, dict) and isinstance(tool.get("version"), str) and
+            tool["version"].startswith(f"Proverif {verifier.identity.TOOL_VERSION}.") and
+            isinstance(tool.get("binary_sha256"), str) and
+            re.fullmatch(r"[0-9a-f]{64}", tool["binary_sha256"]) is not None,
+            "missing or wrong compromise verifier identity")
+    require(report.get("expected_verifier_source") ==
+            json.loads(verifier.identity.CONTRACTS.read_text())["verifier_source"],
+            "missing or mismatched pinned verifier source")
+    require(report.get("runner_sha256") == verifier.identity.sha256(Path(verifier.__file__).read_bytes()),
+            "stale compromise runner")
+    version_log = (path.parent / "verifier-version.log").read_text().splitlines()
+    require(bool(version_log) and version_log[0] == tool["version"], "verifier version log disagrees")
     require(report.get("status") == "passed" and report.get("source_regions") == verifier.identity.check_source_contracts(),
             "incomplete or mismatched compromise source mapping")
     base = verifier.identity.MODEL.read_text()
