@@ -1,0 +1,93 @@
+.github/workflows/security-assurance.yml
+  s_0acd2adb357b18::t_6b5ef12dee8940 83-84
+README.md
+  s_0acd2adb357b18::t_97f95048f3cb2c 357-361
+scripts/security/assurance.py
+  s_0acd2adb357b18::t_d8bab3103befee 30,32-34,115-117
+src/transport/udp/quic/frame.rs
+  s_0acd2adb357b18::t_2309b02bd9de26 1122-1257
+src/transport/udp/quic/mod.rs
+  s_0acd2adb357b18::t_1ec325e5667a6a 20-24
+src/transport/udp/quic/transport_params.rs
+  s_0acd2adb357b18::t_5d27c9db12785f 817-861
+src/transport/udp/quic/varint.rs
+  s_0acd2adb357b18::t_fcdf9711848f07 133-163
+tests/protocol_differential.rs
+  s_0acd2adb357b18::t_c2c643d5c60d72 1-695
+tests/protocol_e2e.rs
+  s_0acd2adb357b18::t_c86cf635f49eb9 1-495
+verification/PROTOCOL.md
+  s_0acd2adb357b18::t_bbd5a28dce15f2 1-79
+.github/workflows/ci-pr.yml
+  s_d2ec2c43d28d8a::t_b9f952c4324672 164-166
+.github/workflows/formal.yml
+  s_f083e143bb47dc::t_1812c5a4875172 5-6
+formal/COVERAGE.md
+  s_54de40ab93d865::t_06b2f540844cfb 54,68-69
+formal/ParallaXFragments.cfg
+  s_54de40ab93d865::t_6654319193c868 1-8
+formal/ParallaXFragments.tla
+  s_54de40ab93d865::t_3d162be3a09ec0 1-207
+formal/ParallaXRecords.cfg
+  s_54de40ab93d865::t_850de9017339ab 1-8
+formal/ParallaXRecords.tla
+  s_54de40ab93d865::t_b6d4f79163aa3b 1-134
+formal/README.md
+  s_54de40ab93d865::t_e95b8714ba03c1 8-9,320-321,324-370
+formal/plx_formal.py
+  s_54de40ab93d865::t_5b44adfad82045 31-34,72,2923-3055,3068-3069,3335-3354,3649-3667
+formal/test_plx_formal.py
+  s_54de40ab93d865::t_8662afdd708395 38-39,138-192,273-288
+tests/protocol_properties.rs
+  s_e2f65cfc4747fa::t_dfeec6601f2fb1 1-441
+tests/support/property.rs
+  s_e2f65cfc4747fa::t_530ff6209480af 1-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fa79625c12c475ccb3e9040b9308f75fb41276b4",
+  "prompts": {},
+  "sessions": {
+    "s_0acd2adb357b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99c6c6d0-06d8-4e35-98e1-0e7efa510d42",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_54de40ab93d865": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e7f0-9134-7330-973c-bfcd718d5b13",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_d2ec2c43d28d8a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e7f3-9ce6-78e3-b636-4f66bb668208",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_e2f65cfc4747fa": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e7f0-aeaf-7323-8a43-3708b1304087",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_f083e143bb47dc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e7f0-2a67-7743-844b-46c5127778bb",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
