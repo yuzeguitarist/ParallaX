@@ -1,0 +1,35 @@
+scripts/verification/protocol_contracts.py
+  s_0acd2adb357b18::t_083db625fdd4fd 28-29
+scripts/verification/test_protocol_contracts.py
+  s_0acd2adb357b18::t_0ecea1877a2867 58
+src/handshake/server.rs
+  s_0acd2adb357b18::t_07bee29ec65513 13522-13727
+src/transport/leg.rs
+  s_0acd2adb357b18::t_9c89e2d0f94da7 227-229,275-284,304-309,353-354,423-524
+src/client/runtime.rs
+  s_d256621147bee8::t_8658aa1e0754fa 5860-6065
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "082a308cf547c5743d8fd7dea3511a406491fb52",
+  "prompts": {},
+  "sessions": {
+    "s_0acd2adb357b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99c6c6d0-06d8-4e35-98e1-0e7efa510d42",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_d256621147bee8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e7f0-e53d-7ff3-8732-83c4e041b258",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
