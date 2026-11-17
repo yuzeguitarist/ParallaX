@@ -7,8 +7,7 @@
 //! ParallaX sends before switching to its own data records.
 
 use std::{
-    fmt,
-    io::{self, Cursor, Read},
+    fmt, io,
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,7 +18,7 @@ use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305,
 };
-use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
@@ -2694,6 +2693,11 @@ fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari26TlsError>
     let mut c = TlsCursor::new(body);
     let _request_context = c.vec_u8()?;
     let list = c.vec_u24()?;
+    if c.remaining() != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "trailing bytes after the certificate list".to_owned(),
+        ));
+    }
     let mut l = TlsCursor::new(list);
     let mut certs = Vec::new();
     while l.remaining() > 0 {
@@ -2725,24 +2729,35 @@ fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari
         ));
     }
     let compressed = c.vec_u24()?;
-    let decoder = ZlibDecoder::new(Cursor::new(compressed));
-    // Cap the actual inflation independently of the declared length so a lying
-    // header (small uncompressed_len, huge real output) cannot exhaust memory
-    // either. take() bounds the bytes pulled from the decoder; reading one extra
-    // byte past the cap lets us detect an over-cap stream.
-    let mut decompressed = Vec::with_capacity(uncompressed_len.min(MAX_DECOMPRESSED_CERT_CHAIN));
-    let mut limited = decoder.take((MAX_DECOMPRESSED_CERT_CHAIN as u64) + 1);
-    limited.read_to_end(&mut decompressed)?;
-    if decompressed.len() > MAX_DECOMPRESSED_CERT_CHAIN {
+    if c.remaining() != 0 {
+        return Err(Safari26TlsError::Handshake(
+            "trailing bytes after compressed certificate".to_owned(),
+        ));
+    }
+    // The declared length is also the inflation budget (RFC 8879 section 5).
+    // One spare byte detects an understated length; require the zlib trailer
+    // and consume the full compressed vector before accepting its output.
+    let mut decompressed = vec![0; uncompressed_len + 1];
+    let mut decoder = Decompress::new(true);
+    let status = decoder
+        .decompress(compressed, &mut decompressed, FlushDecompress::Finish)
+        .map_err(|_| Safari26TlsError::Handshake("zlib decompression failed".to_owned()))?;
+    if decoder.total_out() > uncompressed_len as u64 {
         return Err(Safari26TlsError::Handshake(
             "compressed_certificate inflates beyond maximum".to_owned(),
         ));
     }
-    if decompressed.len() != uncompressed_len {
+    if status != Status::StreamEnd || decoder.total_in() != compressed.len() as u64 {
+        return Err(Safari26TlsError::Handshake(
+            "compressed_certificate incomplete or trailing zlib stream".to_owned(),
+        ));
+    }
+    if decoder.total_out() != uncompressed_len as u64 {
         return Err(Safari26TlsError::Handshake(
             "compressed_certificate length mismatch".to_owned(),
         ));
     }
+    decompressed.truncate(uncompressed_len);
     parse_certificate_body(&decompressed)
 }
 
@@ -3141,6 +3156,60 @@ mod tests {
             matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("length mismatch")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn compressed_certificate_requires_complete_zlib_stream_and_exact_input_consumption() {
+        let plain = certificate_body(&[&[0x30, 3, 2, 1, 0]]);
+        let body = build_compressed_cert_body(plain.len(), &plain);
+        assert_eq!(
+            parse_compressed_certificate_body(&body).unwrap(),
+            vec![vec![0x30, 3, 2, 1, 0]]
+        );
+        // Keep the TLS vector length self-consistent while removing bytes of the
+        // zlib checksum. Producing all Certificate bytes is not stream completion.
+        for removed in 1..=4 {
+            let mut truncated = body[..body.len() - removed].to_vec();
+            let length = (truncated.len() - 8) as u32;
+            truncated[5..8].copy_from_slice(&length.to_be_bytes()[1..]);
+            assert!(
+                parse_compressed_certificate_body(&truncated).is_err(),
+                "missing {removed} checksum bytes"
+            );
+        }
+        let mut trailing = body;
+        trailing.push(0);
+        let length = (trailing.len() - 8) as u32;
+        trailing[5..8].copy_from_slice(&length.to_be_bytes()[1..]);
+        assert!(
+            parse_compressed_certificate_body(&trailing).is_err(),
+            "bytes after the zlib stream are not certificate compression output"
+        );
+    }
+
+    #[test]
+    fn compressed_certificate_rejects_trailing_bytes_after_its_tls_vector() {
+        let plain = certificate_body(&[&[0x30, 3, 2, 1, 0]]);
+        let mut body = build_compressed_cert_body(plain.len(), &plain);
+        assert!(parse_compressed_certificate_body(&body).is_ok());
+        body.push(0);
+        assert!(parse_compressed_certificate_body(&body).is_err());
+    }
+
+    #[test]
+    fn certificate_body_requires_exact_consumption_in_raw_and_compressed_paths() {
+        let mut plain = certificate_body(&[&[0x30, 3, 2, 1, 0]]);
+        assert_eq!(
+            parse_certificate_body(&plain).unwrap(),
+            vec![vec![0x30, 3, 2, 1, 0]]
+        );
+        plain.push(0);
+        assert!(
+            parse_certificate_body(&plain).is_err(),
+            "bytes after Certificate.certificate_list"
+        );
+        let compressed = build_compressed_cert_body(plain.len(), &plain);
+        assert!(parse_compressed_certificate_body(&compressed).is_err());
     }
 
     #[test]

@@ -18,12 +18,11 @@
 //! [`write_handshake`]: ClientHandshake::write_handshake
 //! [`read_handshake`]: ClientHandshake::read_handshake
 
-use std::io::Read;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, ML_KEM_768};
-use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use rand::{rngs::OsRng, RngCore};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
@@ -1435,24 +1434,32 @@ fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTl
         ));
     }
     let compressed = c.vec_u24()?;
-    let decoder = ZlibDecoder::new(compressed);
-    let mut decompressed = Vec::with_capacity(uncompressed_len.min(MAX_DECOMPRESSED_CERT_CHAIN));
-    let mut limited = decoder.take((MAX_DECOMPRESSED_CERT_CHAIN as u64) + 1);
-    limited
-        .read_to_end(&mut decompressed)
-        .map_err(|_| QuicTlsError::alert(ALERT_BAD_CERTIFICATE, "zlib decompression failed"))?;
-    if decompressed.len() > MAX_DECOMPRESSED_CERT_CHAIN {
+    if c.remaining() != 0 {
         return Err(QuicTlsError::alert(
-            ALERT_BAD_CERTIFICATE,
-            "compressed_certificate inflates beyond maximum",
+            ALERT_DECODE_ERROR,
+            "trailing bytes after compressed certificate",
         ));
     }
-    if decompressed.len() != uncompressed_len {
+    // One spare output byte detects an understated length without inflating an
+    // unbounded stream. Require the zlib trailer and consume the entire vector.
+    let mut decompressed = vec![0; uncompressed_len + 1];
+    let mut decoder = Decompress::new(true);
+    let status = decoder
+        .decompress(compressed, &mut decompressed, FlushDecompress::Finish)
+        .map_err(|_| QuicTlsError::alert(ALERT_BAD_CERTIFICATE, "zlib decompression failed"))?;
+    if status != Status::StreamEnd || decoder.total_in() != compressed.len() as u64 {
+        return Err(QuicTlsError::alert(
+            ALERT_BAD_CERTIFICATE,
+            "compressed_certificate incomplete or trailing zlib stream",
+        ));
+    }
+    if decoder.total_out() != uncompressed_len as u64 {
         return Err(QuicTlsError::alert(
             ALERT_BAD_CERTIFICATE,
             "compressed_certificate length mismatch",
         ));
     }
+    decompressed.truncate(uncompressed_len);
     parse_certificate_body(&decompressed)
 }
 
@@ -2622,5 +2629,351 @@ mod tests {
         let mut nonzero = [0_u8; X25519_KEY_LEN];
         nonzero[0] = 1;
         reject_degenerate_x25519(&nonzero).unwrap();
+    }
+
+    fn drain_authentication_flight(
+        mut write: impl FnMut(&mut Vec<u8>) -> Option<KeyChange>,
+    ) -> (Vec<u8>, Vec<&'static str>) {
+        let mut flight = Vec::new();
+        let mut changes = Vec::new();
+        for _ in 0..8 {
+            let mut bytes = Vec::new();
+            let change = write(&mut bytes);
+            let done = bytes.is_empty() && change.is_none();
+            if let Some(change) = change {
+                changes.push(match change {
+                    KeyChange::RejectZeroRtt => "reject_early",
+                    KeyChange::ZeroRtt { .. } => "early",
+                    KeyChange::Handshake { .. } => "handshake",
+                    KeyChange::OneRtt { .. } => "application",
+                });
+            }
+            flight.extend_from_slice(&bytes);
+            if done {
+                return (flight, changes);
+            }
+        }
+        panic!("handshake output did not quiesce");
+    }
+
+    fn authentication_test_server() -> super::super::ServerHandshake {
+        use aws_lc_rs::{
+            rand::SystemRandom,
+            signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
+        };
+        let signing =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        super::super::ServerHandshake::new(
+            Arc::new(vec![vec![0x30, 3, 2, 1, 0]]),
+            signing.as_ref(),
+            vec![b"h3".to_vec()],
+            vec![0x0f, 0],
+            Some(Zeroizing::new([0x55; 32])),
+        )
+        .unwrap()
+    }
+
+    // Drive the actual cold handshake up to, but not including, a selected
+    // server message. Every MAC below is initially produced by the real peer.
+    fn client_before_server_message(
+        kind: u8,
+    ) -> (ClientHandshake, super::super::ServerHandshake, Vec<Vec<u8>>) {
+        let mut client = handshake();
+        let mut server = authentication_test_server();
+        let (hello, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        server.read_handshake(&hello).unwrap();
+        let (flight, changes) = drain_authentication_flight(|bytes| server.write_handshake(bytes));
+        assert_eq!(changes, ["handshake", "application"]);
+        let mut rest = Vec::new();
+        let mut cursor = 0;
+        while cursor < flight.len() {
+            let length = ((flight[cursor + 1] as usize) << 16)
+                | ((flight[cursor + 2] as usize) << 8)
+                | flight[cursor + 3] as usize;
+            let message = &flight[cursor..cursor + 4 + length];
+            if !rest.is_empty() || message[0] == kind {
+                rest.push(message.to_vec());
+            } else {
+                client.read_handshake(message).unwrap();
+            }
+            cursor += message.len();
+        }
+        assert_eq!(rest.first().map(|message| message[0]), Some(kind));
+        let (bytes, changes) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        assert!(bytes.is_empty());
+        assert_eq!(changes, ["handshake"]);
+        (client, server, rest)
+    }
+
+    fn assert_client_has_no_application_flight(client: &mut ClientHandshake) {
+        assert!(client.is_handshaking());
+        assert!(client.pending_client_finished.is_none());
+        assert!(client.pending_1rtt_keys.is_none());
+        assert!(client.pending_session_ticket.is_none());
+        assert!(client.resumption_master_secret().is_err());
+        assert!(client
+            .export_keying_material(&mut [0; 32], b"unfinished", b"")
+            .is_err());
+        let (bytes, changes) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        assert!(bytes.is_empty() && changes.is_empty());
+    }
+
+    #[test]
+    fn server_finished_mac_or_length_failure_does_not_commit_client_application_state() {
+        for variant in 0..4 {
+            let (mut client, server, flight) = client_before_server_message(HANDSHAKE_FINISHED);
+            assert_eq!(client.read_state, ReadState::Finished);
+            let transcript = client.transcript.clone();
+            let mut body = flight[0][4..].to_vec();
+            match variant {
+                0 => body[0] ^= 1,
+                1 => {
+                    body.pop();
+                }
+                2 => body.push(0),
+                _ => body.clear(),
+            }
+            let error = client
+                .read_handshake(&msg(HANDSHAKE_FINISHED, &body))
+                .unwrap_err();
+            assert_eq!(error.alert_description(), Some(ALERT_DECRYPT_ERROR));
+            assert_eq!(client.read_state, ReadState::Finished);
+            assert_eq!(client.transcript, transcript);
+            assert_client_has_no_application_flight(&mut client);
+            assert!(
+                server.is_handshaking(),
+                "no client Finished or ticket was produced"
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_server_finished_installs_application_keys_only_after_complete_verified_message() {
+        for cut in [0, 1, 3, 4, 35] {
+            let (mut client, mut server, flight) = client_before_server_message(HANDSHAKE_FINISHED);
+            let finished = &flight[0];
+            assert_eq!(finished.len(), 36);
+            client.read_handshake(&finished[..cut]).unwrap();
+            assert_eq!(client.read_state, ReadState::Finished);
+            assert_client_has_no_application_flight(&mut client);
+            client.read_handshake(&finished[cut..]).unwrap();
+            assert_eq!(client.read_state, ReadState::Complete);
+            let (client_finished, changes) =
+                drain_authentication_flight(|bytes| client.write_handshake(bytes));
+            assert_eq!(changes, ["application"]);
+            assert!(!client.is_handshaking());
+            server.read_handshake(&client_finished).unwrap();
+            assert!(!server.is_handshaking());
+            let (ticket, changes) =
+                drain_authentication_flight(|bytes| server.write_handshake(bytes));
+            assert!(changes.is_empty());
+            assert_eq!(ticket[0], HANDSHAKE_NEW_SESSION_TICKET);
+            client.read_handshake(&ticket).unwrap();
+            assert!(client.take_session_ticket(1_000_000).is_some());
+        }
+    }
+
+    fn zlib_bytes(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut compressor =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        compressor.write_all(plain).unwrap();
+        compressor.finish().unwrap()
+    }
+
+    fn compressed_certificate_body(algorithm: u16, declared: usize, compressed: &[u8]) -> Vec<u8> {
+        let mut body = algorithm.to_be_bytes().to_vec();
+        body.extend_from_slice(&(declared as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(&(compressed.len() as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(compressed);
+        body
+    }
+
+    #[test]
+    fn compressed_certificate_real_state_path_preserves_wire_transcript_and_exact_cap() {
+        for at_cap in [false, true] {
+            let (mut client, _, remaining) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+            let (certificate, expected) = if at_cap {
+                let der = vec![0; MAX_DECOMPRESSED_CERT_CHAIN - 9];
+                let mut body = vec![0]; // empty certificate_request_context
+                body.extend_from_slice(&((der.len() + 5) as u32).to_be_bytes()[1..]);
+                body.extend_from_slice(&(der.len() as u32).to_be_bytes()[1..]);
+                body.extend_from_slice(&der);
+                body.extend_from_slice(&[0, 0]); // empty per-certificate extensions
+                assert_eq!(body.len(), MAX_DECOMPRESSED_CERT_CHAIN);
+                (body, vec![der])
+            } else {
+                (remaining[0][4..].to_vec(), vec![vec![0x30, 3, 2, 1, 0]])
+            };
+            let body = compressed_certificate_body(1, certificate.len(), &zlib_bytes(&certificate));
+            let message = msg(HANDSHAKE_COMPRESSED_CERTIFICATE, &body);
+            let mut transcript = client.transcript.clone();
+            transcript.extend_from_slice(&message);
+            client.read_handshake(&message).unwrap();
+            assert_eq!(client.read_state, ReadState::CertificateVerify);
+            assert_eq!(client.server_certs, expected);
+            assert_eq!(
+                client.transcript, transcript,
+                "hash compressed wire bytes, not inflated bytes"
+            );
+            // This test stops at CertificateVerify: the modified server flight
+            // deliberately has no peer signature/Finished over its new transcript.
+            assert_client_has_no_application_flight(&mut client);
+        }
+    }
+
+    #[test]
+    fn malformed_compressed_certificates_cannot_advance_the_real_client_state() {
+        let (_, _, remaining) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+        let certificate = &remaining[0][4..];
+        let compressed = zlib_bytes(certificate);
+        let good = compressed_certificate_body(1, certificate.len(), &compressed);
+        let mut vector_truncated = good.clone();
+        vector_truncated.pop();
+        let mut outer_trailing = good.clone();
+        outer_trailing.push(0);
+        let mut stream_trailing = compressed.clone();
+        stream_trailing.push(0);
+        let cases = [
+            (
+                "algorithm",
+                compressed_certificate_body(2, certificate.len(), &compressed),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                "declared cap",
+                compressed_certificate_body(1, MAX_DECOMPRESSED_CERT_CHAIN + 1, &compressed),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                "inflation cap",
+                compressed_certificate_body(
+                    1,
+                    1,
+                    &zlib_bytes(&vec![0; MAX_DECOMPRESSED_CERT_CHAIN + 1]),
+                ),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                "length mismatch",
+                compressed_certificate_body(1, certificate.len() + 1, &compressed),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                "invalid zlib",
+                compressed_certificate_body(1, certificate.len(), &[0xff, 0xff]),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            ("truncated vector", vector_truncated, ALERT_DECODE_ERROR),
+            (
+                "truncated zlib checksum",
+                compressed_certificate_body(
+                    1,
+                    certificate.len(),
+                    &compressed[..compressed.len() - 1],
+                ),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            ("outer trailing", outer_trailing, ALERT_DECODE_ERROR),
+            (
+                "stream trailing",
+                compressed_certificate_body(1, certificate.len(), &stream_trailing),
+                ALERT_BAD_CERTIFICATE,
+            ),
+        ];
+        for (label, body, alert) in cases {
+            let (mut client, _, _) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+            let transcript = client.transcript.clone();
+            let error = client
+                .read_handshake(&msg(HANDSHAKE_COMPRESSED_CERTIFICATE, &body))
+                .expect_err(label);
+            assert_eq!(error.alert_description(), Some(alert), "{label}");
+            assert_eq!(client.read_state, ReadState::Certificate, "{label}");
+            assert!(client.server_certs.is_empty(), "{label}");
+            assert_eq!(client.transcript, transcript, "{label}");
+            assert_client_has_no_application_flight(&mut client);
+        }
+    }
+
+    #[test]
+    fn valid_psk_without_early_data_skips_guard_and_completes_certificate_fallback() {
+        use super::super::ticket::{seal_ticket, TicketState};
+        use super::super::ZeroRttGuard;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct SpyGuard(AtomicUsize);
+        impl ZeroRttGuard for SpyGuard {
+            fn accept_ticket(&self, _: &[u8], _: u64) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = TicketState {
+            suite: 0x1301,
+            alpn: b"h3".to_vec(),
+            psk: Zeroizing::new(vec![0x34; 32]),
+            issued_at: now - 1,
+            lifetime_secs: 3600,
+        };
+        let ticket = ClientTicket {
+            ticket: seal_ticket(&[0x55; 32], &state).unwrap(),
+            psk: state.psk.clone(),
+            suite: state.suite,
+            alpn: state.alpn.clone(),
+            peer_transport_params: vec![0x0f, 0],
+            age_add: 0,
+            lifetime_secs: 3600,
+            received_at_ms: now * 1000,
+        };
+        let mut client = ClientHandshake::new_resumption(
+            handshake().config.clone(),
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x0f, 0],
+            &[],
+            &ticket,
+            now * 1000,
+        )
+        .unwrap();
+        // Only this test fixture's pre-emission offer/transcript changes. The
+        // shared test helper uses the production server parser to assert that
+        // the actual wire retains PSK identity/binder while omitting early_data.
+        let hello = super::super::server::tests::psk_offer_without_early_data(
+            &client.client_hello,
+            &ticket.psk,
+        );
+        client.client_hello = hello.clone();
+        client.transcript = hello;
+        client.pending_0rtt_keys = None;
+        let guard = Arc::new(SpyGuard(AtomicUsize::new(0)));
+        let mut server = authentication_test_server();
+        server.set_zero_rtt_guard(guard.clone());
+        let (hello, changes) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        assert!(changes.is_empty());
+        server.read_handshake(&hello).unwrap();
+        assert_eq!(guard.0.load(Ordering::SeqCst), 0);
+        let (flight, changes) = drain_authentication_flight(|bytes| server.write_handshake(bytes));
+        assert_eq!(changes, ["handshake", "application"]);
+        assert!(!server.is_early_data_accepted());
+        client.read_handshake(&flight).unwrap();
+        assert!(!client.psk_accepted);
+        assert!(!client.is_early_data_accepted());
+        assert!(client.peer_certificates().is_some());
+        let (finished, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        server.read_handshake(&finished).unwrap();
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(guard.0.load(Ordering::SeqCst), 0);
+        let (mut client_exporter, mut server_exporter) = ([0; 32], [0; 32]);
+        client
+            .export_keying_material(&mut client_exporter, b"no early", b"context")
+            .unwrap();
+        server
+            .export_keying_material(&mut server_exporter, b"no early", b"context")
+            .unwrap();
+        assert_eq!(client_exporter, server_exporter);
     }
 }

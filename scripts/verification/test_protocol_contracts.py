@@ -55,7 +55,7 @@ class ProtocolContractControls(unittest.TestCase):
         return path, report
 
     def test_real_references_are_valid_without_claiming_execution(self):
-        self.assertEqual(len(self.entries), 40)
+        self.assertEqual(len(self.entries), 45)
         self.assertEqual({entry["id"] for entry in self.entries}, contracts.REQUIRED_IDS)
 
     def test_empty_missing_duplicate_and_stale_references_are_rejected(self):

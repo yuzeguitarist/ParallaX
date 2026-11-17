@@ -67,11 +67,21 @@
     {
       "id": "tls-trust",
       "spec": "## 24. Conformance Summary",
-      "claim": "A real camouflage TLS client rejects an untrusted origin chain or mismatched SNI, then succeeds after the operator corrects trust or SNI.",
+      "claim": "A real camouflage TLS client rejects an untrusted origin chain or mismatched SNI, then succeeds after corrected trust or SNI. Its Certificate parsers require exact outer/list consumption; the compressed parser also requires a complete, exactly consumed zlib stream before certificate verification.",
       "sources": [
         {
           "file": "src/tls/safari26.rs",
           "symbol": "verify_server_certificate",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/safari26.rs",
+          "symbol": "parse_certificate_body",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/safari26.rs",
+          "symbol": "parse_compressed_certificate_body",
           "kind": "fn"
         }
       ],
@@ -85,11 +95,26 @@
           "suite": "protocol_e2e",
           "file": "tests/protocol_e2e.rs",
           "name": "binary_origin_name_mismatch_is_rejected_and_sni_correction_recovers"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::compressed_certificate_requires_complete_zlib_stream_and_exact_input_consumption"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::compressed_certificate_rejects_trailing_bytes_after_its_tls_vector"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::certificate_body_requires_exact_consumption_in_raw_and_compressed_paths"
         }
       ],
-      "bounds": "Fresh generated CA/leaf, a wrong CA or DNS name, explicit client rejection and no target connection.",
+      "bounds": "Fresh generated CA/leaf, a wrong CA or DNS name, explicit client rejection and no target connection. Parser fixtures include valid positive controls, each one-to-four-byte checksum truncation, zlib/outer-vector trailing bytes and bytes after Certificate.certificate_list in raw and compressed paths.",
       "external_conditions": [
-        "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
+        "Binary trust-recovery fixtures require Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children. Parser fixtures use synthetic certificate bytes and do not independently prove certificate-chain validation."
       ]
     },
     {
@@ -1314,6 +1339,201 @@
       "bounds": "Trusted local origin byte exchange and finite captured/template constraints.",
       "external_conditions": [
         "Unix loopback fixtures. Statistical indistinguishability and live-censor resistance require separate field measurements."
+      ]
+    },
+    {
+      "id": "quic-finished-authentication",
+      "spec": "### 12.5 QUIC ClientHello (QUIC plane)",
+      "claim": "The actual QUIC TLS client and server reject incorrect or wrong-length Finished MACs without completing the handshake; fragmented valid Finished messages commit client application state or server ticket issuance only after complete verification.",
+      "sources": [
+        {
+          "file": "src/tls/quic/handshake.rs",
+          "symbol": "handle_server_finished",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/quic/server.rs",
+          "symbol": "verify_client_finished",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/handshake.rs",
+          "name": "tls::quic::handshake::tests::server_finished_mac_or_length_failure_does_not_commit_client_application_state"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/handshake.rs",
+          "name": "tls::quic::handshake::tests::fragmented_server_finished_installs_application_keys_only_after_complete_verified_message"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/server.rs",
+          "name": "tls::quic::server::tests::client_finished_mac_or_length_failure_does_not_complete_server_or_issue_ticket"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/server.rs",
+          "name": "tls::quic::server::tests::fragmented_client_finished_issues_ticket_only_after_verified_completion"
+        }
+      ],
+      "bounds": "Real peer-produced handshake flights with flipped, short, long and empty MACs plus bounded fragmentation. Client rejection preserves transcript/state and produces no application keys/exporter; server rejection prevents completion/tickets, while its earlier TLS-permitted application write keys remain installed.",
+      "external_conditions": [
+        "Controlled certificate-verifier fixtures isolate Finished authentication; certificate-chain validation has separate evidence. Cryptographic hardness is assumed."
+      ]
+    },
+    {
+      "id": "quic-psk-admission",
+      "spec": "### 12.8 QUIC 0-RTT resumption (optional)",
+      "claim": "Ticket expiry, suite/ALPN mismatch, invalid sealed tickets, missing early-data offer and incorrect binders reject PSK selection before consulting the single-use guard; guard refusal also prevents early-data acceptance, with real certificate-handshake fallback.",
+      "sources": [
+        {
+          "file": "src/tls/quic/server.rs",
+          "symbol": "try_accept_psk",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/server.rs",
+          "name": "tls::quic::server::tests::psk_rejection_precedes_single_use_guard_and_completes_certificate_fallback"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/handshake.rs",
+          "name": "tls::quic::handshake::tests::valid_psk_without_early_data_skips_guard_and_completes_certificate_fallback"
+        }
+      ],
+      "bounds": "Seven server ticket/offer cases include a valid positive control and counted guard rejection. A separate client fixture removes only early_data from a real PSK offer, recomputes a correct binder and confirms the parsed PSK identity/binder remain present. Pre-guard rejection requires zero guard calls; valid and guard-refused offers call once. All rejected PSK offers complete an ordinary 1-RTT certificate handshake with matching exporters.",
+      "external_conditions": [
+        "Synthetic sealed-ticket state and controlled certificate-verifier fixtures; durable replay/restart behavior remains a separate zero-rtt contract."
+      ]
+    },
+    {
+      "id": "quic-compressed-certificate",
+      "spec": "### 12.5 QUIC ClientHello (QUIC plane)",
+      "claim": "The actual QUIC client Certificate state accepts only a complete, exactly consumed zlib CompressedCertificate with matching bounded output length, preserves the compressed wire transcript and rejects malformed inputs before advancing state.",
+      "sources": [
+        {
+          "file": "src/tls/quic/handshake.rs",
+          "symbol": "parse_compressed_certificate_body",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/quic/handshake.rs",
+          "symbol": "process_message",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/handshake.rs",
+          "name": "tls::quic::handshake::tests::compressed_certificate_real_state_path_preserves_wire_transcript_and_exact_cap"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/handshake.rs",
+          "name": "tls::quic::handshake::tests::malformed_compressed_certificates_cannot_advance_the_real_client_state"
+        }
+      ],
+      "bounds": "Normal and exact 256KiB inflated certificate bodies; unsupported algorithm, declared/inflated over-cap output, mismatched length, invalid zlib, truncated vector/checksum and outer/stream trailing bytes. Rejection preserves the Certificate state, empty chain and pre-message transcript.",
+      "external_conditions": [
+        "Controlled certificate-verifier fixture. Successful parser cases stop at CertificateVerify; they do not claim a complete authenticated handshake over the modified compressed transcript."
+      ]
+    },
+    {
+      "id": "http3-stream-framing",
+      "spec": "### 12.6 HTTP/3 fingerprint (QUIC plane)",
+      "claim": "The actual streaming H3 relay reader rejects non-DATA and over-cap frames and distinguishes partial-header/payload FIN from clean frame-boundary FIN, preserving preceding complete records.",
+      "sources": [
+        {
+          "file": "src/transport/leg.rs",
+          "symbol": "poll_read",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/leg.rs",
+          "symbol": "is_clean_close",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/leg.rs",
+          "name": "transport::leg::tests::h3_stream_reader_rejects_invalid_frames_and_partial_fin"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/leg.rs",
+          "name": "transport::leg::tests::h3_stream_truncated_tail_preserves_prior_records_but_is_not_clean_close"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/leg.rs",
+          "name": "transport::leg::tests::h3_stream_real_quic_fin_rejects_truncated_framing_after_a_valid_record"
+        }
+      ],
+      "bounds": "In-memory byte cuts through two nonminimal eight-byte varints and a DATA body, malformed frame type/1MiB+1 length, plus actual QUIC FIN after a complete record and each malformed tail. Empty streams and complete zero-length DATA frames remain clean positive controls.",
+      "external_conditions": [
+        "Loopback QUIC is required for the production H3DataFrameLegReader classification check. These are framing tests, not an independent AEAD oracle."
+      ]
+    },
+    {
+      "id": "quic-relay-done",
+      "spec": "### 3.1 Inner message magics (4-byte ASCII)",
+      "claim": "Both relay roles require an authenticated exact TCP DONE marker after QUIC transfer; wrong marker/tag or missing TCP data fails, an in-flight valid DONE may finish during the post-QUIC-close grace, and an alive QUIC peer cannot suppress the absolute read backstop.",
+      "sources": [
+        {
+          "file": "src/client/runtime.rs",
+          "symbol": "client_exchange_quic_done",
+          "kind": "fn"
+        },
+        {
+          "file": "src/handshake/server.rs",
+          "symbol": "server_exchange_quic_done",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::client_quic_done_rejects_wrong_marker_bad_aead_and_tcp_eof"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::client_quic_done_grace_completes_only_a_valid_inflight_record"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::client_quic_done_missing_record_hits_backstop_while_quic_is_alive"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::server_quic_done_rejects_wrong_marker_bad_aead_and_tcp_eof"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::server_quic_done_grace_completes_only_a_valid_inflight_record"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::server_quic_done_missing_record_hits_backstop_while_quic_is_alive"
+        }
+      ],
+      "bounds": "Both directions consume preceding relay-tail records before DONE to check nonce continuity. Wrong marker, bad AEAD, empty/partial-header TCP EOF, actual QUIC close followed by completion or expiry of the two-second grace, and the 120-second read backstop under paused time with continuously exchanged QUIC liveness bytes. The backstop cases do not simulate a blocked TCP write.",
+      "external_conditions": [
+        "Serial ignored library tests require loopback TCP/UDP sockets; the absolute-backstop fixtures also require Tokio paused-clock controls."
       ]
     }
   ]

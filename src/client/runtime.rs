@@ -5857,6 +5857,212 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum ClientDonePeer {
+        WrongMarker,
+        BadAead,
+        Eof,
+        PartialEof,
+        GraceDone,
+        GraceMissing,
+        LiveMissing,
+    }
+
+    async fn client_done_exchange_case(case: ClientDonePeer) -> Result<(), ClientRuntimeError> {
+        use crate::crypto::session::AeadCodec;
+        use crate::protocol::data::{CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD};
+        use crate::traffic::PaddingProfile;
+        use crate::transport::udp::test_support::loopback_pair;
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        fn codec(aad: &'static [u8]) -> DataRecordCodec {
+            DataRecordCodec::new(
+                AeadCodec::new([0x31; 32], [0x52; 12]),
+                PaddingProfile::new(0, 0).unwrap(),
+                aad,
+            )
+        }
+        let (_server_ep, _client_ep, client_conn, server_conn) =
+            timeout(Duration::from_secs(5), loopback_pair())
+                .await
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connected, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let (client_read, mut client_write) = connected.unwrap().into_split();
+        let (peer_read, mut peer_write) = accepted.unwrap().0.into_split();
+        let mut seal = codec(CLIENT_TO_SERVER_AAD);
+        let mut open = codec(SERVER_TO_CLIENT_AAD);
+        let mut peer_open = codec(CLIENT_TO_SERVER_AAD);
+        let mut peer_seal = codec(SERVER_TO_CLIENT_AAD);
+        // DONE must continue the relay's nonce counters in both directions.
+        assert_eq!(
+            peer_open
+                .open(&seal.seal(b"upload tail", &mut OsRng).unwrap())
+                .unwrap(),
+            b"upload tail"
+        );
+        assert_eq!(
+            open.open(&peer_seal.seal(b"download tail", &mut OsRng).unwrap())
+                .unwrap(),
+            b"download tail"
+        );
+        let mut exchange = Box::pin(client_exchange_quic_done(
+            &client_conn,
+            &mut client_write,
+            client_read,
+            &mut seal,
+            &mut open,
+            1,
+        ));
+        let mut peer_reader = TlsRecordReader::new(peer_read);
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut exchange => panic!("client concluded before the peer DONE: {result:?}"),
+                record = peer_reader.read_record() => {
+                    assert_eq!(peer_open.open(&record.unwrap()).unwrap(), QUIC_RELAY_DONE_MARKER);
+                }
+            }
+        }).await.expect("client must first send its correctly sequenced DONE");
+        let payload = if matches!(case, ClientDonePeer::WrongMarker) {
+            b"wrong marker".as_slice()
+        } else {
+            QUIC_RELAY_DONE_MARKER
+        };
+        let mut reply = peer_seal.seal(payload, &mut OsRng).unwrap();
+        match case {
+            ClientDonePeer::WrongMarker => peer_write.write_all(&reply).await.unwrap(),
+            ClientDonePeer::BadAead => {
+                *reply.last_mut().unwrap() ^= 1;
+                peer_write.write_all(&reply).await.unwrap();
+            }
+            ClientDonePeer::Eof => peer_write.shutdown().await.unwrap(),
+            ClientDonePeer::PartialEof => {
+                peer_write.write_all(&reply[..3]).await.unwrap();
+                peer_write.shutdown().await.unwrap();
+            }
+            ClientDonePeer::GraceDone | ClientDonePeer::GraceMissing => {
+                peer_write.write_all(&reply[..3]).await.unwrap();
+                tokio::select! {
+                    result = &mut exchange => panic!("partial DONE was accepted: {result:?}"),
+                    _ = sleep(Duration::from_millis(10)) => {}
+                }
+                server_conn.close(0u32.into(), b"done-test-peer-close");
+                timeout(
+                    Duration::from_secs(2),
+                    crate::transport::udp::endpoint::conn_closed(&client_conn),
+                )
+                .await
+                .unwrap();
+                // No complete record exists yet: this poll must take the closed
+                // arm and leave the production grace read pending.
+                std::future::poll_fn(|cx| {
+                    assert!(exchange.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                if matches!(case, ClientDonePeer::GraceDone) {
+                    peer_write.write_all(&reply[3..]).await.unwrap();
+                }
+            }
+            ClientDonePeer::LiveMissing => {
+                let (mut alive_send, _unused) = client_conn.open_bi();
+                alive_send.write_all(b"a").await.unwrap();
+                let (_unused, mut alive_recv) =
+                    timeout(Duration::from_secs(5), server_conn.accept_bi())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut byte = [0];
+                alive_recv.read_exact(&mut byte).await.unwrap();
+                tokio::time::pause();
+                let wall = std::time::Instant::now();
+                for _ in 0..=QUIC_RELAY_DONE_BACKSTOP.as_secs() {
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                    let state =
+                        std::future::poll_fn(|cx| Poll::Ready(exchange.as_mut().poll(cx))).await;
+                    assert!(
+                        !client_conn.is_closed() && !server_conn.is_closed(),
+                        "live QUIC must not substitute an idle/grace failure for the DONE backstop"
+                    );
+                    if let Poll::Ready(result) = state {
+                        return result;
+                    }
+                    alive_send.write_all(b"a").await.unwrap();
+                    let mut read = Box::pin(alive_recv.read_exact(&mut byte));
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut read => { result.unwrap(); break; }
+                            _ = tokio::task::yield_now() => {
+                                assert!(wall.elapsed() < Duration::from_secs(10), "QUIC liveness fixture stalled");
+                            }
+                        }
+                    }
+                }
+                panic!("missing DONE exceeded its absolute backstop");
+            }
+        }
+        timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("DONE result must be bounded")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn client_quic_done_rejects_wrong_marker_bad_aead_and_tcp_eof() {
+        for case in [
+            ClientDonePeer::WrongMarker,
+            ClientDonePeer::BadAead,
+            ClientDonePeer::Eof,
+            ClientDonePeer::PartialEof,
+        ] {
+            let error = client_done_exchange_case(case).await.unwrap_err();
+            match case {
+                ClientDonePeer::WrongMarker => assert!(
+                    matches!(error, ClientRuntimeError::Io(e) if e.kind() == io::ErrorKind::InvalidData)
+                ),
+                ClientDonePeer::BadAead => assert!(matches!(
+                    error,
+                    ClientRuntimeError::Handshake(ClientHandshakeError::DataRecord(
+                        DataRecordError::Aead(_)
+                    ))
+                )),
+                _ => assert!(
+                    matches!(error, ClientRuntimeError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn client_quic_done_grace_completes_only_a_valid_inflight_record() {
+        client_done_exchange_case(ClientDonePeer::GraceDone)
+            .await
+            .unwrap();
+        let error = client_done_exchange_case(ClientDonePeer::GraceMissing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientRuntimeError::Io(e) if e.kind() == io::ErrorKind::ConnectionAborted)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets and paused-clock liveness pumping"]
+    async fn client_quic_done_missing_record_hits_backstop_while_quic_is_alive() {
+        let error = client_done_exchange_case(ClientDonePeer::LiveMissing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientRuntimeError::Io(e) if e.kind() == io::ErrorKind::TimedOut && e.to_string() == "QUIC fast-plane teardown DONE backstop elapsed")
+        );
+    }
+
     /// The UDP circuit breaker: starts closed, trips on an unusable outcome and
     /// suppresses negotiation until the TTL elapses, then lets exactly ONE
     /// connection claim the half-open trial (concurrent callers in that window

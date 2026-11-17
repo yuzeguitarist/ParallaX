@@ -1143,7 +1143,7 @@ impl ServerHandshake {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use aws_lc_rs::kem::{Ciphertext, DecapsulationKey};
 
@@ -2070,5 +2070,320 @@ mod tests {
             server_unauth.marker_result().is_none(),
             "a valid marker on an unauthorized SNI is dropped (DN-1: fronted to origin)"
         );
+    }
+
+    fn authentication_test_server(stek: [u8; 32]) -> ServerHandshake {
+        let signing =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        ServerHandshake::new(
+            Arc::new(vec![vec![0x30, 3, 2, 1, 0]]),
+            signing.as_ref(),
+            vec![b"h3".to_vec()],
+            vec![0x0f, 0],
+            Some(Zeroizing::new(stek)),
+        )
+        .unwrap()
+    }
+
+    fn authentication_test_client() -> super::super::ClientHandshake {
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, QUIC_VERSION_V1,
+        };
+        ClientHandshake::new(
+            Arc::new(ClientConfig::new(
+                Arc::new(AcceptAnyServerCert),
+                vec![b"h3".to_vec()],
+            )),
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x0f, 0],
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn drain_authentication_flight(
+        mut write: impl FnMut(&mut Vec<u8>) -> Option<KeyChange>,
+    ) -> (Vec<u8>, Vec<&'static str>) {
+        let mut flight = Vec::new();
+        let mut changes = Vec::new();
+        for _ in 0..8 {
+            let mut bytes = Vec::new();
+            let change = write(&mut bytes);
+            let done = bytes.is_empty() && change.is_none();
+            if let Some(change) = change {
+                changes.push(match change {
+                    KeyChange::RejectZeroRtt => "reject_early",
+                    KeyChange::ZeroRtt { .. } => "early",
+                    KeyChange::Handshake { .. } => "handshake",
+                    KeyChange::OneRtt { .. } => "application",
+                });
+            }
+            flight.extend_from_slice(&bytes);
+            if done {
+                return (flight, changes);
+            }
+        }
+        panic!("handshake output did not quiesce");
+    }
+
+    fn server_before_client_finished() -> (ServerHandshake, super::super::ClientHandshake, Vec<u8>)
+    {
+        let mut client = authentication_test_client();
+        let mut server = authentication_test_server([0x54; 32]);
+        let (hello, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        server.read_handshake(&hello).unwrap();
+        let (flight, changes) = drain_authentication_flight(|bytes| server.write_handshake(bytes));
+        // TLS 1.3 derives server application keys with the server Finished; they
+        // legitimately precede authentication of the client's Finished.
+        assert_eq!(changes, ["handshake", "application"]);
+        client.read_handshake(&flight).unwrap();
+        let (finished, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        assert_eq!(finished[0], HANDSHAKE_FINISHED);
+        assert_eq!(server.state, ServerState::ExpectClientFinished);
+        assert!(server.pending_post_handshake.is_empty());
+        (server, client, finished)
+    }
+
+    fn assert_server_does_not_complete_or_issue_ticket(server: &mut ServerHandshake) {
+        assert!(server.is_handshaking());
+        assert_eq!(server.state, ServerState::ExpectClientFinished);
+        assert!(server.expected_client_finished.is_some());
+        assert!(server.pending_post_handshake.is_empty());
+        assert!(
+            server.pending_1rtt_keys.is_none(),
+            "the legitimate earlier key change was already drained"
+        );
+        let (bytes, changes) = drain_authentication_flight(|bytes| server.write_handshake(bytes));
+        assert!(bytes.is_empty() && changes.is_empty());
+    }
+
+    #[test]
+    fn client_finished_mac_or_length_failure_does_not_complete_server_or_issue_ticket() {
+        for variant in 0..4 {
+            let (mut server, _, finished) = server_before_client_finished();
+            let transcript = server.transcript.clone();
+            let mut body = finished[4..].to_vec();
+            match variant {
+                0 => body[0] ^= 1,
+                1 => {
+                    body.pop();
+                }
+                2 => body.push(0),
+                _ => body.clear(),
+            }
+            let error = server
+                .read_handshake(&handshake_message(HANDSHAKE_FINISHED, &body))
+                .unwrap_err();
+            assert_eq!(error.alert_description(), Some(ALERT_DECRYPT_ERROR));
+            assert_eq!(server.transcript, transcript);
+            assert_server_does_not_complete_or_issue_ticket(&mut server);
+        }
+    }
+
+    #[test]
+    fn fragmented_client_finished_issues_ticket_only_after_verified_completion() {
+        for cut in [0, 1, 3, 4, 35] {
+            let (mut server, mut client, finished) = server_before_client_finished();
+            assert_eq!(finished.len(), 36);
+            server.read_handshake(&finished[..cut]).unwrap();
+            assert_server_does_not_complete_or_issue_ticket(&mut server);
+            server.read_handshake(&finished[cut..]).unwrap();
+            assert_eq!(server.state, ServerState::Complete);
+            assert!(!server.is_handshaking());
+            assert!(server.expected_client_finished.is_none());
+            let (ticket, changes) =
+                drain_authentication_flight(|bytes| server.write_handshake(bytes));
+            assert!(changes.is_empty());
+            assert_eq!(
+                ticket[0],
+                super::super::ticket::HANDSHAKE_NEW_SESSION_TICKET
+            );
+            client.read_handshake(&ticket).unwrap();
+            assert!(client.take_session_ticket(1_000_000).is_some());
+            let (mut client_exporter, mut server_exporter) = ([0; 32], [0; 32]);
+            client
+                .export_keying_material(&mut client_exporter, b"finished", b"context")
+                .unwrap();
+            server
+                .export_keying_material(&mut server_exporter, b"finished", b"context")
+                .unwrap();
+            assert_eq!(client_exporter, server_exporter);
+        }
+    }
+
+    // Inspect the actual ServerHello wire, independently of the client parser.
+    fn server_hello_psk_selection(hello: &[u8]) -> usize {
+        let mut at = 39 + hello[38] as usize + 3;
+        let extensions_len = u16::from_be_bytes([hello[at], hello[at + 1]]) as usize;
+        at += 2;
+        assert_eq!(at + extensions_len, hello.len());
+        let mut selected = 0;
+        while at < hello.len() {
+            let kind = u16::from_be_bytes([hello[at], hello[at + 1]]);
+            let length = u16::from_be_bytes([hello[at + 2], hello[at + 3]]) as usize;
+            if kind == EXT_PRE_SHARED_KEY {
+                assert_eq!(&hello[at + 4..at + 4 + length], &[0, 0]);
+                selected += 1;
+            }
+            at += 4 + length;
+        }
+        selected
+    }
+
+    // Shared only with the sibling client state-machine test. Alter the wire
+    // offer, not a parsed summary, and bind the PSK to that exact new transcript.
+    pub(crate) fn psk_offer_without_early_data(hello: &[u8], psk: &[u8]) -> Vec<u8> {
+        let original = parse_client_hello(&hello[4..]).unwrap();
+        assert!(original.offers_early_data);
+        let body = without_extension(&hello[4..], EXT_EARLY_DATA);
+        let mut changed = handshake_message(HANDSHAKE_CLIENT_HELLO, &body);
+        let summary = parse_client_hello(&changed[4..]).unwrap();
+        assert!(!summary.offers_early_data);
+        assert!(summary.psk_identity.is_some());
+        assert_eq!(summary.psk_identity, original.psk_identity);
+        let binder_len = summary
+            .psk_binder
+            .as_ref()
+            .expect("PSK binder retained")
+            .len();
+        let truncate_to = changed.len() - 2 - summary.psk_binders_wire_len.unwrap();
+        let suite = CipherSuite::Aes128GcmSha256;
+        let early = early_secret_from_psk(suite, psk);
+        let key = binder_finished_key(suite, &early).unwrap();
+        let binder = psk_binder(suite, &key, &suite.digest(&changed[..truncate_to])).unwrap();
+        assert_eq!(binder.len(), binder_len);
+        let start = changed.len() - binder_len;
+        changed[start..].copy_from_slice(&binder);
+        let rebound = parse_client_hello(&changed[4..]).unwrap();
+        assert_eq!(rebound.psk_binder.as_deref(), Some(binder.as_slice()));
+        changed
+    }
+
+    #[test]
+    fn psk_rejection_precedes_single_use_guard_and_completes_certificate_fallback() {
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, ClientTicket, QUIC_VERSION_V1,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct SpyGuard {
+            calls: AtomicUsize,
+            identity: Vec<u8>,
+            accept: bool,
+        }
+        impl ZeroRttGuard for SpyGuard {
+            fn accept_ticket(&self, identity: &[u8], _: u64) -> bool {
+                assert_eq!(identity, self.identity);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.accept
+            }
+        }
+        for case in [
+            "valid",
+            "expired",
+            "suite",
+            "alpn",
+            "binder",
+            "replay",
+            "invalid-ticket",
+        ] {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let stek = [0x73; 32];
+            let mut state = TicketState {
+                suite: if case == "suite" { 0x1302 } else { 0x1301 },
+                alpn: if case == "alpn" {
+                    b"other".to_vec()
+                } else {
+                    b"h3".to_vec()
+                },
+                psk: Zeroizing::new(vec![0x42; if case == "suite" { 48 } else { 32 }]),
+                issued_at: now - 1,
+                lifetime_secs: 3600,
+            };
+            if case == "expired" {
+                state.issued_at = now - 10;
+                state.lifetime_secs = 1;
+            }
+            let mut ticket = ClientTicket {
+                ticket: seal_ticket(&stek, &state).unwrap(),
+                psk: state.psk.clone(),
+                suite: state.suite,
+                alpn: state.alpn.clone(),
+                peer_transport_params: vec![0x0f, 0],
+                age_add: 0,
+                lifetime_secs: 3600,
+                received_at_ms: now * 1000,
+            };
+            if case == "binder" {
+                ticket.psk[0] ^= 1;
+            }
+            if case == "invalid-ticket" {
+                ticket.ticket[0] ^= 1;
+            }
+            let mut client = ClientHandshake::new_resumption(
+                Arc::new(ClientConfig::new(
+                    Arc::new(AcceptAnyServerCert),
+                    vec![b"h3".to_vec()],
+                )),
+                QUIC_VERSION_V1,
+                "example.com",
+                vec![0x0f, 0],
+                &[],
+                &ticket,
+                now * 1000,
+            )
+            .unwrap();
+            let guard = Arc::new(SpyGuard {
+                calls: AtomicUsize::new(0),
+                identity: ticket.ticket.clone(),
+                accept: case != "replay",
+            });
+            let mut server = authentication_test_server(stek);
+            server.set_zero_rtt_guard(guard.clone());
+            let (hello, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+            server.read_handshake(&hello).unwrap();
+            let accepted = case == "valid";
+            let expected_calls = usize::from(matches!(case, "valid" | "replay"));
+            assert_eq!(guard.calls.load(Ordering::SeqCst), expected_calls, "{case}");
+            assert_eq!(server.is_early_data_accepted(), accepted, "{case}");
+            assert_eq!(server.pending_0rtt_keys.is_some(), accepted, "{case}");
+            assert_eq!(
+                server_hello_psk_selection(server.pending_server_hello.as_ref().unwrap()),
+                usize::from(accepted),
+                "{case}"
+            );
+            let (flight, changes) =
+                drain_authentication_flight(|bytes| server.write_handshake(bytes));
+            assert_eq!(changes.contains(&"early"), accepted, "{case}");
+            client.read_handshake(&flight).unwrap();
+            assert_eq!(client.is_early_data_accepted(), accepted, "{case}");
+            assert_eq!(
+                client.peer_certificates().is_some(),
+                !accepted,
+                "fallback must authenticate its certificate flight: {case}"
+            );
+            let (finished, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+            server.read_handshake(&finished).unwrap();
+            assert!(
+                !client.is_handshaking() && !server.is_handshaking(),
+                "{case}"
+            );
+            assert_eq!(guard.calls.load(Ordering::SeqCst), expected_calls, "{case}");
+            let (mut client_exporter, mut server_exporter) = ([0; 32], [0; 32]);
+            client
+                .export_keying_material(&mut client_exporter, b"fallback", b"context")
+                .unwrap();
+            server
+                .export_keying_material(&mut server_exporter, b"fallback", b"context")
+                .unwrap();
+            assert_eq!(
+                client_exporter, server_exporter,
+                "genuine matching 1-RTT keys: {case}"
+            );
+        }
     }
 }

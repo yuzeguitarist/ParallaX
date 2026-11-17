@@ -25,6 +25,8 @@ records-batch-failure records-padding mux-lifecycle mux-isolation egress-policy
 quic-packet quic-packet-crypto quic-frame quic-replay quic-recovery
 quic-flow-control quic-key-update-close http2-carrier http3-framing http3-settings
 qpack-fields udp-exporter udp-probe zero-rtt camouflage-splice
+quic-finished-authentication quic-psk-admission quic-compressed-certificate
+http3-stream-framing quic-relay-done
 """.split())
 
 
