@@ -1,0 +1,55 @@
+src/handshake/server.rs
+  s_0acd2adb357b18::t_df3e7d4e5becc9 78-81,2208-2240,2243,8153-8213,14583-14612,14628,14634,14638,14646,14663-14670
+supply-chain/README.md
+  s_0acd2adb357b18::t_1f567fa5f33f44 42-55
+fuzz/supply-chain/audits.toml
+  s_f083e143bb47dc::t_d8745a0e39691c 4-48
+src/tls/quic/handshake.rs
+  s_0fa46421f48596::t_2e1f4f30e468e5 1459-1466,1469,1475,2878,2883,2990-3057
+src/tls/safari26.rs
+  s_0fa46421f48596::t_8cb8c2ba253d9a 46,58-59,85-86,638,646-648,659-663,764,814-829,1433-1434,1575-1581,1590-1591,2489-2495,2501-2502,2532-2538,2549,2557-2559,2570,2573-2579,2591-2593,2771-2777,2779-2780,2791-2793,2803-2805,2807-2809,2813-2815,2819-2821,2828-2834,2987-2993,3163-3179,3210,3224,3234-3237,3240,3254,4382-4383,4394,4400-4402,6267,6269-6273,6307,6322,6339,6362,6588,6592-6593,6609,6613-6614,6630,6647,6985-7188,7474-7476,7478,7649,7770,7807-7875,7890,7940,7960,7993
+src/tls/server_hello.rs
+  s_375336c51ee2b9::t_fb43c074df3a2d 11-13,17,20-21,49-146,156,169-170,196,281-294,305-408
+supply-chain/audits.toml
+  s_f083e143bb47dc::t_7819d295254c4b 4-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9f698428d0a42df5c49dfbfc805b69179ded705a",
+  "prompts": {},
+  "sessions": {
+    "s_0acd2adb357b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99c6c6d0-06d8-4e35-98e1-0e7efa510d42",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_0fa46421f48596": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e8de-65f1-78f0-96d9-8aade56834de",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_375336c51ee2b9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e89c-7367-7643-92ce-35e8be93af95",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_f083e143bb47dc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e7f0-2a67-7743-844b-46c5127778bb",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
