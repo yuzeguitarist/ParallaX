@@ -43,7 +43,10 @@ use super::{
         SIG_RSA_PSS_RSAE_SHA512, TLS12, TLS13, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
         TLS_CHACHA20_POLY1305_SHA256, X25519_KEY_LEN,
     },
-    server_hello::{parse_server_hello_records, server_hello_payload, ServerHelloReassembly},
+    server_hello::{
+        is_compat_change_cipher_spec, parse_server_hello_records, server_hello_payload,
+        ServerHelloReassembly, MAX_CHANGE_CIPHER_SPEC_RECORDS,
+    },
 };
 use crate::crypto::{
     auth::{
@@ -93,12 +96,6 @@ const TLS_ALERT_DESC_UNSUPPORTED_EXTENSION: u8 = 110;
 /// compression). Real chains are a few KiB; 256 KiB is generous headroom while
 /// bounding the memory an attacker-supplied CompressedCertificate can force.
 const MAX_DECOMPRESSED_CERT_CHAIN: usize = 256 * 1024;
-
-/// Maximum ChangeCipherSpec records tolerated across a handshake. RFC 8446 allows
-/// at most one (a middlebox-compatibility no-op); accepting unbounded CCS lets an
-/// on-path attacker (CCS is unauthenticated/pre-AEAD) trickle them to stall the
-/// client handshake indefinitely.
-const MAX_CHANGE_CIPHER_SPEC_RECORDS: usize = 2;
 
 /// Upper bound on a single encrypted handshake message length declared by the
 /// (still-unauthenticated, at this stage) server. Must exceed
@@ -646,6 +643,12 @@ impl Safari26TlsSession {
                     if reassembly.started() {
                         return Err(ServerHelloError::NotHandshakeRecord.into());
                     }
+                    if !is_compat_change_cipher_spec(&record) {
+                        return Err(Safari26TlsError::protocol(
+                            TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                            "invalid compatibility ChangeCipherSpec",
+                        ));
+                    }
                     ccs_records += 1;
                     if ccs_records > MAX_CHANGE_CIPHER_SPEC_RECORDS {
                         return Err(Safari26TlsError::Handshake(
@@ -665,6 +668,15 @@ impl Safari26TlsSession {
                 _ => return Err(Safari26TlsError::MissingServerHello),
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn read_server_hello_record_for_test(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> Result<(Vec<u8>, Vec<RecordEvent>), Safari26TlsError> {
+        let records = self.read_server_hello_record(stream).await?;
+        Ok((records, self.tap.events.clone()))
     }
 
     fn tls_shared_secret(
@@ -780,6 +792,12 @@ impl Safari26TlsSession {
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
             match header.content_type {
                 TLS_RECORD_CHANGE_CIPHER_SPEC => {
+                    if !is_compat_change_cipher_spec(&record) || !handshake_buf.is_empty() {
+                        return Err(Safari26TlsError::protocol(
+                            TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                            "invalid or interleaved ChangeCipherSpec in server flight",
+                        ));
+                    }
                     ccs_records += 1;
                     if ccs_records > MAX_CHANGE_CIPHER_SPEC_RECORDS {
                         return Err(Safari26TlsError::Handshake(
@@ -930,6 +948,12 @@ impl Safari26TlsSession {
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
             match header.content_type {
                 TLS_CONTENT_ALERT => return parse_alert(&record),
+                TLS_RECORD_CHANGE_CIPHER_SPEC => {
+                    return Err(Safari26TlsError::protocol(
+                        TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                        "ChangeCipherSpec arrived after server Finished",
+                    ));
+                }
                 TLS_RECORD_APPLICATION_DATA => {
                     let decrypted = keys.server_application.decrypt_record(&record)?;
                     if decrypted.content_type == TLS_RECORD_HANDSHAKE {
@@ -1141,6 +1165,12 @@ impl Safari26TlsSession {
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
             match header.content_type {
                 TLS_CONTENT_ALERT => return parse_alert(&record),
+                TLS_RECORD_CHANGE_CIPHER_SPEC => {
+                    return Err(Safari26TlsError::protocol(
+                        TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                        "ChangeCipherSpec arrived after server Finished",
+                    ));
+                }
                 TLS_RECORD_APPLICATION_DATA => {
                     let chunk = keys.server_application.decrypt_record(&record)?;
                     if chunk.content_type == TLS_RECORD_HANDSHAKE {
@@ -2447,6 +2477,12 @@ impl RecordCipher {
             .rposition(|b| *b != 0)
             .ok_or(Safari26TlsError::Aead)?;
         let content_type = payload[content_type_pos];
+        if content_type == TLS_RECORD_CHANGE_CIPHER_SPEC {
+            return Err(Safari26TlsError::protocol(
+                TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                "protected ChangeCipherSpec is forbidden in TLS 1.3",
+            ));
+        }
         payload.truncate(content_type_pos);
         Ok(PlainRecord {
             content_type,
@@ -2601,6 +2637,14 @@ fn process_server_handshake_messages(
                     return Err(Safari26TlsError::protocol(
                         TLS_ALERT_DESC_DECRYPT_ERROR,
                         "server Finished verify_data mismatch",
+                    ));
+                }
+                // Finished immediately precedes a key change and must end its
+                // record (RFC 8446 section 5.1). TLS padding is already removed.
+                if !buf.is_empty() {
+                    return Err(Safari26TlsError::protocol(
+                        TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                        "server flight carried trailing handshake bytes after Finished",
                     ));
                 }
                 transcript.push(&message);
@@ -7187,6 +7231,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefix_ccs_rejects_bad_values_and_record_budget() {
+        let mut cases = Vec::new();
+        for payload in [&[][..], &[0][..], &[2][..], &[1, 1][..], &[1, 0][..]] {
+            cases.push((tls_record(TLS_RECORD_CHANGE_CIPHER_SPEC, payload), false));
+        }
+        cases.push((
+            change_cipher_spec().repeat(MAX_CHANGE_CIPHER_SPEC_RECORDS + 1),
+            true,
+        ));
+        for (mut wire, over_budget) in cases {
+            wire.extend_from_slice(&valid_safari_server_hello());
+            let mut session = test_session();
+            let (mut client, mut peer) = loopback().await;
+            peer.write_all(&wire).await.unwrap();
+            let result = session.read_server_hello_record(&mut client).await;
+            if over_budget {
+                assert!(
+                    matches!(result, Err(Safari26TlsError::Handshake(ref message)) if message.contains("too many ChangeCipherSpec"))
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Safari26TlsError::Protocol {
+                        description: 10,
+                        ..
+                    })
+                ));
+            }
+            let (mut fallback, mut origin) = loopback().await;
+            origin.write_all(&wire).await.unwrap();
+            assert!(
+                crate::handshake::server::read_forwarded_server_hello_for_test(&mut fallback)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn read_server_hello_accepts_maximum_compat_ccs_then_handshake() {
         let mut session = test_session();
         let (mut client, mut peer) = loopback().await;
@@ -7871,6 +7954,139 @@ mod tests {
             assert!(matches!(error, Safari26TlsError::Certificate(_)));
             assert_eq!(fatal_alert_description(&error), Some(42));
         }
+    }
+
+    #[test]
+    fn server_finished_rejects_complete_and_partial_same_record_tail() {
+        for compressed in [false, true] {
+            let (wire, _) = signed_server_flight(compressed, false);
+            let mut clean = wire.clone();
+            let mut flight = ServerFlight::default();
+            process_unverified_server_flight(
+                &mut clean,
+                &mut flight,
+                &mut HandshakeTranscript::new(),
+                &mut app_keys(),
+            )
+            .unwrap();
+            assert!(flight.finished && clean.is_empty());
+            for tail in [
+                vec![HANDSHAKE_NEW_SESSION_TICKET],
+                post_handshake_ticket(&[], b"ticket", &[]),
+            ] {
+                let mut keys = app_keys();
+                let mut peer_keys = app_keys();
+                let record = peer_keys
+                    .server_handshake
+                    .encrypt_record(TLS_RECORD_HANDSHAKE, &[wire.clone(), tail].concat())
+                    .unwrap();
+                let mut plaintext = keys
+                    .server_handshake
+                    .decrypt_record(&record)
+                    .unwrap()
+                    .plaintext;
+                let mut rejected = ServerFlight::default();
+                let mut transcript = HandshakeTranscript::new();
+                let error = process_unverified_server_flight(
+                    &mut plaintext,
+                    &mut rejected,
+                    &mut transcript,
+                    &mut keys,
+                )
+                .expect_err("Finished must end the encrypted record before the key change");
+                assert_eq!(fatal_alert_description(&error), Some(10));
+                assert!(!rejected.finished);
+                assert!(transcript.bytes().len() < wire.len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ccs_records_reject_invalid_shapes_and_invalid_epochs() {
+        for stage in 0..3 {
+            for (body, protected) in [
+                (vec![], false),
+                (vec![2], false),
+                (vec![1, 1], false),
+                (vec![1], true),
+                (vec![1], false),
+            ] {
+                if stage == 0 && !protected && body == [1] {
+                    continue; // Valid compatibility CCS before peer Finished.
+                }
+                let mut session = test_session();
+                let (mut stream, mut peer) = loopback().await;
+                let mut keys = app_keys();
+                let mut peer_keys = app_keys();
+                let record = if protected {
+                    let cipher = if stage == 0 {
+                        &mut peer_keys.server_handshake
+                    } else {
+                        &mut peer_keys.server_application
+                    };
+                    cipher
+                        .encrypt_record(TLS_RECORD_CHANGE_CIPHER_SPEC, &body)
+                        .unwrap()
+                } else {
+                    tls_record(TLS_RECORD_CHANGE_CIPHER_SPEC, &body)
+                };
+                peer.write_all(&record).await.unwrap();
+                drop(peer);
+                stream.readable().await.unwrap();
+                let error = timeout(Duration::from_secs(2), async {
+                    if stage == 0 {
+                        session
+                            .read_encrypted_server_flight(
+                                &mut stream,
+                                &mut keys,
+                                &mut HandshakeTranscript::new(),
+                            )
+                            .await
+                            .err()
+                    } else if stage == 1 {
+                        session
+                            .drain_post_handshake(&mut stream, &mut keys)
+                            .await
+                            .err()
+                    } else {
+                        keys.negotiated_alpn = Some(b"h2".to_vec());
+                        session
+                            .await_http2_settings_ack(&mut stream, &mut keys)
+                            .await
+                            .err()
+                    }
+                })
+                .await
+                .expect("invalid CCS must fail without another record")
+                .expect("CCS cannot be accepted outside its compatibility window");
+                assert_eq!(
+                    fatal_alert_description(&error),
+                    Some(10),
+                    "stage={stage}, protected={protected}, body={body:?}"
+                );
+            }
+        }
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut peer_keys = app_keys();
+        let partial = peer_keys
+            .server_handshake
+            .encrypt_record(TLS_RECORD_HANDSHAKE, &[8, 0])
+            .unwrap();
+        peer.write_all(&[partial, change_cipher_spec()].concat())
+            .await
+            .unwrap();
+        drop(peer);
+        let error = session
+            .read_encrypted_server_flight(
+                &mut stream,
+                &mut app_keys(),
+                &mut HandshakeTranscript::new(),
+            )
+            .await
+            .err()
+            .expect("CCS cannot interrupt a fragmented handshake");
+        assert_eq!(fatal_alert_description(&error), Some(10));
     }
 
     fn assert_rejected_server_certificate_body(body: &[u8]) {

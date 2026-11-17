@@ -8,6 +8,8 @@ const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const TLS13_VERSION: u16 = 0x0304;
 const RANDOM_LEN: usize = 32;
+// Match the existing bounded middlebox-compatibility budget (also used by rustls).
+pub(crate) const MAX_CHANGE_CIPHER_SPEC_RECORDS: usize = 2;
 // Handshake header, fixed fields, maximum session ID and u16 extension vector.
 const MAX_SERVER_HELLO_MESSAGE: usize = 4 + 2 + 32 + 1 + 32 + 2 + 1 + 2 + u16::MAX as usize;
 const MAX_SERVER_HELLO_RECORDS: usize = 256;
@@ -35,6 +37,12 @@ pub enum ServerHelloError {
     Truncated,
     #[error("ServerHello length is invalid")]
     InvalidLength,
+}
+
+pub(crate) fn is_compat_change_cipher_spec(record: &[u8]) -> bool {
+    super::record::parse_exact(record).is_ok_and(|(header, payload)| {
+        header.content_type == 0x14 && header.total_len == record.len() && payload == [1]
+    })
 }
 
 pub fn parse_server_hello(record: &[u8]) -> Result<ServerHello, ServerHelloError> {

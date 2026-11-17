@@ -68,6 +68,12 @@ the same concatenated original records at both ends. Real-reader tests compare
 the contexts and derived keys, include fragmented HRR and cover the server's
 single eight-second deadline. Existing coalesced TLS 1.2 origin rejection and
 non-strict forwarding remain intact; TLS 1.3 trailing messages remain invalid.
+Valid plaintext compatibility CCS prefixes are validated and forwarded under the
+existing two-record bound and whole deadline; they remain outside both ParallaX
+handshake-record hashes and the TLS handshake transcript. Partial-message
+interleaving remains rejected. Malformed/protected CCS and CCS after Finished
+fail, while verified Finished must end its decrypted record before application
+keys can be installed. Complete and partial same-record tails have regressions.
 
 ## Run and reproduce
 

@@ -150,7 +150,7 @@
     {
       "id": "tls-server-hello",
       "spec": "### 12.3 ServerHello (TCP plane)",
-      "claim": "The real TLS validator requires the original 32-byte session ID echo, TLS 1.3 and valid extension framing; the extraction helper separately rejects truncated nested lengths. Both real readers reassemble fragmented ServerHello while retaining matching original record bytes for ParallaX key derivation; TLS hashes only the logical handshake. Existing TLS 1.2 coalesced-record forwarding/rejection behavior is preserved.",
+      "claim": "The real TLS validator requires the original 32-byte session ID echo, TLS 1.3 and valid extension framing; the extraction helper separately rejects truncated nested lengths. Both real readers reassemble fragmented ServerHello while retaining matching original record bytes for ParallaX key derivation; TLS hashes only the logical handshake. Existing TLS 1.2 coalesced-record forwarding/rejection behavior is preserved. Valid compatibility CCS prefixes are forwarded byte-for-byte under the existing two-record bound and total deadline, while both ParallaX contexts retain their original handshake-record-only representation.",
       "sources": [
         {
           "file": "src/tls/safari26.rs",
@@ -165,6 +165,11 @@
         {
           "file": "src/tls/server_hello.rs",
           "symbol": "ServerHelloReassembly::push_record",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/server_hello.rs",
+          "symbol": "is_compat_change_cipher_spec",
           "kind": "fn"
         }
       ],
@@ -233,6 +238,21 @@
           "suite": "protocol_library",
           "file": "src/tls/server_hello.rs",
           "name": "tls::server_hello::tests::reassembles_maximum_server_hello_extension_vector"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::prefix_ccs_is_forwarded_without_changing_server_hello_context"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::prefix_ccs_forwarding_write_uses_the_whole_handshake_deadline"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::prefix_ccs_rejects_bad_values_and_record_budget"
         }
       ],
       "bounds": "Finite strict-validator fixtures plus generated extraction fields and every truncated prefix. Reassembly is capped at 65,611 message bytes and 256 records; the server uses one total 8-second deadline. Tests cover every split of the fixture, a maximum extension vector, truncated/oversized/interleaved fragments and both legacy strict-mode outcomes.",
@@ -422,7 +442,7 @@
     {
       "id": "tls-finished",
       "spec": "### 7.1 Sequence",
-      "claim": "Finished is accepted only after the required encrypted-extensions/certificate-verification order and with correct verify_data.",
+      "claim": "Finished is accepted only after the required encrypted-extensions/certificate-verification order and with correct verify_data. Verified Finished must end its decrypted record; neither a complete nor partial tail commits completion. Protected CCS, malformed CCS and CCS outside the compatibility window fail with unexpected_message.",
       "sources": [
         {
           "file": "src/tls/safari26.rs",
@@ -445,9 +465,19 @@
           "suite": "protocol_library",
           "file": "src/tls/safari26.rs",
           "name": "tls::safari26::tests::process_handshake_rejects_finished_with_wrong_verify_data"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::server_finished_rejects_complete_and_partial_same_record_tail"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::ccs_records_reject_invalid_shapes_and_invalid_epochs"
         }
       ],
-      "bounds": "Finite handshake-flight state and MAC fixtures; cryptographic hardness is assumed.",
+      "bounds": "Finite handshake-flight state and MAC fixtures; cryptographic hardness is assumed. Real signed raw/compressed flights and actual handshake/application record ciphers cover tails and CCS across handshake, drain and H2 stages.",
       "external_conditions": []
     },
     {
