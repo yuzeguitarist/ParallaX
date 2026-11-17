@@ -3,6 +3,7 @@
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,6 +11,14 @@ import plx_formal
 
 
 class FormalModelTests(unittest.TestCase):
+    def test_tlc_never_executes_an_implicit_temporary_jar(self):
+        with patch.object(plx_formal.subprocess, "Popen") as java:
+            for command in ("tlc", "all"):
+                with self.subTest(command=command), self.assertRaises(SystemExit) as error:
+                    plx_formal.main([command])
+                self.assertEqual(error.exception.code, 2)
+            java.assert_not_called()
+
     def test_real_model_holds_and_matches_tla(self):
         reports = plx_formal.check_all()
         names = {report.name: report.states for report in reports}

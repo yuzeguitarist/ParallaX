@@ -88,6 +88,7 @@ pub struct SourceLimiter {
     inner: Mutex<Inner>,
     cap_v4: u32,
     cap_v6: u32,
+    aggregate_cap_v6: u32,
     v6_prefix_len: u8,
     max_entries: usize,
     idle_grace: Duration,
@@ -168,13 +169,18 @@ impl SourceLimiter {
         let max_entries = connection_limit
             .saturating_mul(4)
             .max(MIN_SOURCE_MAP_ENTRIES);
-        Self::with_params(
-            cap_v4,
-            cap_v6,
+        let source_share = u32::try_from((connection_limit / 4).max(1)).unwrap_or(u32::MAX);
+        let mut limiter = Self::with_params(
+            cap_v4.min(source_share),
+            cap_v6.min(source_share),
             v6_prefix_len,
             max_entries,
             SOURCE_IDLE_GRACE,
-        )
+        );
+        Arc::get_mut(&mut limiter)
+            .expect("new limiter has one owner")
+            .aggregate_cap_v6 = cap_v6.saturating_mul(AGG_V6_FANOUT).min(source_share);
+        limiter
     }
 
     fn with_params(
@@ -192,6 +198,7 @@ impl SourceLimiter {
             }),
             cap_v4,
             cap_v6,
+            aggregate_cap_v6: cap_v6.saturating_mul(AGG_V6_FANOUT),
             v6_prefix_len,
             max_entries,
             idle_grace,
@@ -212,7 +219,7 @@ impl SourceLimiter {
         // IPv6 /48 aggregate ceiling, checked read-only BEFORE the per-/64 cap so
         // a rejection never half-admits (no map entry created, no counts bumped).
         if let Some(agg_key) = agg_key {
-            let agg_cap = self.cap_v6.saturating_mul(AGG_V6_FANOUT);
+            let agg_cap = self.aggregate_cap_v6;
             if inner.agg_v6.get(&agg_key).copied().unwrap_or(0) >= agg_cap {
                 return None;
             }
@@ -338,6 +345,36 @@ fn masked_v6(addr: Ipv6Addr, prefix_len: u8) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn low_global_limit_clamps_v4_v6_and_rotating_v6_prefixes() {
+        let limiter = SourceLimiter::new(256, 256, 64, 8);
+        let mut permits = Vec::new();
+        for _ in 0..2 {
+            permits.push(
+                Arc::clone(&limiter)
+                    .try_admit("192.0.2.1".parse().unwrap())
+                    .unwrap(),
+            );
+        }
+        assert!(Arc::clone(&limiter)
+            .try_admit("192.0.2.1".parse().unwrap())
+            .is_none());
+        for subnet in 0..2 {
+            permits.push(
+                Arc::clone(&limiter)
+                    .try_admit(IpAddr::V6(Ipv6Addr::new(
+                        0x2001, 0xdb8, 1, subnet, 0, 0, 0, 1,
+                    )))
+                    .unwrap(),
+            );
+        }
+        assert!(Arc::clone(&limiter)
+            .try_admit("2001:db8:1:ffff::1".parse().unwrap())
+            .is_none());
+        assert!(Arc::clone(&limiter)
+            .try_admit("2001:db8:2::1".parse().unwrap())
+            .is_some());
+    }
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 

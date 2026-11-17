@@ -11,7 +11,7 @@
 //!
 //! The PRODUCTION round-trip rides an HTTP/3 **request bidi** stream (RFC 9114):
 //! the client writes a HEADERS frame (Safari-26 request fields, method GET)
-//! followed by a DATA frame whose body is the `PXp1 + nonce` request; the server
+//! followed by a DATA frame carrying an opaque PSK-authenticated challenge; the server
 //! replies with a `:status 200` HEADERS frame and a DATA frame whose body is the
 //! `PXp2 + HMAC` response. For single-Connect relay and speed runs, that retained
 //! request bidi can carry the fast-plane payload; mux-over-QUIC quiesces the
@@ -40,12 +40,11 @@ use super::quic::endpoint::{Connection, RecvStream, SendStream};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const PROBE_REQUEST_MAGIC: &[u8; 4] = b"PXp1";
 const PROBE_RESPONSE_MAGIC: &[u8; 4] = b"PXp2";
 const PROBE_NONCE_LEN: usize = 16;
 const PROBE_RESPONSE_LEN: usize = 32;
-/// On-wire request length: magic + nonce.
-const PROBE_REQUEST_WIRE_LEN: usize = 4 + PROBE_NONCE_LEN;
+/// The request is pseudorandom even to a TLS peer that does not hold the PSK.
+const PROBE_REQUEST_WIRE_LEN: usize = PROBE_NONCE_LEN + 32;
 /// On-wire response length: magic + HMAC.
 const PROBE_RESPONSE_WIRE_LEN: usize = 4 + PROBE_RESPONSE_LEN;
 
@@ -81,6 +80,33 @@ fn probe_response(token: &[u8; UDP_AUTH_TOKEN_LEN], nonce: &[u8]) -> [u8; PROBE_
     mac.finalize().into_bytes().into()
 }
 
+fn probe_request(psk: &[u8], context: &[u8], nonce: &[u8; PROBE_NONCE_LEN]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(psk).expect("HMAC accepts any key length");
+    mac.update(b"parallax/udp/probe/request/v2");
+    mac.update(&(context.len() as u64).to_be_bytes());
+    mac.update(context);
+    mac.update(nonce);
+    let mut request = nonce.to_vec();
+    request.extend_from_slice(&mac.finalize().into_bytes());
+    request
+}
+
+fn request_nonce<'a>(
+    request: &'a [u8],
+    psk: &[u8],
+    context: &[u8],
+) -> Result<&'a [u8], ProbeError> {
+    if request.len() != PROBE_REQUEST_WIRE_LEN {
+        return Err(ProbeError::Malformed);
+    }
+    let nonce: &[u8; PROBE_NONCE_LEN] = request[..PROBE_NONCE_LEN].try_into().unwrap();
+    let expected = probe_request(psk, context, nonce);
+    if !bool::from(request.ct_eq(&expected)) {
+        return Err(ProbeError::Malformed);
+    }
+    Ok(&request[..PROBE_NONCE_LEN])
+}
+
 /// Client side: send an authenticated probe over the UDP leg and classify the
 /// result against the Happy-Eyeballs `timeout`.
 ///
@@ -98,9 +124,7 @@ pub async fn probe_client(
     let token = export_udp_auth_token(connection, psk, context)?;
     let nonce: [u8; PROBE_NONCE_LEN] = rand::random();
 
-    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
-    request.extend_from_slice(PROBE_REQUEST_MAGIC);
-    request.extend_from_slice(&nonce);
+    let request = probe_request(psk, context, &nonce);
 
     let expected = probe_response(&token, &nonce);
     let started = Instant::now();
@@ -179,10 +203,8 @@ pub async fn serve_probe(
         .read_to_end(&mut request)
         .await
         .map_err(|err| ProbeError::ConnectionLost(err.to_string()))?;
-    if request.len() != PROBE_REQUEST_WIRE_LEN || &request[..4] != PROBE_REQUEST_MAGIC {
-        return Err(ProbeError::Malformed);
-    }
-    let response = probe_response(&token, &request[4..]);
+    let nonce = request_nonce(&request, psk, context)?;
+    let response = probe_response(&token, nonce);
     let mut reply = Vec::with_capacity(PROBE_RESPONSE_WIRE_LEN);
     reply.extend_from_slice(PROBE_RESPONSE_MAGIC);
     reply.extend_from_slice(&response);
@@ -202,7 +224,7 @@ pub async fn serve_probe(
 // `probe_response` HMAC are UNCHANGED): only the carrier moves from a bare uni
 // round-trip to an HTTP/3 request bidi stream. The client writes a HEADERS frame
 // (Safari-26 request fields for `authority`, method GET) followed by a DATA frame
-// whose body is the SAME `PXp1 + nonce` request bytes; the server replies with a
+// whose body is the same opaque authenticated request; the server replies with a
 // `:status 200` HEADERS frame and a DATA frame whose body is the SAME
 // `PXp2 + HMAC` response bytes. After a Verified exchange the SAME bidi stream
 // carries the relay (DATA-framed sealed records), so the probe round-trip IS the
@@ -231,9 +253,7 @@ pub async fn probe_client_over_bidi(
     let token = export_udp_auth_token(connection, psk, context)?;
     let nonce: [u8; PROBE_NONCE_LEN] = rand::random();
 
-    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
-    request.extend_from_slice(PROBE_REQUEST_MAGIC);
-    request.extend_from_slice(&nonce);
+    let request = probe_request(psk, context, &nonce);
 
     let started = Instant::now();
 
@@ -255,9 +275,8 @@ pub async fn probe_client_over_bidi(
     }
 }
 
-/// Send the H3 probe request (HEADERS + DATA(magic||nonce)) on the bidi send half,
-/// returning the freshly generated nonce. SENDING needs no exporter token (the
-/// token only gates response verification), so a resuming client sends this as
+/// Send the opaque PSK-authenticated H3 challenge, returning its nonce.
+/// Sending needs the PSK but no exporter token, so a resuming client sends this as
 /// 0-RTT early data BEFORE the handshake completes — it is non-sensitive (a random
 /// challenge), so sending it to a not-yet-authenticated server leaks nothing. The
 /// caller awaits the handshake, then verifies the response with
@@ -265,11 +284,11 @@ pub async fn probe_client_over_bidi(
 pub(crate) async fn probe_client_send_request_early(
     send: &mut SendStream,
     authority: &str,
+    psk: &[u8],
+    context: &[u8],
 ) -> Result<[u8; PROBE_NONCE_LEN], ProbeError> {
     let nonce: [u8; PROBE_NONCE_LEN] = rand::random();
-    let mut request = Vec::with_capacity(PROBE_REQUEST_WIRE_LEN);
-    request.extend_from_slice(PROBE_REQUEST_MAGIC);
-    request.extend_from_slice(&nonce);
+    let request = probe_request(psk, context, &nonce);
     probe_client_write_request(send, authority, &request).await?;
     Ok(nonce)
 }
@@ -383,10 +402,8 @@ pub async fn serve_probe_over_bidi(
 
     let token = export_udp_auth_token(connection, psk, context)?;
     let request = read_probe_data_after_headers(recv).await?;
-    if request.len() != PROBE_REQUEST_WIRE_LEN || &request[..4] != PROBE_REQUEST_MAGIC {
-        return Err(ProbeError::Malformed);
-    }
-    let response = probe_response(&token, &request[4..]);
+    let nonce = request_nonce(&request, psk, context)?;
+    let response = probe_response(&token, nonce);
     let mut reply = Vec::with_capacity(PROBE_RESPONSE_WIRE_LEN);
     reply.extend_from_slice(PROBE_RESPONSE_MAGIC);
     reply.extend_from_slice(&response);
@@ -453,6 +470,21 @@ mod tests {
     const CTX: &[u8] = b"probe-offer-context";
 
     #[test]
+    fn probe_request_is_opaque_and_bound_to_psk_context_and_nonce() {
+        let nonce = [7; PROBE_NONCE_LEN];
+        let request = probe_request(PSK, CTX, &nonce);
+        assert_eq!(request_nonce(&request, PSK, CTX).unwrap(), nonce);
+        assert!(request_nonce(&request, b"wrong PSK", CTX).is_err());
+        assert!(request_nonce(&request, PSK, b"wrong context").is_err());
+        let mut tampered = request.clone();
+        tampered[0] ^= 1;
+        assert!(request_nonce(&tampered, PSK, CTX).is_err());
+        assert_ne!(request, probe_request(PSK, CTX, &[8; PROBE_NONCE_LEN]));
+        assert_ne!(&request[..4], b"PXp1");
+        assert_ne!(&request[PROBE_NONCE_LEN..PROBE_NONCE_LEN + 4], b"PXp1");
+    }
+
+    #[test]
     fn probe_response_is_deterministic_and_bound_to_token_and_nonce() {
         let token_a = [3_u8; UDP_AUTH_TOKEN_LEN];
         let token_b = [4_u8; UDP_AUTH_TOKEN_LEN];
@@ -516,12 +548,25 @@ mod tests {
         const WRONG_PSK: &[u8] = b"a-completely-different-psk-value!";
         // Drive both sides with join!: serve_probe only QUEUES its reply, so
         // server_conn must stay alive until the client has read it.
-        let server = serve_probe(&server_conn, WRONG_PSK, CTX);
+        let server = async {
+            let recv = server_conn.accept_uni().await.unwrap();
+            let mut request = Vec::new();
+            recv.take(PROBE_REQUEST_WIRE_LEN as u64 + 1)
+                .read_to_end(&mut request)
+                .await
+                .unwrap();
+            let nonce = request_nonce(&request, PSK, CTX).unwrap();
+            let token = export_udp_auth_token(&server_conn, WRONG_PSK, CTX).unwrap();
+            let mut reply = PROBE_RESPONSE_MAGIC.to_vec();
+            reply.extend_from_slice(&probe_response(&token, nonce));
+            let mut send = server_conn.open_uni();
+            send.write_all(&reply).await.unwrap();
+            send.finish();
+        };
         let client = probe_client(&client_conn, PSK, CTX, Duration::from_secs(5));
-        let (server_res, client_res) = tokio::join!(server, client);
-        // The server happily answers (it cannot tell its token is "wrong"); the
+        let (_, client_res) = tokio::join!(server, client);
+        // The test peer intentionally answers with a wrong token; the
         // mismatch is detected only on the client's authenticated compare.
-        server_res.expect("server serve_probe");
         let outcome = client_res.expect("client probe");
         assert_eq!(
             outcome,
@@ -583,7 +628,7 @@ mod tests {
         };
         let client = async {
             let (mut send, mut recv) = client_conn.open_bi();
-            let nonce = probe_client_send_request_early(&mut send, AUTHORITY)
+            let nonce = probe_client_send_request_early(&mut send, AUTHORITY, PSK, CTX)
                 .await
                 .expect("send probe request early");
             probe_client_read_and_verify(
@@ -611,9 +656,11 @@ mod tests {
 
         let server = async {
             let (mut send, mut recv) = server_conn.accept_bi().await.expect("accept_bi");
-            serve_probe_over_bidi(&server_conn, &mut send, &mut recv, WRONG_PSK, CTX)
-                .await
-                .expect("server serve_probe_over_bidi");
+            assert!(matches!(
+                serve_probe_over_bidi(&server_conn, &mut send, &mut recv, WRONG_PSK, CTX).await,
+                Err(ProbeError::Malformed)
+            ));
+            send.finish();
             (send, recv)
         };
         let client = async {
@@ -633,15 +680,15 @@ mod tests {
         let (_server_streams, outcome) = tokio::join!(server, client);
         assert_eq!(
             outcome,
-            ProbeOutcome::Failed,
-            "a bidi response that fails the exporter-bound HMAC must be Failed, not Verified"
+            ProbeOutcome::Unreachable,
+            "a peer without the PSK refuses the request"
         );
     }
 
     /// Wire-structure oracle (application layer): the client's probe request on the
     /// H3 request bidi must be a HEADERS frame whose QPACK field section decodes to
     /// EXACTLY Safari-26's request fields (method GET, `:authority` = the camouflage
-    /// SNI), followed by a DATA frame carrying the `PXp1` probe request. The
+    /// SNI), followed by a DATA frame carrying the opaque probe request. The
     /// server's reply must be a `:status 200` HEADERS frame + a DATA frame. This
     /// asserts the H3 framing the censor would observe matches Safari ground truth.
     ///
@@ -676,16 +723,13 @@ mod tests {
                 safari26_request_fields(AUTHORITY),
                 "client probe HEADERS must equal Safari-26 request fields",
             );
-            // Second frame: DATA carrying the PXp1 probe request.
+            // Second frame: DATA carrying the opaque probe request.
             let (dtype, dpayload) = super::super::h3::read_one_h3_frame(&mut recv, 4096)
                 .await
                 .expect("read client DATA");
             assert_eq!(dtype, FRAME_TYPE_DATA, "client second frame must be DATA");
-            assert_eq!(
-                &dpayload[..4],
-                PROBE_REQUEST_MAGIC,
-                "DATA carries PXp1 request"
-            );
+            request_nonce(&dpayload, PSK, CTX)
+                .expect("DATA carries an authenticated opaque request");
 
             // Reply with the real server response so the client classifies Verified.
             serve_probe_response_for_test(&server_conn, &mut send, &dpayload).await;
@@ -725,7 +769,7 @@ mod tests {
             encode_frame, response_status_200_headers_frame, FRAME_TYPE_DATA,
         };
         let token = export_udp_auth_token(conn, PSK, CTX).expect("export token");
-        let response = probe_response(&token, &request[4..]);
+        let response = probe_response(&token, request_nonce(request, PSK, CTX).unwrap());
         let mut reply = Vec::new();
         reply.extend_from_slice(PROBE_RESPONSE_MAGIC);
         reply.extend_from_slice(&response);

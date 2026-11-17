@@ -161,8 +161,8 @@ pub fn pack_sig(sig: &mut [u8; SIGNBYTES], c: &[u8; CTILDEBYTES], z: &Polyvecl, 
     }
 
     let mut k = 0usize;
-    for i in 0..K {
-        for (j, &coefficient) in h.vec[i].coeffs.iter().enumerate() {
+    for (i, p) in h.vec.iter().enumerate() {
+        for (j, &coefficient) in p.coeffs.iter().enumerate() {
             // Hint `h` is public signature output, so the branch on a nonzero
             // coefficient is sanctioned (plan §5).
             if coefficient != 0 {

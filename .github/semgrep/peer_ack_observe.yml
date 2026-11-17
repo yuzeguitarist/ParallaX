@@ -382,6 +382,8 @@ rules:
             recv_data_total: $INIT_RECV_DATA_TOTAL,
             recv_data_consumed: $INIT_RECV_DATA_CONSUMED,
             recv_pending_total: $INIT_RECV_PENDING_TOTAL,
+            receive_memory: $INIT_RECEIVE_MEMORY,
+            send_buffered_total: $INIT_SEND_BUFFERED_TOTAL,
             need_max_data: $INIT_NEED_MAX_DATA,
             peer_flow_applied: $INIT_PEER_FLOW_APPLIED,
             peer_msd_bidi_local: $INIT_PEER_MSD_BIDI_LOCAL,

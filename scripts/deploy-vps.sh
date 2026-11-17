@@ -1379,9 +1379,9 @@ fi"
   # rename, which needs WRITE access on the containing directory. Handing the
   # real config dir to the service user would also hand it every sibling file
   # (e.g. the Polar Signals token/env installed there), so the seal instead runs
-  # in a parallax-owned staging dir under /var/lib/parallax (the service's own
-  # state dir) and root installs the sealed config + bundle back into the
-  # root-owned config dir. The parallax user ends up owning exactly its config
+  # in a service-owned child of a root-owned /run directory. Root installs only
+  # bytes read by the service user back into the root-owned config dir. The
+  # parallax user ends up owning exactly its config
   # file, the bundle, and the state dir — nothing else. Skipped (with a loud
   # warning) when the config dir is a shared system directory whose ownership
   # and mode we must not manage, or when the operator passed --no-seal. Seal
@@ -1403,37 +1403,49 @@ fi"
 $sudo_prefix chown root:root $q_remote_config_dir
 $sudo_prefix chmod 0755 $q_remote_config_dir
 if command -v runuser >/dev/null 2>&1; then
-  # Stage in the service's own state dir, seal there, then install the sealed
-  # results (still 0600, owner parallax) into the root-owned config dir. The
-  # host key is created at /var/lib/parallax/host.key either way, and the
+  # Keep root's input and the staging entry outside the service's writable
+  # namespace. Every read and write within the service-owned child runs as
+  # parallax, including publication reads, so planted symlinks confer no root
+  # read/write authority. Keep the canonical staging path stable because seal
+  # namespaces its entries by config identity. The host key is created at
+  # /var/lib/parallax/host.key either way, and the
   # rewritten config references the bundle by bare file name, which resolves
   # against whatever directory the config is loaded from.
   seal_config_name=$q_seal_config_name
   seal_identity=\"\$(printf %s $q_remote_config | sha256sum)\"
-  seal_staging=\"/var/lib/parallax/.seal-staging-\${seal_identity%% *}\"
-  $sudo_prefix rm -rf \"\$seal_staging\"
+  seal_root=\"/run/parallax-seal-\${seal_identity%% *}\"
+  $sudo_prefix rm -rf \"\$seal_root\"
+  $sudo_prefix install -d -m 0710 -o root -g parallax \"\$seal_root\"
+  seal_staging=\"\$seal_root/work\"
   $sudo_prefix install -d -m 0700 -o parallax -g parallax \"\$seal_staging\"
-  $sudo_prefix install -m 0600 -o parallax -g parallax $q_tmp/parallax.server.toml \"\$seal_staging/\$seal_config_name\"
+  $sudo_prefix install -m 0640 -o root -g parallax $q_tmp/parallax.server.toml \"\$seal_root/input\"
+  $sudo_prefix runuser -u parallax -- install -m 0600 \"\$seal_root/input\" \"\$seal_staging/\$seal_config_name\"
   # Seed the staging dir with the CURRENT live bundle (if any) so 'plx seal'
-  # retains its entries. The config-specific name and stable staging identity
-  # keep separate deployments from replacing one another's keys. Legacy shared
+  # retains its entries. The config-specific name and stable identity keep
+  # separate deployments from replacing one another's keys. Legacy shared
   # parallax.secrets.enc bundles remain untouched for configs that still use them.
   if $sudo_prefix test -f $q_remote_config.secrets.enc; then
-    $sudo_prefix install -m 0600 -o parallax -g parallax $q_remote_config.secrets.enc \"\$seal_staging/\$seal_config_name.secrets.enc\"
+    $sudo_prefix runuser -u parallax -- install -m 0600 $q_remote_config.secrets.enc \"\$seal_staging/\$seal_config_name.secrets.enc\"
   fi
   # Reused legacy configs can reference the shared bundle by relative name.
   # Copy it only for resolution; publish only the config-specific bundle below.
   if $sudo_prefix test -f $q_remote_config_dir/parallax.secrets.enc; then
-    $sudo_prefix install -m 0600 -o parallax -g parallax $q_remote_config_dir/parallax.secrets.enc \"\$seal_staging/parallax.secrets.enc\"
+    $sudo_prefix runuser -u parallax -- install -m 0600 $q_remote_config_dir/parallax.secrets.enc \"\$seal_staging/parallax.secrets.enc\"
   fi
   if $sudo_prefix runuser -u parallax -- $q_remote_bin seal -c \"\$seal_staging/\$seal_config_name\"; then
-    $sudo_prefix install -m 0600 -o parallax -g parallax \"\$seal_staging/\$seal_config_name.secrets.enc\" $q_remote_config.secrets.enc
-    $sudo_prefix install -m 0600 -o parallax -g parallax \"\$seal_staging/\$seal_config_name\" $q_remote_config
-    echo \"Server secrets are machine-bound (sealed); the config on this VPS is no longer a plaintext bearer credential.\"
+    if $sudo_prefix runuser -u parallax -- cat \"\$seal_staging/\$seal_config_name.secrets.enc\" | $sudo_prefix install -m 0600 -o root -g root /dev/stdin \"\$seal_root/bundle\" \\
+      && $sudo_prefix runuser -u parallax -- cat \"\$seal_staging/\$seal_config_name\" | $sudo_prefix install -m 0600 -o root -g root /dev/stdin \"\$seal_root/config\"; then
+      $sudo_prefix install -m 0600 -o parallax -g parallax \"\$seal_root/bundle\" $q_remote_config.secrets.enc
+      $sudo_prefix install -m 0600 -o parallax -g parallax \"\$seal_root/config\" $q_remote_config
+      echo \"Server secrets are machine-bound (sealed); the config on this VPS is no longer a plaintext bearer credential.\"
+    else
+      echo 'warning: could not read sealed staging outputs as parallax; live bundle was not replaced.' >&2
+    fi
   else
     echo 'warning: plx seal failed; the server config still holds INLINE PLAINTEXT secrets at '$q_remote_config' (kept 0600, owner parallax). Fix the reported error and re-run the deploy to retry sealing.' >&2
   fi
-  $sudo_prefix rm -rf \"\$seal_staging\"
+  $sudo_prefix rm -rf \"\$seal_root\"
+  seal_root=''
 else
   echo 'warning: runuser not found on the VPS; skipped plx seal — the server config holds INLINE PLAINTEXT secrets at '$q_remote_config' (kept 0600, owner parallax). Install runuser (util-linux) and re-run the deploy to seal.' >&2
 fi"
@@ -1451,6 +1463,7 @@ fi"
 export PATH=\"\$PATH:/usr/sbin:/sbin\"
 PARCA_AGENT_CHANNEL=$q_parca_agent_channel
 cleanup_remote_tmp() {
+  if [[ -n \"\${seal_root:-}\" ]]; then $sudo_prefix rm -rf \"\$seal_root\"; fi
   rm -rf $q_tmp
 }
 trap cleanup_remote_tmp EXIT

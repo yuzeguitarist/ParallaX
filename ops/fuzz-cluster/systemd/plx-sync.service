@@ -17,7 +17,7 @@ Environment=RUSTUP_HOME=/var/lib/plxfuzz/.rustup
 Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # sync.sh reads /etc/plxfuzz/{node-id,pat,repo,pinned-commit,campaign-tag} and
 # the shard table; the PAT is never passed as an argument.
-ExecStart=/var/lib/plxfuzz/bin/sync.sh
+ExecStart=/usr/local/lib/plxfuzz/sync.sh
 # A merge can pull many contribs; give it room but cap it so a hung tick is
 # reaped before the next one fires.
 TimeoutStartSec=1800

@@ -30,7 +30,7 @@ impl ExtraFdBudget {
     }
 }
 
-pub(super) struct ExtraFdReservation<'a> {
+pub(crate) struct ExtraFdReservation<'a> {
     budget: &'a ExtraFdBudget,
     count: usize,
 }

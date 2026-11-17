@@ -128,10 +128,12 @@ walk away.
 The service home is `0700`. Git remotes contain only the plain HTTPS repository
 URL; GitHub CLI reads `GH_TOKEN` from each service's environment. Re-running
 bootstrap also removes legacy credential-bearing fetch/push URLs from existing
-source, status, and crash clones. A local bootstrap installs its adjacent
-operator package. With `curl | bash`, `PLXFUZZ_OPS_COMMIT` selects the operator
+source, status, and crash clones. Operator scripts live in root-owned
+`/usr/local/lib/plxfuzz`. `PLXFUZZ_OPS_COMMIT` selects the operator
 revision (default `main`); bootstrap resolves and logs one commit SHA and
-installs the entire package from that commit while fuzz source stays pinned.
+installs the entire package from a clean private repository at that commit while
+fuzz source stays pinned. Local execution uses the same trusted download path;
+it does not adopt an adjacent package or the service-owned source clone.
 For a repeatable deployment, use a reviewed SHA in both the download URL and
 `PLXFUZZ_OPS_COMMIT`.
 
@@ -209,7 +211,7 @@ Boxes are disposable. The **only** inputs a box reads on boot are (1) the
 immutable pinned commit and (2) the off-box corpus Release — nothing on the old
 disk feeds a new box. To swap a box (e.g. at day 15, or any time one dies):
 
-1. **Destroy** the DigitalOcean droplet (optionally run the drain step first if
+1. **Destroy** the DigitalOcean droplet (optionally run `sudo /usr/local/lib/plxfuzz/drain.sh` first if
    the box is still reachable, to flush the last <~1 min of un-pushed corpus;
    skipping it loses only additive deltas any worker re-finds in seconds).
 2. **Create** a fresh c-4 with the same Ubuntu 24.04 image.

@@ -1,8 +1,9 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     fs::{self, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
+    net::IpAddr,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -131,6 +132,9 @@ pub struct ReplayCache {
     /// this queue is non-empty: the immediate path's append would journal its own
     /// entry ahead of the still-queued ones.
     pending_persist: VecDeque<ReplayEntry>,
+    pending_transcripts: HashSet<[u8; 32]>,
+    source_commits: HashMap<IpAddr, usize>,
+    nonce_sources: HashMap<[u8; 8], IpAddr>,
     /// One-shot injected failure consumed by the next header commit in
     /// [`Self::persist_authenticated_entry`] (tests only).
     #[cfg(test)]
@@ -176,6 +180,9 @@ impl ReplayCache {
             nonces: HashSet::with_capacity(capacity),
             transcripts: HashSet::with_capacity(capacity),
             pending_persist: VecDeque::new(),
+            pending_transcripts: HashSet::new(),
+            source_commits: HashMap::new(),
+            nonce_sources: HashMap::new(),
             #[cfg(test)]
             fail_header_commit: None,
             #[cfg(all(test, unix))]
@@ -317,6 +324,52 @@ impl ReplayCache {
 
     pub fn insert_new(&mut self, entry: ReplayEntry, now: u64) -> Result<bool, ReplayCacheError> {
         Ok(self.insert_new_outcome(entry, now)? == ReplayInsertOutcome::Inserted)
+    }
+
+    /// Reserve a fresh, unseen hello only for the lifetime of its in-flight
+    /// handshake. Probers cannot burn a journal entry without the data proof.
+    pub(crate) fn reserve_pending(&mut self, entry: &ReplayEntry, now: u64) -> bool {
+        self.prune_expired(now);
+        if self.pending_transcripts.len() >= self.capacity.max(1) {
+            return false;
+        }
+        self.is_fresh(entry.timestamp, now)
+            && !self.nonces.contains(&entry.nonce)
+            && !self.transcripts.contains(&entry.transcript_fingerprint)
+            && self
+                .pending_transcripts
+                .insert(entry.transcript_fingerprint)
+    }
+
+    pub(crate) fn release_pending(&mut self, transcript: &[u8; 32]) {
+        self.pending_transcripts.remove(transcript);
+    }
+
+    /// A single source may consume at most one quarter of the live replay
+    /// journal. Quotas expire with actual retained entries, including clock skew,
+    /// rather than a shorter wall-clock admission bucket.
+    pub(crate) fn insert_new_outcome_for_source(
+        &mut self,
+        entry: ReplayEntry,
+        now: u64,
+        source: IpAddr,
+    ) -> Result<ReplayInsertOutcome, ReplayCacheError> {
+        self.prune_expired(now);
+        if self.capacity > 0
+            && self
+                .source_commits
+                .get(&source)
+                .is_some_and(|count| *count >= (self.capacity / 4).max(1))
+        {
+            return Ok(ReplayInsertOutcome::CacheFull);
+        }
+        let nonce = entry.nonce;
+        let result = self.insert_new_outcome(entry, now)?;
+        if result == ReplayInsertOutcome::Inserted && self.capacity > 0 {
+            *self.source_commits.entry(source).or_default() += 1;
+            self.nonce_sources.insert(nonce, source);
+        }
+        Ok(result)
     }
 
     /// Like [`insert_new`] but distinguishes WHY an entry was not inserted.
@@ -515,12 +568,25 @@ impl ReplayCache {
         // catches up, those handshakes must still be blocked as replays.
         #[cfg(test)]
         let scanned_entries = &mut self.prune_scanned_entries;
+        let source_commits = &mut self.source_commits;
+        let nonce_sources = &mut self.nonce_sources;
         self.order.retain(|entry| {
             #[cfg(test)]
             {
                 *scanned_entries += 1;
             }
-            is_unexpired(entry)
+            let keep = is_unexpired(entry);
+            if !keep {
+                if let Some(source) = nonce_sources.remove(&entry.nonce) {
+                    if let Some(count) = source_commits.get_mut(&source) {
+                        *count -= 1;
+                        if *count == 0 {
+                            source_commits.remove(&source);
+                        }
+                    }
+                }
+            }
+            keep
         });
         if self.order.len() == previous_len {
             return;
@@ -799,7 +865,7 @@ fn open_cache_file_for_append(path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     options.open(path)
 }
@@ -1402,6 +1468,67 @@ mod proofs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_quota_preserves_other_sources_and_expires_with_entries() {
+        let mut cache = ReplayCache::new(8);
+        let source = "192.0.2.1".parse().unwrap();
+        let other = "192.0.2.2".parse().unwrap();
+        let entry = |n| ReplayEntry {
+            timestamp: 100,
+            nonce: [n; 8],
+            transcript_fingerprint: [n; 32],
+        };
+        for n in 1..=2 {
+            assert_eq!(
+                cache
+                    .insert_new_outcome_for_source(entry(n), 100, source)
+                    .unwrap(),
+                ReplayInsertOutcome::Inserted
+            );
+        }
+        assert_eq!(
+            cache
+                .insert_new_outcome_for_source(entry(3), 100, source)
+                .unwrap(),
+            ReplayInsertOutcome::CacheFull
+        );
+        assert_eq!(
+            cache
+                .insert_new_outcome_for_source(entry(4), 100, other)
+                .unwrap(),
+            ReplayInsertOutcome::Inserted
+        );
+        let next = ReplayEntry {
+            timestamp: 221,
+            ..entry(5)
+        };
+        assert_eq!(
+            cache
+                .insert_new_outcome_for_source(next, 221, source)
+                .unwrap(),
+            ReplayInsertOutcome::Inserted
+        );
+        assert_eq!(cache.source_commits.len(), 1);
+        assert_eq!(cache.nonce_sources.len(), 1);
+    }
+
+    #[test]
+    fn pending_reservations_reject_duplicate_stale_and_committed_hellos() {
+        let mut cache = ReplayCache::new(8);
+        let entry = ReplayEntry {
+            timestamp: 100,
+            nonce: [1; 8],
+            transcript_fingerprint: [2; 32],
+        };
+        assert!(!cache.reserve_pending(&entry, 221));
+        assert!(cache.reserve_pending(&entry, 100));
+        assert!(!cache.reserve_pending(&entry, 100));
+        cache.release_pending(&entry.transcript_fingerprint);
+        assert!(cache.reserve_pending(&entry, 100));
+        assert!(cache.insert_new(entry.clone(), 100).unwrap());
+        cache.release_pending(&entry.transcript_fingerprint);
+        assert!(!cache.reserve_pending(&entry, 100));
+    }
     use super::*;
 
     #[cfg(unix)]
@@ -2396,6 +2523,31 @@ mod tests {
             matches!(err, ReplayCacheError::Io(_)),
             "symlinked cache path must surface an I/O error (O_NOFOLLOW), got {err:?}",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_append_refuses_a_symlink_swapped_after_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.cache");
+        let victim = dir.path().join("victim");
+        let key = b"0123456789abcdef0123456789abcdef";
+        let now = current_unix_timestamp().unwrap();
+        let mut cache = ReplayCache::load_or_create_authenticated(&path, 8, key).unwrap();
+        let entry = |nonce| ReplayEntry {
+            timestamp: now,
+            nonce: [nonce; 8],
+            transcript_fingerprint: [nonce; 32],
+        };
+        assert!(cache.insert_new(entry(1), now).unwrap());
+        fs::write(&victim, b"must remain unchanged").unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        assert!(matches!(
+            cache.insert_new(entry(2), now),
+            Err(ReplayCacheError::Io(_))
+        ));
+        assert_eq!(fs::read(&victim).unwrap(), b"must remain unchanged");
     }
 
     #[test]
