@@ -525,10 +525,15 @@
       "name": "Denial-of-Service Resistance Testing",
       "group": "protocol",
       "mode": "automated",
-      "claim": "Known malformed/resource-pressure paths enforce replay/source admission, bounded identity/fragment/frame allocation, per-connection/endpoint flow budgets and sibling-stream isolation.",
-      "protocol_contracts": ["replay-gates", "identity-reassembly", "command-chunks", "quic-flow-control", "mux-isolation", "quic-compressed-certificate", "http3-stream-framing"],
+      "claim": "Known malformed/resource-pressure paths enforce replay/source admission, bounded identity/fragment/frame allocation, per-connection/endpoint flow budgets and sibling-stream isolation. Fatal server TLS errors release buffered input, prevent repeated CRYPTO growth and terminate admitted connections with bounded reclamation.",
+      "protocol_contracts": ["replay-gates", "identity-reassembly", "command-chunks", "quic-flow-control", "mux-isolation", "quic-compressed-certificate", "http3-stream-framing", "quic-finished-authentication"],
       "tests": [
         {"suite": "protocol_library", "file": "src/transport/udp/quic/endpoint.rs", "name": "transport::udp::quic::endpoint::tests::splice_and_pending_admission_is_bounded_per_source"},
+        {"suite": "protocol_library", "file": "src/tls/quic/server.rs", "name": "tls::quic::server::tests::fatal_server_length_error_clears_input_and_queued_flight_permanently"},
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/endpoint.rs", "name": "transport::udp::quic::endpoint::tests::admitted_server_tls_error_closes_before_later_crypto"},
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/endpoint.rs", "name": "transport::udp::quic::endpoint::tests::cold_start_first_initial_tls_error_closes_immediately"},
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/endpoint.rs", "name": "transport::udp::quic::endpoint::tests::first_marked_client_hello_transport_error_splices_without_authorization"},
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/endpoint.rs", "name": "transport::udp::quic::endpoint::tests::pending_marked_client_hello_transport_error_splices_without_authorization"},
         {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::endpoint_receive_budget_is_shared_and_released_on_read_reset_and_drop"}
       ],
       "analyses": ["docs/security/threat-model.md", "verification/concurrency/README.md"],

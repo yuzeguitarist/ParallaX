@@ -1310,10 +1310,6 @@ impl Connection {
         self.tls.is_handshaking()
     }
 
-    pub(super) fn is_client(&self) -> bool {
-        self.side == Side::Client
-    }
-
     /// Take a resumption ticket received on this connection via a post-handshake
     /// NewSessionTicket (client only; the server returns `None`). `now_ms` stamps
     /// the ticket-age epoch.

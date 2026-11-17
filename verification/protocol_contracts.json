@@ -1469,7 +1469,7 @@
     {
       "id": "quic-finished-authentication",
       "spec": "### 12.5 QUIC ClientHello (QUIC plane)",
-      "claim": "The actual QUIC TLS client and server reject incorrect or wrong-length Finished MACs without completing the handshake; fragmented valid Finished messages commit client application state or server ticket issuance only after complete verification.",
+      "claim": "The actual QUIC TLS client and server reject incorrect or wrong-length Finished MACs without completing the handshake; fragmented valid Finished messages commit client application state or server ticket issuance only after complete verification. Fatal server TLS errors latch, discard retained input and queued output, and prevent later valid input or deferred marker authorization from reviving the session. Locally admitted connections, including cold-start first packets, close on fatal errors while pending origin-splice decisions remain silent.",
       "sources": [
         {
           "file": "src/tls/quic/handshake.rs",
@@ -1479,6 +1479,21 @@
         {
           "file": "src/tls/quic/server.rs",
           "symbol": "verify_client_finished",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/quic/server.rs",
+          "symbol": "ServerHandshake::read_handshake",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/quic/server.rs",
+          "symbol": "ServerHandshake::authorize_client_hello",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/udp/quic/endpoint.rs",
+          "symbol": "close_datagram_error",
           "kind": "fn"
         }
       ],
@@ -1502,9 +1517,44 @@
           "suite": "protocol_library",
           "file": "src/tls/quic/server.rs",
           "name": "tls::quic::server::tests::fragmented_client_finished_issues_ticket_only_after_verified_completion"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/server.rs",
+          "name": "tls::quic::server::tests::fatal_server_length_error_clears_input_and_queued_flight_permanently"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/server.rs",
+          "name": "tls::quic::server::tests::failed_client_finished_cannot_resume_with_a_valid_finished"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/server.rs",
+          "name": "tls::quic::server::tests::fatal_marker_flight_cannot_authorize_deferred_client_hello"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/endpoint.rs",
+          "name": "transport::udp::quic::endpoint::tests::admitted_server_tls_error_closes_before_later_crypto"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/endpoint.rs",
+          "name": "transport::udp::quic::endpoint::tests::cold_start_first_initial_tls_error_closes_immediately"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/endpoint.rs",
+          "name": "transport::udp::quic::endpoint::tests::first_marked_client_hello_transport_error_splices_without_authorization"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/endpoint.rs",
+          "name": "transport::udp::quic::endpoint::tests::pending_marked_client_hello_transport_error_splices_without_authorization"
         }
       ],
-      "bounds": "Real peer-produced handshake flights with flipped, short, long and empty MACs plus bounded fragmentation. Client rejection preserves transcript/state and produces no application keys/exporter; server rejection prevents completion/tickets, while its earlier TLS-permitted application write keys remain installed.",
+      "bounds": "Real peer-produced handshake flights with flipped, short, long and empty MACs plus bounded fragmentation. Client rejection preserves transcript/state and produces no application keys/exporter; server rejection prevents completion/tickets, while its earlier TLS-permitted application write keys remain installed. Oversized server headers, repeated contiguous input and deferred marker authorization are checked directly; real sealed Initial/Handshake packets verify exact UDP close codes, no revival and connection/source-quota reclamation for cold and marked admission. First/follow-up held ClientHello frames with fatal transport errors require original-datagram origin delivery, peer silence, released quotas and an unconsumed marker that permits a later valid retry.",
       "external_conditions": [
         "Controlled certificate-verifier fixtures isolate Finished authentication; certificate-chain validation has separate evidence. Cryptographic hardness is assumed."
       ]

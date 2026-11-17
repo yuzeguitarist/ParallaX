@@ -552,6 +552,7 @@ pub struct ServerHandshake {
     expected_client_finished: Option<Vec<u8>>,
     handshake_complete: bool,
     inbound: Vec<u8>,
+    failed_alert: Option<u8>,
     /// STEK for sealing 0-RTT resumption tickets. `None` disables ticket issuance,
     /// so a cold-start-only server behaves exactly as before.
     stek: Option<Zeroizing<[u8; 32]>>,
@@ -622,6 +623,7 @@ impl ServerHandshake {
             expected_client_finished: None,
             handshake_complete: false,
             inbound: Vec::new(),
+            failed_alert: None,
             stek,
             selected_alpn: None,
             pending_post_handshake: Vec::new(),
@@ -677,6 +679,12 @@ impl ServerHandshake {
     }
 
     pub(crate) fn authorize_client_hello(&mut self) -> Result<(), QuicTlsError> {
+        if let Some(description) = self.failed_alert {
+            return Err(QuicTlsError::alert(
+                description,
+                "TLS session already failed",
+            ));
+        }
         if self.state != ServerState::AwaitMarkerAuthorization || self.marker_result.is_none() {
             return Err(QuicTlsError::Protocol(
                 "ClientHello marker not authorized".into(),
@@ -750,6 +758,9 @@ impl ServerHandshake {
     /// EncryptedExtensions/Certificate/CertificateVerify/Finished (Handshake) +
     /// 1-RTT keys.
     pub fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
+        if self.failed_alert.is_some() {
+            return None;
+        }
         if let Some(keys) = self.pending_0rtt_keys.take() {
             // 0-RTT open keys, installed before the ServerHello so the transport can
             // decrypt early-data packets that arrived alongside the ClientHello.
@@ -782,6 +793,29 @@ impl ServerHandshake {
     /// Feed reassembled CRYPTO bytes (the ClientHello, then the client Finished).
     /// Returns `Ok(true)` once handshake data (peer TPs / completion) is available.
     pub fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
+        if let Some(description) = self.failed_alert {
+            return Err(QuicTlsError::alert(
+                description,
+                "TLS session already failed",
+            ));
+        }
+        let result = self.read_handshake_inner(data);
+        if let Err(error) = &result {
+            self.failed_alert = Some(error.alert_description().unwrap_or(80));
+            self.inbound.clear();
+            self.pending_server_hello = None;
+            self.pending_handshake_keys = None;
+            self.pending_handshake_flight = None;
+            self.pending_0rtt_keys = None;
+            self.pending_1rtt_keys = None;
+            self.pending_post_handshake.clear();
+            self.deferred_client_hello = None;
+            self.marker_result = None;
+        }
+        result
+    }
+
+    fn read_handshake_inner(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
         self.inbound.extend_from_slice(data);
         loop {
             if self.inbound.len() < 4 {
@@ -2179,6 +2213,136 @@ pub(super) mod tests {
             assert_eq!(error.alert_description(), Some(ALERT_DECRYPT_ERROR));
             assert_eq!(server.transcript, transcript);
             assert_server_does_not_complete_or_issue_ticket(&mut server);
+        }
+    }
+
+    fn assert_failed_server_has_no_buffer_or_flight(server: &mut ServerHandshake) {
+        assert!(server.inbound.is_empty());
+        assert!(server.pending_server_hello.is_none());
+        assert!(server.pending_handshake_keys.is_none());
+        assert!(server.pending_handshake_flight.is_none());
+        assert!(server.pending_0rtt_keys.is_none());
+        assert!(server.pending_1rtt_keys.is_none());
+        assert!(server.pending_post_handshake.is_empty());
+        assert!(server.deferred_client_hello.is_none());
+        let (bytes, changes) = drain_authentication_flight(|bytes| server.write_handshake(bytes));
+        assert!(bytes.is_empty() && changes.is_empty());
+    }
+
+    #[test]
+    fn fatal_server_length_error_clears_input_and_queued_flight_permanently() {
+        for before_hello in [false, true] {
+            let mut server = authentication_test_server([0x54; 32]);
+            let mut client = authentication_test_client();
+            let (hello, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+            if !before_hello {
+                server.read_handshake(&hello).unwrap();
+                assert!(server.pending_server_hello.is_some());
+                assert!(server.pending_handshake_keys.is_some());
+                assert!(server.pending_1rtt_keys.is_some());
+            }
+            // A 65,537-byte declaration is impossible under the existing cap.
+            let error = server.read_handshake(&[1, 1, 0, 1]).unwrap_err();
+            assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+            let transcript = server.transcript.clone();
+            assert_failed_server_has_no_buffer_or_flight(&mut server);
+            for _ in 0..16 {
+                let error = server.read_handshake(&[0x55; 4096]).unwrap_err();
+                assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+                assert_failed_server_has_no_buffer_or_flight(&mut server);
+            }
+            let error = server.read_handshake(&hello).unwrap_err();
+            assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+            assert_eq!(server.transcript, transcript);
+            assert!(server.is_handshaking());
+            assert_failed_server_has_no_buffer_or_flight(&mut server);
+        }
+    }
+
+    #[test]
+    fn failed_client_finished_cannot_resume_with_a_valid_finished() {
+        let (mut server, _, finished) = server_before_client_finished();
+        let transcript = server.transcript.clone();
+        let mut invalid = finished.clone();
+        *invalid.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            server
+                .read_handshake(&invalid)
+                .unwrap_err()
+                .alert_description(),
+            Some(ALERT_DECRYPT_ERROR)
+        );
+        assert_failed_server_has_no_buffer_or_flight(&mut server);
+        assert_eq!(
+            server
+                .read_handshake(&finished)
+                .unwrap_err()
+                .alert_description(),
+            Some(ALERT_DECRYPT_ERROR)
+        );
+        assert_eq!(server.transcript, transcript);
+        assert!(server.is_handshaking());
+        assert_failed_server_has_no_buffer_or_flight(&mut server);
+    }
+
+    #[test]
+    fn fatal_marker_flight_cannot_authorize_deferred_client_hello() {
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, QuicMarkerConfig, QUIC_VERSION_V1,
+        };
+        let kp = X25519KeyPair::generate();
+        let psk = Zeroizing::new(vec![4; 32]);
+        let config = Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                QuicMarkerConfig {
+                    psk: psk.clone(),
+                    server_static_public: kp.public,
+                },
+            ),
+        );
+        let mut client = ClientHandshake::new(
+            config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x0f, 0],
+            b"dcid",
+        )
+        .unwrap();
+        let (hello, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        for coalesced in [false, true] {
+            let mut server = authentication_test_server([0x54; 32]);
+            server.set_marker_key(
+                psk.clone(),
+                Zeroizing::new(kp.private),
+                b"dcid".to_vec(),
+                vec!["example.com".into()],
+            );
+            let mut input = Vec::new();
+            if coalesced {
+                input.extend_from_slice(&hello);
+            } else {
+                server.read_handshake(&hello).unwrap();
+                assert!(server.marker_result().is_some());
+                assert!(server.deferred_client_hello.is_some());
+            }
+            input.extend_from_slice(&[1, 1, 0, 1]);
+            assert_eq!(
+                server
+                    .read_handshake(&input)
+                    .unwrap_err()
+                    .alert_description(),
+                Some(ALERT_DECODE_ERROR)
+            );
+            assert_eq!(
+                server
+                    .authorize_client_hello()
+                    .unwrap_err()
+                    .alert_description(),
+                Some(ALERT_DECODE_ERROR)
+            );
+            assert!(server.marker_result().is_none());
+            assert!(server.signing_key.is_none() && server.schedule.is_none());
+            assert_failed_server_has_no_buffer_or_flight(&mut server);
         }
     }
 

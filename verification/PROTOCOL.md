@@ -74,6 +74,14 @@ handshake-record hashes and the TLS handshake transcript. Partial-message
 interleaving remains rejected. Malformed/protected CCS and CCS after Finished
 fail, while verified Finished must end its decrypted record before application
 keys can be installed. Complete and partial same-record tails have regressions.
+QUIC server fatal errors also latch before later CRYPTO can be appended: retained
+input, deferred marker authorization and queued output are discarded. Admitted
+server connections and cold-start first-packet errors close with the exact TLS
+error code and release connection/source state; pending origin-splice decisions
+retain their separate silent, bounded path. Real sealed-packet regressions cover
+subsequent valid/malicious input, bad-AEAD drops and reclamation.
+Fatal frame errors during a held marked ClientHello also bypass authorization
+and marker consumption, replaying the complete original flight to the origin.
 
 ## Run and reproduce
 

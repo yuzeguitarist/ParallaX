@@ -980,33 +980,17 @@ impl Driver {
         // decides, which is exactly the property the splice exists to provide.
         let oversize = data.len() > self.recv_cap();
         if let Some(c) = self.conns.get(&peer) {
-            // Established (already authenticated) connection: nothing to conceal
-            // from this peer, so the cap simply holds.
+            // Locally admitted connection: the cap holds before and after TLS.
             if oversize {
                 return;
             }
             self.dirty.lock().unwrap().insert(peer);
             let mut core = c.core.lock().unwrap();
-            if let Some(error) = core
-                .handle_datagram_ecn(data, ecn, now)
-                .err()
-                .filter(|_| core.is_client() || !core.is_handshaking())
-            {
-                // Authenticated packet processing can fail before the outgoing
-                // client's TLS handshake completes. Such errors are terminal;
-                // pending server marker/origin-splice decisions stay silent.
-                let (code, frame_type) = match &error {
-                    QuicTlsError::Transport {
-                        error_code,
-                        frame_type,
-                        ..
-                    } => (*error_code, *frame_type),
-                    QuicTlsError::Alert { description, .. } => {
-                        (0x100 + u64::from(*description), 0x06)
-                    }
-                    _ => (0x0a, 0), // PROTOCOL_VIOLATION.
-                };
-                core.close_transport(code, frame_type, error.to_string().as_bytes());
+            if let Err(error) = core.handle_datagram_ecn(data, ecn, now) {
+                // Held marker/origin-splice cores use the separate pending path.
+                // Every resident connection must terminate on a fatal TLS error,
+                // including a server that has not received client Finished yet.
+                close_datagram_error(&mut core, error);
             }
             drop(core);
             c.wake_handles();
@@ -1154,11 +1138,14 @@ impl Driver {
             write_wakers: Mutex::new(Vec::new()),
             accept_taken: std::sync::atomic::AtomicBool::new(false),
         });
-        let _ = shared
+        let initial_result = shared
             .core
             .lock()
             .unwrap()
             .handle_datagram_ecn(data, ecn, now);
+        if let Err(error) = initial_result {
+            close_datagram_error(&mut shared.core.lock().unwrap(), error);
+        }
 
         // Cold-start (no marker key): terminate locally immediately, exactly as the
         // pre-marker behaviour — no buffering, no added per-connection latency.
@@ -1201,12 +1188,10 @@ impl Driver {
         now: Instant,
     ) {
         if let Some(p) = self.pending.get_mut(&peer) {
-            let _ = p
-                .shared
-                .core
-                .lock()
-                .unwrap()
-                .handle_datagram_ecn(data, ecn, now);
+            let mut core = p.shared.core.lock().unwrap();
+            if let Err(error) = core.handle_datagram_ecn(data, ecn, now) {
+                close_datagram_error(&mut core, error);
+            }
             p.datagrams.push(data.to_vec());
         }
         self.decide_pending(peer, now);
@@ -1217,7 +1202,7 @@ impl Driver {
     /// otherwise. While the ClientHello is still incomplete AND the buffer budget
     /// remains, this is a no-op: nothing is emitted and the flight keeps buffering.
     fn decide_pending(&mut self, peer: SocketAddr, now: Instant) {
-        let (processed, marker, count, held_for) = match self.pending.get(&peer) {
+        let (processed, marker, count, held_for, failed) = match self.pending.get(&peer) {
             Some(p) => {
                 let core = p.shared.core.lock().unwrap();
                 (
@@ -1225,6 +1210,7 @@ impl Driver {
                     core.marker_result(),
                     p.datagrams.len(),
                     now.duration_since(p.created),
+                    core.is_closed(),
                 )
             }
             None => return,
@@ -1233,7 +1219,10 @@ impl Driver {
         // only until the decision deadline. Past it, fall through to a splice so an
         // incomplete first flight reaches the origin (which ACKs like a real origin)
         // instead of being held silently, which is an active-probing distinguisher.
-        if !processed && count < MAX_PENDING_INITIALS && held_for < PENDING_DECIDE_DELAY {
+        // A later frame may fail after a marked CH parsed: such held cores must
+        // splice without authorizing the CH or flushing their queued local close.
+        if !failed && !processed && count < MAX_PENDING_INITIALS && held_for < PENDING_DECIDE_DELAY
+        {
             return;
         }
         let p = self.pending.remove(&peer).expect("pending entry present");
@@ -1242,7 +1231,8 @@ impl Driver {
         // a replay (same nonce/ts) returns false and is spliced. `marker_fresh` runs
         // at most once per flight (only here, when the CH is decided), so a buffered
         // or replayed flight never pollutes the replay cache.
-        let terminate = processed && matches!(marker, Some(m) if self.marker_fresh(m, now));
+        let terminate =
+            !failed && processed && matches!(marker, Some(m) if self.marker_fresh(m, now));
         if terminate {
             // Promote intact: the buffered server flight flushes on the run loop's
             // next `flush()`, right after this datagram is handled.
@@ -1541,6 +1531,19 @@ impl Driver {
             }
         }
     }
+}
+
+fn close_datagram_error(core: &mut Core, error: QuicTlsError) {
+    let (code, frame_type) = match &error {
+        QuicTlsError::Transport {
+            error_code,
+            frame_type,
+            ..
+        } => (*error_code, *frame_type),
+        QuicTlsError::Alert { description, .. } => (0x100 + u64::from(*description), 0x06),
+        _ => (0x0a, 0), // PROTOCOL_VIOLATION.
+    };
+    core.close_transport(code, frame_type, error.to_string().as_bytes());
 }
 
 fn source_key(peer: SocketAddr) -> IpAddr {
@@ -2958,6 +2961,285 @@ mod tests {
         })
         .await
         .expect("authenticated error must reach the peer over UDP")
+    }
+
+    async fn assert_server_tls_failure_is_reaped(
+        driver: &mut Driver,
+        peer_socket: &UdpSocket,
+        client: &mut Core,
+    ) {
+        let peer = peer_socket.local_addr().unwrap();
+        let server = driver.conns[&peer].clone();
+        assert!(matches!(
+            server.core.lock().unwrap().close_reason(),
+            Some(CloseReason::LocalTransport(0x132, 0x06, _))
+        ));
+        driver.flush().await;
+        let mut datagram = [0; MAX_UDP_PAYLOAD];
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.close_reason().is_none() {
+                let (size, _) = peer_socket.recv_from(&mut datagram).await.unwrap();
+                client
+                    .handle_datagram(&datagram[..size], Instant::now())
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("server TLS decode_error reaches the peer over UDP");
+        assert!(matches!(
+            client.close_reason(),
+            Some(CloseReason::PeerTransport(0x132, 0x06, _))
+        ));
+        let deadline = server.core.lock().unwrap().next_timeout().unwrap();
+        server.core.lock().unwrap().handle_timeout(deadline);
+        driver.dirty.lock().unwrap().insert(peer);
+        driver.flush().await;
+        assert!(!driver.conns.contains_key(&peer));
+        assert!(driver.source_counts.is_empty());
+        assert!(!driver.conn_deadlines.contains_key(&peer));
+    }
+
+    #[tokio::test]
+    async fn admitted_server_tls_error_closes_before_later_crypto() {
+        for marked in [false, true] {
+            let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = peer_socket.local_addr().unwrap();
+            let kp = crate::crypto::session::X25519KeyPair::generate();
+            let psk = Zeroizing::new(vec![3; 32]);
+            let server_config = if marked {
+                base_server_config(None, Some((psk.clone(), Zeroizing::new(kp.private))))
+            } else {
+                server_config()
+            };
+            let config = if marked {
+                Arc::new(
+                    ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()])
+                        .with_marker(crate::tls::quic::QuicMarkerConfig {
+                            psk,
+                            server_static_public: kp.public,
+                        }),
+                )
+            } else {
+                client_config()
+            };
+            let mut driver = test_driver(Some(server_config)).await;
+            let mut client =
+                Core::new_client(config, "example.com", random_cid(), ConnectionId::new(&[]))
+                    .unwrap();
+            let now = Instant::now();
+            while let Some(initial) = client.poll_transmit(now) {
+                driver.on_datagram(&initial, peer, 0);
+            }
+            assert!(driver.pending.is_empty() && driver.conns.contains_key(&peer));
+            let server = driver.conns[&peer].clone();
+            while let Some(datagram) = server.core.lock().unwrap().poll_transmit(now) {
+                client.handle_datagram(&datagram, now).unwrap();
+            }
+            assert!(!client.is_handshaking());
+            assert!(server.is_handshaking() && !server.is_closed());
+            let finished = client.test_handshake_crypto().to_vec();
+            assert_eq!(finished[0], 20);
+            let oversized_header = [20, 1, 0, 1]; // 65,537 exceeds the server limit.
+            let mut corrupt = client.test_handshake_packet(0, &oversized_header);
+            *corrupt.last_mut().unwrap() ^= 1;
+            driver.on_datagram(&corrupt, peer, 0);
+            assert!(
+                !server.is_closed(),
+                "unauthenticatable packets remain drops"
+            );
+            let invalid = client.test_handshake_packet(0, &oversized_header);
+            driver.on_datagram(&invalid, peer, 0);
+            assert!(
+                server.is_closed(),
+                "a resident server TLS error is terminal"
+            );
+            let valid = client.test_handshake_packet(4, &finished);
+            driver.on_datagram(&valid, peer, 0);
+            for index in 0..16 {
+                let tail = client
+                    .test_handshake_packet(4 + finished.len() as u64 + index * 1024, &[0; 1024]);
+                driver.on_datagram(&tail, peer, 0);
+            }
+            assert!(server.is_handshaking(), "later CRYPTO cannot complete TLS");
+            assert_server_tls_failure_is_reaped(&mut driver, &peer_socket, &mut client).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_start_first_initial_tls_error_closes_immediately() {
+        use super::super::conn::seal_packet;
+        use super::super::frame::Frame;
+        use super::super::packet::{Header, LongType};
+        use crate::tls::quic::{initial_keys, Side};
+
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = peer_socket.local_addr().unwrap();
+        let dcid = random_cid();
+        let keys = initial_keys(dcid.as_slice(), Side::Client);
+        let mut client =
+            Core::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[])).unwrap();
+        let mut driver = test_driver(Some(server_config())).await;
+        for packet_number in 0..8 {
+            let datagram = seal_packet(
+                &keys.local,
+                Header::Long {
+                    ty: LongType::Initial,
+                    version: QUIC_VERSION_V1,
+                    dcid,
+                    scid: ConnectionId::new(&[]),
+                    token: Vec::new(),
+                    length: 0,
+                    packet_number,
+                    pn_len: 1,
+                },
+                &[
+                    Frame::Crypto {
+                        offset: packet_number * 4,
+                        data: &[1, 1, 0, 1],
+                    },
+                    Frame::Padding(MIN_INITIAL_DATAGRAM),
+                ],
+            );
+            driver.on_datagram(&datagram, peer, 0);
+            assert!(
+                driver.conns[&peer].is_closed(),
+                "the first cold-start TLS error must close without another packet"
+            );
+        }
+        assert_server_tls_failure_is_reaped(&mut driver, &peer_socket, &mut client).await;
+    }
+
+    async fn assert_marked_transport_error_is_spliced(split: bool) {
+        use super::super::conn::seal_packet;
+        use super::super::frame::{Ack, Frame};
+        use super::super::packet::{Header, LongType};
+        use super::super::transport_params::TransportParameters;
+        use crate::tls::quic::{initial_keys, ClientHandshake, Side};
+
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = peer_socket.local_addr().unwrap();
+        let kp = crate::crypto::session::X25519KeyPair::generate();
+        let psk = Zeroizing::new(vec![3; 32]);
+        let mut driver = test_driver(Some(server_config_marker(
+            origin.local_addr().unwrap(),
+            psk.clone(),
+            kp.private,
+        )))
+        .await;
+        let config = Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                crate::tls::quic::QuicMarkerConfig {
+                    psk,
+                    server_static_public: kp.public,
+                },
+            ),
+        );
+        let dcid = random_cid();
+        let keys = initial_keys(dcid.as_slice(), Side::Client);
+        let mut tls = ClientHandshake::new(
+            config,
+            QUIC_VERSION_V1,
+            "example.com",
+            TransportParameters::safari_client(&[]).encode_safari_client(),
+            dcid.as_slice(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        assert!(tls.write_handshake(&mut hello).is_none());
+        assert_eq!(hello[0], 1);
+        let packet = |number, offset, chunk: &[u8], invalid_ack| {
+            let mut frames = vec![Frame::Crypto {
+                offset,
+                data: chunk,
+            }];
+            if invalid_ack {
+                // This held core has never transmitted packet zero. The ACK is
+                // syntactically valid but fails after processing the marked CH.
+                frames.push(Frame::Ack(Ack {
+                    largest: 0,
+                    delay: 0,
+                    ranges: vec![(0, 0)],
+                    ecn: None,
+                }));
+            }
+            frames.push(Frame::Padding(
+                MIN_INITIAL_DATAGRAM.saturating_sub(chunk.len()).max(3),
+            ));
+            let datagram = seal_packet(
+                &keys.local,
+                Header::Long {
+                    ty: LongType::Initial,
+                    version: QUIC_VERSION_V1,
+                    dcid,
+                    scid: ConnectionId::new(&[]),
+                    token: Vec::new(),
+                    length: 0,
+                    packet_number: number,
+                    pn_len: 1,
+                },
+                &frames,
+            );
+            assert!(looks_like_initial(&datagram) && datagram.len() <= driver.recv_cap());
+            datagram
+        };
+        let cut = if split { hello.len() / 2 } else { 0 };
+        let mut originals = Vec::new();
+        if split {
+            originals.push(packet(0, 0, &hello[..cut], false));
+        }
+        originals.push(packet(u64::from(split), cut as u64, &hello[cut..], true));
+        let recovery = packet(2, 0, &hello, false);
+        for (index, datagram) in originals.iter().enumerate() {
+            driver.on_datagram(datagram, peer, 0);
+            if split && index == 0 {
+                assert!(driver.pending.contains_key(&peer) && driver.conns.is_empty());
+            }
+        }
+        assert!(
+            driver.conns.is_empty(),
+            "a transport failure cannot authorize a marked CH"
+        );
+        assert!(driver.pending.is_empty());
+        assert!(
+            driver.marker_replay.is_empty(),
+            "rejection cannot consume the marker"
+        );
+        assert!(driver.source_counts.is_empty() && driver.pending_sources.is_empty());
+        let mut bytes = [0; MAX_UDP_PAYLOAD];
+        for original in originals {
+            let (size, _) =
+                tokio::time::timeout(Duration::from_secs(1), origin.recv_from(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&bytes[..size], original);
+        }
+        driver.flush().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), peer_socket.recv_from(&mut bytes))
+                .await
+                .is_err(),
+            "a held failure must never emit a local close or flight"
+        );
+        driver.on_datagram(&recovery, peer, 0);
+        assert!(driver.conns.contains_key(&peer));
+        assert!(driver.pending.is_empty() && driver.splices.is_empty());
+        assert_eq!(
+            driver.marker_replay.len(),
+            1,
+            "the same unconsumed marker remains usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_marked_client_hello_transport_error_splices_without_authorization() {
+        assert_marked_transport_error_is_spliced(false).await;
+    }
+
+    #[tokio::test]
+    async fn pending_marked_client_hello_transport_error_splices_without_authorization() {
+        assert_marked_transport_error_is_spliced(true).await;
     }
 
     #[tokio::test]
