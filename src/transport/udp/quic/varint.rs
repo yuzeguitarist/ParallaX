@@ -130,3 +130,34 @@ mod tests {
         assert_eq!(decode(&buf), Some((0x3fff, 2)));
     }
 }
+
+#[cfg(test)]
+mod generated_properties {
+    use super::super::property;
+    use super::*;
+
+    #[test]
+    fn generated_varints_preserve_value_prefix_length_and_nonminimal_forms() {
+        property::check("quic-varint", |case| {
+            let value = case.a & MAX;
+            let mut canonical = Vec::new();
+            encode(value, &mut canonical);
+            prop_assert_eq!(canonical.len(), size(value));
+            prop_assert_eq!(decode(&canonical), Some((value, canonical.len())));
+            for (width, prefix) in [(1, 0u8), (2, 0x40), (4, 0x80), (8, 0xc0)] {
+                if width < size(value) {
+                    continue;
+                }
+                let bytes = value.to_be_bytes();
+                let mut wire = bytes[8 - width..].to_vec();
+                wire[0] |= prefix;
+                for end in 0..width {
+                    prop_assert_eq!(decode(&wire[..end]), None);
+                }
+                wire.extend_from_slice(case.payload(16));
+                prop_assert_eq!(decode(&wire), Some((value, width)));
+            }
+            Ok(())
+        });
+    }
+}

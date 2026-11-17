@@ -27,8 +27,11 @@ def selections(kind: str, replay_test: str | None = None) -> list[tuple[str, lis
     if kind == "protocol":
         return [(name, ["cargo", "test", "--locked", "--test", name], [])
                 for name in ("security_protocol_differential", "security_fault_injection",
+                             "protocol_differential", "protocol_properties",
                              "security_plaintext_allocation",
-                             "mldsa_differential", "mldsa_acvp")]
+                             "mldsa_differential", "mldsa_acvp")] + [
+            ("quic_properties", ["cargo", "test", "--locked", "--lib",
+                                 "generated_properties"], [])]
     if kind == "listener":
         return [("security_listener", ["cargo", "test", "--locked", "--test",
                                       "security_listener"], ["--ignored"])]
@@ -109,6 +112,9 @@ def main() -> int:
                 "PARALLAX_SHUTTLE_SEED": "20260828",
                 "PARALLAX_SHUTTLE_ITERATIONS": "200",
                 "PARALLAX_MODEL_WORKLOAD_SEED": "0" if args.kind == "loom" else "257"}
+    if args.kind == "protocol":
+        defaults.update({"PARALLAX_PROP_SEED": "0x504c585f50524f50",
+                         "PARALLAX_PROP_CASES": "256"})
     for key, value in defaults.items():
         env.setdefault(key, value)
     report = {"schema_version": 1, "kind": args.kind, "status": "running",

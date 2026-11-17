@@ -51,7 +51,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/crypto/quic_marker.rs` | not-exhaustive | HMAC over ClientHello.random |
 | `src/crypto/pool.rs` | not-exhaustive | production worker queue and lifecycle are exercised under bounded Loom/Shuttle schedules; arbitrary closures, OS threads and all schedules are not proved |
 | `src/crypto/replay.rs` | bounded-elsewhere | Kani checks post-HMAC digest copying and wiping. ParallaXReplay is the in-memory stage_insert order for one slot; the journal MAC and disk are not proved |
-| `src/crypto/session.rs` | bounded-elsewhere | Kani proves nonce injectivity in the sequence and substream HKDF-info injectivity in the stream id. AEAD and HKDF bytes are not enumerated. ParallaXSession only anchors the degenerate-secret check |
+| `src/crypto/session.rs` | bounded-elsewhere | Kani proves nonce injectivity in the sequence and substream HKDF-info injectivity in the stream id. AEAD and HKDF bytes are not enumerated. ParallaXSession anchors the degenerate-secret check; ParallaXRecords covers a three-sequence reservation window and permanent poison across fresh-key rekey |
 | `src/fingerprint/http2.rs` | not-exhaustive | HTTP/2 frame bytes |
 | `src/fingerprint/http3.rs` | not-exhaustive | HTTP/3 and QPACK bytes |
 | `src/fingerprint/mod.rs` | not-exhaustive | module wiring |
@@ -65,8 +65,8 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/netmatrix.rs` | not-exhaustive | live network measurements |
 | `src/probe.rs` | not-exhaustive | external reachability probe over sockets and clocks; not the UDP probe machine |
 | `src/process_hardening.rs` | not-exhaustive | OS sandbox, rlimits, and procfs |
-| `src/protocol/command.rs` | not-exhaustive | command codecs over unbounded records. The PX1P status byte is exhausted by check_probe_status_bytes for ParallaXProbe; other commands are not |
-| `src/protocol/data.rs` | bounded-elsewhere | Kani checks record capacity, nonce-budget reservation, and poisoned-state rejection; AEAD record bodies are not proved |
+| `src/protocol/command.rs` | not-exhaustive | command codecs over unbounded records. The PX1P status byte is exhausted by check_probe_status_bytes for ParallaXProbe. ParallaXFragments covers all partitions of 1..3-byte PX1F payloads, two frames, and abstract reject classes; arbitrary bytes and PX1I caller reassembly are not proved |
+| `src/protocol/data.rs` | bounded-elsewhere | Kani checks record capacity, nonce-budget reservation, and poisoned-state rejection. ParallaXRecords covers parallel seal reservation, failure poison, and publication control; AEAD bodies and arbitrary record batches are not proved |
 | `src/protocol/mod.rs` | not-exhaustive | module wiring |
 | `src/runtime_guard.rs` | not-exhaustive | OS user, group, and process role |
 | `src/secret_store.rs` | not-exhaustive | sealed secret files and the OS keystore |

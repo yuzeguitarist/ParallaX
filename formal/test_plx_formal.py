@@ -35,6 +35,8 @@ class FormalModelTests(unittest.TestCase):
                 "ParallaXClose": 21,
                 "ParallaXBbr": 56,
                 "ParallaXPacket": 14,
+                "ParallaXRecords": 70,
+                "ParallaXFragments": 23,
             },
         )
         for machine in plx_formal.machines():
@@ -133,6 +135,61 @@ class FormalModelTests(unittest.TestCase):
             compiled.holds({"app": True, "phase": "app", "epoch": 1, "binding": True})
         )
 
+    def test_record_failure_cannot_roll_back_or_clear_poison(self):
+        machine = plx_formal.records_machine()
+        cases = (
+            (plx_formal.act("RollbackReservation", 'phase = "failed" /\\ next # 0', next="0"),
+             "ReservationIsNeverRolledBack"),
+            (plx_formal.act("ReviveAfterFailure", 'phase = "failed" /\\ poisoned', poisoned="FALSE"),
+             "FailedBatchPoisonsPermanently"),
+            (plx_formal.act("PublishBeforeSibling", 'phase = "reserved" /\\ remaining = 1',
+                           phase='"ready"', published="TRUE"),
+             "PublishOnlyWholeSuccess"),
+        )
+        for bad_action, invariant in cases:
+            with self.subTest(action=bad_action.name), self.assertRaises(plx_formal.FormalError) as caught:
+                plx_formal.check_machine(replace(machine, actions=machine.actions + (bad_action,)))
+            self.assertIn(invariant, str(caught.exception))
+            self.assertIn(bad_action.name, str(caught.exception))
+
+    def test_fragment_completion_requires_all_bytes_and_clears_latch(self):
+        machine = plx_formal.fragments_machine()
+        cases = (
+            (plx_formal.act("EmitPrefix", 'total = 3 /\\ cursor = 1 /\\ ~stopped',
+                           total="0", cursor="0", frames="frames + 1", emitted="TRUE",
+                           outcome='"complete"'),
+             "EmitOnlyCompleteFrame"),
+            (plx_formal.act("KeepOldLatch", "emitted /\\ ~stopped /\\ total = 0", total="1"),
+             "CompletionClearsLatch"),
+        )
+        for bad_action, invariant in cases:
+            with self.subTest(action=bad_action.name), self.assertRaises(plx_formal.FormalError) as caught:
+                plx_formal.check_machine(replace(machine, actions=machine.actions + (bad_action,)))
+            self.assertIn(invariant, str(caught.exception))
+            self.assertIn(bad_action.name, str(caught.exception))
+
+    def test_new_correspondence_contracts_detect_poison_and_latch_removal(self):
+        cases = (
+            ("src/crypto/session.rs", "self.next = 0;",
+             "self.next = 0; self.poisoned = false;", "without clearing poison"),
+            ("src/protocol/command.rs", "self.expected_total = None;",
+             "/* completion latch reset removed */", "clears state before emission"),
+        )
+        for relative, before, after, message in cases:
+            with self.subTest(file=relative), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for source_path in plx_formal.CORRESPOND_FILES:
+                    target = root / source_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text((plx_formal.ROOT / source_path).read_text())
+                target = root / relative
+                source = target.read_text()
+                self.assertEqual(source.count(before), 1)
+                target.write_text(source.replace(before, after, 1))
+                with self.assertRaises(plx_formal.FormalError) as caught:
+                    plx_formal.correspond(root)
+                self.assertIn(message, str(caught.exception))
+
     def test_readme_names_every_invariant(self):
         text = (plx_formal.FORMAL / "README.md").read_text()
         for machine in plx_formal.machines():
@@ -213,6 +270,22 @@ class FormalModelTests(unittest.TestCase):
 
 
 EXPECTED_INVARIANTS = {
+    "ParallaXRecords": {
+        "ReservedRangesNeverOverlap": 'phase = "reserved" => (base = prior_end /\\ base < next /\\ next = high)',
+        "ReservationIsNeverRolledBack": "next = high",
+        "FailedBatchPoisonsPermanently": "failed => poisoned",
+        "PoisonedCannotDispatch": 'poisoned => (phase # "reserved" /\\ ~published)',
+        "PublishOnlyWholeSuccess": 'published => (phase = "ready" /\\ remaining = 0 /\\ ~poisoned /\\ ~failed)',
+        "RecordWindowIsBounded": "next \\in {0, 1, 2, 3} /\\ epoch \\in {0, 1}",
+    },
+    "ParallaXFragments": {
+        "FragmentsStayWithinTotal": '(total = 0 => cursor = 0) /\\ (total # 0 => (cursor < total /\\ total \\in {1, 2, 3}))',
+        "EmitOnlyCompleteFrame": 'emitted => (outcome = "complete" /\\ last_size = last_total /\\ last_total # 0 /\\ frames # 0)',
+        "CompletionClearsLatch": 'outcome = "complete" => (total = 0 /\\ cursor = 0)',
+        "RejectedChunkEmitsNothing": 'outcome = "error" => (stopped /\\ ~emitted)',
+        "PartialChunkEmitsNothing": 'outcome = "partial" => (~emitted /\\ total # 0 /\\ cursor # 0)',
+        "FrameCountIsBounded": "frames \\in {0, 1, 2}",
+    },
     "ParallaXSession": {
         "AppOnlyAfterIdentity": 'app => (phase = "app" /\\ binding /\\ epoch = 1 /\\ usable /\\ keys)',
         "VerifiedImpliesBinding": 'phase \\in {"verified", "app"} => (binding /\\ epoch = 1 /\\ keys /\\ usable)',

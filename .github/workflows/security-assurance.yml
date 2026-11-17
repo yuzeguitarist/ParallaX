@@ -80,6 +80,8 @@ jobs:
       - name: Execute bounded project suite
         env:
           SUITE: ${{ matrix.suite }}
+          PARALLAX_PROP_SEED: ${{ github.run_id }}
+          PARALLAX_PROP_CASES: ${{ github.event_name == 'schedule' && '1024' || '256' }}
         run: python3 scripts/security/assurance.py "$SUITE"
       - name: Retain selected tests, bounds and reproduction logs
         if: always()

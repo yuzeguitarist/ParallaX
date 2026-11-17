@@ -5,6 +5,8 @@ the TCP session (handshake, PQ rekey, replay, identity, reconnect), the QUIC
 TLS handshake order, 0-RTT ticket use, the replay-insert decision, the UDP
 probe outcome, the inbound auth gates, QUIC key installation, QUIC close and
 drain, the BBR mode graph, and the QUIC first-byte class.
+The record-batch and framed-command models add bounded checks of nonce
+reservation/failure and repeated PX1F reassembly.
 
 This is a model of control state, not a byte-level proof of X25519, ML-KEM, or
 AEAD. A step such as `AuthOk` stands in for a check the Rust code already
@@ -315,5 +317,54 @@ JVM is up. The 0.79s figure is not a cold-JVM number.
 - BBR loss not assigning the mode, and ProbeRTT only after the pipe fills
 - first-byte fixed bit, short header, and long type, including Retry
 - PX1P status bytes 0, 1, and 2
+- record batches reserve before dispatch, poison before returning a worker failure, and publish only after successful collection; fresh-key rekey preserves poison
+- PX1F reassembly checks total/offset before append and resets the total latch and buffer before emitting a complete frame
 
 A reorder that removes one of those anchors fails `correspond` even though the TLA+ model itself still checks.
+
+## Bounded record batches (`ParallaXRecords`)
+
+The added record model follows `RecordSequence` and
+`DataRecordCodec::seal_records_into_parallel`: a batch consumes its complete
+sequence range before workers run; a worker failure permanently poisons the
+codec; ciphertext is published after all workers succeed. It explores batches
+of one or two records in a three-sequence window, across two key epochs.
+`FreshKeyRekey` assumes a new independent key/nonce namespace. The actual u64
+arithmetic and AES-GCM key-usage limit remain separate Kani properties.
+This model does not prove AEAD security, worker scheduling, serial opening,
+or the freshness of derived key bytes.
+
+| Invariant | Unreachable situation |
+| --- | --- |
+| `ReservedRangesNeverOverlap` | A new batch starts inside an earlier reservation in the same key epoch |
+| `ReservationIsNeverRolledBack` | Failure restores a consumed sequence range |
+| `FailedBatchPoisonsPermanently` | A worker failure loses its poison, including through rekey |
+| `PoisonedCannotDispatch` | A poisoned codec reserves or publishes another batch |
+| `PublishOnlyWholeSuccess` | A partial or failed batch publishes ciphertext |
+| `RecordWindowIsBounded` | The model leaves its three-sequence, two-epoch bounds |
+
+## Bounded framed commands (`ParallaXFragments`)
+
+The PX1F model follows `FramedReassembler::push` and enumerates every positive
+chunk partition of total lengths 1, 2, and 3, followed by a second frame through
+the same reassembler. Decode errors, excess capacity, changed totals, and wrong
+offsets are abstract reject classes: their concrete byte parser is covered by
+Rust tests, not enumerated by this model. The model assumes that the caller
+aborts on a rejected chunk; it does not claim that `push` itself becomes
+permanently poisoned. PX1I shares the offset-chunk wire decoder but has separate
+caller reassembly, which this model does not prove.
+
+| Invariant | Unreachable situation |
+| --- | --- |
+| `FragmentsStayWithinTotal` | Partial accumulation exceeds its latched total |
+| `EmitOnlyCompleteFrame` | A partial frame is returned as a complete payload |
+| `CompletionClearsLatch` | A completed frame leaves its old total or buffer for the next frame |
+| `RejectedChunkEmitsNothing` | A rejected call returns a frame |
+| `PartialChunkEmitsNothing` | A partial call returns a frame |
+| `FrameCountIsBounded` | The model exceeds two completed frames |
+
+These two models are checked by both the Python explorer and the generated
+TLA+/TLC specs through the existing `formal` workflow. Counterexample self-tests
+exercise nonce rollback, poison removal, early emission, and stale completion
+state. They check the checker and its contracts; they are not attacks on a
+running proxy or a whole-implementation proof.

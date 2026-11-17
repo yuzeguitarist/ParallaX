@@ -28,6 +28,10 @@ What is modeled, and what is not:
 * BBR mode: Startup, ProbeBW, and ProbeRTT. The window in bytes is not modeled.
 * QUIC first byte: the fixed bit, header form, and long-packet type. Later
   header fields are not modeled.
+* Record batches: reserve-before-dispatch, ordered publication, permanent poison
+  after worker failure, and fresh-key rekey in a three-sequence nonce window.
+* Framed commands: every partition of payload lengths 1..3, two successive
+  frames, completion reset, and terminal rejection of malformed chunks.
 
 Run ``python3 formal/plx_formal.py check`` from the repository root.
 """
@@ -65,6 +69,7 @@ CORRESPOND_FILES = (
     "src/transport/udp/quic/congestion.rs",
     "src/transport/udp/quic/packet.rs",
     "src/protocol/command.rs",
+    "src/protocol/data.rs",
 )
 
 Scalar = Union[bool, int, str]
@@ -2915,6 +2920,139 @@ def packet_machine() -> Machine:
     )
 
 
+def records_machine() -> Machine:
+    """Parallel outbound batches in a three-sequence window and two key epochs.
+
+    The small counter is an abstraction of the checked u64 counter, whose
+    arithmetic and real AES retirement bound are proved separately by Kani.
+    Rekey assumes a fresh key/nonce namespace; key derivation is not proved here.
+    No worker result is published until every result has succeeded.
+    """
+    actions = []
+    for count in (1, 2):
+        actions.append(act(
+            f"Reserve{count}",
+            f'phase = "ready" /\\ ~poisoned /\\ next < {4 - count}',
+            phase='"reserved"', base="next + 0", prior_end="high + 0",
+            next=f"next + {count}", high=f"next + {count}",
+            remaining=str(count), published="FALSE",
+        ))
+    actions.extend((
+        act("CollectFirstSuccess", 'phase = "reserved" /\\ remaining = 2', remaining="1"),
+        act("CollectLastSuccess", 'phase = "reserved" /\\ remaining = 1', remaining="0"),
+        act("PublishWholeBatch", 'phase = "reserved" /\\ remaining = 0',
+            phase='"ready"', published="TRUE"),
+        act("WorkerFailure", 'phase = "reserved" /\\ remaining # 0',
+            phase='"failed"', poisoned="TRUE", failed="TRUE", remaining="0", published="FALSE"),
+        act("FreshKeyRekey", 'phase \\in {"ready", "failed"} /\\ epoch = 0',
+            phase='"ready"', epoch="1", next="0", high="0", base="0",
+            prior_end="0", remaining="0", published="FALSE"),
+        act("CloseRecords", 'phase # "closed" /\\ phase # "reserved"',
+            phase='"closed"', published="FALSE"),
+    ))
+    return Machine(
+        name="ParallaXRecords",
+        blurb="Bounded batch nonce reservation, publication, failure poison, and fresh-key rekey.",
+        fields=("phase", "epoch", "next", "high", "base", "prior_end", "remaining", "poisoned", "failed", "published"),
+        defaults={"phase": "ready", "epoch": 0, "next": 0, "high": 0,
+                  "base": 0, "prior_end": 0, "remaining": 0, "poisoned": False,
+                  "failed": False, "published": False},
+        initials=(),
+        actions=tuple(actions),
+        invariants=(
+            claim("ReservedRangesNeverOverlap", "new reservations begin after every earlier reservation in this key epoch",
+                  'phase = "reserved" => (base = prior_end /\\ base < next /\\ next = high)'),
+            claim("ReservationIsNeverRolledBack", "the next sequence stays at the consumed high-water mark",
+                  "next = high"),
+            claim("FailedBatchPoisonsPermanently", "worker failure remains poisoned even across a rekey",
+                  "failed => poisoned"),
+            claim("PoisonedCannotDispatch", "a poisoned codec cannot reserve or publish a later batch",
+                  'poisoned => (phase # "reserved" /\\ ~published)'),
+            claim("PublishOnlyWholeSuccess", "only a complete successful batch publishes ciphertext",
+                  'published => (phase = "ready" /\\ remaining = 0 /\\ ~poisoned /\\ ~failed)'),
+            claim("RecordWindowIsBounded", "the abstract counter has three sequences and two independent key epochs",
+                  "next \\in {0, 1, 2, 3} /\\ epoch \\in {0, 1}"),
+        ),
+        witnesses=(
+            claim("BatchCanPublish", "successful batches publish after reservation", "published"),
+            claim("CounterCanRetire", "the abstract nonce window can be exhausted", 'next = 3 /\\ phase = "ready"'),
+            claim("RekeyKeepsPoison", "rekey cannot revive a failed codec", 'epoch = 1 /\\ failed /\\ poisoned /\\ phase = "ready"'),
+            claim("FreshEpochCanPublish", "a live codec can publish in a fresh key epoch", "epoch = 1 /\\ published"),
+            claim("PartialWorkerSuccessIsBuffered", "one result can succeed while its sibling remains unpublished",
+                  'phase = "reserved" /\\ next = 2 /\\ base = 0 /\\ remaining = 1 /\\ ~published'),
+        ),
+        terminal='phase = "closed"',
+    )
+
+
+def fragments_machine() -> Machine:
+    """Every valid partition up to three bytes, and two successive PX1F frames.
+
+    Offset, total, and length validation are abstracted into their reject classes.
+    A caller aborts the frame/session on error; retrying a rejected reassembler
+    is outside this model. Byte values and allocator behavior are not modeled.
+    """
+    actions = []
+    for total in (1, 2, 3):
+        for offset in range(total):
+            for count in range(1, total - offset + 1):
+                end = offset + count
+                complete = end == total
+                latch = 0 if offset == 0 else total
+                assign = dict(
+                    total="0" if complete else str(total),
+                    cursor="0" if complete else str(end),
+                    last_total=str(total), last_size=str(end),
+                    outcome='"complete"' if complete else '"partial"',
+                    emitted="TRUE" if complete else "FALSE",
+                )
+                if complete:
+                    assign["frames"] = "frames + 1"
+                actions.append(act(
+                    f"Chunk{total}At{offset}Len{count}",
+                    f'~stopped /\\ frames < 2 /\\ total = {latch} /\\ cursor = {offset}',
+                    **assign,
+                ))
+    # Each reject class stands for arbitrary bytes that fail the corresponding
+    # decode_ref/push gate. Earlier successful frames remain observable, but the
+    # rejected call emits no payload and cannot be followed by another push.
+    for reason in ("Decode", "TooLarge", "ChangedTotal", "WrongOffset"):
+        guard = "~stopped /\\ frames < 2"
+        if reason == "ChangedTotal":
+            guard += " /\\ total # 0"
+        actions.append(act(f"Reject{reason}", guard, stopped="TRUE",
+                           emitted="FALSE", outcome='"error"'))
+    return Machine(
+        name="ParallaXFragments",
+        blurb="Bounded PX1F partitions, total/offset rejection, and completion reset before the next frame.",
+        fields=("total", "cursor", "frames", "last_total", "last_size", "outcome", "emitted", "stopped"),
+        defaults={"total": 0, "cursor": 0, "frames": 0, "last_total": 0,
+                  "last_size": 0, "outcome": "none", "emitted": False, "stopped": False},
+        initials=(),
+        actions=tuple(actions),
+        invariants=(
+            claim("FragmentsStayWithinTotal", "a partial payload cannot exceed its latched total",
+                  '(total = 0 => cursor = 0) /\\ (total # 0 => (cursor < total /\\ total \\in {1, 2, 3}))'),
+            claim("EmitOnlyCompleteFrame", "only an exactly complete frame can be returned",
+                  'emitted => (outcome = "complete" /\\ last_size = last_total /\\ last_total # 0 /\\ frames # 0)'),
+            claim("CompletionClearsLatch", "a returned frame clears the latch and buffer before reuse",
+                  'outcome = "complete" => (total = 0 /\\ cursor = 0)'),
+            claim("RejectedChunkEmitsNothing", "a malformed or inconsistent chunk emits no frame",
+                  'outcome = "error" => (stopped /\\ ~emitted)'),
+            claim("PartialChunkEmitsNothing", "a partial chunk remains buffered",
+                  'outcome = "partial" => (~emitted /\\ total # 0 /\\ cursor # 0)'),
+            claim("FrameCountIsBounded", "two frames suffice to exercise completion and reuse",
+                  "frames \\in {0, 1, 2}"),
+        ),
+        witnesses=(
+            claim("PartialFrameIsReachable", "a multi-chunk payload remains buffered", 'outcome = "partial"'),
+            claim("SecondFrameCanComplete", "the same reassembler accepts a second complete frame", "frames = 2 /\\ emitted"),
+            claim("BadContinuationIsRejected", "a malformed continuation after a partial frame fails closed", "stopped /\\ total # 0"),
+        ),
+        terminal="stopped \\/ frames = 2",
+    )
+
+
 def machines() -> tuple[Machine, ...]:
     return (
         session_machine(),
@@ -2927,6 +3065,8 @@ def machines() -> tuple[Machine, ...]:
         close_machine(),
         bbr_machine(),
         packet_machine(),
+        records_machine(),
+        fragments_machine(),
     )
 
 
@@ -3190,6 +3330,26 @@ MACHINE_ANCHORS: dict[str, dict[str, tuple[str, ...]]] = {
         "src/transport/udp/quic/packet.rs": (
             "datagram.first()?",
             "_ => LongType::Retry",
+        ),
+    },
+    "ParallaXRecords": {
+        "src/crypto/session.rs": (
+            "self.ensure_usable()?;",
+            "self.next = end;",
+            "self.records.reset_for_rekey();",
+        ),
+        "src/protocol/data.rs": (
+            "self.aead.reserve_sequence(record_count as u64)?",
+            "self.aead.poison();",
+            "out.extend_from_slice(segment);",
+        ),
+    },
+    "ParallaXFragments": {
+        "src/protocol/command.rs": (
+            "FramedChunk::decode_ref(chunk)?",
+            "FramedChunkError::InconsistentTotal",
+            "self.expected_total = None;",
+            "std::mem::take(&mut self.assembled)",
         ),
     },
 }
@@ -3486,6 +3646,25 @@ def correspond(root: Path = ROOT) -> None:
     bbr = text["src/transport/udp/quic/congestion.rs"]
     packet = text["src/transport/udp/quic/packet.rs"]
     command = text["src/protocol/command.rs"]
+    data = text["src/protocol/data.rs"]
+
+    reserve = _extract_fn(session, "reserve")
+    _order(reserve, ("self.ensure_usable()?", ".checked_add(count)", "self.next = end", "Ok(base)"),
+           "record sequence reservation consumes its checked range before returning", problems)
+    reset = _extract_fn(session, "reset_for_rekey")
+    if reset[reset.index("{") + 1 : reset.rfind("}")].strip() != "self.next = 0;":
+        problems.append("record rekey must reset the counter without clearing poison")
+    batch = _extract_fn(data, "seal_records_into_parallel")
+    _order(batch, ("self.ensure_seal_budget(record_count)?", "self.aead.reserve_sequence(record_count as u64)?",
+                   "pool.run_ordered(jobs)", "self.aead.poison();", "return Err(err)",
+                   "out.extend_from_slice(segment)"),
+           "record batch reserves before dispatch and rejects failures before publication", problems)
+    push = _extract_fn(command, "push")
+    _order(push, ("FramedChunk::decode_ref(chunk)?", "total_len > cap", "FramedChunkError::InconsistentTotal",
+                  "chunk.offset as usize != self.assembled.len()", "self.assembled.extend_from_slice(chunk.bytes)",
+                  "self.assembled.len() == total_len", "self.expected_total = None",
+                  "std::mem::take(&mut self.assembled)"),
+           "framed reassembly validates before append and clears state before emission", problems)
 
     if "FallbackReason::Replay" in server:
         problems.append(
