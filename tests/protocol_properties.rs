@@ -325,37 +325,82 @@ fn tcp_auth_keys_and_masked_carrier_recover_generated_material() {
         let psk = case.array::<32>(0);
         let client_private = case.array::<32>(32);
         let server_private = case.array::<32>(64);
-        let public = case.array::<32>(96);
+        let tls_private = case.array::<32>(96);
         let tail = case.array::<16>(128);
         let client_public = x25519_public_from_private(&client_private);
+        let tls_public = x25519_public_from_private(&tls_private);
         let server_public = x25519_public_from_private(&server_private);
         let client_key = derive_client_auth_key(&psk, &client_private, &server_public).unwrap();
         let server_key = derive_server_auth_key(&psk, &server_private, &client_public).unwrap();
         prop_assert_eq!(&*client_key, &*server_key);
-        let shared =
-            parallax::crypto::session::x25519_shared_secret(&client_private, &server_public);
+        let shared = parallax::crypto::session::x25519_shared_secret(&tls_private, &server_public);
         let mut hello = include_bytes!("fixtures/safari26_cloudflare_com_clienthello.bin").to_vec();
         let parsed = parse_client_hello(&hello).unwrap();
         let sni = parsed.sni.as_deref().unwrap();
+        let captured_share = parsed.x25519_key_share.unwrap();
+        let offsets: Vec<_> = hello
+            .windows(32)
+            .enumerate()
+            .filter_map(|(at, bytes)| (bytes == captured_share).then_some(at))
+            .collect();
+        prop_assert_eq!(offsets.len(), 1);
+        hello[offsets[0]..offsets[0] + 32].copy_from_slice(&tls_public);
         let random =
-            build_masked_stateful_client_random(&psk, &shared, sni, &public, &tail).unwrap();
+            build_masked_stateful_client_random(&psk, &shared, sni, &client_public, &tail).unwrap();
         let session_id = build_masked_stateful_auth_session_id(
             &psk,
             &shared,
             &client_key[..],
             sni,
-            &public,
+            &client_public,
             &random,
             &tail,
         )
         .unwrap();
         hello[11..43].copy_from_slice(&random);
-        hello[parsed.session_id_range].copy_from_slice(&session_id);
+        hello[parsed.session_id_range.clone()].copy_from_slice(&session_id);
         let recovered = recover_stateful_auth_material(&hello, &psk, &shared)
             .unwrap()
             .unwrap();
-        prop_assert_eq!(recovered.x25519_public, public);
+        prop_assert_eq!(recovered.x25519_public, client_public);
         prop_assert_eq!(recovered.tail, tail);
+
+        // Exercise the real server decision, including tag verification and both
+        // distinct ECDH slots; recovering masked material alone cannot prove auth.
+        use parallax::handshake::server::{decide_inbound, FallbackReason, InboundDecision};
+        let allowed = [sni.to_owned()];
+        let decision = decide_inbound(&hello, &psk, &allowed, &server_private).unwrap();
+        let InboundDecision::Authenticated(authenticated) = decision else {
+            return Err("valid generated carrier did not authenticate".into());
+        };
+        prop_assert_eq!(authenticated.x25519_key_share, client_public);
+        prop_assert_eq!(
+            authenticated.timestamp,
+            u64::from_be_bytes(tail[..8].try_into().unwrap())
+        );
+        prop_assert_eq!(authenticated.nonce.as_slice(), &tail[8..]);
+        let mut bad = hello.clone();
+        bad[parsed.session_id_range.start + case.a as usize % 16] ^= 1;
+        prop_assert_eq!(
+            decide_inbound(&bad, &psk, &allowed, &server_private).unwrap(),
+            InboundDecision::Fallback(FallbackReason::AuthFailed)
+        );
+        let mut bad = hello.clone();
+        bad[11 + case.b as usize % 32] ^= 1;
+        prop_assert_eq!(
+            decide_inbound(&bad, &psk, &allowed, &server_private).unwrap(),
+            InboundDecision::Fallback(FallbackReason::AuthFailed)
+        );
+        let mut wrong_psk = psk;
+        wrong_psk[0] ^= 1;
+        prop_assert_eq!(
+            decide_inbound(&hello, &wrong_psk, &allowed, &server_private).unwrap(),
+            InboundDecision::Fallback(FallbackReason::AuthFailed)
+        );
+        prop_assert_eq!(
+            decide_inbound(&hello, &psk, &["denied.example".into()], &server_private).unwrap(),
+            InboundDecision::Fallback(FallbackReason::UnauthorizedSni(sni.to_owned()))
+        );
         Ok(())
     });
 }

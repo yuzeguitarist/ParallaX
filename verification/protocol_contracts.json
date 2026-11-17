@@ -1,0 +1,1320 @@
+{
+  "schema_version": 1,
+  "scope": "Finite protocol obligations tied to exact source/test references and optional matching assurance execution evidence; not an exhaustive whole-implementation proof.",
+  "contracts": [
+    {
+      "id": "socks-addresses",
+      "spec": "### 15.1 SOCKS5 front-end (client-facing)",
+      "claim": "SOCKS5 accepts only no-auth CONNECT with valid version/reserved/address/UTF-8/nonzero-port fields; IPv4, IPv6 and DOMAIN parsing consumes exactly the request and retains following application bytes.",
+      "sources": [
+        {
+          "file": "src/client/socks.rs",
+          "symbol": "accept_connect",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_carrier",
+          "file": "tests/protocol_carrier.rs",
+          "name": "generated_socks_formats_preserve_payload_under_short_reads_and_every_eof"
+        },
+        {
+          "suite": "protocol_carrier",
+          "file": "tests/protocol_carrier.rs",
+          "name": "socks_discriminants_and_invalid_domains_match_the_literal_oracle"
+        }
+      ],
+      "bounds": "Generated addresses up to 255 bytes, each request prefix EOF, short reads/writes, every byte of the fixed discriminants.",
+      "external_conditions": []
+    },
+    {
+      "id": "initial-payload",
+      "spec": "### 15.1 SOCKS5 front-end (client-facing)",
+      "claim": "Initial payload capture respects the protocol cap and 4096-byte implementation cap and yields empty input when its 2ms deadline expires.",
+      "sources": [
+        {
+          "file": "src/client/initial_payload.rs",
+          "symbol": "read_initial_payload",
+          "kind": "fn"
+        },
+        {
+          "file": "src/client/initial_payload.rs",
+          "symbol": "INITIAL_PAYLOAD_CAPTURE_TIMEOUT",
+          "kind": "const"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/client/initial_payload.rs",
+          "name": "client::initial_payload::tests::captures_waiting_initial_payload"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/initial_payload.rs",
+          "name": "client::initial_payload::tests::respects_protocol_payload_cap"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/initial_payload.rs",
+          "name": "client::initial_payload::tests::returns_empty_when_no_payload_arrives_before_timeout"
+        }
+      ],
+      "bounds": "Existing finite waiting-input/cap/deadline fixtures; not a proof of scheduler timing.",
+      "external_conditions": []
+    },
+    {
+      "id": "tls-trust",
+      "spec": "## 24. Conformance Summary",
+      "claim": "A real camouflage TLS client rejects an untrusted origin chain or mismatched SNI, then succeeds after the operator corrects trust or SNI.",
+      "sources": [
+        {
+          "file": "src/tls/safari26.rs",
+          "symbol": "verify_server_certificate",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_untrusted_origin_is_rejected_and_trust_correction_recovers"
+        },
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_origin_name_mismatch_is_rejected_and_sni_correction_recovers"
+        }
+      ],
+      "bounds": "Fresh generated CA/leaf, a wrong CA or DNS name, explicit client rejection and no target connection.",
+      "external_conditions": [
+        "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
+      ]
+    },
+    {
+      "id": "tls-server-hello",
+      "spec": "### 12.3 ServerHello (TCP plane)",
+      "claim": "The real TLS validator requires the original 32-byte session ID echo, TLS 1.3 and valid extension framing; the extraction helper separately rejects truncated nested lengths.",
+      "sources": [
+        {
+          "file": "src/tls/safari26.rs",
+          "symbol": "parse_safari_server_hello",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/server_hello.rs",
+          "symbol": "parse_server_hello",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::parse_safari_server_hello_rejects_short_session_id"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::parse_safari_server_hello_rejects_mismatched_session_id_echo"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::server_hello_rejects_duplicate_unsolicited_and_trailing_extensions"
+        },
+        {
+          "suite": "protocol_carrier",
+          "file": "tests/protocol_carrier.rs",
+          "name": "generated_server_hello_extracts_prefix_and_rejects_nested_length_overruns"
+        }
+      ],
+      "bounds": "Finite strict-validator fixtures plus generated extraction fields and every truncated prefix.",
+      "external_conditions": []
+    },
+    {
+      "id": "tls-retry",
+      "spec": "### 12.3 ServerHello (TCP plane)",
+      "claim": "One supported TLS HelloRetryRequest rewrites only the requested key share/cookie, collapses the transcript and emits one compat CCS before ClientHello2.",
+      "sources": [
+        {
+          "file": "src/tls/safari26.rs",
+          "symbol": "parse_safari_server_hello",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::retry_client_hello_differs_from_the_first_only_in_key_share"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::hello_retry_emits_exactly_one_change_cipher_spec_before_client_hello2"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::transcript_collapses_client_hello1_into_message_hash"
+        }
+      ],
+      "bounds": "Synthetic HRR groups/cookies and captured second-flight bytes.",
+      "external_conditions": [
+        "The documented authenticated-proxy HRR transcript limitation remains; these are TLS retry checks, not successful proxy establishment through an HRR origin."
+      ]
+    },
+    {
+      "id": "carrier-auth",
+      "spec": "### 7.2 Phase A details (carrier authentication)",
+      "claim": "Masked TCP authentication bytes bind SNI, random, public key, timestamp and nonce; wrong PSK/static pin falls through to the origin without opening a target.",
+      "sources": [
+        {
+          "file": "src/crypto/auth.rs",
+          "symbol": "recover_stateful_auth_material",
+          "kind": "fn"
+        },
+        {
+          "file": "src/handshake/server.rs",
+          "symbol": "decide_inbound",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_differential",
+          "file": "tests/protocol_differential.rs",
+          "name": "tcp_auth_carrier_bytes_match_independent_hkdf_hmac_oracle"
+        },
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_wrong_psk_falls_back_without_target_and_recovers"
+        },
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_wrong_x25519_pin_falls_back_without_target_and_recovers"
+        }
+      ],
+      "bounds": "Independent HMAC/HKDF carrier construction plus real child-binary rejection/recovery.",
+      "external_conditions": [
+        "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
+      ]
+    },
+    {
+      "id": "degenerate-x25519",
+      "spec": "### 5.2 X25519 hygiene (MUST)",
+      "claim": "All-zero X25519 shared secrets are rejected before initial/auth/hybrid derivation succeeds.",
+      "sources": [
+        {
+          "file": "src/crypto/session.rs",
+          "symbol": "derive_keys_from_shared",
+          "kind": "fn"
+        },
+        {
+          "file": "src/crypto/auth.rs",
+          "symbol": "derive_client_auth_key_from_shared",
+          "kind": "fn"
+        },
+        {
+          "file": "src/crypto/pq.rs",
+          "symbol": "hybrid_sandwich_rekey",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/crypto/session.rs",
+          "name": "crypto::session::tests::derive_keys_rejects_all_zero_shared_secret"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/crypto/auth.rs",
+          "name": "crypto::auth::tests::rejects_degenerate_auth_shared_secret_before_hkdf"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/crypto/pq.rs",
+          "name": "crypto::pq::tests::hybrid_rekey_rejects_degenerate_x25519_shared_secret"
+        }
+      ],
+      "bounds": "Three production derivation entry points, explicit degenerate-secret fixtures.",
+      "external_conditions": []
+    },
+    {
+      "id": "replay-gates",
+      "spec": "### 7.4 Replay / freshness check",
+      "claim": "Freshness/skew, nonce/transcript replay, full capacity and persistent journal integrity are distinct decisions; cache pressure cannot evict a fresh replay guard.",
+      "sources": [
+        {
+          "file": "src/crypto/replay.rs",
+          "symbol": "insert_new_outcome",
+          "kind": "fn"
+        },
+        {
+          "file": "src/crypto/replay.rs",
+          "symbol": "load_or_create_authenticated",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_properties",
+          "file": "tests/protocol_properties.rs",
+          "name": "replay_cache_matches_generated_histories_without_evicting_fresh_entries"
+        },
+        {
+          "suite": "security_listener",
+          "file": "tests/security_listener.rs",
+          "name": "real_listener_enforces_replay_integrity_capacity_and_source_admission"
+        }
+      ],
+      "bounds": "Generated small cache histories plus actual server journal replay/capacity/corruption and source-admission fixtures.",
+      "external_conditions": [
+        "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
+      ]
+    },
+    {
+      "id": "tls-drain",
+      "spec": "### 7.3 Phase B details",
+      "claim": "The TLS-to-PQ handoff drains complete records and preserves buffered H2 bytes; a partial-record timeout/EOF does not establish a clean boundary.",
+      "sources": [
+        {
+          "file": "src/tls/safari26.rs",
+          "symbol": "drain_post_handshake",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::drain_post_handshake_resumes_partial_header_and_payload"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::drain_post_handshake_rejects_partial_record_timeout_and_eof"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::drain_post_handshake_preserves_h2_frame_split_across_phases"
+        }
+      ],
+      "bounds": "Controlled fragmented records, paused/bounded deadlines and H2 phase boundaries.",
+      "external_conditions": []
+    },
+    {
+      "id": "tls-finished",
+      "spec": "### 7.1 Sequence",
+      "claim": "Finished is accepted only after the required encrypted-extensions/certificate-verification order and with correct verify_data.",
+      "sources": [
+        {
+          "file": "src/tls/safari26.rs",
+          "symbol": "process_server_handshake_messages",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::process_handshake_rejects_finished_before_encrypted_extensions"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::process_handshake_rejects_finished_before_certificate_verify"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::process_handshake_rejects_finished_with_wrong_verify_data"
+        }
+      ],
+      "bounds": "Finite handshake-flight state and MAC fixtures; cryptographic hardness is assumed.",
+      "external_conditions": []
+    },
+    {
+      "id": "pq-rekey",
+      "spec": "### 5.7 Post-quantum rekey (hybrid ratchet)",
+      "claim": "Initial/hybrid/epoch/substream derived bytes match an independent HKDF/HMAC oracle; malformed ML-KEM keys/ciphertexts are rejected.",
+      "sources": [
+        {
+          "file": "src/crypto/pq.rs",
+          "symbol": "hybrid_sandwich_rekey",
+          "kind": "fn"
+        },
+        {
+          "file": "src/crypto/session.rs",
+          "symbol": "expand_epoch_keys",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_differential",
+          "file": "tests/protocol_differential.rs",
+          "name": "initial_hybrid_epoch_and_substream_schedules_match_rfc5869_oracle"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/crypto/pq.rs",
+          "name": "crypto::pq::tests::encapsulate_rejects_malformed_public_key"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/crypto/pq.rs",
+          "name": "crypto::pq::tests::decapsulate_rejects_malformed_ciphertext"
+        }
+      ],
+      "bounds": "Specified key-schedule labels and bounded PSK/epoch/stream-ID vectors; not a proof of ML-KEM.",
+      "external_conditions": []
+    },
+    {
+      "id": "identity-binding",
+      "spec": "### 5.6 Server identity proof (Phase B authentication)",
+      "claim": "ML-DSA identity signatures bind the transcript, PQ wire exchange and epoch; a wrong pinned identity closes before target dial.",
+      "sources": [
+        {
+          "file": "src/crypto/identity.rs",
+          "symbol": "pq_rekey_binding",
+          "kind": "fn"
+        },
+        {
+          "file": "src/handshake/client.rs",
+          "symbol": "verify_server_identity_payload",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_differential",
+          "file": "tests/protocol_differential.rs",
+          "name": "transcript_and_identity_bindings_match_independent_serialization"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/crypto/identity.rs",
+          "name": "crypto::identity::tests::mldsa87_identity_signature_binds_pq_rekey_exchange"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/crypto/identity.rs",
+          "name": "crypto::identity::tests::mldsa87_identity_signature_binds_epoch"
+        },
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_wrong_identity_never_opens_a_target"
+        }
+      ],
+      "bounds": "Independent serialization and generated key/signature fixtures plus wrong-pin child process.",
+      "external_conditions": [
+        "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
+      ]
+    },
+    {
+      "id": "identity-reassembly",
+      "spec": "### 6.4 SERVER_IDENTITY (`PX1S`) and chunk (`PX1I`) — server → client",
+      "claim": "The actual client identity-flight reader requires bounded contiguous PX1I chunks and rejects EOF, malformed framing, wrong AEAD and prior-epoch records.",
+      "sources": [
+        {
+          "file": "src/client/runtime.rs",
+          "symbol": "read_server_identity_payload",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::identity_reader_reassembles_and_verifies_a_pq_bound_signature"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::identity_reader_rejects_changed_total_and_noncontiguous_offsets"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::identity_reader_rejects_bad_aead_and_prior_epoch_records"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::identity_reader_rejects_eof_between_chunks_and_inside_records"
+        }
+      ],
+      "bounds": "Actual async caller over bounded in-memory records, including the exact configured payload limit.",
+      "external_conditions": []
+    },
+    {
+      "id": "command-connect",
+      "spec": "### 6.1 CONNECT (`PX1C`) — client → server",
+      "claim": "CONNECT preserves host/port/initial payload and rejects zero/oversized fields, truncation and trailing bytes according to the independent wire parser.",
+      "sources": [
+        {
+          "file": "src/protocol/command.rs",
+          "symbol": "CONNECT_MAGIC",
+          "kind": "const"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_properties",
+          "file": "tests/protocol_properties.rs",
+          "name": "connect_lengths_are_exact_and_prefixes_cannot_decode"
+        },
+        {
+          "suite": "security_protocol_differential",
+          "file": "tests/security_protocol_differential.rs",
+          "name": "connect_acceptance_fields_and_encoding_match_the_spec_oracle"
+        }
+      ],
+      "bounds": "Generated 1–255-byte hosts and bounded payloads plus the differential malformed corpus.",
+      "external_conditions": []
+    },
+    {
+      "id": "command-key-exchange",
+      "spec": "### 6.3 SERVER_KEY_EXCHANGE (`PX1K`) — server → client",
+      "claim": "PX1Q/PX1K/PX1S lengths, cipher-suite tags and fields match the independent wire oracle; invalid lengths/suite values fail.",
+      "sources": [
+        {
+          "file": "src/protocol/command.rs",
+          "symbol": "SERVER_KEY_EXCHANGE_MAGIC",
+          "kind": "const"
+        },
+        {
+          "file": "src/protocol/command.rs",
+          "symbol": "PQ_REKEY_MAGIC",
+          "kind": "const"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_properties",
+          "file": "tests/protocol_properties.rs",
+          "name": "pq_and_identity_messages_reject_changed_declared_lengths"
+        },
+        {
+          "suite": "protocol_differential",
+          "file": "tests/protocol_differential.rs",
+          "name": "remaining_control_codecs_match_independent_wire_oracle"
+        }
+      ],
+      "bounds": "Bounded valid records with every truncation and single-bit mutation of the differential seeds.",
+      "external_conditions": []
+    },
+    {
+      "id": "command-chunks",
+      "spec": "### 5.8 Chunked handshake reassembly (`PX1F` / `PX1I`)",
+      "claim": "Chunk declarations remain bounded and ordered; malformed/repeated offsets do not produce a false completion and a completed PX1F reassembler can be reused.",
+      "sources": [
+        {
+          "file": "src/protocol/command.rs",
+          "symbol": "push",
+          "kind": "fn"
+        },
+        {
+          "file": "src/protocol/command.rs",
+          "symbol": "FRAMED_CHUNK_MAGIC",
+          "kind": "const"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_properties",
+          "file": "tests/protocol_properties.rs",
+          "name": "chunks_are_bounded_ordered_and_reassembler_is_reusable"
+        },
+        {
+          "suite": "security_protocol_differential",
+          "file": "tests/security_protocol_differential.rs",
+          "name": "chunk_acceptance_fields_and_ranges_match_the_spec_oracle"
+        },
+        {
+          "suite": "security_fault_injection",
+          "file": "tests/security_fault_injection.rs",
+          "name": "reassembly_rejects_sequence_and_resource_faults_without_false_completion"
+        }
+      ],
+      "bounds": "Generated payloads up to 4096 bytes, malformed sequence/resource corpus, PX1F/PX1I wire parser differential.",
+      "external_conditions": []
+    },
+    {
+      "id": "command-mux",
+      "spec": "### 6.5 MUX_FRAME (`PX1M`) — bidirectional",
+      "claim": "All MUX kinds preserve fields and prefix consumption across concatenated frames; invalid kinds/framing fail independently of encoding success.",
+      "sources": [
+        {
+          "file": "src/protocol/command.rs",
+          "symbol": "MUX_FRAME_MAGIC",
+          "kind": "const"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_properties",
+          "file": "tests/protocol_properties.rs",
+          "name": "mux_concatenation_preserves_each_frame_and_exact_consumption"
+        },
+        {
+          "suite": "security_protocol_differential",
+          "file": "tests/security_protocol_differential.rs",
+          "name": "mux_acceptance_fields_and_prefix_consumption_match_the_spec_oracle"
+        }
+      ],
+      "bounds": "Five frame kinds, generated stream IDs/payloads, independent mutated/truncated corpus.",
+      "external_conditions": []
+    },
+    {
+      "id": "command-udp",
+      "spec": "### 6.6 UDP negotiation messages (optional, QUIC plane)",
+      "claim": "UDP offer/request/decline/probe status and speed commands preserve their exact fields, lengths and canonical encoding; unknown extensible values retain their specified compatibility semantics.",
+      "sources": [
+        {
+          "file": "src/protocol/command.rs",
+          "symbol": "UDP_OFFER_MAGIC",
+          "kind": "const"
+        },
+        {
+          "file": "src/protocol/command.rs",
+          "symbol": "SPEED_TEST_MAGIC",
+          "kind": "const"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_properties",
+          "file": "tests/protocol_properties.rs",
+          "name": "udp_and_speed_control_commands_enforce_exact_framing"
+        },
+        {
+          "suite": "protocol_differential",
+          "file": "tests/protocol_differential.rs",
+          "name": "remaining_control_codecs_match_independent_wire_oracle"
+        }
+      ],
+      "bounds": "All current control-command families; fixed probe statuses and generated version/reason/CC/FEC/byte-count fields.",
+      "external_conditions": []
+    },
+    {
+      "id": "records-aead",
+      "spec": "### 5.5 AEAD record sealing and nonce",
+      "claim": "Both record ciphers and directions match independent ciphertext/plaintext oracles; tampering, reflected directions and replay do not yield plaintext.",
+      "sources": [
+        {
+          "file": "src/protocol/data.rs",
+          "symbol": "seal",
+          "kind": "fn"
+        },
+        {
+          "file": "src/protocol/data.rs",
+          "symbol": "open",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_properties",
+          "file": "tests/protocol_properties.rs",
+          "name": "aead_tampering_reflection_and_replay_never_yield_plaintext"
+        },
+        {
+          "suite": "security_protocol_differential",
+          "file": "tests/security_protocol_differential.rs",
+          "name": "framed_aead_matches_independent_backend_in_both_directions_across_counter_carry_and_rekey"
+        }
+      ],
+      "bounds": "AES-256-GCM and ChaCha20-Poly1305, bounded payload/padding, sequence carry and fresh-key rekey.",
+      "external_conditions": []
+    },
+    {
+      "id": "records-nonce-budget",
+      "spec": "### 5.5 AEAD record sealing and nonce",
+      "claim": "Nonce reservations do not wrap; serial/parallel AEAD usage limits are enforced before output/callbacks and a fresh rekey resets the usage epoch.",
+      "sources": [
+        {
+          "file": "src/crypto/session.rs",
+          "symbol": "reserve",
+          "kind": "fn"
+        },
+        {
+          "file": "src/protocol/data.rs",
+          "symbol": "ensure_seal_budget",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/protocol/data.rs",
+          "name": "protocol::data::tests::parallel_seal_rejects_sequence_overflow"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/protocol/data.rs",
+          "name": "protocol::data::tests::aes_budget_is_shared_by_serial_and_parallel_seals_and_fresh_rekey"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/protocol/data.rs",
+          "name": "protocol::data::tests::aes_batches_reject_crossing_budget_before_output_or_callbacks"
+        }
+      ],
+      "bounds": "Exact synthetic counter/budget boundary states; no millions-of-record timing experiment required.",
+      "external_conditions": []
+    },
+    {
+      "id": "records-batch-failure",
+      "spec": "### 10.1 Record batching and parallel sealing",
+      "claim": "A failed parallel batch publishes no partial output, consumes its reserved nonce range and poisons future operations even across rekey.",
+      "sources": [
+        {
+          "file": "src/protocol/data.rs",
+          "symbol": "seal_records_into_parallel",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/protocol/data.rs",
+          "name": "protocol::data::tests::parallel_seal_failure_reserves_nonces_and_poisons_even_after_rekey"
+        },
+        {
+          "suite": "security_fault_injection",
+          "file": "tests/security_fault_injection.rs",
+          "name": "a_failed_batch_commits_no_output_invalidates_serial_input_and_poison_is_sticky"
+        }
+      ],
+      "bounds": "Injected worker/open failures and finite mixed serial/parallel batches.",
+      "external_conditions": []
+    },
+    {
+      "id": "records-padding",
+      "spec": "### 11.1 Plaintext layout (recap)",
+      "claim": "Padding trailers are bounded and removed exactly; record construction rejects unusable/over-cap lengths without leaking unfinished plaintext into committed output.",
+      "sources": [
+        {
+          "file": "src/traffic.rs",
+          "symbol": "remove_in_place",
+          "kind": "fn"
+        },
+        {
+          "file": "src/protocol/data.rs",
+          "symbol": "finish_record",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/traffic.rs",
+          "name": "traffic::tests::padding_remove_in_place_rejects_oversized_pad_length"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/protocol/data.rs",
+          "name": "protocol::data::tests::record_builder_rejects_oversized_plaintext_and_resets_buffer"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/protocol/data.rs",
+          "name": "protocol::data::tests::exact_padded_batch_has_exact_wire_lengths_and_one_nonce_per_record"
+        }
+      ],
+      "bounds": "Finite exact-capacity, oversized trailer and unfinished builder fixtures.",
+      "external_conditions": []
+    },
+    {
+      "id": "mux-lifecycle",
+      "spec": "### 9.1 MUX framing and stream lifecycle",
+      "claim": "MUX stream ordering, half-close and peer reset semantics survive the actual relay path rather than only codec roundtrips.",
+      "sources": [
+        {
+          "file": "src/handshake/server.rs",
+          "symbol": "process_server_mux_frame",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::mux_single_stream_small_consecutive_payloads_preserve_order_and_fin"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::client_mux_download_preserves_reset_versus_fin_on_local_socket"
+        }
+      ],
+      "bounds": "Actual loopback carrier and stream control fixtures.",
+      "external_conditions": [
+        "Unix loopback sockets; this is not all possible async schedules."
+      ]
+    },
+    {
+      "id": "mux-isolation",
+      "spec": "### 9.3 Mux scheduling and liveness (implementation behavior, wire-transparent)",
+      "claim": "Concurrent streams preserve identity and a stalled stream does not block unrelated traffic; binary TCP and QUIC MUX paths must actually be selected.",
+      "sources": [
+        {
+          "file": "src/handshake/server.rs",
+          "symbol": "process_server_mux_frame",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::mux_stalled_stream_does_not_block_other_streams"
+        },
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_tcp_mux_isolates_concurrent_streams"
+        },
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_quic_mux_isolates_concurrent_streams"
+        }
+      ],
+      "bounds": "Finite concurrent distinct payloads, stalled-stream fixture and explicit carrier-selection logs.",
+      "external_conditions": [
+        "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
+      ]
+    },
+    {
+      "id": "egress-policy",
+      "spec": "## 15. Address Format",
+      "claim": "A client-selected private target is rejected after authentication with no target connection; operator-fixed loopback fixtures do not bypass this test.",
+      "sources": [
+        {
+          "file": "src/handshake/server.rs",
+          "symbol": "connect_outbound_target",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_client_selected_private_target_is_denied_after_authentication"
+        }
+      ],
+      "bounds": "One actual loopback/private target, explicit production egress-denial log and observed EOF.",
+      "external_conditions": [
+        "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
+      ]
+    },
+    {
+      "id": "quic-packet",
+      "spec": "### 12.5 QUIC ClientHello (QUIC plane)",
+      "claim": "QUIC packet headers/numbers match independent layout/nearest-candidate oracles, preserve boundaries and reject reserved/unsupported forms.",
+      "sources": [
+        {
+          "file": "src/transport/udp/quic/packet.rs",
+          "symbol": "decode_packet_number",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/udp/quic/packet.rs",
+          "symbol": "locate_pn_offset",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/packet.rs",
+          "name": "transport::udp::quic::packet::generated_properties::generated_packet_numbers_match_nearest_candidate_and_minimal_width_oracles"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/packet.rs",
+          "name": "transport::udp::quic::packet::generated_properties::generated_wire_headers_preserve_fields_boundaries_and_reserved_bit_rejection"
+        }
+      ],
+      "bounds": "Generated legal packet-number windows/CIDs and malformed/truncated header classes.",
+      "external_conditions": []
+    },
+    {
+      "id": "quic-packet-crypto",
+      "spec": "### 5.1 Primitives",
+      "claim": "QUIC Initial key material matches RFC 9001 and protected payload/header composition rejects tampering.",
+      "sources": [
+        {
+          "file": "src/tls/quic/keys.rs",
+          "symbol": "encrypt_in_place",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/quic/keys.rs",
+          "symbol": "decrypt_header",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/keys.rs",
+          "name": "tls::quic::keys::tests::initial_packet_key_iv_match_rfc9001"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/keys.rs",
+          "name": "tls::quic::keys::tests::aead_open_rejects_tampered_tag"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/packet.rs",
+          "name": "transport::udp::quic::packet::tests::header_aead_and_hp_compose_round_trip"
+        }
+      ],
+      "bounds": "RFC vector plus every supported suite's finite seal/open/header-protection fixtures.",
+      "external_conditions": []
+    },
+    {
+      "id": "quic-frame",
+      "spec": "## 10. Flow Control",
+      "claim": "Every implemented QUIC frame family preserves fields; truncation, unknown types and ACK underflow fail closed without resynchronization.",
+      "sources": [
+        {
+          "file": "src/transport/udp/quic/frame.rs",
+          "symbol": "encode",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/frame.rs",
+          "name": "transport::udp::quic::frame::generated_properties::generated_frame_families_preserve_fields_and_concatenation"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/frame.rs",
+          "name": "transport::udp::quic::frame::generated_properties::generated_length_frames_reject_truncation_and_ack_underflow"
+        }
+      ],
+      "bounds": "All implemented frame variants, bounded payloads and generated varint/length/range boundaries.",
+      "external_conditions": []
+    },
+    {
+      "id": "quic-replay",
+      "spec": "## 10. Flow Control",
+      "claim": "Protected packet allocation never reuses a number or advances on rejection, and receive-range eviction cannot reopen a replay window.",
+      "sources": [
+        {
+          "file": "src/transport/udp/quic/spaces.rs",
+          "symbol": "allocate_protected",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/udp/quic/spaces.rs",
+          "symbol": "insert",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/spaces.rs",
+          "name": "transport::udp::quic::spaces::generated_properties::generated_receive_histories_match_set_model_and_preserve_replay_watermark"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/spaces.rs",
+          "name": "transport::udp::quic::spaces::generated_properties::generated_protected_allocations_never_reuse_numbers_or_advance_on_rejection"
+        }
+      ],
+      "bounds": "Generated set-model histories and synthetic sequence/confidentiality limits.",
+      "external_conditions": []
+    },
+    {
+      "id": "quic-recovery",
+      "spec": "## 10. Flow Control",
+      "claim": "ACK/discard/loss histories conserve in-flight bytes, pure-ACK tracking stays bounded and RTT estimates match integer RFC EWMA equations.",
+      "sources": [
+        {
+          "file": "src/transport/udp/quic/recovery.rs",
+          "symbol": "on_ack",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/udp/quic/recovery.rs",
+          "symbol": "detect_lost",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/udp/quic/recovery.rs",
+          "symbol": "update",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/recovery.rs",
+          "name": "transport::udp::quic::recovery::generated_properties::generated_ack_discard_and_loss_histories_match_independent_packet_list"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/recovery.rs",
+          "name": "transport::udp::quic::recovery::generated_properties::generated_pure_ack_flood_retains_only_recent_issued_entries_without_losing_in_flight"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/recovery.rs",
+          "name": "transport::udp::quic::recovery::generated_properties::generated_rtt_history_matches_integer_nanosecond_rfc_ewma"
+        }
+      ],
+      "bounds": "Bounded generated packet/ACK/time histories; no live-network loss distribution claim.",
+      "external_conditions": []
+    },
+    {
+      "id": "quic-flow-control",
+      "spec": "## 10. Flow Control",
+      "claim": "RESET_STREAM accounts for final size and releases connection credit; sequential streams replenish limits without retaining unbounded finished state.",
+      "sources": [
+        {
+          "file": "src/transport/udp/quic/conn.rs",
+          "symbol": "recv_reset_stream",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/udp/quic/conn.rs",
+          "symbol": "credit_connection_window",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/conn.rs",
+          "name": "transport::udp::quic::conn::tests::reset_stream_reclaims_connection_flow_control_credit"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/conn.rs",
+          "name": "transport::udp::quic::conn::tests::reset_stream_final_size_is_validated_and_flow_accounted"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/conn.rs",
+          "name": "transport::udp::quic::conn::tests::sequential_finished_streams_replenish_credit_and_release_state"
+        }
+      ],
+      "bounds": "Deterministic sans-I/O peer pairs and finite sequential/large-transfer fixtures.",
+      "external_conditions": []
+    },
+    {
+      "id": "quic-key-update-close",
+      "spec": "## 8. State Machine",
+      "claim": "Pre-Finished ciphertext cannot commit key-phase state; premature/unacknowledged updates and exhaustion fail closed, and closed peers drain then become quiet.",
+      "sources": [
+        {
+          "file": "src/transport/udp/quic/conn.rs",
+          "symbol": "open_data_packet",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/udp/quic/conn.rs",
+          "symbol": "build_close_packet",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/conn.rs",
+          "name": "transport::udp::quic::conn::tests::key_phase_pre_finished_ciphertexts_cannot_decrypt_or_commit"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/conn.rs",
+          "name": "transport::udp::quic::conn::tests::key_phase_unconfirmed_or_unacknowledged_updates_and_exhaustion_fail_closed"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/quic/conn.rs",
+          "name": "transport::udp::quic::conn::tests::closed_connection_goes_quiet_drains_and_stops_peer"
+        }
+      ],
+      "bounds": "Synthetic key generations/confidentiality budgets, deterministic timers and close ordering.",
+      "external_conditions": []
+    },
+    {
+      "id": "http2-carrier",
+      "spec": "### 12.4 HTTP/2 fingerprint (TCP plane)",
+      "claim": "H2 frame headers preserve all 24 length bits and reserved stream-ID semantics, and opening preface/settings/ACK behavior matches the wire shape.",
+      "sources": [
+        {
+          "file": "src/fingerprint/http2.rs",
+          "symbol": "parse_complete",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/safari26.rs",
+          "symbol": "process_http2_frames",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_carrier",
+          "file": "tests/protocol_carrier.rs",
+          "name": "generated_http2_headers_settings_and_prefaces_match_wire_layout"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::process_http2_frames_acks_each_settings_in_one_batch"
+        }
+      ],
+      "bounds": "Literal preface/setting encodings, bounded payloads, declared 24-bit length boundary classes and batched settings.",
+      "external_conditions": []
+    },
+    {
+      "id": "http3-framing",
+      "spec": "### 12.6 HTTP/3 fingerprint (QUIC plane)",
+      "claim": "H3 stream/frame varints accept legal non-minimal encodings, preserve prefix consumption and reject truncated/over-cap length claims.",
+      "sources": [
+        {
+          "file": "src/fingerprint/http3.rs",
+          "symbol": "decode_frame",
+          "kind": "fn"
+        },
+        {
+          "file": "src/fingerprint/http3.rs",
+          "symbol": "read_stream_type",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_carrier",
+          "file": "tests/protocol_carrier.rs",
+          "name": "generated_http3_varints_frames_and_advertised_lengths_match_independent_oracle"
+        }
+      ],
+      "bounds": "All four varint widths, bounded payloads, 1MiB cap and hostile 32/62-bit declared lengths.",
+      "external_conditions": []
+    },
+    {
+      "id": "http3-settings",
+      "spec": "### 12.6 HTTP/3 fingerprint (QUIC plane)",
+      "claim": "H3 SETTINGS syntax and the subsequent exact Safari shape check are distinct: the actual shape rejects reordering, duplicates, extra entries and wrong fixed values.",
+      "sources": [
+        {
+          "file": "src/fingerprint/http3.rs",
+          "symbol": "parse_settings_payload",
+          "kind": "fn"
+        },
+        {
+          "file": "src/fingerprint/http3.rs",
+          "symbol": "is_safari26_settings",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_carrier",
+          "file": "tests/protocol_carrier.rs",
+          "name": "generated_http3_settings_parser_and_shape_checks_match_independent_values"
+        }
+      ],
+      "bounds": "Independent varint-pair oracle, generated GREASE derivation, every prefix and invalid three-setting shape class.",
+      "external_conditions": []
+    },
+    {
+      "id": "qpack-fields",
+      "spec": "### 12.6 HTTP/3 fingerprint (QUIC plane)",
+      "claim": "Static QPACK literals and name references decode independent non-Huffman encodings; dynamic references, bad indices, invalid UTF-8/Huffman and oversize claims fail.",
+      "sources": [
+        {
+          "file": "src/fingerprint/http3.rs",
+          "symbol": "decode_field_section",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_carrier",
+          "file": "tests/protocol_carrier.rs",
+          "name": "generated_qpack_literal_and_name_reference_decoding_uses_independent_wire"
+        },
+        {
+          "suite": "protocol_carrier",
+          "file": "tests/protocol_carrier.rs",
+          "name": "qpack_static_indices_and_malformed_strings_fail_without_aliasing"
+        }
+      ],
+      "bounds": "Bounded raw literal strings, integer continuation boundaries, specified static indices and malformed reference corpus.",
+      "external_conditions": []
+    },
+    {
+      "id": "udp-exporter",
+      "spec": "### 14.1 QUIC-plane auth token (RFC 5705 exporter binding)",
+      "claim": "Exporter auth tokens bind both the PSK and live session/offer context; a token cannot transfer between sessions or offers.",
+      "sources": [
+        {
+          "file": "src/transport/udp/auth.rs",
+          "symbol": "export_udp_auth_token",
+          "kind": "fn"
+        },
+        {
+          "file": "src/transport/udp/auth.rs",
+          "symbol": "exporter_context",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_differential",
+          "file": "tests/protocol_differential.rs",
+          "name": "initial_hybrid_epoch_and_substream_schedules_match_rfc5869_oracle"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/auth.rs",
+          "name": "transport::udp::auth::tests::exporter_context_matches_independent_length_prefixed_hash"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/auth.rs",
+          "name": "transport::udp::auth::tests::live_exporter_tokens_cannot_transfer_between_sessions_or_offers"
+        }
+      ],
+      "bounds": "Independent length-prefixed context hash and real loopback QUIC exporter pairs.",
+      "external_conditions": [
+        "Loopback UDP sockets; standard cryptographic collision assumptions apply."
+      ]
+    },
+    {
+      "id": "udp-probe",
+      "spec": "## 14. UDP/QUIC Fast-Plane Specification",
+      "claim": "A correct bidi probe verifies, wrong token/malformed reply is rejected, and server-declined UDP retains successful TCP operation with shared retry suppression.",
+      "sources": [
+        {
+          "file": "src/transport/udp/probe.rs",
+          "symbol": "probe_client_over_bidi",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/probe.rs",
+          "name": "transport::udp::probe::tests::bidi_probe_verifies_over_loopback"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/probe.rs",
+          "name": "transport::udp::probe::tests::bidi_probe_with_wrong_token_is_failed_not_verified"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/probe.rs",
+          "name": "transport::udp::probe::tests::bidi_probe_malformed_reply_is_malformed_not_unreachable"
+        },
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_udp_decline_falls_back_and_suppresses_repeated_probes"
+        }
+      ],
+      "bounds": "Actual H3 request bidi and bounded probe outcomes; server decline observed through production child logs.",
+      "external_conditions": [
+        "Unix child processes and loopback TCP/UDP sockets; temporary CA is trusted only by children."
+      ]
+    },
+    {
+      "id": "zero-rtt",
+      "spec": "### 12.8 QUIC 0-RTT resumption (optional)",
+      "claim": "A second session actually accepts early data; ticket replay falls back to 1-RTT and single-use state persists over server restart.",
+      "sources": [
+        {
+          "file": "src/transport/udp/zero_rtt.rs",
+          "symbol": "accept_ticket",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/mod.rs",
+          "name": "transport::udp::zero_rtt_resumption::two_session_resumption_accepts_early_data"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/mod.rs",
+          "name": "transport::udp::zero_rtt_resumption::replayed_ticket_is_rejected_and_falls_back_to_1rtt"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/transport/udp/mod.rs",
+          "name": "transport::udp::zero_rtt_resumption::single_use_persists_across_server_restart"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/client/runtime.rs",
+          "name": "client::runtime::tests::run_client_udp_probe_resumes_with_0rtt_on_the_second_session"
+        }
+      ],
+      "bounds": "Two controlled sessions, replay and disk-backed restart; actual server early-data acceptance assertions.",
+      "external_conditions": [
+        "Loopback TCP/UDP sockets and temporary ticket/replay state."
+      ]
+    },
+    {
+      "id": "camouflage-splice",
+      "spec": "## 13. Origin-Splice (Active-Probing Resistance)",
+      "claim": "Unauthenticated TLS is relayed to the actual origin and the proxy remains usable; Safari GREASE/cipher opening constraints are checked separately.",
+      "sources": [
+        {
+          "file": "src/handshake/server.rs",
+          "symbol": "relay_fallback",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/safari_shape.rs",
+          "symbol": "safari_cipher_suites",
+          "kind": "fn"
+        }
+      ],
+      "tests": [
+        {
+          "suite": "protocol_e2e",
+          "file": "tests/protocol_e2e.rs",
+          "name": "binary_unauthenticated_tls_splice_preserves_origin_and_recovers"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari_shape.rs",
+          "name": "tls::safari_shape::tests::cipher_suites_are_grease_led_and_complete"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari_shape.rs",
+          "name": "tls::safari_shape::tests::grease_set_forces_distinct_first_and_last_extension"
+        }
+      ],
+      "bounds": "Trusted local origin byte exchange and finite captured/template constraints.",
+      "external_conditions": [
+        "Unix loopback fixtures. Statistical indistinguishability and live-censor resistance require separate field measurements."
+      ]
+    }
+  ]
+}

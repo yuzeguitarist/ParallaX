@@ -6,6 +6,13 @@ the existing verification layers; each layer checks different properties.
 Coverage of every protocol phase does not mean every possible execution is
 proved, or that these models prove the Rust implementation as a whole.
 
+The [contract ledger](protocol_contracts.json) makes 40 individual obligations
+explicit: each names its SPEC section, production symbol, assertion, exact Rust
+test selectors, finite bounds and remaining external conditions. The checker
+distinguishes valid references from actual passing execution. A changed or
+missing selector, incomplete run, ignored test, stale/dirty revision or missing
+completion log cannot count as execution evidence.
+
 ## Coverage matrix
 
 Paths in the property/differential columns are relative to `tests/`, except the
@@ -14,16 +21,17 @@ crate-private QUIC unit tests. Existing tests remain part of this matrix.
 | Protocol surface | Formal verification | E2E / runtime integration | Property / differential checks |
 | --- | --- | --- | --- |
 | SOCKS5 admission and destination routing (§15) | Inbound/session gates model authentication order, not SOCKS bytes | `protocol_e2e`: fragmented SOCKS negotiation, DOMAIN request, invalid method, real encrypted CONNECT and private-target denial | CONNECT lengths, truncation, trailing bytes and independent parser in `protocol_properties` / `security_protocol_differential` |
-| TCP carrier authentication, transcript and freshness (§5, §7) | Session, inbound, replay models; source-order correspondence | Certificate-verified binary TCP/QUIC sessions; persistent replay/admission in `security_listener` | Generated authentication recovery/tampering, replay-cache decisions; independent HKDF/HMAC, carrier bytes and transcript serialization in `protocol_differential` |
+| TCP carrier authentication, transcript and freshness (§5, §7) | Session explicitly separates pending-admission splice from post-PQ-proof commit refusal/close; inbound/replay models and source-order correspondence | Binary wrong PSK/static pin/CA/SNI rejection followed by corrected-client recovery; `security_listener` distinguishes known-replay splice from late capacity refusal | Generated full server auth decision, recovery/tag/random/PSK/SNI tampering, replay-cache histories; independent HKDF/HMAC/carrier/transcript oracles |
 | Hybrid X25519 + ML-KEM, identity, epoch/substream keys (§5.3–5.7) | Session gates and Kani nonce/substream-info properties; [ProVerif identity/rekey slice](proverif/README.md) | Every successful binary case completes production PQ/identity; wrong ML-DSA pin closes before target dial | Independent key schedule/identity-message oracle; `mldsa_differential`, `mldsa_acvp`; existing ML-KEM roundtrip and malformed-input tests |
 | All PX1 control messages, including speed and UDP (§3, §6) | Session/probe order; status-byte sweep | Real CONNECT, UDP request/offer/probe/decline; existing speed runtime tests | All command families covered between `protocol_properties`, `protocol_differential` and `security_protocol_differential`; semantic fields, acceptance, encoding and consumption |
-| PX1F/PX1I chunk framing (§5.8) | New `ParallaXFragments`: every positive partition of 1–3 bytes, two successive PX1F frames, invalid continuation classes | Production PQ and identity flights are used by binary cases | Generated chunk/reassembly bounds and reuse; independent PX1F/PX1I wire parsers; `security_fault_injection` sequence/resource faults |
+| PX1F/PX1I chunk framing (§5.8) | `ParallaXFragments` covers bounded PX1F partitions/reuse; `ParallaXIdentityChunks` models the actual client's AEAD/total/offset/cap/verify/CONNECT gates | Seven `identity_reader_*` tests call the production PX1I reader after real PQ rekey: valid signature, exact 16KiB, changed total/offset, EOF, bad AEAD/old epoch and wrong framing | Generated chunk/reassembly bounds and reuse; independent PX1F/PX1I wire parsers; `security_fault_injection` sequence/resource faults |
 | AES-GCM / ChaCha20-Poly1305 records, padding, counters and batches (§5.5, §10–11) | New `ParallaXRecords`: reserve, collect, publish, sticky poison and fresh-key rekey; existing Kani arithmetic proofs | Binary cases carry large bidirectional payloads and clean FIN | Generated direction/tamper/replay invariants; existing RustCrypto-vs-aws-lc record oracle, counter carry, rekey, serial/parallel batches and rollback/fault tests |
-| TCP single stream / MUX lifecycle (§9) | Session/record gates; existing bounded concurrency/Kani checks cover selected production transitions | Separate binary TCP/MUX cases with concurrent distinct payloads; existing runtime tests cover different targets, backpressure, FIN/reset and watchdogs | Generated concatenated MUX frames and exact consumption; independent MUX parser |
-| QUIC TLS, packet/frame/transport-parameter codecs and recovery (§12, §14) | QUIC handshake, key installation, packet classification, BBR and close models; existing Kani bounded admission/ACK/parameter proofs | Separate binary QUIC/MUX cases require Verified probes and actual QUIC data-mode selection; existing lossy/reordered/duplicated packet simulation | Generated crate-private varint/frame/transport-parameter properties; existing RFC 9000/9001/8448 vectors; independent QUIC marker and TLS record header oracles |
-| UDP negotiation, exporter binding and TCP fallback (§6.6, §14) | Probe/session models check retention only after matching Verified outcome | Binary server-decline case verifies TCP payload delivery and suppression of repeated probes; QUIC cases verify successful retention | Independent exporter-token schedule and every negotiation command, status values, lengths and canonical encoding |
+| TCP single stream / MUX lifecycle (§9) | `ParallaXMux`: two streams, capacity 1/2, bidirectional FIN, reset/idle/setup failure, asynchronous cancellation, slot reuse, sibling isolation and carrier teardown | Separate binary TCP/MUX cases with concurrent distinct payloads and IPv4/DOMAIN/IPv6 SOCKS requests; existing runtime tests cover different targets, backpressure, FIN/reset and watchdogs | Generated concatenated MUX frames and exact consumption; independent MUX parser |
+| QUIC TLS, packet/frame/transport-parameter codecs and recovery (§12, §14) | QUIC handshake/key-install/packet/BBR/close models; existing Kani admission/ACK/parameter proofs | Binary QUIC/MUX requires actual retained QUIC data-mode evidence; lossy/reordered/duplicated packet simulation | Independent PN nearest-candidate/width and header wire oracles, receive-set/replay-watermark and ACK/loss/in-flight list models, integer RTT EWMA; frame/varint/transport-parameter generators and RFC vectors |
+| UDP negotiation, exporter binding and TCP fallback (§6.6, §14) | Probe/session models check retention only after matching Verified outcome | Binary server-decline verifies TCP delivery and suppression of repeated probes; two live TLS sessions prove tokens cannot transfer across session or offer context | Independent exporter context-hash and token schedule; every negotiation command/status/length/canonical encoding |
 | Tickets, 0-RTT single use, restart and reconnect (§12.8) | ZeroRtt/keys/session models include binder, durable replay guard, busy/full rejection and reconnect | Existing `transport::udp::zero_rtt_resumption` tests assert early acceptance, replay-to-1RTT fallback and restart persistence; `run_client_udp_probe_resumes_with_0rtt_on_the_second_session` checks the client runtime | Existing ticket/parser/replay tests; generated replay-cache boundaries. Binary QUIC cases run two sessions but do not claim to observe early-data acceptance |
-| Camouflage and unauthenticated origin splice (§11–13) | Inbound/session/packet models cover control order | Existing `security_listener`, `gfw_simulator`, `e2e_tunnel_roundtrip` and origin-splice tests exercise the actual listener and TLS origin | Existing Safari H2/H3/ClientHello baselines and distinguisher suite; generated record bounds and independent TLS length/content-type sweep supplement them |
+| Camouflage and unauthenticated origin splice (§11–13) | Inbound/session/packet models cover control order | Ordinary unmarked rustls client completes TLS and application exchange through the binary server to the real fixture origin; server remains usable afterward | Independent H2 headers/SETTINGS, H3 varints/frames/SETTINGS, QPACK literal/static wire and malformed input; captured Safari baselines remain separate evidence |
+| H3 control/business stream framing (§12.6) | Probe/session models gate retained business traffic | Both business directions check 4096/4097, fragmented nonminimal varints, body EOF and untouched following DATA; control checks both QPACK orders, duplicates, SETTINGS-first, 256/257 and framing EOF | Buffered H3 codecs have independent length/consumption oracles in `protocol_carrier` |
 
 ## Run and reproduce
 
@@ -37,11 +45,16 @@ python3 -m unittest discover -s formal -p 'test_*.py'
 python3 formal/plx_formal.py tlc --jar /path/to/trusted/tla2tools.jar
 
 cargo test --locked --test protocol_properties --test protocol_differential
+cargo test --locked --test protocol_carrier
 cargo test --locked --lib generated_properties
 cargo test --locked --test protocol_e2e -- --ignored --test-threads=1
 
 # Existing oracles, fault tests and new generated/differential tests, with evidence:
 python3 scripts/security/assurance.py protocol
+python3 scripts/verification/check_spec.py
+python3 scripts/verification/protocol_contracts.py --check
+# After committing, require matching clean-revision run logs, not just references:
+python3 scripts/verification/protocol_contracts.py --check --evidence target/security/assurance/protocol/report.json
 # All existing loopback suites, including explicit 0-RTT runtime acceptance:
 cargo test --locked -- --ignored --test-threads=1
 ```
@@ -60,6 +73,25 @@ generated/differential tests with a seed derived from the Actions run ID, and
 1,024 cases on scheduled runs. The assurance report records the effective seed,
 case budget, selected tests and logs under `target/security/assurance/protocol/`.
 Formal/TLC, Kani and ProVerif retain their dedicated workflows and toolchains.
+The protocol assurance run now includes the entire library with
+`--include-ignored --test-threads=1`, all protocol oracle targets, binary E2E and
+the real listener suite. Source-reference checking alone never claims these ran.
+
+The `protocol-coverage` job additionally runs all test targets under pinned
+`cargo-llvm-cov` 0.8.7 and retains raw JSON, text with uncovered source lines and
+HTML. These metrics include inline unit-test code and Rust instrumentation;
+they do not measure native crypto assembly or every instruction in abruptly
+terminated child processes. Coverage percentages are not a proof of assertions
+or a promise of 100% implementation coverage.
+
+The Linux `public-route` job runs `python3 scripts/verification/public_route.py`.
+It creates fresh unnamed network namespaces containing only loopback, assigns
+public IPv4/IPv6 address shapes there and runs the actual binary TCP case with
+`PARALLAX_TEST_PUBLIC_TARGET`. That case omits the server fixed-target override,
+requires two real SOCKS-selected target connections and complete payload/FIN,
+and emits a required execution witness. The addresses never leave the isolated
+namespace. The job fails if privilege/isolation or the witness is missing; the
+ordinary loopback case is not accepted as evidence for this lane.
 
 ## Bounds
 
@@ -70,10 +102,12 @@ Formal/TLC, Kani and ProVerif retain their dedicated workflows and toolchains.
   their generated tests compile only under `cfg(test)`.
 - Differential tests use independent wire parsers/layouts and crypto backends.
   They are not a second complete interoperable TLS/QUIC implementation.
-- Successful binary E2E uses an operator-fixed loopback target because the
+- Ordinary successful binary E2E uses an operator-fixed loopback target because the
   production egress policy forbids client-selected private destinations. The
   separate denial case exercises that production policy without a bypass.
   Temporary CA trust is restricted to child processes. Tests require Unix;
   no public origin, global trust-store change or production test hook is needed.
+  ClientChosen public-address success has its separate isolated Linux lane;
+  arbitrary external DNS and live Internet reachability remain external tests.
 - Local fixtures and Safari baselines do not establish Internet reachability,
   resistance to every censor or statistical indistinguishability on live paths.

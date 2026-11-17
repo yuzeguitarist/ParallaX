@@ -116,6 +116,9 @@ jobs:
           python3 -B -m unittest discover -s scripts/traffic_lab -p 'test_*.py'
           python3 -B -m unittest discover -s ops/traffic-lab -p 'test_*.py'
           python3 -m unittest discover -s formal -p 'test_*.py'
+          python3 -m unittest discover -s scripts/verification -p 'test_*.py'
+          python3 scripts/verification/check_spec.py
+          python3 scripts/verification/protocol_contracts.py --check
           python3 scripts/wiki_sync/test_convert.py
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -161,6 +164,7 @@ jobs:
             --test mldsa_differential \
             --test no_timeout_ratchet \
             --test prober_loop \
+            --test protocol_carrier \
             --test protocol_differential \
             --test protocol_e2e \
             --test protocol_properties \

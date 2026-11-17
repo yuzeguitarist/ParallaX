@@ -27,11 +27,12 @@ def selections(kind: str, replay_test: str | None = None) -> list[tuple[str, lis
     if kind == "protocol":
         return [(name, ["cargo", "test", "--locked", "--test", name], [])
                 for name in ("security_protocol_differential", "security_fault_injection",
-                             "protocol_differential", "protocol_properties",
+                             "protocol_differential", "protocol_properties", "protocol_carrier",
                              "security_plaintext_allocation",
                              "mldsa_differential", "mldsa_acvp")] + [
-            ("quic_properties", ["cargo", "test", "--locked", "--lib",
-                                 "generated_properties"], [])]
+            ("protocol_library", ["cargo", "test", "--locked", "--lib"], ["--include-ignored"]),
+            ("protocol_e2e", ["cargo", "test", "--locked", "--test", "protocol_e2e"], ["--ignored"]),
+            ("security_listener", ["cargo", "test", "--locked", "--test", "security_listener"], ["--ignored"])]
     if kind == "listener":
         return [("security_listener", ["cargo", "test", "--locked", "--test",
                                       "security_listener"], ["--ignored"])]

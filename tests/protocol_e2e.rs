@@ -1,6 +1,6 @@
 //! Shipped-binary E2E: SOCKS5 -> authenticated TLS/PQ/identity -> TCP or
-//! QUIC/H3 relay -> local target. Every endpoint is loopback; only the child
-//! client trusts the temporary CA. No cfg(test) certificate bypass is involved.
+//! QUIC/H3 relay -> local target. By default every endpoint is loopback; only
+//! the child client trusts the temporary CA. No cfg(test) certificate bypass is involved.
 //!
 //! Run: cargo test --locked --test protocol_e2e -- --ignored --test-threads=1
 //! QUIC assertions require both a Verified probe and the server's actual relay
@@ -11,11 +11,16 @@
 //! chosen loopback destinations are deliberately denied by the production SSRF
 //! policy. A separate case omits that setting and verifies the denial after a
 //! real encrypted ConnectRequest, without adding a test escape to that policy.
+//! With PARALLAX_TEST_PUBLIC_TARGET=<IP>, only binary_tcp_socks_pq_identity_roundtrip
+//! binds its echo target at that explicitly supplied IP and omits data_target.
+//! Run that exact test with --ignored --nocapture inside an isolated Linux
+//! network namespace where the public-shaped IP is already assigned. Only this
+//! mode emits PUBLIC_ROUTE_VERIFIED after two actual client-selected relays.
 
 #![cfg(unix)]
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener as StdListener};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -28,9 +33,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use parallax::crypto::{identity, session::X25519KeyPair};
 use rand::{rngs::OsRng, RngCore};
 use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose,
 };
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -114,9 +120,10 @@ impl Drop for Binary {
     }
 }
 
-fn local_pki() -> (Arc<rustls::ServerConfig>, String) {
+fn local_pki(root_name: &str) -> (Arc<rustls::ServerConfig>, String, CertificateDer<'static>) {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.distinguished_name.push(DnType::CommonName, root_name);
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca = ca.self_signed(&ca_key).unwrap();
@@ -137,7 +144,7 @@ fn local_pki() -> (Arc<rustls::ServerConfig>, String) {
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
     )
     .unwrap();
-    (Arc::new(config), ca.pem())
+    (Arc::new(config), ca.pem(), ca.der().clone())
 }
 
 async fn serve_origin(mut stream: TcpStream, config: Arc<rustls::ServerConfig>) -> io::Result<()> {
@@ -155,16 +162,84 @@ async fn serve_origin(mut stream: TcpStream, config: Arc<rustls::ServerConfig>) 
         }
         tls.read_tls(&mut Cursor::new(&buffer[..n]))?;
         tls.process_new_packets().map_err(io::Error::other)?;
+        // Ordinary browsers must receive real TLS application traffic through
+        // the unauthenticated splice. The authenticated path can abandon this
+        // origin at PQ cutover, independently of this application echo.
+        loop {
+            match tls.reader().read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => tls.writer().write_all(&buffer[..n])?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
+async fn browser_tls_echo(server: SocketAddr, ca: CertificateDer<'static>) {
+    timeout(STEP, async {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let mut tls =
+            rustls::ClientConnection::new(Arc::new(config), ServerName::try_from(SNI).unwrap())
+                .unwrap();
+        let mut wire = TcpStream::connect(server).await.unwrap();
+        let payload = b"ordinary TLS application bytes through the origin splice";
+        tls.writer().write_all(payload).unwrap();
+        let mut echoed = Vec::new();
+        let mut buffer = [0; 16 * 1024];
+        while echoed.len() < payload.len() {
+            while tls.wants_write() {
+                let mut flight = Vec::new();
+                tls.write_tls(&mut flight).unwrap();
+                wire.write_all(&flight).await.unwrap();
+            }
+            let n = wire.read(&mut buffer).await.unwrap();
+            assert_ne!(
+                n, 0,
+                "ordinary TLS splice closed before the application reply"
+            );
+            tls.read_tls(&mut Cursor::new(&buffer[..n])).unwrap();
+            tls.process_new_packets().unwrap();
+            loop {
+                match tls.reader().read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => echoed.extend_from_slice(&buffer[..n]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("ordinary TLS splice application read failed: {error}"),
+                }
+            }
+        }
+        assert_eq!(echoed, payload);
+        tls.send_close_notify();
+        let mut close = Vec::new();
+        tls.write_tls(&mut close).unwrap();
+        wire.write_all(&close).await.unwrap();
+        wire.shutdown().await.unwrap();
+    })
+    .await
+    .expect("unauthenticated TLS splice must complete with verified origin identity");
+}
+
 async fn connect_socks(local: SocketAddr, target: SocketAddr) -> TcpStream {
-    timeout(STEP, connect_socks_inner(local, target))
+    timeout(STEP, connect_socks_inner(local, target, 3, &[]))
         .await
         .expect("SOCKS connect and negotiation must complete")
 }
 
-async fn connect_socks_inner(local: SocketAddr, target: SocketAddr) -> TcpStream {
+async fn connect_socks_inner(
+    local: SocketAddr,
+    target: SocketAddr,
+    atyp: u8,
+    initial_payload: &[u8],
+) -> TcpStream {
     let mut app = TcpStream::connect(local).await.unwrap();
     // Fragment negotiation and use the DOMAIN address form, rather than calling
     // a protocol helper. The actual SOCKS listener must parse these wire bytes.
@@ -174,9 +249,30 @@ async fn connect_socks_inner(local: SocketAddr, target: SocketAddr) -> TcpStream
     let mut method = [0; 2];
     app.read_exact(&mut method).await.unwrap();
     assert_eq!(method, [5, 0]);
-    let mut request = vec![5, 1, 0, 3, 9];
-    request.extend_from_slice(b"127.0.0.1");
+    let mut request = vec![5, 1, 0, atyp];
+    match atyp {
+        1 => match target.ip() {
+            std::net::IpAddr::V4(ip) => request.extend_from_slice(&ip.octets()),
+            std::net::IpAddr::V6(_) => unreachable!("IPv6 targets require SOCKS ATYP 4 or DOMAIN"),
+        },
+        3 => {
+            let host = target.ip().to_string();
+            request.push(u8::try_from(host.len()).unwrap());
+            request.extend_from_slice(host.as_bytes());
+        }
+        4 => {
+            let ip = match target.ip() {
+                std::net::IpAddr::V6(ip) => ip,
+                // Existing fixed-target mux cases intentionally test the IPv6
+                // address form while the operator routes to the IPv4 fixture.
+                std::net::IpAddr::V4(_) => std::net::Ipv6Addr::LOCALHOST,
+            };
+            request.extend_from_slice(&ip.octets());
+        }
+        _ => unreachable!("E2E driver only sends the three SOCKS address forms"),
+    }
     request.extend_from_slice(&target.port().to_be_bytes());
+    request.extend_from_slice(initial_payload);
     app.write_all(&request).await.unwrap();
     let mut reply = [0; 10];
     app.read_exact(&mut reply).await.unwrap();
@@ -186,13 +282,23 @@ async fn connect_socks_inner(local: SocketAddr, target: SocketAddr) -> TcpStream
 }
 
 async fn roundtrip(local: SocketAddr, target: SocketAddr, stream: u8) {
-    let mut app = connect_socks(local, target).await;
     let payload: Vec<_> = (0..(256 * 1024 + 37))
         .map(|i| ((i * 37 + usize::from(stream)) % 251) as u8)
         .collect();
+    let atyp = if target.is_ipv6() && stream == 1 {
+        4
+    } else {
+        [1, 3, 4][usize::from(stream - 1) % 3]
+    };
+    let mut app = timeout(
+        STEP,
+        connect_socks_inner(local, target, atyp, &payload[..4096]),
+    )
+    .await
+    .expect("SOCKS request pipelined with initial application payload must succeed");
     let (mut read, mut write) = app.split();
     let send = async {
-        for chunk in payload.chunks(8191) {
+        for chunk in payload[4096..].chunks(8191) {
             write.write_all(chunk).await.unwrap();
         }
         write.shutdown().await.unwrap();
@@ -214,6 +320,65 @@ async fn roundtrip(local: SocketAddr, target: SocketAddr, stream: u8) {
         .expect("SOCKS authenticated roundtrip and half-close must complete");
 }
 
+async fn malformed_socks(local: SocketAddr, client: &mut Binary) {
+    for (greeting, reason) in [
+        (&[4, 1, 0][..], "unsupported SOCKS version: 4"),
+        (
+            &[5, 0][..],
+            "SOCKS client offered no authentication methods",
+        ),
+    ] {
+        timeout(STEP, async {
+            let mut app = TcpStream::connect(local).await.unwrap();
+            app.write_all(greeting).await.unwrap();
+            app.shutdown().await.unwrap();
+            let mut byte = [0];
+            assert!(matches!(app.read(&mut byte).await, Ok(0) | Err(_)));
+        })
+        .await
+        .expect("invalid SOCKS greeting must close locally");
+        client.wait_for(reason).await;
+    }
+    for (request, reason) in [
+        (
+            &[5, 2, 0, 1, 127, 0, 0, 1, 0, 80][..],
+            "unsupported SOCKS command: 2",
+        ),
+        (
+            &[5, 1, 1, 1, 127, 0, 0, 1, 0, 80][..],
+            "SOCKS reserved byte must be zero",
+        ),
+        (&[5, 1, 0, 1, 127][..], "SOCKS error: I/O error:"),
+        (&[5, 1, 0, 4, 0, 0, 0][..], "SOCKS error: I/O error:"),
+        (&[5, 1, 0, 3, 3, b'a'][..], "SOCKS error: I/O error:"),
+        (&[5, 1, 0, 3, 0, 0, 80][..], "SOCKS domain name is empty"),
+        (
+            &[5, 1, 0, 3, 1, 0xff, 0, 80][..],
+            "SOCKS domain name is not valid UTF-8",
+        ),
+        (
+            &[5, 1, 0, 1, 127, 0, 0, 1, 0, 0][..],
+            "SOCKS target port must not be zero",
+        ),
+        (&[5, 1, 0, 9][..], "unsupported SOCKS address type: 9"),
+    ] {
+        timeout(STEP, async {
+            let mut app = TcpStream::connect(local).await.unwrap();
+            app.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0; 2];
+            app.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+            app.write_all(request).await.unwrap();
+            app.shutdown().await.unwrap();
+            let mut byte = [0];
+            assert!(matches!(app.read(&mut byte).await, Ok(0) | Err(_)));
+        })
+        .await
+        .expect("invalid SOCKS request must close locally");
+        client.wait_for(reason).await;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Case {
     Tcp,
@@ -223,17 +388,42 @@ enum Case {
     DeclineUdp,
     WrongIdentity,
     DeniedTarget,
+    WrongPsk,
+    WrongX25519,
+    UntrustedOrigin,
+    WrongOriginName,
+    OriginSplice,
+    SocksBoundaries,
 }
 
 async fn scenario(case: Case) {
     let dir = tempfile::tempdir().unwrap();
-    let (origin_config, ca) = local_pki();
+    let (origin_config, ca, ca_der) = local_pki("ParallaX E2E Trusted Root");
     let ca_path = dir.path().join("ca.pem");
     write_private(&ca_path, ca.as_bytes());
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_addr = origin.local_addr().unwrap();
-    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public_target = if matches!(case, Case::Tcp) {
+        std::env::var_os("PARALLAX_TEST_PUBLIC_TARGET").map(|value| {
+            value
+                .into_string()
+                .expect("PARALLAX_TEST_PUBLIC_TARGET must be an IP address")
+                .parse::<std::net::IpAddr>()
+                .expect("PARALLAX_TEST_PUBLIC_TARGET must be an IP address")
+        })
+    } else {
+        None
+    };
+    let target_ip = public_target.unwrap_or(std::net::Ipv4Addr::LOCALHOST.into());
+    let target = TcpListener::bind(SocketAddr::new(target_ip, 0))
+        .await
+        .expect("bind the exact requested E2E echo target address");
     let target_addr = target.local_addr().unwrap();
+    assert_eq!(
+        target_addr.ip(),
+        target_ip,
+        "fixture must bind the requested IP"
+    );
     let target_accepts = Arc::new(AtomicUsize::new(0));
     let mut fixtures = JoinSet::new();
     fixtures.spawn(async move {
@@ -291,10 +481,15 @@ async fn scenario(case: Case) {
     let server_path = dir.path().join("server.toml");
     let client_path = dir.path().join("client.toml");
     let traffic = if mux { 8 } else { 1 };
-    let fixed_target = if matches!(case, Case::DeniedTarget) {
+    let fixed_target = if matches!(case, Case::DeniedTarget) || public_target.is_some() {
         String::new()
     } else {
         format!("data_target = \"{target_addr}\"")
+    };
+    let allowed_sni = if matches!(case, Case::WrongOriginName) {
+        "\"example.com\", \"mismatch.example\""
+    } else {
+        "\"example.com\""
     };
     let server_text = format!(
         r#"mode = "server"
@@ -312,15 +507,16 @@ fallback_addr = "{origin_addr}"
 private_key = "{}"
 identity_secret_key = "{}"
 replay_cache_path = {}
-authorized_sni = ["{SNI}"]
+authorized_sni = [{allowed_sni}]
 "#,
         STANDARD.encode(psk),
         STANDARD.encode(session.private),
         STANDARD.encode(&identity.secret),
         toml::Value::String(dir.path().join("replay.cache").to_str().unwrap().to_owned()),
     );
-    let client_text = format!(
-        r#"mode = "client"
+    let make_client_config = |client_psk: &[u8], public: &[u8; 32], sni: &str, pin: &[u8]| {
+        format!(
+            r#"mode = "client"
 [crypto]
 psk = "{}"
 [traffic]
@@ -331,21 +527,45 @@ probe_timeout_ms = 3000
 [client]
 listen = "{client_addr}"
 server_addr = "{server_addr}"
-sni = "{SNI}"
+sni = "{sni}"
 server_public_key = "{}"
 server_identity_public_key = "{}"
 "#,
-        STANDARD.encode(psk),
-        STANDARD.encode(session.public),
-        STANDARD.encode(&pinned_identity),
-    );
+            STANDARD.encode(client_psk),
+            STANDARD.encode(public),
+            STANDARD.encode(pin),
+        )
+    };
+    let mut client_psk = psk;
+    if matches!(case, Case::WrongPsk) {
+        client_psk[0] ^= 1;
+    }
+    let client_public = if matches!(case, Case::WrongX25519) {
+        X25519KeyPair::generate().public
+    } else {
+        session.public
+    };
+    let client_sni = if matches!(case, Case::WrongOriginName) {
+        "mismatch.example"
+    } else {
+        SNI
+    };
+    let client_text = make_client_config(&client_psk, &client_public, client_sni, &pinned_identity);
+    let initial_ca = if matches!(case, Case::UntrustedOrigin) {
+        let (_, unrelated_ca, _) = local_pki("ParallaX E2E Unrelated Root");
+        let path = dir.path().join("unrelated-ca.pem");
+        write_private(&path, unrelated_ca.as_bytes());
+        path
+    } else {
+        ca_path.clone()
+    };
     write_private(&server_path, server_text.as_bytes());
     write_private(&client_path, client_text.as_bytes());
     drop(server_reservation);
     let mut server = Binary::spawn("serve", &server_path, &ca_path);
     server.wait_for("ParallaX server listening").await;
     drop(client_reservation);
-    let mut client = Binary::spawn("client", &client_path, &ca_path);
+    let mut client = Binary::spawn("client", &client_path, &initial_ca);
     client.wait_for("ParallaX client SOCKS5 listening").await;
 
     // Invalid SOCKS methods must be rejected locally, without opening a target.
@@ -360,7 +580,28 @@ server_identity_public_key = "{}"
     drop(invalid);
     assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
 
-    if matches!(case, Case::WrongIdentity | Case::DeniedTarget) {
+    if matches!(case, Case::OriginSplice) {
+        browser_tls_echo(server_addr, ca_der).await;
+        server.wait_for("AuthFailed").await;
+        assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
+        assert!(!server
+            .logs()
+            .contains("authenticated pre-data mode started"));
+    }
+    if matches!(case, Case::SocksBoundaries) {
+        malformed_socks(client_addr, &mut client).await;
+        assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            server.logs().matches("accepted outer connection").count(),
+            0
+        );
+    }
+
+    let failed_then_recover = matches!(
+        case,
+        Case::WrongPsk | Case::WrongX25519 | Case::UntrustedOrigin | Case::WrongOriginName
+    );
+    if matches!(case, Case::WrongIdentity | Case::DeniedTarget) || failed_then_recover {
         let mut app = connect_socks(client_addr, target_addr).await;
         let _ = app.write_all(b"must never reach target").await;
         let mut byte = [0];
@@ -373,16 +614,46 @@ server_identity_public_key = "{}"
         );
         if matches!(case, Case::WrongIdentity) {
             client.wait_for("server identity verification failed").await;
-        } else {
+        } else if matches!(case, Case::DeniedTarget) {
             server
                 .wait_for("client-selected outbound target is denied by server egress policy")
                 .await;
+        } else if matches!(case, Case::WrongPsk | Case::WrongX25519) {
+            server.wait_for("AuthFailed").await;
+            assert!(!server
+                .logs()
+                .contains("authenticated pre-data mode started"));
+        } else {
+            client.wait_for("TLS certificate verification failed").await;
+            let reason = if matches!(case, Case::UntrustedOrigin) {
+                "UnknownIssuer"
+            } else {
+                "CertNotValidForName"
+            };
+            client.wait_for(reason).await;
         }
         assert_eq!(
             target_accepts.load(Ordering::SeqCst),
             0,
             "identity and egress checks must precede target dial"
         );
+        if failed_then_recover {
+            drop(app);
+            drop(client);
+            let recovered_config = dir.path().join("recovered-client.toml");
+            write_private(
+                &recovered_config,
+                make_client_config(&psk, &session.public, SNI, &identity.public).as_bytes(),
+            );
+            client = Binary::spawn("client", &recovered_config, &ca_path);
+            client.wait_for("ParallaX client SOCKS5 listening").await;
+            roundtrip(client_addr, target_addr, 1).await;
+            assert_eq!(
+                target_accepts.load(Ordering::SeqCst),
+                1,
+                "corrected credentials must recover against the same server"
+            );
+        }
     } else {
         if mux {
             tokio::join!(
@@ -437,6 +708,13 @@ server_identity_public_key = "{}"
                 "decline must trip the shared circuit breaker"
             );
         }
+        if matches!(case, Case::SocksBoundaries) {
+            assert_eq!(
+                server.logs().matches("accepted outer connection").count(),
+                2,
+                "malformed SOCKS must not launch detached handshakes"
+            );
+        }
     }
     assert!(
         server.child.try_wait().unwrap().is_none(),
@@ -450,6 +728,10 @@ server_identity_public_key = "{}"
     drop(server);
     // JoinSet aborts all fixture listeners and their owned connections on panic.
     fixtures.shutdown().await;
+    if let Some(ip) = public_target {
+        assert_eq!(target_accepts.load(Ordering::SeqCst), 2);
+        println!("\nPUBLIC_ROUTE_VERIFIED {ip}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -492,4 +774,40 @@ async fn binary_wrong_identity_never_opens_a_target() {
 #[ignore = "requires loopback TCP sockets and shipped child binaries"]
 async fn binary_client_selected_private_target_is_denied_after_authentication() {
     scenario(Case::DeniedTarget).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_wrong_psk_falls_back_without_target_and_recovers() {
+    scenario(Case::WrongPsk).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_wrong_x25519_pin_falls_back_without_target_and_recovers() {
+    scenario(Case::WrongX25519).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_untrusted_origin_is_rejected_and_trust_correction_recovers() {
+    scenario(Case::UntrustedOrigin).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_origin_name_mismatch_is_rejected_and_sni_correction_recovers() {
+    scenario(Case::WrongOriginName).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_unauthenticated_tls_splice_preserves_origin_and_recovers() {
+    scenario(Case::OriginSplice).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_malformed_socks_stays_local_then_valid_requests_recover() {
+    scenario(Case::SocksBoundaries).await;
 }

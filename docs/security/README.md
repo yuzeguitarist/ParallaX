@@ -15,7 +15,7 @@ metadata. Model/canary crates are isolated non-shipping workspaces.
 
 | Command | Purpose |
 | --- | --- |
-| `python3 scripts/security/assurance.py protocol` | Independent parser/AEAD oracles, faulty I/O and existing ML-DSA oracle/vectors |
+| `python3 scripts/security/assurance.py protocol` | All library tests including serial network cases, generated/differential carrier oracles, binary E2E, real listener and ML-DSA vectors |
 | `python3 scripts/security/assurance.py listener` | Real child server/TLS, replay persistence/capacity/corruption and source quota recovery; localhost only |
 | `python3 scripts/security/assurance.py std` | Production limiter, FD budget and pool scenarios with standard-library synchronization |
 | `python3 scripts/security/assurance.py loom` | Actual production limiter, FD budget and pool under bounded Loom exploration |

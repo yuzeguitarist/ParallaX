@@ -5524,6 +5524,236 @@ mod tests {
         (session, pending, kx_record)
     }
 
+    async fn identity_reader_test_session() -> (ClientDataSession, DataRecordCodec, [u8; 32]) {
+        let (mut session, pending, exchange) = session_with_server_key_exchange();
+        let (_, mut before_rekey) =
+            data_codecs(session.session_keys(), TrafficConfig::default()).unwrap();
+        let exchange_payload = open_framed_payload(&mut before_rekey, &exchange);
+        let binding = pending.identity_binding(&exchange_payload);
+        let mut wire = exchange.as_slice();
+        apply_server_key_exchange_after_residuals(&mut wire, &mut session, &pending, PSK)
+            .await
+            .unwrap();
+        let (_, server_seal) =
+            data_codecs(session.session_keys(), TrafficConfig::default()).unwrap();
+        (session, server_seal, binding)
+    }
+
+    fn identity_reader_test_seal(seal: &mut DataRecordCodec, chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for chunk in chunks {
+            seal.seal_into(chunk, &mut OsRng, &mut wire).unwrap();
+        }
+        wire
+    }
+
+    async fn identity_reader_test_receive(
+        session: &mut ClientDataSession,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, ClientRuntimeError> {
+        timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (connected, accepted) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let mut client = connected.unwrap();
+            let (mut server, _) = accepted.unwrap();
+            let send = async {
+                // Split TLS headers and ciphertext across socket writes. The
+                // production reader owns record framing as well as reassembly.
+                for part in wire.chunks(3) {
+                    server.write_all(part).await.unwrap();
+                }
+                server.shutdown().await.unwrap();
+            };
+            let (_, result) =
+                tokio::join!(send, read_server_identity_payload(&mut client, session));
+            result
+        })
+        .await
+        .expect("identity reader must finish or reject after peer EOF")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_reassembles_and_verifies_a_pq_bound_signature() {
+        let (mut session, mut seal, binding) = identity_reader_test_session().await;
+        let identity_keys = identity::keypair();
+        let server_pin = [91; 32];
+        let keys = session.session_keys();
+        let signature = identity::sign_server_identity(
+            &identity_keys.secret,
+            &keys.transcript_hash,
+            &server_pin,
+            &binding,
+            keys.epoch,
+        )
+        .unwrap();
+        let proof = ServerIdentityProof { signature }.encode().unwrap();
+        let chunks = ServerIdentityChunk::encode_all(&proof, 317).unwrap();
+        assert!(chunks.len() > 1);
+        let wire = identity_reader_test_seal(&mut seal, &chunks);
+        let received = identity_reader_test_receive(&mut session, &wire)
+            .await
+            .unwrap();
+        assert_eq!(received, proof);
+        session
+            .verify_server_identity_payload(&received, &identity_keys.public, &server_pin)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_accepts_exactly_the_payload_limit() {
+        let (mut session, mut seal, _) = identity_reader_test_session().await;
+        let payload: Vec<_> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+        let chunks = ServerIdentityChunk::encode_all(&payload, 701).unwrap();
+        let wire = identity_reader_test_seal(&mut seal, &chunks);
+        assert_eq!(
+            identity_reader_test_receive(&mut session, &wire)
+                .await
+                .unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_rejects_changed_total_and_noncontiguous_offsets() {
+        for (total, offset) in [(9, 2), (8, 1), (8, 3), (8, 0)] {
+            let (mut session, mut seal, _) = identity_reader_test_session().await;
+            let chunks = [
+                ServerIdentityChunk {
+                    total_len: 8,
+                    offset: 0,
+                    bytes: b"ab".to_vec(),
+                }
+                .encode()
+                .unwrap(),
+                ServerIdentityChunk {
+                    total_len: total,
+                    offset,
+                    bytes: b"cd".to_vec(),
+                }
+                .encode()
+                .unwrap(),
+            ];
+            let wire = identity_reader_test_seal(&mut seal, &chunks);
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::InvalidServerIdentityChunks)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_rejects_oversized_totals_before_reassembly() {
+        for total_len in [16 * 1024 + 1, u32::MAX] {
+            let (mut session, mut seal, _) = identity_reader_test_session().await;
+            let chunk = ServerIdentityChunk {
+                total_len,
+                offset: 0,
+                bytes: vec![1],
+            }
+            .encode()
+            .unwrap();
+            let wire = identity_reader_test_seal(&mut seal, &[chunk]);
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::ServerIdentityTooLarge)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_rejects_eof_between_chunks_and_inside_records() {
+        for truncate in [0, 1, 8] {
+            let (mut session, mut seal, _) = identity_reader_test_session().await;
+            let chunk = ServerIdentityChunk {
+                total_len: 4,
+                offset: 0,
+                bytes: b"ab".to_vec(),
+            }
+            .encode()
+            .unwrap();
+            let mut wire = identity_reader_test_seal(&mut seal, &[chunk]);
+            if truncate > 0 {
+                wire.truncate(truncate);
+            }
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_rejects_bad_aead_and_prior_epoch_records() {
+        for old_epoch in [false, true] {
+            let (mut session, pending, exchange) = session_with_server_key_exchange();
+            let (_, mut seal) =
+                data_codecs(session.session_keys(), TrafficConfig::default()).unwrap();
+            let mut exchange_wire = exchange.as_slice();
+            apply_server_key_exchange_after_residuals(
+                &mut exchange_wire,
+                &mut session,
+                &pending,
+                PSK,
+            )
+            .await
+            .unwrap();
+            if !old_epoch {
+                (_, seal) = data_codecs(session.session_keys(), TrafficConfig::default()).unwrap();
+            }
+            let chunks = ServerIdentityChunk::encode_all(b"identity", 20).unwrap();
+            let mut wire = identity_reader_test_seal(&mut seal, &chunks);
+            if !old_epoch {
+                *wire.last_mut().unwrap() ^= 1;
+            }
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::Handshake(
+                    ClientHandshakeError::DataRecord(DataRecordError::Aead(_))
+                ))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_requires_px1i_framing_and_valid_chunk_bounds() {
+        use crate::protocol::command::ServerIdentityChunkError;
+        let bare_proof = ServerIdentityProof {
+            signature: vec![1; crate::crypto::mldsa::SIG_BYTES],
+        }
+        .encode()
+        .unwrap();
+        let mut zero_total = ServerIdentityChunk {
+            total_len: 1,
+            offset: 0,
+            bytes: vec![1],
+        }
+        .encode()
+        .unwrap();
+        zero_total[4..8].copy_from_slice(&0_u32.to_be_bytes());
+        for (chunk, expected) in [
+            (bare_proof, ServerIdentityChunkError::BadMagic),
+            (b"PX1Ishort".to_vec(), ServerIdentityChunkError::Truncated),
+            (zero_total, ServerIdentityChunkError::InvalidOffset),
+        ] {
+            let (mut session, mut seal, _) = identity_reader_test_session().await;
+            let wire = identity_reader_test_seal(&mut seal, &[chunk]);
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::Handshake(ClientHandshakeError::ServerIdentityChunk(error))) if error == expected
+            ));
+        }
+    }
+
     /// Regression for the original high-RTT handshake-failure bug (client budget
     /// 16 records vs server forward limit 64): the client must skip
     /// `MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS` camouflage records (well under

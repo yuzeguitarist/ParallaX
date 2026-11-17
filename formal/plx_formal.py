@@ -9,7 +9,7 @@ still matches the assumptions the tables were built from.
 
 What is modeled, and what is not:
 
-* TCP session: inbound auth, epoch-0 keys, PQ rekey, replay commit, identity,
+* TCP session: inbound auth, early pending admission, epoch-0 keys, PQ replay commit, identity,
   application data, UDP retain, failure, and reconnect. Crypto bytes are not
   modeled; a successful auth step stands in for a passing PSK/X25519 check.
 * QUIC TLS handshake: the client ``ReadState`` order and the server
@@ -21,7 +21,8 @@ What is modeled, and what is not:
   then transcript, then capacity) for one slot. The journal MAC is not modeled.
 * UDP probe: the timeout / loss / reply classification and the server's
   retain / hard-fail / stay decision. HMAC bytes are not modeled.
-* Inbound gates: auth, then SNI, then authorization. Replay is not a gate here.
+* Inbound decision function: auth, SNI, authorization. The surrounding pending
+  replay-admission gate is modeled separately in the TCP session machine.
 * QUIC key installation: the order ``write_handshake`` emits 0-RTT, Handshake,
   and 1-RTT keys. Key bytes are not modeled.
 * QUIC close: one local CONNECTION_CLOSE, a silent peer or idle close, then drain.
@@ -32,6 +33,10 @@ What is modeled, and what is not:
   after worker failure, and fresh-key rekey in a three-sequence nonce window.
 * Framed commands: every partition of payload lengths 1..3, two successive
   frames, completion reset, and terminal rejection of malformed chunks.
+* TCP MUX: two streams under capacity one/two, half-close in either direction,
+  asynchronous cancellation, local failure isolation, and carrier teardown.
+* PX1I caller: bounded arbitrary chunk metadata, authenticated decode, strict
+  accumulation, identity verification, and establishment failure/deadline gates.
 
 Run ``python3 formal/plx_formal.py check`` from the repository root.
 """
@@ -502,6 +507,9 @@ def _compile_rhs(expr: str, index: dict[str, int]):
     if text.isdigit():
         value = int(text)
         return lambda _st, value=value: value
+    if text in index:
+        i = index[text]
+        return lambda st, i=i: st[i]
     parts = text.split("+")
     if len(parts) == 2 and parts[1].strip().isdigit():
         field = parts[0].strip()
@@ -640,12 +648,16 @@ def check_machine(machine: Machine) -> Report:
 def session_machine() -> Machine:
     """TCP camouflage session, from the first record through reconnect.
 
-    Replay is not decided at ClientHello time. Auth success does not install
-    keys: ``derive_keys_from_shared`` rejects an all-zero X25519 secret first
-    and closes without splicing. Epoch-0 keys exist only after that check.
-    The replay cache is committed when the PQ rekey frame arrives; a replay,
-    a stale timestamp, a full cache, or a missing cache closes the connection
-    before ``apply_server_pq_rekey``. ``hybrid_sandwich_rekey`` rejects an
+    Replay admission has two phases. After auth/SNI, ``reserve_pending`` can
+    refuse an already committed, stale, duplicate-pending, or pending-full
+    hello; a busy lock also refuses it. This early refusal splices without
+    epoch-0 keys. Admission success reserves only an in-flight transcript,
+    not a durable journal entry. A missing optional cache skips reservation.
+    ``derive_keys_from_shared`` then rejects an all-zero X25519 secret without
+    splicing. Epoch-0 keys exist only after admission and that check.
+    The replay cache is committed only after a valid PQ rekey frame arrives;
+    a race, newly stale timestamp, full journal/source quota, or missing cache
+    closes before ``apply_server_pq_rekey``. ``hybrid_sandwich_rekey`` rejects an
     all-zero ephemeral the same way and does not advance the epoch. Identity
     verification requires the binding written by a successful rekey.
     Application data and UDP retain happen only after identity succeeds.
@@ -658,6 +670,7 @@ def session_machine() -> Machine:
         "binding",
         "keys",
         "usable",
+        "admission",
         "replay",
         "attempt",
         "app",
@@ -670,6 +683,7 @@ def session_machine() -> Machine:
         "binding": False,
         "keys": False,
         "usable": False,
+        "admission": "none",
         "replay": "none",
         "attempt": 0,
         "app": False,
@@ -681,7 +695,7 @@ def session_machine() -> Machine:
     return Machine(
         name="ParallaXSession",
         blurb=(
-            "Handshake, PQ rekey, replay commit, identity, app data, "
+            "Handshake, early pending admission, late PQ replay commit, identity, app data, "
             "UDP retain, failure, and reconnect."
         ),
         fields=fields,
@@ -692,15 +706,31 @@ def session_machine() -> Machine:
             act("MissingSni", 'phase = "idle"', phase='"failed"', how='"splice"'),
             act("UnauthorizedSni", 'phase = "idle"', phase='"failed"', how='"splice"'),
             act("AuthOk", 'phase = "idle"', phase='"authed"'),
+            act("AdmitPendingReplay", 'phase = "authed"',
+                phase='"admitted"', admission='"reserved"'),
+            act("AdmitWithoutReplayCache", 'phase = "authed"',
+                phase='"admitted"', admission='"missing"'),
+            *tuple(
+                act(name, 'phase = "authed"', phase='"failed"',
+                    admission=f'"{reason}"', how='"splice"')
+                for name, reason in (
+                    ("EarlyStaleSplice", "stale"),
+                    ("EarlyCommittedNonceSplice", "committed_nonce"),
+                    ("EarlyCommittedTranscriptSplice", "committed_transcript"),
+                    ("EarlyDuplicatePendingSplice", "duplicate_pending"),
+                    ("EarlyPendingFullSplice", "pending_full"),
+                    ("EarlyBusyLockSplice", "busy"),
+                )
+            ),
             act(
                 "DegenerateSharedSecret",
-                'phase = "authed"',
+                'phase = "admitted"',
                 phase='"failed"',
                 how='"degen"',
             ),
             act(
                 "InstallEpoch0",
-                'phase = "authed"',
+                'phase = "admitted"',
                 phase='"epoch0"',
                 keys="TRUE",
                 usable="TRUE",
@@ -713,24 +743,34 @@ def session_machine() -> Machine:
             ),
             act(
                 "ReplayReplayed",
-                'phase = "rekey_wait" /\\ replay = "pending"',
+                'phase = "rekey_wait" /\\ replay = "pending" /\\ admission = "reserved"',
                 phase='"rejected"',
                 replay='"replayed"',
                 **drop,
             ),
             act(
                 "ReplayStale",
-                'phase = "rekey_wait" /\\ replay = "pending"',
+                'phase = "rekey_wait" /\\ replay = "pending" /\\ admission = "reserved"',
                 phase='"rejected"',
                 replay='"stale"',
                 **drop,
             ),
             act(
                 "ReplayCacheFull",
-                'phase = "rekey_wait" /\\ replay = "pending"',
+                'phase = "rekey_wait" /\\ replay = "pending" /\\ admission = "reserved"',
                 phase='"rejected"',
                 replay='"full"',
                 **drop,
+            ),
+            act(
+                "ReplaySourceQuota",
+                'phase = "rekey_wait" /\\ replay = "pending" /\\ admission = "reserved"',
+                phase='"rejected"', replay='"source_quota"', **drop,
+            ),
+            act(
+                "ReplayMissingCache",
+                'phase = "rekey_wait" /\\ replay = "pending" /\\ admission = "missing"',
+                phase='"rejected"', replay='"missing"', **drop,
             ),
             act(
                 "RekeyMalformed",
@@ -740,7 +780,7 @@ def session_machine() -> Machine:
             ),
             act(
                 "RekeyDegenerate",
-                'phase = "rekey_wait" /\\ replay = "pending"',
+                'phase = "rekey_wait" /\\ replay = "pending" /\\ admission = "reserved"',
                 phase='"failed"',
                 replay='"inserted"',
                 how='"rekey_degen"',
@@ -754,7 +794,7 @@ def session_machine() -> Machine:
             ),
             act(
                 "RekeyOk",
-                'phase = "rekey_wait" /\\ replay = "pending" /\\ usable',
+                'phase = "rekey_wait" /\\ replay = "pending" /\\ admission = "reserved" /\\ usable',
                 phase='"rekeyed"',
                 replay='"inserted"',
                 epoch="epoch + 1",
@@ -792,6 +832,7 @@ def session_machine() -> Machine:
                 binding="FALSE",
                 keys="FALSE",
                 usable="FALSE",
+                admission='"none"',
                 replay='"none"',
                 app="FALSE",
                 udp='"none"',
@@ -817,18 +858,33 @@ def session_machine() -> Machine:
             ),
             claim(
                 "ReplayClosesBeforeRekey",
-                "replay, stale, and cache-full close before rekey: epoch stays 0",
-                'replay \\in {"replayed", "stale", "full"} => (phase = "rejected" /\\ epoch = 0 /\\ ~binding /\\ ~app /\\ ~usable)',
+                "late replay/stale/full/source-quota/missing-cache refusal closes at epoch 0 without splicing",
+                'replay \\in {"replayed", "stale", "full", "source_quota", "missing"} => (phase = "rejected" /\\ epoch = 0 /\\ keys /\\ ~binding /\\ ~app /\\ ~usable /\\ how # "splice")',
+            ),
+            claim(
+                "PendingRefusalSplicesWithoutKeys",
+                "early replay admission refusal splices before any session keys are installed",
+                'admission \\in {"stale", "committed_nonce", "committed_transcript", "duplicate_pending", "pending_full", "busy"} => (phase = "failed" /\\ how = "splice" /\\ epoch = 0 /\\ ~keys /\\ ~usable /\\ ~binding /\\ ~app)',
+            ),
+            claim(
+                "EpochZeroRequiresAdmission",
+                "epoch-0 keys require an accepted pending gate, or the optional-cache-missing path",
+                'keys => admission \\in {"reserved", "missing"}',
+            ),
+            claim(
+                "AdmittedStillHasNoKeys",
+                "pending admission alone does not install keys before the shared-secret check",
+                'phase = "admitted" => (admission \\in {"reserved", "missing"} /\\ epoch = 0 /\\ ~keys /\\ ~usable /\\ ~binding)',
             ),
             claim(
                 "IdleAndReconnectAreFresh",
                 "idle, including after reconnect, holds no keys, binding, app data, or failure class",
-                'phase = "idle" => (epoch = 0 /\\ ~binding /\\ ~keys /\\ ~usable /\\ ~app /\\ udp = "none" /\\ replay = "none" /\\ how = "none")',
+                'phase = "idle" => (epoch = 0 /\\ ~binding /\\ ~keys /\\ ~usable /\\ ~app /\\ udp = "none" /\\ admission = "none" /\\ replay = "none" /\\ how = "none")',
             ),
             claim(
                 "AuthedHasNoKeys",
                 "authentication alone has not installed epoch-0 keys",
-                'phase = "authed" => (epoch = 0 /\\ ~keys /\\ ~usable /\\ ~binding /\\ how = "none")',
+                'phase = "authed" => (epoch = 0 /\\ ~keys /\\ ~usable /\\ ~binding /\\ admission = "none" /\\ how = "none")',
             ),
             claim(
                 "PostAuthDegenerateDoesNotSplice",
@@ -842,7 +898,7 @@ def session_machine() -> Machine:
             ),
             claim(
                 "SpliceIsTheInboundReject",
-                "a fallback splice is an inbound auth or SNI reject before keys exist",
+                "a fallback splice is an inbound auth/SNI or early pending-admission refusal before keys exist",
                 'how = "splice" => (phase = "failed" /\\ ~keys /\\ epoch = 0 /\\ ~binding)',
             ),
             claim(
@@ -873,12 +929,12 @@ def session_machine() -> Machine:
             claim(
                 "RejectedOnlyAfterReplay",
                 "the rejected phase is produced only by a replay-cache refusal",
-                'phase = "rejected" => replay \\in {"replayed", "stale", "full"}',
+                'phase = "rejected" => replay \\in {"replayed", "stale", "full", "source_quota", "missing"}',
             ),
             claim(
                 "BindingMeansRekeyedEpoch",
                 "an identity binding exists only at epoch 1 after a fresh replay insert",
-                'binding => (epoch = 1 /\\ replay = "inserted" /\\ phase \\in {"rekeyed", "verified", "app", "closed", "failed"})',
+                'binding => (epoch = 1 /\\ admission = "reserved" /\\ replay = "inserted" /\\ phase \\in {"rekeyed", "verified", "app", "closed", "failed"})',
             ),
             claim(
                 "AttemptInBounds",
@@ -899,12 +955,12 @@ def session_machine() -> Machine:
             ),
             claim(
                 "ReplayIsRejected",
-                "a replayed hello is rejected with epoch still 0",
+                "a replay race after early admission is rejected with epoch still 0",
                 'phase = "rejected" /\\ replay = "replayed" /\\ epoch = 0 /\\ ~usable',
             ),
             claim(
                 "StaleIsRejected",
-                "a stale handshake is rejected before rekey",
+                "a reserved hello that expires before its data proof is rejected before rekey",
                 'phase = "rejected" /\\ replay = "stale"',
             ),
             claim(
@@ -912,10 +968,28 @@ def session_machine() -> Machine:
                 "a full replay cache sheds the handshake before rekey",
                 'phase = "rejected" /\\ replay = "full"',
             ),
+            claim("PendingAdmissionCanInstallEpochZero", "an early fresh reservation may proceed to epoch-0 keys",
+                  'admission = "reserved" /\\ phase = "epoch0" /\\ keys'),
+            *tuple(
+                claim(name, "early pending admission refusal splices with no epoch-0 keys",
+                      f'admission = "{reason}" /\\ phase = "failed" /\\ how = "splice" /\\ ~keys')
+                for name, reason in (
+                    ("EarlyStaleUsesOrigin", "stale"),
+                    ("EarlyCommittedNonceUsesOrigin", "committed_nonce"),
+                    ("EarlyCommittedTranscriptUsesOrigin", "committed_transcript"),
+                    ("DuplicatePendingUsesOrigin", "duplicate_pending"),
+                    ("PendingCapacityUsesOrigin", "pending_full"),
+                    ("BusyReplayLockUsesOrigin", "busy"),
+                )
+            ),
+            claim("LateMissingCacheCloses", "missing optional cache fails closed at the later data-proof commit",
+                  'admission = "missing" /\\ replay = "missing" /\\ phase = "rejected" /\\ keys /\\ how # "splice"'),
+            claim("LateSourceQuotaCloses", "a per-source committed-journal quota refusal closes after the data proof",
+                  'admission = "reserved" /\\ replay = "source_quota" /\\ phase = "rejected" /\\ keys /\\ how # "splice"'),
             claim(
                 "AuthFailureInstallsNoKeys",
                 "auth and SNI failures install no keys",
-                'how = "splice" /\\ phase = "failed" /\\ ~keys',
+                'how = "splice" /\\ admission = "none" /\\ phase = "failed" /\\ ~keys',
             ),
             claim(
                 "PostAuthDegenerateInstallsNoKeys",
@@ -3053,6 +3127,201 @@ def fragments_machine() -> Machine:
     )
 
 
+def mux_machine() -> Machine:
+    """Two TCP MUX streams, capacity one or two, and asynchronous task exit.
+
+    Task completion and the next admission's prune are one observation step.
+    An abort request is deliberately a separate step from task exit. Snapshot
+    fields are edge monitors, so isolation and half-close assertions compare
+    the real pre/post state instead of assuming a transition is harmless.
+    ``turn`` records event parity, permitting repeated ignored/Cover frames
+    without a stuttering action in the Python checker. No step bound is used.
+    """
+    per_stream = ("task", "upload", "up", "down", "charged")
+    defaults: dict[str, Scalar] = {
+        "phase": "open", "capacity": 1, "turn": 0,
+        "focus": 0, "event": "initial", "released": False,
+    }
+    for sid in (0, 1):
+        for field in per_stream:
+            value: Scalar = "none" if field == "task" else False
+            defaults[f"{field}{sid}"] = value
+            defaults[f"before_{field}{sid}"] = value
+    actions = []
+
+    def local(sid: int, name: str, guard: str, **assign: str) -> None:
+        snapshots = {f"before_{field}{i}": f"{field}{i}"
+                     for i in (0, 1) for field in per_stream}
+        phase = 'phase \\in {"open", "closing"}' if name == "CancellationDone" else 'phase = "open"'
+        for turn in (0, 1):
+            actions.append(act(
+                f"{name}{sid}Turn{turn}",
+                f'{phase} /\\ turn = {turn} /\\ ({guard})',
+                **snapshots, **assign, turn=str(1 - turn),
+                focus=str(sid), event=f'"{name}"',
+            ))
+
+    for sid in (0, 1):
+        peer = 1 - sid
+        live = f'task{sid} \\in {{"connecting", "relaying"}}'
+        abort = {f"task{sid}": '"cancelling"', f"upload{sid}": "FALSE"}
+        release = {f"task{sid}": '"none"', f"upload{sid}": "FALSE",
+                   f"up{sid}": "FALSE", f"down{sid}": "FALSE",
+                   f"charged{sid}": "FALSE", "released": "TRUE"}
+        local(sid, "Open", f'task{sid} = "none" /\\ (capacity = 2 \\/ ~charged{peer})',
+              **{f"task{sid}": '"connecting"', f"upload{sid}": "TRUE",
+                 f"up{sid}": "TRUE", f"down{sid}": "TRUE", f"charged{sid}": "TRUE"})
+        local(sid, "DuplicateOpen", f'task{sid} # "none"')
+        local(sid, "CapacityReject", f'task{sid} = "none" /\\ capacity = 1 /\\ charged{peer}')
+        local(sid, "ConnectOk", f'task{sid} = "connecting"', **{f"task{sid}": '"relaying"'})
+        for failure in ("ResolveFailure", "ConnectFailure", "TuneFailure", "InitialWriteFailure"):
+            local(sid, failure, f'task{sid} = "connecting"', **abort)
+        local(sid, "DataDelivered", f'{live} /\\ upload{sid} /\\ up{sid}')
+        local(sid, "DataIgnored", f'~upload{sid}')
+        local(sid, "Fin", f'upload{sid}', **{f"upload{sid}": "FALSE"})
+        local(sid, "DuplicateFin", f'~upload{sid}')
+        local(sid, "UploadDrained", f'task{sid} = "relaying" /\\ ~upload{sid} /\\ up{sid}',
+              **{f"up{sid}": "FALSE"})
+        local(sid, "TargetFin", f'task{sid} = "relaying" /\\ down{sid}',
+              **{f"down{sid}": "FALSE"})
+        local(sid, "BothDirectionsDone", f'task{sid} = "relaying" /\\ ~up{sid} /\\ ~down{sid}',
+              **release)
+        local(sid, "Reset", f'task{sid} # "none"', **abort)
+        local(sid, "UnknownReset", f'task{sid} = "none"')
+        local(sid, "UploadStall", f'{live} /\\ upload{sid}', **abort)
+        local(sid, "TargetReadError", f'task{sid} = "relaying"', **abort)
+        local(sid, "StreamIdle", f'task{sid} = "relaying"', **release)
+        local(sid, "CancellationDone", f'task{sid} = "cancelling"', **release)
+        actions.append(act(
+            f"TeardownAbort{sid}", f'phase = "closing" /\\ {live}',
+            event='"teardown"', **abort,
+        ))
+    local(0, "Cover", 'phase = "open"')
+    actions.append(act("CarrierTeardown", 'phase = "open"', phase='"closing"',
+                       event='"teardown"', upload0="FALSE", upload1="FALSE"))
+    actions.append(act("CarrierTeardownComplete", 'phase = "closing" /\\ task0 = "none" /\\ task1 = "none"',
+                       phase='"closed"', event='"teardown"'))
+    same = lambda sid: " /\\ ".join(f"{field}{sid} = before_{field}{sid}" for field in per_stream)
+    invariants = [
+        claim("MuxCapacityCountsBothHalves", "a one-slot carrier never owns two unfinished supervisors",
+              "capacity = 1 => ~(charged0 /\\ charged1)"),
+        claim("MuxLocalEventsPreserveSibling", "a frame, setup failure, or cancellation affects only its own stream",
+              f'event # "teardown" => ((focus = 0 => ({same(1)})) /\\ (focus = 1 => ({same(0)})))'),
+        claim("MuxRejectedOpenAndCoverAreInert", "duplicate/capacity Open rejection and Cover change neither stream",
+              f'event \\in {{"DuplicateOpen", "CapacityReject", "Cover"}} => ({same(0)} /\\ {same(1)})'),
+        claim("MuxTeardownReleasesAllSlots", "carrier teardown leaves no owned supervisor or target half",
+              'phase = "closed" => (~charged0 /\\ ~charged1 /\\ ~up0 /\\ ~up1 /\\ ~down0 /\\ ~down1)'),
+    ]
+    for sid in (0, 1):
+        invariants.extend((
+            claim(f"MuxOwnership{sid}", "a live task and its slot remain paired until task exit",
+                  f'(charged{sid} => task{sid} # "none") /\\ (task{sid} # "none" => charged{sid}) /\\ (upload{sid} => charged{sid})'),
+            claim(f"MuxLiveHalfKeepsSlot{sid}", "one remaining relay direction still consumes capacity",
+                  f'(up{sid} \\/ down{sid}) => charged{sid}'),
+            claim(f"MuxFinIsHalfClose{sid}", "FIN removes upload routing while preserving the supervisor and both target halves",
+                  f'event = "Fin" /\\ focus = {sid} => (~upload{sid} /\\ charged{sid} /\\ task{sid} = before_task{sid} /\\ up{sid} = before_up{sid} /\\ down{sid} = before_down{sid})'),
+            claim(f"MuxDataRequiresUploadRoute{sid}", "no new DATA is enqueued after upload routing is removed",
+                  f'event = "DataDelivered" /\\ focus = {sid} => (upload{sid} /\\ up{sid} /\\ charged{sid})'),
+            claim(f"MuxResetKeepsSlotUntilExit{sid}", "requesting cancellation does not prematurely release its slot",
+                  f'event = "Reset" /\\ focus = {sid} => (task{sid} = "cancelling" /\\ charged{sid} /\\ ~upload{sid})'),
+        ))
+    return Machine(
+        name="ParallaXMux", blurb="Two TCP MUX streams: admission, half-close, local reset, task exit, and sibling isolation.",
+        fields=tuple(defaults), defaults=defaults, initials=({"capacity": 1}, {"capacity": 2}),
+        actions=tuple(actions), invariants=tuple(invariants),
+        witnesses=(
+            claim("MuxTwoStreamsCanRelay", "two streams can coexist on a two-slot carrier",
+                  'task0 = "relaying" /\\ task1 = "relaying" /\\ capacity = 2'),
+            claim("MuxHalfCloseStillConsumesCapacity", "an upload FIN cannot free a slot while the download remains live",
+                  'capacity = 1 /\\ charged0 /\\ ~upload0 /\\ ~up0 /\\ down0'),
+            claim("MuxResetExitIsAsynchronous", "an aborted supervisor still consumes its slot before task exit",
+                  'task0 = "cancelling" /\\ charged0 /\\ up0'),
+            claim("MuxFreedSlotCanBeReused", "task exit permits a later admission",
+                  'released /\\ event = "Open" /\\ capacity = 1'),
+            claim("MuxSetupFailureLeavesSiblingLive", "a failed target setup leaves another active stream intact",
+                  'event = "ConnectFailure" /\\ focus = 0 /\\ task1 = "relaying"'),
+            claim("MuxCarrierWaitsForTaskExit", "carrier teardown still owns aborted supervisors until they exit",
+                  'phase = "closing" /\\ task0 = "cancelling" /\\ charged0'),
+        ), terminal='phase = "closed"',
+    )
+
+
+def identity_chunks_machine() -> Machine:
+    """PX1I caller parsing with exhaustive bounded candidate metadata.
+
+    Total 0..4, offset 0..3, length 0..4 are external inputs, not valid-input
+    assumptions. Capacity is scaled to three bytes. AEAD/ML-DSA outcomes are
+    opaque checks; arbitrary byte strings, signature math, and clocks are not
+    proved. The outer establishment deadline may interrupt every pre-CONNECT
+    state, including partial records and the blocking verification await.
+    """
+    actions = []
+    for total in range(5):
+        for offset in range(4):
+            for count in range(5):
+                actions.append(act(
+                    f"ReadT{total}O{offset}L{count}", 'phase = "reading"',
+                    phase='"auth"', incoming_total=str(total), incoming_offset=str(offset),
+                    incoming_len=str(count), incoming_end=str(offset + count),
+                ))
+    fail = lambda reason: dict(phase='"failed"', reason=f'"{reason}"')
+    actions.extend((
+        act("IdentityReadEof", 'phase = "reading"', **fail("eof")),
+        act("IdentityReadIoError", 'phase = "reading"', **fail("io")),
+        act("IdentityAuthFails", 'phase = "auth"', **fail("aead")),
+        act("IdentityAuthOk", 'phase = "auth"', phase='"decode"'),
+        act("IdentityDecodeReject", 'phase = "decode" /\\ (incoming_total = 0 \\/ incoming_len = 0 \\/ incoming_total < incoming_end)', **fail("decode")),
+        act("IdentityDecodeOk", 'phase = "decode" /\\ incoming_total # 0 /\\ incoming_len # 0 /\\ ~(incoming_total < incoming_end)', phase='"cap"'),
+        act("IdentityCapReject", 'phase = "cap" /\\ incoming_total = 4', **fail("capacity")),
+        act("IdentityCapOk", 'phase = "cap" /\\ incoming_total < 4', phase='"total"'),
+        act("IdentityLatchFirstTotal", 'phase = "total" /\\ total = 0', total="incoming_total", phase='"offset"'),
+        act("IdentityCheckTotal", 'phase = "total" /\\ total # 0 /\\ incoming_total = total', phase='"offset"'),
+        act("IdentityChangedTotal", 'phase = "total" /\\ total # 0 /\\ incoming_total # total', **fail("changed_total")),
+        act("IdentityWrongOffset", 'phase = "offset" /\\ incoming_offset # cursor', **fail("offset")),
+        act("IdentityAppend", 'phase = "offset" /\\ incoming_offset = cursor',
+            before_cursor="cursor", cursor="incoming_end", phase='"completion"'),
+        act("IdentityPartial", 'phase = "completion" /\\ cursor < total', phase='"reading"'),
+        act("IdentityAssembled", 'phase = "completion" /\\ cursor = total', phase='"assembled"'),
+        act("IdentityMissingBinding", 'phase = "assembled" /\\ ~binding', **fail("binding")),
+        act("IdentityBadSignature", 'phase = "assembled" /\\ binding', **fail("signature")),
+        act("IdentityVerifyOk", 'phase = "assembled" /\\ binding', phase='"verified"', verified="TRUE"),
+        act("IdentityThenConnect", 'phase = "verified"', phase='"connect"', connect_sent="TRUE"),
+        act("IdentityEstablishmentTimeout", 'phase \\in {"reading", "auth", "decode", "cap", "total", "offset", "completion", "assembled", "verified"}', **fail("deadline")),
+    ))
+    return Machine(
+        name="ParallaXIdentityChunks", blurb="PX1I caller: bounded arbitrary chunk metadata, AEAD, reassembly, verification, deadline, CONNECT gate.",
+        fields=("phase", "total", "cursor", "before_cursor", "incoming_total", "incoming_offset", "incoming_len", "incoming_end", "binding", "verified", "connect_sent", "reason"),
+        defaults={"phase": "reading", "total": 0, "cursor": 0, "incoming_total": 0,
+                  "before_cursor": 0, "incoming_offset": 0, "incoming_len": 0, "incoming_end": 0,
+                  "binding": True, "verified": False, "connect_sent": False, "reason": "none"},
+        initials=({"binding": True}, {"binding": False}), actions=tuple(actions),
+        invariants=(
+            claim("IdentityBufferNeverExceedsCap", "no accepted metadata can grow the caller buffer beyond its bounded capacity",
+                  "cursor \\in {0, 1, 2, 3} /\\ total \\in {0, 1, 2, 3} /\\ ~(total < cursor)"),
+            claim("IdentityAppendRequiresValidatedMetadata", "append follows a matching total, exact offset, positive length, and in-range end",
+                  'phase = "completion" => (total = incoming_total /\\ incoming_offset = before_cursor /\\ cursor = incoming_end /\\ incoming_len # 0 /\\ incoming_offset < cursor /\\ ~(total < cursor))'),
+            claim("IdentityPartialCannotVerify", "partial accumulation cannot be returned or verified",
+                  'phase \\in {"assembled", "verified", "connect"} => (total # 0 /\\ cursor = total)'),
+            claim("IdentityVerificationNeedsWholeBoundPayload", "verification success requires the full payload and the PQ identity binding",
+                  "verified => (binding /\\ total # 0 /\\ cursor = total)"),
+            claim("IdentityFailureBlocksConnect", "EOF, AEAD, framing, signature, or deadline failure cannot send CONNECT",
+                  'phase = "failed" => ~connect_sent'),
+            claim("IdentityConnectWaitsForVerification", "CONNECT follows complete reassembly and successful identity verification",
+                  'connect_sent => (phase = "connect" /\\ verified /\\ binding /\\ cursor = total /\\ total # 0)'),
+        ),
+        witnesses=(
+            claim("IdentityCanConnect", "a complete authenticated and verified payload permits CONNECT", "connect_sent"),
+            claim("IdentityPartialReadCanTimeout", "the deadline can abort a partially assembled payload", 'reason = "deadline" /\\ cursor # 0 /\\ cursor < total'),
+            claim("IdentityTotalChangeIsRejected", "an inconsistent continuation is rejected", 'reason = "changed_total"'),
+            claim("IdentityOutOfOrderIsRejected", "a gap, overlap, or duplicate offset is rejected", 'reason = "offset"'),
+            claim("IdentityCapacityIsChecked", "an over-cap but structurally valid chunk is rejected", 'reason = "capacity"'),
+            claim("IdentityMissingPqBindingFails", "complete chunks alone cannot bypass a missing PQ binding", 'reason = "binding"'),
+            claim("IdentitySignatureFailureBlocksConnect", "complete chunks can still fail identity verification", 'reason = "signature"'),
+            claim("IdentityPartialEofIsFailure", "EOF after partial accumulation is a failure", 'reason = "eof" /\\ cursor # 0'),
+        ), terminal='phase \\in {"failed", "connect"}',
+    )
+
+
 def machines() -> tuple[Machine, ...]:
     return (
         session_machine(),
@@ -3067,6 +3336,8 @@ def machines() -> tuple[Machine, ...]:
         packet_machine(),
         records_machine(),
         fragments_machine(),
+        mux_machine(),
+        identity_chunks_machine(),
     )
 
 
@@ -3233,6 +3504,8 @@ def _parse_ledger(text: str) -> dict[str, tuple[str, str]]:
 MACHINE_ANCHORS: dict[str, dict[str, tuple[str, ...]]] = {
     "ParallaXSession": {
         "src/handshake/server.rs": (
+            "cache.reserve_pending(&entry, now)",
+            "if !fresh",
             "if !commit_pending_replay_entry",
             "apply_server_pq_rekey(",
         ),
@@ -3252,6 +3525,11 @@ MACHINE_ANCHORS: dict[str, dict[str, tuple[str, ...]]] = {
         "src/crypto/pq.rs": (
             "ct_eq(&[0_u8; 32])",
             "DegenerateSharedSecret",
+        ),
+        "src/crypto/replay.rs": (
+            "fn reserve_pending(",
+            "self.pending_transcripts.len() >= self.capacity.max(1)",
+            "self.is_fresh(entry.timestamp, now)",
         ),
     },
     "ParallaXQuic": {
@@ -3350,6 +3628,22 @@ MACHINE_ANCHORS: dict[str, dict[str, tuple[str, ...]]] = {
             "FramedChunkError::InconsistentTotal",
             "self.expected_total = None;",
             "std::mem::take(&mut self.assembled)",
+        ),
+    },
+    "ParallaXMux": {
+        "src/handshake/server.rs": (
+            "self.tasks.retain(|_, h| !h.is_finished())",
+            "streams.live_count() >= context.max_streams",
+            "streams.uploads.remove(&frame.stream_id)",
+            "tokio::try_join!(reader, writer)",
+        ),
+    },
+    "ParallaXIdentityChunks": {
+        "src/client/runtime.rs": (
+            "read_server_identity_payload(&mut server, &mut data_session).await?",
+            "total_len > MAX_SERVER_IDENTITY_PAYLOAD",
+            "chunk.offset as usize != assembled.len()",
+            "CLIENT_ESTABLISH_TIMEOUT",
         ),
     },
 }
@@ -3666,11 +3960,73 @@ def correspond(root: Path = ROOT) -> None:
                   "std::mem::take(&mut self.assembled)"),
            "framed reassembly validates before append and clears state before emission", problems)
 
+    mux = _extract_fn(server, "process_server_mux_frame")
+    mux_open = _extract_at(mux, "MuxFrameKind::Open =>")
+    _order(mux_open, ("streams.prune_finished()", "streams.uploads.contains_key", "streams.tasks.contains_key",
+                      "downlink.reset_unregistered", "return Ok(())", "streams.live_count() >= context.max_streams",
+                      "downlink.register", "tokio::spawn", "streams.uploads.insert", "streams.tasks.insert"),
+           "MUX Open rejects duplicates and exhausted live-task capacity before spawning", problems)
+    mux_fin = _extract_at(mux, "MuxFrameKind::Fin =>")
+    if "streams.uploads.remove(&frame.stream_id)" not in mux_fin or "streams.tasks" in mux_fin or ".abort(" in mux_fin:
+        problems.append("MUX Fin must remove only upload routing and retain the live supervisor slot")
+    mux_reset = _extract_at(mux, "MuxFrameKind::Reset =>")
+    _order(mux_reset, ("streams.uploads.remove", "streams.tasks.get", "handle.abort()", "downlink.purge"),
+           "MUX Reset requests cancellation and purges without releasing the task slot early", problems)
+    if re.search(r"streams\.tasks\.(remove|clear|drain)\s*\(", mux_reset):
+        problems.append("MUX Reset cannot remove the task slot before cancellation completes")
+    if _extract_at(mux, "MuxFrameKind::Cover =>").strip() != "MuxFrameKind::Cover => {}":
+        problems.append("MUX Cover must not change substream lifecycle state")
+    live_count = _extract_fn(server, "live_count")
+    _order(live_count, ("self.prune_finished()", "self.tasks.len()"),
+           "MUX admission counts unfinished supervisors, including half-closed streams", problems)
+    prune = _extract_fn(server, "prune_finished")
+    _order(prune, ("self.tasks.retain(|_, h| !h.is_finished())", "self.uploads.retain"),
+           "MUX pruning releases only completed supervisors before dropping stale routes", problems)
+    teardown = _extract_fn(server, "teardown")
+    _order(teardown, ("self.uploads.clear()", "handle.abort()", "self.tasks.drain()", "handle.await"),
+           "MUX completed teardown awaits aborted supervisors before releasing their targets", problems)
+    supervisor = _extract_fn(server, "server_mux_upstream_task")
+    _order(supervisor, ("resolve_connect_target(", "connect_outbound_target(", "tune_tcp_stream(",
+                        "target.write_all(&initial)", "tokio::try_join!(reader, writer)"),
+           "MUX setup and both relay directions remain owned by the stream supervisor", problems)
+    if supervisor.count("downlink.reset().await") < 4:
+        problems.append("MUX setup resolve/connect/tune/initial-write failure must reset the affected stream")
+    identity_read = _extract_fn(runtime, "read_server_identity_payload")
+    _order(identity_read, ("server_records.read_record_into(&mut record).await?",
+                           "data_session.open_server_record_in_place(&mut record)?", "ServerIdentityChunk::decode_ref(&record)",
+                           "total_len > MAX_SERVER_IDENTITY_PAYLOAD", "Some(expected) if expected != total_len",
+                           "chunk.offset as usize != assembled.len()", "assembled.extend_from_slice(chunk.bytes)",
+                           "assembled.len() == total_len", "return Ok(assembled)"),
+           "PX1I caller authenticates and validates capacity/total/offset before completion", problems)
+    establish = _extract_fn(runtime, "establish_authenticated_data_session_with_resolver")
+    _order(establish, ("match timeout(", "CLIENT_ESTABLISH_TIMEOUT", "establish_authenticated_data_session_inner(",
+                       "Err(_) => Err", "io::ErrorKind::TimedOut"),
+           "PX1I caller and verification remain inside one establishment deadline", problems)
+
     if "FallbackReason::Replay" in server:
         problems.append(
             "src/handshake/server.rs now constructs FallbackReason::Replay; "
-            "the live reject is the PQ replay commit, so the session model must be updated"
+            "update the modeled early pending-splice and late PQ-commit-close branches"
         )
+
+    inbound = _extract_fn(server, "handle_connection_inner")
+    authenticated = _extract_at(inbound, "ConnectionDecision::Authenticated(authenticated) =>")
+    _order(authenticated, ("cache.try_lock()", "cache.reserve_pending(&entry, now)",
+                            "if !fresh", "return relay_admitted_fallback(",
+                            "Some(PendingReplayEntry", "reserved: true", "accept_authenticated_with_origin("),
+           "early pending admission refuses through origin splice before authenticated establishment", problems)
+    refuse_pending = _extract_at(authenticated, "if !fresh")
+    if "return relay_admitted_fallback(" not in refuse_pending:
+        problems.append("early pending refusal must return the admitted origin fallback")
+    if "Err(std::sync::TryLockError::WouldBlock) => false" not in authenticated:
+        problems.append("a busy replay-cache lock must refuse early pending admission")
+    pending_gate = _extract_fn(replay, "reserve_pending")
+    _order(pending_gate, ("self.prune_expired(now)",
+                          "self.pending_transcripts.len() >= self.capacity.max(1)", "return false",
+                          "self.is_fresh(entry.timestamp, now)", "!self.nonces.contains(&entry.nonce)",
+                          "!self.transcripts.contains(&entry.transcript_fingerprint)",
+                          ".pending_transcripts", ".insert(entry.transcript_fingerprint)"),
+           "pending gate checks capacity, freshness, committed replay, then reserves a unique in-flight transcript", problems)
 
     inner = _extract_fn(runtime, "establish_authenticated_data_session_inner")
     _order(
@@ -3679,6 +4035,7 @@ def correspond(root: Path = ROOT) -> None:
             "connect_and_establish_data_session(",
             "build_pq_rekey_record(",
             "apply_server_key_exchange_after_residuals(",
+            "read_server_identity_payload(&mut server, &mut data_session).await?",
             "verify_server_identity_payload_blocking(",
         ),
         "client establish order",
@@ -3704,6 +4061,7 @@ def correspond(root: Path = ROOT) -> None:
     _order(
         data_mode,
         (
+            "let pq_rekey = match PqRekeyRequest::decode_ref(",
             "if !commit_pending_replay_entry",
             "return Ok(())",
             "apply_server_pq_rekey(",

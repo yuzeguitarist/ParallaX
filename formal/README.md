@@ -7,6 +7,9 @@ probe outcome, the inbound auth gates, QUIC key installation, QUIC close and
 drain, the BBR mode graph, and the QUIC first-byte class.
 The record-batch and framed-command models add bounded checks of nonce
 reservation/failure and repeated PX1F reassembly.
+The TCP MUX model checks admission and independent substream lifetimes; a
+separate PX1I caller model checks bounded metadata through identity verification
+and the CONNECT barrier, including establishment failures.
 
 This is a model of control state, not a byte-level proof of X25519, ML-KEM, or
 AEAD. A step such as `AuthOk` stands in for a check the Rust code already
@@ -45,25 +48,42 @@ reachable state.
 ### TCP session (`ParallaXSession`)
 
 Auth failure, a missing SNI, and an unauthorized SNI splice to the camouflage
-origin and install no keys. A degenerate all-zero X25519 shared secret is
-rejected after that auth, inside `derive_keys_from_shared`, and closes
-without splicing. The same reject in `hybrid_sandwich_rekey` fails the PQ
-rekey after that insert and does not advance the epoch. Replay is decided
-when the PQ rekey frame is committed. A missing cache fails closed the same way. `FallbackReason::Replay`
-is not constructed; a replay, a stale timestamp, or a full cache closes the
-connection before `apply_server_pq_rekey`.
+origin and install no keys. After auth/SNI pass, replay handling has two gates:
+
+1. **Early pending admission:** `handle_connection_inner` calls
+   `reserve_pending` before `accept_authenticated_with_origin`. The cache first
+   prunes expired entries and checks pending capacity, then checks timestamp
+   freshness, committed nonce/transcript, and duplicate pending transcript.
+   Refusal, including a busy cache lock, returns `relay_admitted_fallback` and
+   installs no epoch-0 keys. Success reserves an in-flight transcript only; it
+   does not commit a durable journal entry. An absent optional cache skips this
+   reservation and proceeds to the later fail-closed gate.
+2. **Late data-proof commit:** only a valid PX1Q reaches
+   `commit_pending_replay_entry`. A previously admitted hello can lose a race,
+   become stale, hit committed-journal capacity/source quota, or have no cache.
+   That refusal takes the jittered close path before `apply_server_pq_rekey`:
+   epoch-0 keys already exist, but epoch 1 and the identity binding do not.
+
+Between the gates, `derive_keys_from_shared` rejects a degenerate all-zero
+X25519 secret without splicing or installing keys. The same reject in
+`hybrid_sandwich_rekey` fails after the late commit without advancing the
+epoch. `FallbackReason::Replay` is not constructed; early replay refusal uses
+the direct admitted-fallback branch, while late commit refusal closes.
 
 | Invariant | Unreachable situation |
 | --- | --- |
 | `AppOnlyAfterIdentity` | Application data before identity, or at any epoch other than 1, or with dead keys |
 | `VerifiedImpliesBinding` | `verified` / `app` without a PQ identity binding and live epoch-1 keys |
 | `RekeyedImpliesFreshCommit` | A rekeyed session whose replay cache insert was not fresh |
-| `ReplayClosesBeforeRekey` | Replay, stale, or cache-full promoting the session past epoch 0 |
+| `ReplayClosesBeforeRekey` | A late replay/stale/full/source-quota/missing-cache refusal splices or promotes the session past epoch 0 |
+| `PendingRefusalSplicesWithoutKeys` | An early pending refusal installs epoch-0 keys or takes the later close branch |
+| `EpochZeroRequiresAdmission` | Session keys exist without passing the early pending gate or its optional-cache-missing branch |
+| `AdmittedStillHasNoKeys` | Pending admission itself installs keys before the shared-secret check |
 | `IdleAndReconnectAreFresh` | A reconnect that keeps the previous epoch, binding, keys, UDP leg, or failure class |
 | `AuthedHasNoKeys` | Authentication that has already installed epoch-0 keys |
 | `PostAuthDegenerateDoesNotSplice` | An all-zero shared secret after auth that splices or installs keys |
 | `RekeyDegenerateStaysAtEpochZero` | An all-zero rekey ephemeral that advances the epoch or splices |
-| `SpliceIsTheInboundReject` | A fallback splice after keys exist |
+| `SpliceIsTheInboundReject` | An auth/SNI or early pending fallback splice after keys exist |
 | `TerminalDropsUsableKeys` | Sealing or sending application data after reject, close, or failure |
 | `UdpRetainOnlyAfterApp` | Retaining the QUIC leg before the session is in the live app phase |
 | `UdpDeclineStaysOnApp` | A failed UDP probe dropping the already-verified TCP session |
@@ -197,7 +217,8 @@ by `check_probe_status_bytes` from the Rust `match`, not by TLC.
 ### Inbound gates (`ParallaXInbound`)
 
 Auth, then SNI presence, then authorization. Replay is not a result of this
-function. The constant-time DH ballast is not a state.
+decision function; its surrounding early pending-admission gate is part of
+`ParallaXSession`. The constant-time DH ballast is not a state.
 
 | Invariant | Unreachable situation |
 | --- | --- |
@@ -304,7 +325,9 @@ JVM is up. The 0.79s figure is not a cold-JVM number.
 `correspond` reads the Rust and checks the order the model depends on, including:
 
 - client establish: session keys, then PQ rekey, then key exchange, then identity; `CONNECT` only after that returns
-- server: replay commit returns before `apply_server_pq_rekey`; the identity flight is written before the data-mode read
+- server: early `reserve_pending` refusal returns the origin splice before authenticated establishment; a busy replay-cache lock refuses admission
+- pending reservation checks capacity, freshness, committed replay, then unique pending transcript; valid PX1Q precedes the late commit, whose refusal returns before `apply_server_pq_rekey`
+- the identity flight is written before the server data-mode read
 - both directions of a rekey update together, and the epoch steps by one
 - identity verification refuses a missing PQ binding
 - QUIC client and server `process_message` arms, and the 0-RTT guard running only after the binder check
@@ -319,6 +342,8 @@ JVM is up. The 0.79s figure is not a cold-JVM number.
 - PX1P status bytes 0, 1, and 2
 - record batches reserve before dispatch, poison before returning a worker failure, and publish only after successful collection; fresh-key rekey preserves poison
 - PX1F reassembly checks total/offset before append and resets the total latch and buffer before emitting a complete frame
+- TCP MUX admission prunes completed tasks, rejects duplicates/capacity before spawn, keeps the supervisor on FIN and cancellation, and joins both relay directions
+- the PX1I caller authenticates, checks capacity/total/offset, then appends and returns only a whole payload; one outer establishment deadline includes reading and verification
 
 A reorder that removes one of those anchors fails `correspond` even though the TLA+ model itself still checks.
 
@@ -368,3 +393,85 @@ TLA+/TLC specs through the existing `formal` workflow. Counterexample self-tests
 exercise nonce rollback, poison removal, early emission, and stale completion
 state. They check the checker and its contracts; they are not attacks on a
 running proxy or a whole-implementation proof.
+
+## TCP MUX lifecycle (`ParallaXMux`)
+
+This model follows `process_server_mux_frame`, `ServerMuxStreams`, and
+`server_mux_upstream_task`. It has two stream IDs and explores capacity one
+and two. Each stream records its supervisor phase (`none`, `connecting`,
+`relaying`, `cancelling`), upload routing, both relay halves, and its charged
+slot. Pre-step snapshots check that each local event preserves its sibling.
+The event-parity bit permits repeated ignored DATA/FIN/RESET and Cover frames;
+there is no trace-length cutoff, so all reachable cycles are explored.
+
+OPEN creates a connecting supervisor only after duplicate and capacity checks.
+New DATA is enqueued only while upload routing exists. FIN removes that routing;
+queued upload completion and target EOF occur independently. Both halves must
+finish before natural slot release. RESET or a stalled/failed target requests
+cancellation, and the slot stays charged until a separate task-exit action.
+Resolution, connect, socket tuning, and initial-write failures affect only that
+stream while the shared carrier is healthy. A stream idle-watchdog exit also
+releases that stream's halves and slot. Cover leaves both streams intact.
+Carrier teardown enters a closing phase, requests aborts, and reaches closed
+only after all supervisors exit; it does not assume immediate abort completion.
+Task completion and the next admission's `prune_finished` are combined into
+one admission-visible transition, rather than modeling stale map entries.
+
+| Invariant | Unreachable situation |
+| --- | --- |
+| `MuxCapacityCountsBothHalves` | Two unfinished supervisors occupy a one-slot carrier |
+| `MuxLocalEventsPreserveSibling` | A stream-local event changes another stream's phase, route, halves, or slot |
+| `MuxRejectedOpenAndCoverAreInert` | Rejected OPEN or Cover changes either stream |
+| `MuxTeardownReleasesAllSlots` | Completed carrier teardown leaves an owned slot or target half |
+| `MuxOwnership0`, `MuxOwnership1` | Supervisor ownership and slot accounting disagree |
+| `MuxLiveHalfKeepsSlot0`, `MuxLiveHalfKeepsSlot1` | Either live relay half has an uncharged slot |
+| `MuxFinIsHalfClose0`, `MuxFinIsHalfClose1` | FIN prematurely destroys a supervisor or target half |
+| `MuxDataRequiresUploadRoute0`, `MuxDataRequiresUploadRoute1` | New DATA is enqueued after upload FIN/RESET |
+| `MuxResetKeepsSlotUntilExit0`, `MuxResetKeepsSlotUntilExit1` | An abort request releases its slot before task exit |
+
+This proves safety of the stated finite abstraction. It does not prove eventual
+task cancellation, OS fd closure, byte/queue ordering, scheduler fairness,
+arbitrary stream counts, client download dispatch, or the native QUIC-bidi
+lifecycle. A shared downlink/control-queue failure may end the whole carrier;
+that failure is represented by `CarrierTeardown`, rather than by a stream-local
+isolation claim. Source anchors detect selected changes in production control order;
+they are not a semantic equivalence proof between Rust and the model.
+
+## PX1I caller (`ParallaXIdentityChunks`)
+
+Unlike the PX1F helper, `read_server_identity_payload` performs its own PX1I
+accumulation. This model enumerates external metadata with total 0..4, offset
+0..3, and chunk length 0..4: all 100 candidate combinations, including invalid
+ones, are selected before validation. The capacity is scaled to three bytes.
+Each candidate then passes through AEAD outcome, structural metadata checks,
+capacity, latched total, offset continuity, append, and completeness. An append
+snapshot retains the previous cursor, so a gap/overlap bypass violates an
+assertion rather than disappearing inside a valid-input assumption.
+
+A complete payload still requires the PQ binding and successful identity
+verification before CONNECT. EOF, I/O, AEAD, inconsistent metadata, missing
+binding, and signature/identity-payload failure all terminate establishment.
+The outer absolute establishment deadline can interrupt any pre-CONNECT
+stage, including partial accumulation and the verification await.
+
+| Invariant | Unreachable situation |
+| --- | --- |
+| `IdentityBufferNeverExceedsCap` | Accepted metadata grows the caller buffer past the bounded capacity |
+| `IdentityAppendRequiresValidatedMetadata` | Append accepts mismatched total, a gap/overlap, or an out-of-range end |
+| `IdentityPartialCannotVerify` | Partial accumulation reaches the assembled, verified, or CONNECT phase |
+| `IdentityVerificationNeedsWholeBoundPayload` | Identity succeeds without a complete payload or PQ binding |
+| `IdentityFailureBlocksConnect` | An establishment failure sends CONNECT |
+| `IdentityConnectWaitsForVerification` | CONNECT bypasses complete accumulation or identity verification |
+
+AEAD and signature outcomes are opaque pass/fail events, not proofs of the
+cryptographic primitives. Arbitrary byte strings, u32-size inputs, allocator
+behavior, partial TCP-record parser internals, and clock/scheduler behavior are
+outside this bounded model. EOF/deadline are events; no real-time termination
+bound is proved. Existing Rust tests and the full-session model cover adjacent
+layers independently.
+
+Additional counterexample self-tests remove capacity/offset checks, free slots
+on FIN/abort, cancel a sibling, deliver DATA after FIN, emit partial identity,
+and bypass failed identity/deadline gates. These checks must fail with a named
+invariant; source-contract tests separately remove the real task-retention and
+PX1I offset anchors from temporary source copies.

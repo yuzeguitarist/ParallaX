@@ -3,7 +3,7 @@ name: formal
 # Protocol state-machine check. The Python checker exhausts the models in
 # formal/plx_formal.py (session, QUIC handshake, 0-RTT, replay insert, UDP
 # probe, inbound gates, key install, QUIC close, BBR mode, first byte,
-# record-batch failure and framed-command reassembly). TLC
+# record-batch failure, framed/identity reassembly and MUX lifecycle). TLC
 # then checks the generated TLA+ with an independent engine. Correspondence
 # fails the job if the Rust control flow those models describe has moved.
 #
