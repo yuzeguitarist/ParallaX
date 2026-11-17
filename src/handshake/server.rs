@@ -75,7 +75,10 @@ use crate::{
             log_record_read, parse_header, read_record, BufferedTlsRecordReader, TlsRecordReader,
             TLS_HEADER_LEN,
         },
-        server_hello::{parse_server_hello, ServerHello, ServerHelloError},
+        server_hello::{
+            parse_server_hello, parse_server_hello_records, ServerHello, ServerHelloError,
+            ServerHelloReassembly,
+        },
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
     transport::{
@@ -2202,12 +2205,42 @@ async fn graceful_close_pre_pq(
     .await;
 }
 
-async fn read_forwarded_server_hello(
+async fn read_forwarded_server_hello<R: tokio::io::AsyncRead + Unpin>(
+    fallback: &mut R,
+) -> Result<ForwardedServerHello, HandshakeServerError> {
+    timeout(HANDSHAKE_TIMEOUT, async {
+        let mut reassembly = ServerHelloReassembly::default();
+        loop {
+            let record = read_record(fallback).await?;
+            // TLS 1.2 can coalesce its plaintext Certificate after ServerHello.
+            // Preserve the original first record for forwarding and strict-TLS
+            // rejection, while TLS 1.3 still requires an exact handshake message.
+            if !reassembly.started() {
+                if let Ok(parsed) = parse_server_hello(&record) {
+                    if !parsed.tls13_selected {
+                        return Ok(ForwardedServerHello {
+                            raw_record: record,
+                            parsed,
+                        });
+                    }
+                }
+            }
+            if reassembly.push_record(&record)? {
+                let raw_record = reassembly.into_records();
+                let parsed = parse_server_hello_records(&raw_record)?;
+                return Ok(ForwardedServerHello { raw_record, parsed });
+            }
+        }
+    })
+    .await
+    .map_err(|_| HandshakeServerError::Timeout)?
+}
+
+#[cfg(test)]
+pub(crate) async fn read_forwarded_server_hello_for_test(
     fallback: &mut TcpStream,
 ) -> Result<ForwardedServerHello, HandshakeServerError> {
-    let raw_record = read_first_record(fallback).await?;
-    let parsed = parse_server_hello(&raw_record)?;
-    Ok(ForwardedServerHello { raw_record, parsed })
+    read_forwarded_server_hello(fallback).await
 }
 
 /// Adds a uniform `[0, jitter]` upward grace to `floor`. The floor is never
@@ -2306,13 +2339,6 @@ fn timeout_tuning() -> TimeoutTuning {
         .get()
         .copied()
         .unwrap_or_else(TimeoutTuning::defaults)
-}
-
-async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeServerError> {
-    timeout(HANDSHAKE_TIMEOUT, read_record(stream))
-        .await
-        .map_err(|_| HandshakeServerError::Timeout)?
-        .map_err(HandshakeServerError::Io)
 }
 
 /// Bounds a handshake-phase write so an authenticated peer that stops reading
@@ -8123,6 +8149,67 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+
+    #[tokio::test]
+    async fn fragmented_server_hello_preserves_forwarded_wire_bytes() {
+        let record = crate::tls::server_hello::tests::server_hello_fixture();
+        let wire =
+            crate::tls::server_hello::tests::fragment_handshake_record(&record, &[1, 3, 40, 55]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (reader, writer) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut reader = reader.unwrap();
+        let mut writer = writer.unwrap().0;
+        writer.write_all(&wire).await.unwrap();
+        drop(writer);
+        let forwarded = read_forwarded_server_hello(&mut reader).await.unwrap();
+        assert_eq!(forwarded.raw_record, wire);
+        assert_eq!(forwarded.parsed.random, [0x44; 32]);
+        assert!(forwarded.parsed.tls13_selected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fragmented_server_hello_uses_one_whole_handshake_deadline() {
+        let record = crate::tls::server_hello::tests::server_hello_fixture();
+        let wire = crate::tls::server_hello::tests::fragment_handshake_record(&record, &[2, 3]);
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&wire[..TLS_HEADER_LEN + 2]).await.unwrap();
+        let started = Instant::now();
+        let reading = tokio::spawn(async move { read_forwarded_server_hello(&mut reader).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(HANDSHAKE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!reading.is_finished());
+        writer
+            .write_all(&wire[TLS_HEADER_LEN + 2..2 * TLS_HEADER_LEN + 3])
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            reading.await.unwrap(),
+            Err(HandshakeServerError::Timeout)
+        ));
+        assert_eq!(Instant::now() - started, HANDSHAKE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn tls13_forwarder_rejects_coalesced_handshake_tail() {
+        let mut record = crate::tls::server_hello::tests::server_hello_fixture();
+        record.extend_from_slice(&[11, 0, 0, 0]);
+        let payload_len = (record.len() - TLS_HEADER_LEN) as u16;
+        record[3..5].copy_from_slice(&payload_len.to_be_bytes());
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&record).await.unwrap();
+        let result = read_forwarded_server_hello(&mut reader).await;
+        assert!(matches!(
+            result,
+            Err(HandshakeServerError::ServerHello(
+                ServerHelloError::InvalidLength
+            ))
+        ));
+    }
 
     #[derive(Default)]
     struct MuxRecordTestWriter {
@@ -14493,7 +14580,36 @@ mod tests {
 
     #[tokio::test]
     async fn strict_tls13_rejection_relays_origin_server_hello_first() {
-        let tls12_server_hello = server_hello_fixture_with_tls12_selected();
+        for coalesced in [false, true] {
+            assert_legacy_server_hello_forwarding(true, coalesced).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn non_strict_tls13_accepts_coalesced_legacy_server_flight() {
+        for coalesced in [false, true] {
+            assert_legacy_server_hello_forwarding(false, coalesced).await;
+        }
+    }
+
+    async fn assert_legacy_server_hello_forwarding(strict_tls13: bool, coalesced: bool) {
+        let mut tls12_server_hello = server_hello_fixture_with_tls12_selected();
+        if coalesced {
+            let certificate = rcgen::generate_simple_self_signed(vec!["example.com".to_owned()])
+                .unwrap()
+                .cert
+                .der()
+                .to_vec();
+            let cert_len = certificate.len() as u32;
+            let mut message = vec![11]; // TLS 1.2 Certificate handshake message.
+            message.extend_from_slice(&(cert_len + 6).to_be_bytes()[1..]);
+            message.extend_from_slice(&(cert_len + 3).to_be_bytes()[1..]);
+            message.extend_from_slice(&cert_len.to_be_bytes()[1..]);
+            message.extend_from_slice(&certificate);
+            tls12_server_hello.extend_from_slice(&message);
+            let payload_len = (tls12_server_hello.len() - TLS_HEADER_LEN) as u16;
+            tls12_server_hello[3..5].copy_from_slice(&payload_len.to_be_bytes());
+        }
         let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fallback_addr = fallback_listener.local_addr().unwrap();
         let expected_first_client_record =
@@ -14509,15 +14625,17 @@ mod tests {
         let server_keys = X25519KeyPair::generate();
         let server_identity_keys = identity::keypair();
         let replay_cache_dir = tempfile::tempdir().unwrap();
-        let config = authenticated_server_config(
+        let mut config = authenticated_server_config(
             fallback_addr,
             &server_keys,
             &server_identity_keys,
             replay_cache_dir.path().join("parallax-replay.cache"),
         );
+        config.strict_tls13 = strict_tls13;
         let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let parallax_addr = parallax_listener.local_addr().unwrap();
         let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let expected_context = transcript_hash(&first_client_record, &tls12_server_hello);
         let accepted = tokio::spawn(async move {
             let (server_side, _) = parallax_listener.accept().await.unwrap();
             accept_authenticated(
@@ -14525,7 +14643,7 @@ mod tests {
                 &config,
                 &[0x5a_u8; 32],
                 server_keys.public,
-                zeroize::Zeroizing::new([0_u8; 32]),
+                zeroize::Zeroizing::new([0x42_u8; 32]),
                 first_client_record,
                 AuthenticatedHello {
                     sni: String::from("example.com"),
@@ -14542,8 +14660,14 @@ mod tests {
         let relayed = read_record(&mut client).await.unwrap();
         assert_eq!(relayed, tls12_server_hello);
 
-        let err = accepted.await.unwrap().unwrap_err();
-        assert!(matches!(err, HandshakeServerError::Tls13Required));
+        let result = accepted.await.unwrap();
+        if strict_tls13 {
+            assert!(matches!(result, Err(HandshakeServerError::Tls13Required)));
+        } else {
+            let handshake = result.unwrap();
+            assert!(!handshake.server_hello.tls13_selected);
+            assert_eq!(handshake.session_keys.transcript_hash, expected_context);
+        }
         fallback_task.await.unwrap();
     }
 

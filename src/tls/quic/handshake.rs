@@ -1456,24 +1456,24 @@ fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
 fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
     let mut c = Cursor::new(body);
     let algorithm = c.u16()?;
+    let uncompressed_len = c.u24()? as usize;
+    let compressed = c.vec_u24()?;
+    if c.remaining() != 0 || compressed.is_empty() {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "malformed compressed certificate vector",
+        ));
+    }
     if algorithm != CERT_COMPRESSION_ZLIB {
         return Err(QuicTlsError::alert(
-            ALERT_BAD_CERTIFICATE,
+            ALERT_ILLEGAL_PARAMETER,
             "unsupported certificate compression algorithm",
         ));
     }
-    let uncompressed_len = c.u24()? as usize;
     if uncompressed_len > MAX_DECOMPRESSED_CERT_CHAIN {
         return Err(QuicTlsError::alert(
-            ALERT_BAD_CERTIFICATE,
+            ALERT_ILLEGAL_PARAMETER,
             "compressed_certificate uncompressed_length exceeds maximum",
-        ));
-    }
-    let compressed = c.vec_u24()?;
-    if c.remaining() != 0 {
-        return Err(QuicTlsError::alert(
-            ALERT_DECODE_ERROR,
-            "trailing bytes after compressed certificate",
         ));
     }
     // One spare output byte detects an understated length without inflating an
@@ -2875,12 +2875,12 @@ mod tests {
             (
                 "algorithm",
                 compressed_certificate_body(2, certificate.len(), &compressed),
-                ALERT_BAD_CERTIFICATE,
+                ALERT_ILLEGAL_PARAMETER,
             ),
             (
                 "declared cap",
                 compressed_certificate_body(1, MAX_DECOMPRESSED_CERT_CHAIN + 1, &compressed),
-                ALERT_BAD_CERTIFICATE,
+                ALERT_ILLEGAL_PARAMETER,
             ),
             (
                 "inflation cap",
@@ -2985,6 +2985,74 @@ mod tests {
             parse_selected_alpn(&[0, 1, 0]).expect_err("RFC 7301 protocol names are nonempty");
         assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
         assert_eq!(parse_selected_alpn(&[0, 3, 2, b'h', b'3']).unwrap(), b"h3");
+    }
+
+    #[test]
+    fn compressed_certificate_alerts_match_tcp_rfc_boundaries() {
+        let (_, _, remaining) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+        let plain = &remaining[0][4..];
+        let compressed = zlib_bytes(plain);
+        let body = compressed_certificate_body(1, plain.len(), &compressed);
+        assert!(parse_compressed_certificate_body(&body).is_ok());
+        assert_eq!(
+            crate::tls::safari26::compressed_certificate_alert_for_test(&body),
+            None
+        );
+        let mut stream_tail = compressed.clone();
+        stream_tail.push(0);
+        let mut outer_tail = body.clone();
+        outer_tail.push(0);
+        let mut truncated_vector = body;
+        truncated_vector.pop();
+        let cases = [
+            (
+                compressed_certificate_body(2, plain.len(), &compressed),
+                ALERT_ILLEGAL_PARAMETER,
+            ),
+            (
+                compressed_certificate_body(1, MAX_DECOMPRESSED_CERT_CHAIN + 1, &[0xff]),
+                ALERT_ILLEGAL_PARAMETER,
+            ),
+            (
+                compressed_certificate_body(1, plain.len(), &[0xff]),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                compressed_certificate_body(1, plain.len(), &compressed[..compressed.len() - 1]),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                compressed_certificate_body(1, plain.len(), &stream_tail),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                compressed_certificate_body(1, plain.len() + 1, &compressed),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                compressed_certificate_body(1, plain.len() - 1, &compressed),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (outer_tail, ALERT_DECODE_ERROR),
+            (truncated_vector, ALERT_DECODE_ERROR),
+            (
+                compressed_certificate_body(1, plain.len(), &[]),
+                ALERT_DECODE_ERROR,
+            ),
+            (vec![0, 2], ALERT_DECODE_ERROR),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                parse_compressed_certificate_body(&body)
+                    .unwrap_err()
+                    .alert_description(),
+                Some(expected)
+            );
+            assert_eq!(
+                crate::tls::safari26::compressed_certificate_alert_for_test(&body),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

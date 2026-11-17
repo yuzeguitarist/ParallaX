@@ -43,7 +43,7 @@ use super::{
         SIG_RSA_PSS_RSAE_SHA512, TLS12, TLS13, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
         TLS_CHACHA20_POLY1305_SHA256, X25519_KEY_LEN,
     },
-    server_hello::parse_server_hello,
+    server_hello::{parse_server_hello_records, server_hello_payload, ServerHelloReassembly},
 };
 use crate::crypto::{
     auth::{
@@ -55,6 +55,8 @@ use crate::crypto::{
     session::{x25519_shared_secret, X25519KeyPair},
 };
 use crate::fingerprint::http2::{Http2Fingerprint, Http2FingerprintError, Http2FrameHeader};
+#[cfg(test)]
+use crate::tls::server_hello::parse_server_hello;
 use crate::tls::server_hello::ServerHelloError;
 
 const POST_HANDSHAKE_DRAIN_LIMIT: usize = 4;
@@ -80,6 +82,8 @@ const TLS_RECORD_VERSION_TLS13: [u8; 2] = [0x03, 0x03];
 // the only alert value tolerated as a clean close (see is_warning_close_notify).
 const TLS_ALERT_LEVEL_WARNING: u8 = 0x01;
 const TLS_ALERT_DESC_CLOSE_NOTIFY: u8 = 0x00;
+const TLS_ALERT_DESC_UNEXPECTED_MESSAGE: u8 = 10;
+const TLS_ALERT_DESC_BAD_CERTIFICATE: u8 = 42;
 const TLS_ALERT_DESC_ILLEGAL_PARAMETER: u8 = 47;
 const TLS_ALERT_DESC_DECRYPT_ERROR: u8 = 51;
 const TLS_ALERT_DESC_MISSING_EXTENSION: u8 = 109;
@@ -454,7 +458,6 @@ impl Safari26TlsSession {
             let server_flight = self
                 .read_encrypted_server_flight(stream, keys, &mut transcript)
                 .await?;
-            verify_server_certificate(&self.sni, &server_flight, &transcript)?;
             keys.install_application_keys(&transcript)?;
             self.write_client_finished(
                 stream,
@@ -632,6 +635,7 @@ impl Safari26TlsSession {
         stream: &mut TcpStream,
     ) -> Result<Vec<u8>, Safari26TlsError> {
         let mut ccs_records = 0_usize;
+        let mut reassembly = ServerHelloReassembly::default();
         loop {
             let record = read_record(stream).await?;
             self.tap_records(RecordDirection::Inbound, &record);
@@ -639,6 +643,9 @@ impl Safari26TlsSession {
                 .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
             match header.content_type {
                 TLS_RECORD_CHANGE_CIPHER_SPEC => {
+                    if reassembly.started() {
+                        return Err(ServerHelloError::NotHandshakeRecord.into());
+                    }
                     ccs_records += 1;
                     if ccs_records > MAX_CHANGE_CIPHER_SPEC_RECORDS {
                         return Err(Safari26TlsError::Handshake(
@@ -649,8 +656,11 @@ impl Safari26TlsSession {
                 }
                 TLS_CONTENT_ALERT => return parse_alert(&record),
                 TLS_RECORD_HANDSHAKE => {
-                    let _ = parse_server_hello(&record)?;
-                    return Ok(record);
+                    if reassembly.push_record(&record)? {
+                        let records = reassembly.into_records();
+                        let _ = parse_server_hello_records(&records)?;
+                        return Ok(records);
+                    }
                 }
                 _ => return Err(Safari26TlsError::MissingServerHello),
             }
@@ -751,6 +761,7 @@ impl Safari26TlsSession {
         let mut ccs_records = 0_usize;
         let mut records_read = 0_usize;
         let mut total_decrypted = 0_usize;
+        let mut certificate_verified = false;
 
         while !flight.finished {
             // Bound the loop before each read: a keyed peer trickling records that
@@ -800,12 +811,22 @@ impl Safari26TlsSession {
                         ));
                     }
                     handshake_buf.extend_from_slice(&decrypted.plaintext);
-                    process_server_handshake_messages(
-                        &mut handshake_buf,
-                        &mut flight,
-                        transcript,
-                        keys,
-                    )?;
+                    loop {
+                        let buffered = handshake_buf.len();
+                        process_server_handshake_messages(
+                            &mut handshake_buf,
+                            &mut flight,
+                            transcript,
+                            keys,
+                        )?;
+                        if !certificate_verified && !flight.certificates.is_empty() {
+                            verify_server_certificate(&self.sni, &flight, transcript)?;
+                            certificate_verified = true;
+                        }
+                        if flight.finished || handshake_buf.len() == buffered {
+                            break;
+                        }
+                    }
                 }
                 _ => {
                     return Err(Safari26TlsError::Handshake(format!(
@@ -1409,10 +1430,8 @@ fn parse_safari_server_hello(
     record: &[u8],
     expected_session_id: &[u8],
 ) -> Result<ParsedServerHello, Safari26TlsError> {
-    let _ = parse_server_hello(record)?;
-    let (_, payload) = super::record::parse_exact(record)
-        .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
-    let mut c = TlsCursor::new(payload);
+    let payload = server_hello_payload(record)?;
+    let mut c = TlsCursor::new(&payload);
     let handshake_type = c.u8()?;
     if handshake_type != HANDSHAKE_SERVER_HELLO {
         return Err(Safari26TlsError::Handshake(
@@ -1553,11 +1572,13 @@ struct RetryKeyShare {
 }
 
 fn is_hello_retry_request(record: &[u8]) -> bool {
-    // record header (5) + handshake type (1) + u24 length (3) + legacy_version (2)
-    const RANDOM_OFFSET: usize = 5 + 1 + 3 + 2;
-    record
-        .get(RANDOM_OFFSET..RANDOM_OFFSET + 32)
-        .is_some_and(|random| random == hrr_random())
+    // Handshake type (1) + u24 length (3) + legacy_version (2).
+    const RANDOM_OFFSET: usize = 1 + 3 + 2;
+    server_hello_payload(record).is_ok_and(|payload| {
+        payload
+            .get(RANDOM_OFFSET..RANDOM_OFFSET + 32)
+            .is_some_and(|random| random == hrr_random())
+    })
 }
 
 /// Parse a HelloRetryRequest, enforcing the same invariants the real ServerHello
@@ -1566,14 +1587,8 @@ fn parse_hello_retry_request(
     record: &[u8],
     expected_session_id: &[u8; 32],
 ) -> Result<HelloRetryRequest, Safari26TlsError> {
-    let (header, payload) = super::record::parse_exact(record)
-        .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
-    if record.len() != header.total_len {
-        return Err(Safari26TlsError::Handshake(
-            "trailing bytes after HelloRetryRequest record".to_owned(),
-        ));
-    }
-    let mut c = TlsCursor::new(payload);
+    let payload = server_hello_payload(record)?;
+    let mut c = TlsCursor::new(&payload);
     if c.u8()? != HANDSHAKE_SERVER_HELLO {
         return Err(Safari26TlsError::Handshake(
             "expected HelloRetryRequest".to_owned(),
@@ -2471,14 +2486,20 @@ struct ServerFlight {
 /// (Certificate#1 + CV) and then present the real chain (Certificate#2) before
 /// Finished — defeating the cover-origin TLS authentication.
 fn reject_out_of_order_certificate(flight: &ServerFlight) -> Result<(), Safari26TlsError> {
-    if !flight.certificates.is_empty() || flight.certificate_verify_seen {
-        return Err(Safari26TlsError::Handshake(
-            "duplicate or out-of-order Certificate message in server flight".to_owned(),
+    if !flight.encrypted_extensions_seen
+        || !flight.certificates.is_empty()
+        || flight.certificate_verify_seen
+    {
+        return Err(Safari26TlsError::protocol(
+            TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+            "duplicate or out-of-order Certificate message in server flight",
         ));
     }
     Ok(())
 }
 
+// Pause after Certificate so the reader validates its chain before consuming
+// buffered CertificateVerify/Finished or waiting for another record.
 fn process_server_handshake_messages(
     buf: &mut Vec<u8>,
     flight: &mut ServerFlight,
@@ -2508,9 +2529,13 @@ fn process_server_handshake_messages(
         let body = &message[4..];
         match message[0] {
             HANDSHAKE_ENCRYPTED_EXTENSIONS => {
-                if flight.encrypted_extensions_seen {
-                    return Err(Safari26TlsError::Handshake(
-                        "duplicate EncryptedExtensions in server flight".to_owned(),
+                if flight.encrypted_extensions_seen
+                    || !flight.certificates.is_empty()
+                    || flight.certificate_verify_seen
+                {
+                    return Err(Safari26TlsError::protocol(
+                        TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                        "duplicate or out-of-order EncryptedExtensions in server flight",
                     ));
                 }
                 parse_encrypted_extensions(body, keys)?;
@@ -2521,6 +2546,7 @@ fn process_server_handshake_messages(
                 reject_out_of_order_certificate(flight)?;
                 flight.certificates = parse_certificate_body(body)?;
                 transcript.push(&message);
+                return Ok(());
             }
             HANDSHAKE_CERTIFICATE_REQUEST => {
                 if !flight.encrypted_extensions_seen
@@ -2528,8 +2554,9 @@ fn process_server_handshake_messages(
                     || !flight.certificates.is_empty()
                     || flight.certificate_verify_seen
                 {
-                    return Err(Safari26TlsError::Handshake(
-                        "duplicate or out-of-order CertificateRequest".to_owned(),
+                    return Err(Safari26TlsError::protocol(
+                        TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                        "duplicate or out-of-order CertificateRequest",
                     ));
                 }
                 parse_certificate_request(body)?;
@@ -2540,11 +2567,16 @@ fn process_server_handshake_messages(
                 reject_out_of_order_certificate(flight)?;
                 flight.certificates = parse_compressed_certificate_body(body)?;
                 transcript.push(&message);
+                return Ok(());
             }
             HANDSHAKE_CERTIFICATE_VERIFY => {
-                if flight.certificate_verify_seen {
-                    return Err(Safari26TlsError::Handshake(
-                        "duplicate CertificateVerify in server flight".to_owned(),
+                if !flight.encrypted_extensions_seen
+                    || flight.certificates.is_empty()
+                    || flight.certificate_verify_seen
+                {
+                    return Err(Safari26TlsError::protocol(
+                        TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                        "duplicate or out-of-order CertificateVerify in server flight",
                     ));
                 }
                 verify_certificate_verify(body, flight, transcript, keys)?;
@@ -2556,8 +2588,9 @@ fn process_server_handshake_messages(
                     || flight.certificates.is_empty()
                     || !flight.certificate_verify_seen
                 {
-                    return Err(Safari26TlsError::Handshake(
-                        "server Finished arrived before the authenticated flight".to_owned(),
+                    return Err(Safari26TlsError::protocol(
+                        TLS_ALERT_DESC_UNEXPECTED_MESSAGE,
+                        "server Finished arrived before the authenticated flight",
                     ));
                 }
                 let expected = keys.server_finished_verify_data(transcript)?;
@@ -2735,12 +2768,19 @@ fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari26TlsError>
 fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari26TlsError> {
     let mut c = TlsCursor::new(body);
     let algorithm = c.u16()?;
+    let uncompressed_len = c.u24()? as usize;
+    let compressed = c.vec_u24()?;
+    if c.remaining() != 0 || compressed.is_empty() {
+        return Err(Safari26TlsError::Handshake(
+            "malformed compressed certificate vector".to_owned(),
+        ));
+    }
     if algorithm != CERT_COMPRESSION_ZLIB {
-        return Err(Safari26TlsError::Unsupported(
+        return Err(Safari26TlsError::protocol(
+            TLS_ALERT_DESC_ILLEGAL_PARAMETER,
             "unsupported compressed_certificate algorithm",
         ));
     }
-    let uncompressed_len = c.u24()? as usize;
     // Reject an oversized declared length BEFORE allocating: a real server
     // certificate chain is a few KiB, and zlib's ~1000:1 ratio means a tiny
     // attacker-supplied blob can declare (and inflate to) gigabytes. Without this
@@ -2748,14 +2788,9 @@ fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari
     // the handshake keys come from the still-unauthenticated server key_share —
     // could OOM-kill the client/prober with one small CompressedCertificate.
     if uncompressed_len > MAX_DECOMPRESSED_CERT_CHAIN {
-        return Err(Safari26TlsError::Handshake(
-            "compressed_certificate uncompressed_length exceeds maximum".to_owned(),
-        ));
-    }
-    let compressed = c.vec_u24()?;
-    if c.remaining() != 0 {
-        return Err(Safari26TlsError::Handshake(
-            "trailing bytes after compressed certificate".to_owned(),
+        return Err(Safari26TlsError::protocol(
+            TLS_ALERT_DESC_ILLEGAL_PARAMETER,
+            "compressed_certificate uncompressed_length exceeds maximum",
         ));
     }
     // The declared length is also the inflation budget (RFC 8879 section 5).
@@ -2765,24 +2800,36 @@ fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, Safari
     let mut decoder = Decompress::new(true);
     let status = decoder
         .decompress(compressed, &mut decompressed, FlushDecompress::Finish)
-        .map_err(|_| Safari26TlsError::Handshake("zlib decompression failed".to_owned()))?;
+        .map_err(|_| {
+            Safari26TlsError::protocol(TLS_ALERT_DESC_BAD_CERTIFICATE, "zlib decompression failed")
+        })?;
     if decoder.total_out() > uncompressed_len as u64 {
-        return Err(Safari26TlsError::Handshake(
-            "compressed_certificate inflates beyond maximum".to_owned(),
+        return Err(Safari26TlsError::protocol(
+            TLS_ALERT_DESC_BAD_CERTIFICATE,
+            "compressed_certificate inflates beyond maximum",
         ));
     }
     if status != Status::StreamEnd || decoder.total_in() != compressed.len() as u64 {
-        return Err(Safari26TlsError::Handshake(
-            "compressed_certificate incomplete or trailing zlib stream".to_owned(),
+        return Err(Safari26TlsError::protocol(
+            TLS_ALERT_DESC_BAD_CERTIFICATE,
+            "compressed_certificate incomplete or trailing zlib stream",
         ));
     }
     if decoder.total_out() != uncompressed_len as u64 {
-        return Err(Safari26TlsError::Handshake(
-            "compressed_certificate length mismatch".to_owned(),
+        return Err(Safari26TlsError::protocol(
+            TLS_ALERT_DESC_BAD_CERTIFICATE,
+            "compressed_certificate length mismatch",
         ));
     }
     decompressed.truncate(uncompressed_len);
     parse_certificate_body(&decompressed)
+}
+
+#[cfg(test)]
+pub(crate) fn compressed_certificate_alert_for_test(body: &[u8]) -> Option<u8> {
+    parse_compressed_certificate_body(body)
+        .err()
+        .and_then(|error| fatal_alert_description(&error))
 }
 
 fn verify_certificate_verify(
@@ -2937,9 +2984,13 @@ impl HandshakeTranscript {
     }
 
     fn push_handshake_record(&mut self, record: &[u8]) -> Result<(), Safari26TlsError> {
-        let (_, payload) = super::record::parse_exact(record)
-            .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
-        self.bytes.extend_from_slice(payload);
+        let mut remaining = record;
+        while !remaining.is_empty() {
+            let (header, payload) = super::record::parse_exact(remaining)
+                .map_err(|err| Safari26TlsError::Handshake(err.to_string()))?;
+            self.bytes.extend_from_slice(payload);
+            remaining = &remaining[header.total_len..];
+        }
         Ok(())
     }
 
@@ -3109,6 +3160,23 @@ pub mod fuzz {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Parser/signature fixtures deliberately use untrusted self-signed leaves.
+    // Production drains these steps only after native chain verification.
+    fn process_unverified_server_flight(
+        buf: &mut Vec<u8>,
+        flight: &mut ServerFlight,
+        transcript: &mut HandshakeTranscript,
+        keys: &mut Tls13Keys,
+    ) -> Result<(), Safari26TlsError> {
+        loop {
+            let buffered = buf.len();
+            process_server_handshake_messages(buf, flight, transcript, keys)?;
+            if flight.finished || buf.len() == buffered {
+                return Ok(());
+            }
+        }
+    }
     use crate::crypto::{
         auth::{derive_server_auth_key, verify_masked_stateful_client_hello_auth_with_material},
         session::X25519KeyPair,
@@ -3139,7 +3207,7 @@ mod tests {
         let body = build_compressed_cert_body(MAX_DECOMPRESSED_CERT_CHAIN + 1, b"hi");
         let err = parse_compressed_certificate_body(&body).unwrap_err();
         assert!(
-            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("exceeds maximum")),
+            matches!(err, Safari26TlsError::Protocol { description: 47, ref message } if message.contains("exceeds maximum")),
             "unexpected error: {err:?}"
         );
     }
@@ -3153,7 +3221,7 @@ mod tests {
         let body = build_compressed_cert_body(64, &plaintext);
         let err = parse_compressed_certificate_body(&body).unwrap_err();
         assert!(
-            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("beyond maximum")),
+            matches!(err, Safari26TlsError::Protocol { description: 42, ref message } if message.contains("beyond maximum")),
             "unexpected error: {err:?}"
         );
     }
@@ -3163,12 +3231,13 @@ mod tests {
         // Only zlib (0x0001) is accepted. Any other CompressedCertificate
         // algorithm must be refused on the still-unauthenticated server flight
         // rather than fed to the zlib decoder. The existing tests only build zlib
-        // bodies, so this arm was never exercised. The algorithm check fires
-        // before the compressed body is read, so a bare 2-byte algorithm suffices.
-        let body = 0x0002_u16.to_be_bytes(); // brotli, not zlib
+        // bodies. A valid TLS vector with an unoffered algorithm is an illegal
+        // parameter; a truncated outer vector is still a decode error.
+        let mut body = build_compressed_cert_body(5, b"hello");
+        body[..2].copy_from_slice(&0x0002_u16.to_be_bytes());
         let err = parse_compressed_certificate_body(&body).unwrap_err();
         assert!(
-            matches!(err, Safari26TlsError::Unsupported(m) if m.contains("algorithm")),
+            matches!(err, Safari26TlsError::Protocol { description: 47, ref message } if message.contains("algorithm")),
             "unexpected error: {err:?}"
         );
     }
@@ -3182,7 +3251,7 @@ mod tests {
         let body = build_compressed_cert_body(6, b"hello");
         let err = parse_compressed_certificate_body(&body).unwrap_err();
         assert!(
-            matches!(err, Safari26TlsError::Handshake(ref m) if m.contains("length mismatch")),
+            matches!(err, Safari26TlsError::Protocol { description: 42, ref message } if message.contains("length mismatch")),
             "unexpected error: {err:?}"
         );
     }
@@ -4310,6 +4379,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn drain_post_handshake_rejects_partial_record_timeout_and_eof() {
+        // A real TCP FIN needs physical I/O polling; automatic virtual-clock
+        // advancement can otherwise turn the EOF case into a timeout.
         for split in [2, 7] {
             for close in [false, true] {
                 let mut session = test_session();
@@ -4320,11 +4391,15 @@ mod tests {
                 stream.readable().await.unwrap();
                 if close {
                     peer.shutdown().await.unwrap();
+                    tokio::time::resume();
                 }
                 let err = session
                     .drain_post_handshake(&mut stream, &mut keys)
                     .await
                     .expect_err("a consumed TLS prefix must never be discarded");
+                if close {
+                    tokio::time::pause();
+                }
                 if !close {
                     assert!(matches!(err, Safari26TlsError::Handshake(ref message)
                         if message == "post-handshake drain timed out mid-record"));
@@ -6189,9 +6264,13 @@ mod tests {
 
     #[test]
     fn reject_out_of_order_certificate_accepts_first_certificate() {
-        // Empty flight, no CertificateVerify yet: must be accepted. Kills the
+        // EncryptedExtensions seen, no CertificateVerify yet: must be accepted. Kills the
         // `delete !` mutant (which would reject the first, in-order Certificate).
-        reject_out_of_order_certificate(&ServerFlight::default()).unwrap();
+        reject_out_of_order_certificate(&ServerFlight {
+            encrypted_extensions_seen: true,
+            ..ServerFlight::default()
+        })
+        .unwrap();
     }
 
     #[test]
@@ -6225,7 +6304,7 @@ mod tests {
         let mut flight = ServerFlight::default();
         let mut transcript = HandshakeTranscript::new();
         let mut keys = app_keys();
-        process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+        process_unverified_server_flight(&mut buf, &mut flight, &mut transcript, &mut keys)
             .unwrap();
         assert_eq!(buf, vec![0x08, 0x00]);
     }
@@ -6240,7 +6319,7 @@ mod tests {
         let mut transcript = HandshakeTranscript::new();
         let mut keys = app_keys();
         let err =
-            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+            process_unverified_server_flight(&mut buf, &mut flight, &mut transcript, &mut keys)
                 .unwrap_err();
         assert!(matches!(err, Safari26TlsError::Unsupported(_)));
         assert!(buf.is_empty()); // the complete 4-byte frame was consumed before rejection
@@ -6257,7 +6336,7 @@ mod tests {
         let mut transcript = HandshakeTranscript::new();
         let mut keys = app_keys();
         let err =
-            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+            process_unverified_server_flight(&mut buf, &mut flight, &mut transcript, &mut keys)
                 .unwrap_err();
         assert!(matches!(
             err,
@@ -6280,7 +6359,7 @@ mod tests {
         let mut flight = ServerFlight::default();
         let mut transcript = HandshakeTranscript::new();
         let mut keys = app_keys();
-        process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+        process_unverified_server_flight(&mut buf, &mut flight, &mut transcript, &mut keys)
             .unwrap();
         assert_eq!(buf.len(), 4); // header retained, nothing drained
     }
@@ -6506,11 +6585,12 @@ mod tests {
         let mut transcript = HandshakeTranscript::new();
         let mut keys = app_keys();
         let err =
-            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+            process_unverified_server_flight(&mut buf, &mut flight, &mut transcript, &mut keys)
                 .unwrap_err();
         assert!(matches!(
             err,
-            Safari26TlsError::Handshake(ref m) if m.contains("before the authenticated flight")
+            Safari26TlsError::Protocol { description: 10, ref message }
+                if message.contains("before the authenticated flight")
         ));
     }
 
@@ -6526,11 +6606,12 @@ mod tests {
         let mut transcript = HandshakeTranscript::new();
         let mut keys = app_keys();
         let err =
-            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+            process_unverified_server_flight(&mut buf, &mut flight, &mut transcript, &mut keys)
                 .unwrap_err();
         assert!(matches!(
             err,
-            Safari26TlsError::Handshake(ref m) if m.contains("before the authenticated flight")
+            Safari26TlsError::Protocol { description: 10, ref message }
+                if message.contains("before the authenticated flight")
         ));
     }
 
@@ -6546,7 +6627,7 @@ mod tests {
         let expected = keys.server_finished_verify_data(&transcript).unwrap();
         let mut buf = finished_message(&expected);
 
-        process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+        process_unverified_server_flight(&mut buf, &mut flight, &mut transcript, &mut keys)
             .unwrap();
         assert!(flight.finished);
         assert!(buf.is_empty());
@@ -6563,7 +6644,7 @@ mod tests {
         let mut buf = finished_message(&[0xAB; 32]);
 
         let err =
-            process_server_handshake_messages(&mut buf, &mut flight, &mut transcript, &mut keys)
+            process_unverified_server_flight(&mut buf, &mut flight, &mut transcript, &mut keys)
                 .unwrap_err();
         assert!(matches!(
             err,
@@ -6902,6 +6983,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fragmented_server_hello_preserves_wire_bytes_and_tls_transcript() {
+        let mut session = test_session();
+        let mut record = valid_safari_server_hello();
+        let session_id = parse_server_hello(&record).unwrap().session_id_range;
+        record[session_id].copy_from_slice(&session.sent_session_id);
+        let wire =
+            crate::tls::server_hello::tests::fragment_handshake_record(&record, &[1, 3, 40, 55]);
+        let (mut client, mut peer) = loopback().await;
+        peer.write_all(&change_cipher_spec()).await.unwrap();
+        peer.write_all(&wire).await.unwrap();
+        drop(peer);
+        let received = session.read_server_hello_record(&mut client).await.unwrap();
+        assert_eq!(received, wire);
+        let mut actual = HandshakeTranscript::new();
+        actual.push_handshake_record(&received).unwrap();
+        assert_eq!(
+            actual.bytes(),
+            &record[super::super::record::TLS_HEADER_LEN..]
+        );
+        let parsed = parse_safari_server_hello(&received, &session.sent_session_id).unwrap();
+        assert_eq!(parsed.key_share, vec![0x42; 32]);
+        assert_eq!(session.tap.events.len(), 6);
+        assert_eq!(
+            session.tap.events[0].content_type,
+            TLS_RECORD_CHANGE_CIPHER_SPEC
+        );
+        assert!(session
+            .tap
+            .events
+            .iter()
+            .all(|event| matches!(event.direction, RecordDirection::Inbound)));
+        let lengths: Vec<_> = session.tap.events[1..]
+            .iter()
+            .map(|event| event.len)
+            .collect();
+        assert_eq!(lengths, [1, 2, 37, 15, record.len() - 5 - 55]);
+
+        let (mut fallback, mut origin) = loopback().await;
+        origin.write_all(&wire).await.unwrap();
+        drop(origin);
+        let forwarded =
+            crate::handshake::server::read_forwarded_server_hello_for_test(&mut fallback)
+                .await
+                .unwrap();
+        assert_eq!(forwarded.raw_record, received);
+        assert_eq!(forwarded.parsed.record_len, wire.len());
+        let psk = [0x5a; 32];
+        let shared = [0x42; 32];
+        let client_keys = crate::handshake::client::derive_session_keys_from_shared(
+            &psk,
+            &shared,
+            &session.client_hello,
+            &received,
+        )
+        .unwrap();
+        let server_context = crate::handshake::transcript::transcript_hash(
+            &session.client_hello,
+            &forwarded.raw_record,
+        );
+        let server_keys =
+            crate::crypto::session::derive_server_keys_from_shared(&psk, &shared, &server_context)
+                .unwrap();
+        assert_eq!(client_keys.transcript_hash, server_context);
+        assert_eq!(client_keys.client_key, server_keys.client_key);
+        assert_eq!(client_keys.server_key, server_keys.server_key);
+    }
+
+    #[tokio::test]
+    async fn fragmented_server_hello_retry_preserves_tls_transcript_and_ccs() {
+        let mut session = test_session();
+        let hrr = hrr_record(
+            GROUP_SECP256R1,
+            &session.sent_session_id,
+            Some(b"retry-cookie"),
+        );
+        let fragmented_hrr =
+            crate::tls::server_hello::tests::fragment_handshake_record(&hrr, &[1, 3, 20, 50]);
+        let server_share = generate_retry_key_share(GROUP_SECP256R1).unwrap();
+        let mut extensions = Vec::new();
+        push_extension(
+            &mut extensions,
+            EXT_SUPPORTED_VERSIONS,
+            &TLS13.to_be_bytes(),
+        )
+        .unwrap();
+        let mut key_share = GROUP_SECP256R1.to_be_bytes().to_vec();
+        push_vec_u16(&mut key_share, &server_share.public).unwrap();
+        push_extension(&mut extensions, EXT_KEY_SHARE, &key_share).unwrap();
+        let mut final_hello = build_safari_server_hello(
+            HANDSHAKE_SERVER_HELLO,
+            TLS12,
+            &[0x11; 32],
+            32,
+            TLS_AES_128_GCM_SHA256,
+            0,
+            &extensions,
+        );
+        let session_id = parse_server_hello(&final_hello).unwrap().session_id_range;
+        final_hello[session_id].copy_from_slice(&session.sent_session_id);
+        let fragmented_final = crate::tls::server_hello::tests::fragment_handshake_record(
+            &final_hello,
+            &[2, 4, 35, 60],
+        );
+        let (mut client, mut peer) = loopback().await;
+        peer.write_all(
+            &[
+                fragmented_hrr.clone(),
+                change_cipher_spec(),
+                fragmented_final.clone(),
+            ]
+            .concat(),
+        )
+        .await
+        .unwrap();
+        let received_hrr = session.read_server_hello_record(&mut client).await.unwrap();
+        assert_eq!(received_hrr, fragmented_hrr);
+        assert!(is_hello_retry_request(&received_hrr));
+        let mut transcript = HandshakeTranscript::new();
+        transcript
+            .push_handshake_record(&session.client_hello)
+            .unwrap();
+        let received_final = session
+            .retry_after_hello_retry_request(&mut client, &mut transcript, &received_hrr)
+            .await
+            .unwrap();
+        assert_eq!(received_final, fragmented_final);
+        assert!(!is_hello_retry_request(&received_final));
+        assert_eq!(read_record(&mut peer).await.unwrap(), change_cipher_spec());
+        let second_client_hello = read_record(&mut peer).await.unwrap();
+        transcript.push_handshake_record(&received_final).unwrap();
+        let digest = TlsCipherSuite::Aes128GcmSha256.digest(&session.client_hello[5..]);
+        let mut expected = vec![HANDSHAKE_MESSAGE_HASH, 0, 0, digest.len() as u8];
+        expected.extend_from_slice(&digest);
+        expected.extend_from_slice(&hrr[5..]);
+        expected.extend_from_slice(&second_client_hello[5..]);
+        expected.extend_from_slice(&final_hello[5..]);
+        assert_eq!(transcript.bytes(), expected);
+        let parsed = parse_safari_server_hello(&received_final, &session.sent_session_id).unwrap();
+        assert_eq!(session.tls_shared_secret(&parsed).unwrap().len(), 32);
+        assert!(session.sent_compat_ccs);
+        assert_eq!(
+            session
+                .tap
+                .events
+                .iter()
+                .filter(|event| matches!(event.direction, RecordDirection::Inbound))
+                .count(),
+            11
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_server_hello_rejects_bad_fragments_without_waiting() {
+        let record = valid_safari_server_hello();
+        let fragmented = crate::tls::server_hello::tests::fragment_handshake_record(&record, &[2]);
+        let first_len = super::super::record::TLS_HEADER_LEN + 2;
+        let mut interleaved = fragmented[..first_len].to_vec();
+        interleaved.extend_from_slice(&change_cipher_spec());
+        interleaved.extend_from_slice(&fragmented[first_len..]);
+        let empty_records = tls_record(TLS_RECORD_HANDSHAKE, &[]).repeat(256);
+        let oversized = tls_record(TLS_RECORD_HANDSHAKE, &[HANDSHAKE_SERVER_HELLO, 1, 0, 72]);
+        let record_oversized = vec![TLS_RECORD_HANDSHAKE, 3, 3, 0x41, 1];
+        for wire in [interleaved, empty_records, oversized, record_oversized] {
+            let mut session = test_session();
+            let (mut client, mut peer) = loopback().await;
+            peer.write_all(&wire).await.unwrap();
+            // Keep the writer open: bounds must fire without requesting a tail.
+            let result = timeout(
+                Duration::from_secs(2),
+                session.read_server_hello_record(&mut client),
+            )
+            .await
+            .expect("client fragment rejection must be bounded");
+            assert!(result.is_err());
+            let (mut fallback, mut origin) = loopback().await;
+            origin.write_all(&wire).await.unwrap();
+            let result = timeout(
+                Duration::from_secs(2),
+                crate::handshake::server::read_forwarded_server_hello_for_test(&mut fallback),
+            )
+            .await
+            .expect("server fragment rejection must be bounded");
+            assert!(result.is_err());
+        }
+        let mut truncated = fragmented;
+        truncated.pop();
+        let mut session = test_session();
+        let (mut client, mut peer) = loopback().await;
+        peer.write_all(&truncated).await.unwrap();
+        drop(peer);
+        assert!(
+            matches!(session.read_server_hello_record(&mut client).await,
+            Err(Safari26TlsError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+        );
+        let (mut fallback, mut origin) = loopback().await;
+        origin.write_all(&truncated).await.unwrap();
+        drop(origin);
+        assert!(
+            matches!(crate::handshake::server::read_forwarded_server_hello_for_test(&mut fallback).await,
+            Err(crate::handshake::server::HandshakeServerError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+        );
+    }
+
+    #[tokio::test]
     async fn read_server_hello_accepts_maximum_compat_ccs_then_handshake() {
         let mut session = test_session();
         let (mut client, mut peer) = loopback().await;
@@ -7186,9 +7471,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_sends_encrypted_decrypt_error_for_invalid_certificate_verify_and_finished() {
+    async fn complete_rejects_untrusted_chain_before_invalid_certificate_verify_and_finished() {
+        // The generated self-signed chain is not trusted. Certificate failure
+        // must take precedence over either later cryptographic error.
         for kind in [HANDSHAKE_CERTIFICATE_VERIFY, HANDSHAKE_FINISHED] {
-            assert_encrypted_server_flight_alert(Some(kind), 51).await;
+            assert_encrypted_server_flight_alert(Some(kind), 42).await;
         }
     }
 
@@ -7359,7 +7646,7 @@ mod tests {
             authenticated_flight(),
         ] {
             let mut request = handshake_message(HANDSHAKE_CERTIFICATE_REQUEST, &valid);
-            assert!(process_server_handshake_messages(
+            assert!(process_unverified_server_flight(
                 &mut request,
                 &mut flight,
                 &mut HandshakeTranscript::new(),
@@ -7480,7 +7767,7 @@ mod tests {
             let mut flight = ServerFlight::default();
             let mut keys = app_keys();
             let expected_transcript = wire.clone();
-            process_server_handshake_messages(&mut wire, &mut flight, &mut transcript, &mut keys)
+            process_unverified_server_flight(&mut wire, &mut flight, &mut transcript, &mut keys)
                 .unwrap();
             assert!(flight.encrypted_extensions_seen);
             assert!(flight.certificate_verify_seen);
@@ -7517,6 +7804,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn review_server_flight_requires_encrypted_extensions_before_certificates() {
+        let body = certificate_body(&[&[0x30, 3, 2, 1, 0]]);
+        for compressed in [false, true] {
+            let mut message = if compressed {
+                handshake_message(
+                    HANDSHAKE_COMPRESSED_CERTIFICATE,
+                    &build_compressed_cert_body(body.len(), &body),
+                )
+            } else {
+                handshake_message(HANDSHAKE_CERTIFICATE, &body)
+            };
+            let mut flight = ServerFlight::default();
+            let mut transcript = HandshakeTranscript::new();
+            let error = process_unverified_server_flight(
+                &mut message,
+                &mut flight,
+                &mut transcript,
+                &mut app_keys(),
+            )
+            .expect_err("Certificate before EncryptedExtensions must fail immediately");
+            assert_eq!(fatal_alert_description(&error), Some(10));
+            assert!(flight.certificates.is_empty());
+            assert!(transcript.bytes().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn review_server_chain_is_validated_before_waiting_for_certificate_verify() {
+        for compressed in [false, true] {
+            let (flight, _) = signed_server_flight(compressed, false);
+            let mut certificate_end = 0;
+            for _ in 0..2 {
+                let length = u32::from_be_bytes([
+                    0,
+                    flight[certificate_end + 1],
+                    flight[certificate_end + 2],
+                    flight[certificate_end + 3],
+                ]) as usize;
+                certificate_end += 4 + length;
+            }
+            let mut session = test_session();
+            let (mut stream, mut peer) = loopback().await;
+            let mut peer_keys = app_keys();
+            peer.write_all(
+                &peer_keys
+                    .server_handshake
+                    .encrypt_record(TLS_RECORD_HANDSHAKE, &flight[..certificate_end])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let error = timeout(
+                Duration::from_secs(2),
+                session.read_encrypted_server_flight(
+                    &mut stream,
+                    &mut app_keys(),
+                    &mut HandshakeTranscript::new(),
+                ),
+            )
+            .await
+            .expect("an untrusted chain must fail while the peer is silent")
+            .err()
+            .expect("the random self-signed chain is not trusted");
+            assert!(matches!(error, Safari26TlsError::Certificate(_)));
+            assert_eq!(fatal_alert_description(&error), Some(42));
+        }
+    }
+
     fn assert_rejected_server_certificate_body(body: &[u8]) {
         for compressed in [false, true] {
             let ee = handshake_message(HANDSHAKE_ENCRYPTED_EXTENSIONS, &[0, 0]);
@@ -7531,7 +7887,7 @@ mod tests {
             let mut wire = [ee.clone(), certificate].concat();
             let mut flight = ServerFlight::default();
             let mut transcript = HandshakeTranscript::new();
-            let error = process_server_handshake_messages(
+            let error = process_unverified_server_flight(
                 &mut wire,
                 &mut flight,
                 &mut transcript,
@@ -7581,7 +7937,7 @@ mod tests {
             let end = offset + 4 + length;
             let mut valid = wire[..end].to_vec();
             let mut flight = ServerFlight::default();
-            process_server_handshake_messages(
+            process_unverified_server_flight(
                 &mut valid,
                 &mut flight,
                 &mut HandshakeTranscript::new(),
@@ -7601,7 +7957,7 @@ mod tests {
                 .concat();
                 let mut transcript = HandshakeTranscript::new();
                 let mut rejected = ServerFlight::default();
-                let error = process_server_handshake_messages(
+                let error = process_unverified_server_flight(
                     &mut malformed,
                     &mut rejected,
                     &mut transcript,
@@ -7634,7 +7990,7 @@ mod tests {
         let mut flight = ServerFlight::default();
         let mut keys = app_keys();
         assert!(matches!(
-            process_server_handshake_messages(&mut wire, &mut flight, &mut transcript, &mut keys),
+            process_unverified_server_flight(&mut wire, &mut flight, &mut transcript, &mut keys),
             Err(Safari26TlsError::Protocol {
                 description: 51,
                 ..

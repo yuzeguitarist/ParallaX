@@ -67,7 +67,7 @@
     {
       "id": "tls-trust",
       "spec": "## 24. Conformance Summary",
-      "claim": "A real camouflage TLS client rejects an untrusted origin chain or mismatched SNI, then succeeds after corrected trust or SNI. Its Certificate parsers require exact outer/list consumption; the compressed parser also requires a complete, exactly consumed zlib stream before certificate verification. Server Certificate contexts are empty and chains/entries nonempty; ALPN and CertificateVerify consume their complete vectors before state commits.",
+      "claim": "A real camouflage TLS client rejects an untrusted origin chain or mismatched SNI, then succeeds after corrected trust or SNI. Its Certificate parsers require exact outer/list consumption; the compressed parser also requires a complete, exactly consumed zlib stream before certificate verification. Server Certificate contexts are empty and chains/entries nonempty; ALPN and CertificateVerify consume their complete vectors before state commits. Chain validation occurs at Certificate before parsing CertificateVerify/Finished or waiting for another record.",
       "sources": [
         {
           "file": "src/tls/safari26.rs",
@@ -130,6 +130,16 @@
           "suite": "protocol_library",
           "file": "src/tls/safari26.rs",
           "name": "tls::safari26::tests::review_certificate_verify_rejects_trailing_bytes_before_state_commit"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::review_server_flight_requires_encrypted_extensions_before_certificates"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::review_server_chain_is_validated_before_waiting_for_certificate_verify"
         }
       ],
       "bounds": "Fresh generated CA/leaf, a wrong CA or DNS name, explicit client rejection and no target connection. Parser fixtures include valid positive controls, each one-to-four-byte checksum truncation, zlib/outer-vector trailing bytes and bytes after Certificate.certificate_list in raw and compressed paths.",
@@ -140,7 +150,7 @@
     {
       "id": "tls-server-hello",
       "spec": "### 12.3 ServerHello (TCP plane)",
-      "claim": "The real TLS validator requires the original 32-byte session ID echo, TLS 1.3 and valid extension framing; the extraction helper separately rejects truncated nested lengths.",
+      "claim": "The real TLS validator requires the original 32-byte session ID echo, TLS 1.3 and valid extension framing; the extraction helper separately rejects truncated nested lengths. Both real readers reassemble fragmented ServerHello while retaining matching original record bytes for ParallaX key derivation; TLS hashes only the logical handshake. Existing TLS 1.2 coalesced-record forwarding/rejection behavior is preserved.",
       "sources": [
         {
           "file": "src/tls/safari26.rs",
@@ -150,6 +160,11 @@
         {
           "file": "src/tls/server_hello.rs",
           "symbol": "parse_server_hello",
+          "kind": "fn"
+        },
+        {
+          "file": "src/tls/server_hello.rs",
+          "symbol": "ServerHelloReassembly::push_record",
           "kind": "fn"
         }
       ],
@@ -173,9 +188,54 @@
           "suite": "protocol_carrier",
           "file": "tests/protocol_carrier.rs",
           "name": "generated_server_hello_extracts_prefix_and_rejects_nested_length_overruns"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::fragmented_server_hello_preserves_wire_bytes_and_tls_transcript"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::fragmented_server_hello_rejects_bad_fragments_without_waiting"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::fragmented_server_hello_preserves_forwarded_wire_bytes"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::fragmented_server_hello_uses_one_whole_handshake_deadline"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::non_strict_tls13_accepts_coalesced_legacy_server_flight"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::tls13_forwarder_rejects_coalesced_handshake_tail"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/handshake/server.rs",
+          "name": "handshake::server::tests::strict_tls13_rejection_relays_origin_server_hello_first"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/server_hello.rs",
+          "name": "tls::server_hello::tests::reassembles_server_hello_at_every_record_split"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/server_hello.rs",
+          "name": "tls::server_hello::tests::reassembles_maximum_server_hello_extension_vector"
         }
       ],
-      "bounds": "Finite strict-validator fixtures plus generated extraction fields and every truncated prefix.",
+      "bounds": "Finite strict-validator fixtures plus generated extraction fields and every truncated prefix. Reassembly is capped at 65,611 message bytes and 256 records; the server uses one total 8-second deadline. Tests cover every split of the fixture, a maximum extension vector, truncated/oversized/interleaved fragments and both legacy strict-mode outcomes.",
       "external_conditions": []
     },
     {
@@ -204,6 +264,11 @@
           "suite": "protocol_library",
           "file": "src/tls/safari26.rs",
           "name": "tls::safari26::tests::transcript_collapses_client_hello1_into_message_hash"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/safari26.rs",
+          "name": "tls::safari26::tests::fragmented_server_hello_retry_preserves_tls_transcript_and_ccs"
         }
       ],
       "bounds": "Synthetic HRR groups/cookies and captured second-flight bytes.",
@@ -1445,7 +1510,7 @@
     {
       "id": "quic-compressed-certificate",
       "spec": "### 12.5 QUIC ClientHello (QUIC plane)",
-      "claim": "The actual QUIC client Certificate state accepts only a complete, exactly consumed zlib CompressedCertificate with matching bounded output length, preserves the compressed wire transcript and rejects malformed inputs before advancing state. Invalid server context or empty chain is terminal, including when a later valid flight arrives in separate CRYPTO packets; the client endpoint sends CRYPTO_ERROR 0x132.",
+      "claim": "The actual QUIC client Certificate state accepts only a complete, exactly consumed zlib CompressedCertificate with matching bounded output length, preserves the compressed wire transcript and rejects malformed inputs before advancing state. Invalid server context or empty chain is terminal, including when a later valid flight arrives in separate CRYPTO packets; the client endpoint sends CRYPTO_ERROR 0x132. TCP and QUIC distinguish malformed vectors (50), unoffered algorithms or declared resource-limit violations (47), and decompression/output-length failures (42).",
       "sources": [
         {
           "file": "src/tls/quic/handshake.rs",
@@ -1483,6 +1548,11 @@
           "suite": "protocol_library",
           "file": "src/transport/udp/quic/endpoint.rs",
           "name": "transport::udp::quic::endpoint::tests::malformed_server_certificate_closes_before_a_later_valid_flight"
+        },
+        {
+          "suite": "protocol_library",
+          "file": "src/tls/quic/handshake.rs",
+          "name": "tls::quic::handshake::tests::compressed_certificate_alerts_match_tcp_rfc_boundaries"
         }
       ],
       "bounds": "Normal and exact 256KiB inflated certificate bodies; unsupported algorithm, declared/inflated over-cap output, mismatched length, invalid zlib, truncated vector/checksum and outer/stream trailing bytes. Rejection preserves the Certificate state, empty chain and pre-message transcript.",

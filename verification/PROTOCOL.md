@@ -55,6 +55,20 @@ Finished tests separately exercise both real peer roles. A rejected client
 Finished prevents server completion and tickets; the server's earlier
 TLS-permitted application write keys remain installed.
 
+The TCP reader requires EncryptedExtensions before either Certificate encoding
+and validates the chain at Certificate, before consuming buffered
+CertificateVerify/Finished or waiting for the peer. Parser/signature unit fixtures
+use an explicitly test-only drain helper for their untrusted self-signed leaves;
+binary fixtures separately exercise native trust. Compression errors distinguish
+malformed wire vectors, unsupported parameters and decompression failures.
+
+Both TCP ServerHello readers reassemble records under shared size/count bounds.
+TLS transcripts contain the logical handshake; ParallaX key derivation retains
+the same concatenated original records at both ends. Real-reader tests compare
+the contexts and derived keys, include fragmented HRR and cover the server's
+single eight-second deadline. Existing coalesced TLS 1.2 origin rejection and
+non-strict forwarding remain intact; TLS 1.3 trailing messages remain invalid.
+
 ## Run and reproduce
 
 Use recent stable Rust and the committed lockfile. No additional Cargo dependency
