@@ -11,6 +11,7 @@ on:
       - 'scripts/security/**'
       - 'scripts/verification/**'
       - 'verification/protocol_contracts.json'
+      - 'verification/security_catalog.json'
       - 'SPEC.md'
       - 'verification/concurrency/**'
       - '.github/scripts/test_security_*.py'
@@ -25,6 +26,7 @@ on:
       - 'scripts/security/**'
       - 'scripts/verification/**'
       - 'verification/protocol_contracts.json'
+      - 'verification/security_catalog.json'
       - 'SPEC.md'
       - 'verification/concurrency/**'
       - '.github/scripts/test_security_*.py'
@@ -83,6 +85,8 @@ jobs:
           python3 -m unittest discover -s scripts/verification -p 'test_*.py'
           python3 scripts/verification/check_spec.py
           python3 scripts/verification/protocol_contracts.py --check
+          python3 scripts/verification/security_catalog.py --check
+          python3 scripts/security/test_timing.py
       - name: Check isolated workspace formatting
         if: matrix.suite == 'std' || matrix.suite == 'loom' || matrix.suite == 'shuttle'
         run: cargo fmt --manifest-path verification/concurrency/Cargo.toml -- --check
@@ -95,6 +99,12 @@ jobs:
       - name: Require executed evidence for every protocol contract
         if: matrix.suite == 'protocol'
         run: python3 scripts/verification/protocol_contracts.py --check --evidence target/security/assurance/protocol/report.json
+      - name: Record security categories and their remaining boundaries
+        if: matrix.suite == 'protocol'
+        run: >-
+          python3 scripts/verification/security_catalog.py
+          --evidence target/security/assurance/protocol/report.json
+          --output target/security/assurance/protocol/security-catalog.json
       - name: Retain selected tests, bounds and reproduction logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

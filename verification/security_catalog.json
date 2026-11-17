@@ -1,0 +1,679 @@
+{
+  "schema_version": 1,
+  "scope": "The 47 requested cryptographic, protocol and traffic/privacy validation categories. Each claim is limited to its mapped executable checks or explicit analysis boundary; category presence and a passing test runner do not establish certification, whole-implementation proofs or measured privacy.",
+  "items": [
+    {
+      "id": "known-answer-testing",
+      "name": "Known Answer Testing (KAT)",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "Shipping X25519 and AEAD interfaces reproduce published RFC/NIST byte answers; ML-DSA key generation, signing and verification are checked against the pinned ACVP fixtures.",
+      "protocol_contracts": ["quic-packet-crypto"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "rfc7748_x25519_public_and_shared_known_answers"},
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "rfc8439_chacha20poly1305_known_answer_through_production_codec"},
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "nist_aes256gcm_known_answers_through_production_codec"},
+        {"suite": "mldsa_acvp", "file": "tests/mldsa_acvp.rs", "name": "acvp_keygen_byte_exact"},
+        {"suite": "mldsa_acvp", "file": "tests/mldsa_acvp.rs", "name": "acvp_siggen_byte_exact"},
+        {"suite": "mldsa_acvp", "file": "tests/mldsa_acvp.rs", "name": "acvp_sigver_matches_testpassed"}
+      ],
+      "analyses": ["tests/mldsa_acvp.rs", "tests/crypto_validation.rs"],
+      "limitations": ["Finite vector conformance does not establish cryptographic strength, constant-time execution or complete algorithm-validation coverage."],
+      "external_requirements": []
+    },
+    {
+      "id": "cryptographic-algorithm-validation",
+      "name": "Cryptographic Algorithm Validation",
+      "group": "cryptography",
+      "mode": "external_validation",
+      "claim": "Published known answers, independent-backend comparisons and malformed-input tests provide reproducible algorithm-conformance prerequisites; they do not confer a CAVP validation.",
+      "protocol_contracts": ["records-aead", "pq-rekey", "quic-packet-crypto"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "published_aead_vectors_bind_every_key_nonce_and_aad_bit"},
+        {"suite": "mldsa_differential", "file": "tests/mldsa_differential.rs", "name": "shared_key_cross_sign_and_verify"}
+      ],
+      "analyses": ["Cargo.toml", "tests/crypto_validation.rs", "tests/mldsa_acvp.rs"],
+      "limitations": ["No CAVP certificate is asserted for this application, these self-tests or its arbitrary compiled operational environments."],
+      "external_requirements": ["Formal CAVP validation requires an accredited laboratory and NIST validation of the exact implementation and operational environment: https://csrc.nist.gov/projects/cryptographic-algorithm-validation-program"]
+    },
+    {
+      "id": "cryptographic-module-validation",
+      "name": "Cryptographic Module Validation",
+      "group": "cryptography",
+      "mode": "external_validation",
+      "claim": "The repository identifies shipping crypto dependencies and checks module interfaces, secret handling and algorithm prerequisites; it does not claim a validated FIPS cryptographic module boundary.",
+      "protocol_contracts": ["degenerate-x25519", "records-batch-failure", "records-nonce-budget"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "malformed_crypto_parameters_fail_before_producing_session_material"}
+      ],
+      "analyses": ["Cargo.toml", "docs/security/README.md", "supply-chain/README.md"],
+      "limitations": ["A validated dependency or successful algorithm test does not make the complete proxy a CMVP-validated module; module boundary, build mode, platform and security policy remain material."],
+      "external_requirements": ["Formal CMVP validation requires a defined module/security policy and accredited laboratory assessment of the exact build and platform: https://csrc.nist.gov/projects/cryptographic-module-validation-program"]
+    },
+    {
+      "id": "encryption-correctness-testing",
+      "name": "Encryption Correctness Testing",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "Both production record ciphers match published answers and an independent backend in both directions, across nonce carry, rekey and serial/parallel batches.",
+      "protocol_contracts": ["records-aead", "records-nonce-budget", "records-batch-failure"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "rfc8439_chacha20poly1305_known_answer_through_production_codec"},
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "nist_aes256gcm_known_answers_through_production_codec"}
+      ],
+      "analyses": ["verification/PROTOCOL.md"],
+      "limitations": ["The selected finite messages and counters are checked; correctness of every native instruction and arbitrary execution is not proved."],
+      "external_requirements": []
+    },
+    {
+      "id": "authenticated-encryption-verification",
+      "name": "Authenticated Encryption Verification",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "Published AEAD messages reject each changed ciphertext/tag bit, truncated input and changed key/nonce/AAD; record-level direction reflection, replay and failed-batch publication also fail.",
+      "protocol_contracts": ["records-aead", "records-batch-failure"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "published_aead_vectors_reject_every_bit_change_and_truncation_without_output"},
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "published_aead_vectors_bind_every_key_nonce_and_aad_bit"}
+      ],
+      "analyses": ["tests/security_plaintext_allocation.rs"],
+      "limitations": ["These are concrete acceptance/output checks, not a computational AEAD security proof or a complete memory-residency analysis."],
+      "external_requirements": []
+    },
+    {
+      "id": "message-authentication-code-verification",
+      "name": "Message Authentication Code Verification",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "HMAC-SHA256 reproduces RFC 4231 short/long-key vectors; independent auth-carrier and exporter oracles check context binding and altered messages/credentials.",
+      "protocol_contracts": ["carrier-auth", "udp-exporter", "quic-psk-admission"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/tls/quic/suite.rs", "name": "tls::quic::suite::tests::sha256_hmac_matches_rfc4231_short_and_long_keys"},
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "protocol_hkdf_and_hmac_known_answers_are_frozen_independently"}
+      ],
+      "analyses": ["src/crypto/auth.rs", "src/transport/udp/auth.rs"],
+      "limitations": ["Validating finite tags and binders is not a proof of all MAC callsites or all secret-dependent timing behavior."],
+      "external_requirements": []
+    },
+    {
+      "id": "digital-signature-verification-testing",
+      "name": "Digital Signature Verification Testing",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "ML-DSA verification agrees with ACVP and an independent implementation; production identity checks reject a wrong pin or changed transcript, epoch and PQ exchange.",
+      "protocol_contracts": ["identity-binding", "identity-reassembly"],
+      "tests": [
+        {"suite": "mldsa_acvp", "file": "tests/mldsa_acvp.rs", "name": "acvp_sigver_matches_testpassed"},
+        {"suite": "mldsa_differential", "file": "tests/mldsa_differential.rs", "name": "hint_region_tamper_rejected_by_both"},
+        {"suite": "mldsa_differential", "file": "tests/mldsa_differential.rs", "name": "shared_key_cross_sign_and_verify"}
+      ],
+      "analyses": ["verification/proverif/README.md"],
+      "limitations": ["The symbolic model assumes ideal signatures; ACVP/differential cases do not certify side-channel resistance or all possible malformed signatures."],
+      "external_requirements": []
+    },
+    {
+      "id": "cryptographic-key-generation-testing",
+      "name": "Cryptographic Key Generation Testing",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "X25519 published keys and ML-DSA ACVP key generation match their answers; OS-backed X25519, ML-KEM and ML-DSA smoke tests check consistency and distinct sampled public keys.",
+      "protocol_contracts": ["degenerate-x25519", "pq-rekey"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "rfc7748_x25519_public_and_shared_known_answers"},
+        {"suite": "mldsa_acvp", "file": "tests/mldsa_acvp.rs", "name": "acvp_keygen_byte_exact"},
+        {"suite": "protocol_library", "file": "src/crypto/session.rs", "name": "crypto::session::tests::os_rng_x25519_key_generation_smoke_has_consistent_distinct_public_keys"},
+        {"suite": "protocol_library", "file": "src/crypto/pq.rs", "name": "crypto::pq::tests::os_rng_mlkem_key_generation_and_encapsulation_smoke_is_consistent"},
+        {"suite": "protocol_library", "file": "src/crypto/identity.rs", "name": "crypto::identity::tests::os_rng_identity_key_generation_and_hedged_signing_smoke_is_consistent"}
+      ],
+      "analyses": ["src/crypto/session.rs", "src/crypto/pq.rs", "src/crypto/identity.rs"],
+      "limitations": ["Distinct sampled keys and valid signatures/decapsulation do not measure entropy or prove resistance to OS RNG compromise."],
+      "external_requirements": []
+    },
+    {
+      "id": "key-derivation-function-testing",
+      "name": "Key Derivation Function Testing (KDF)",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "HKDF-Extract matches RFC 5869; independent frozen answers check protocol-specific HKDF/HMAC labels and generated oracles check initial, hybrid, epoch, direction and substream derivation.",
+      "protocol_contracts": ["pq-rekey", "udp-exporter"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/tls/quic/suite.rs", "name": "tls::quic::suite::tests::sha256_hkdf_extract_matches_rfc5869"},
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "protocol_hkdf_and_hmac_known_answers_are_frozen_independently"},
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "derived_keys_separate_session_direction_epoch_substream_and_hybrid_components"}
+      ],
+      "analyses": ["verification/proverif/source_contracts.json"],
+      "limitations": ["Protocol-specific info/labels have independently frozen answers; they are not presented as the RFC's published arbitrary-info OKM vectors or as a computational KDF proof."],
+      "external_requirements": []
+    },
+    {
+      "id": "key-management-testing",
+      "name": "Key Management Testing",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "Live secret containers expose redacted Debug output and zeroization/drop contracts; record keys separate contexts and rekey does not clear sticky failure poison.",
+      "protocol_contracts": ["records-nonce-budget", "records-batch-failure"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/crypto/session.rs", "name": "crypto::session::tests::session_and_x25519_secret_containers_live_wipe_and_redact_debug"},
+        {"suite": "protocol_library", "file": "src/crypto/pq.rs", "name": "crypto::pq::tests::mlkem_secret_containers_live_wipe_without_reading_dropped_storage"},
+        {"suite": "protocol_library", "file": "src/crypto/identity.rs", "name": "crypto::identity::tests::identity_secret_container_live_wipe_has_automatic_drop_contract"}
+      ],
+      "analyses": ["src/crypto/session.rs", "src/crypto/pq.rs", "docs/security/threat-model.md"],
+      "limitations": ["Tests inspect owned live buffers and declared drop contracts, not freed storage. Compiler copies, registers, allocator remnants, swap, crash dumps and physical secure erasure remain outside this claim.", "Equality compile-fail doctests are additional API controls and must run with cargo test --locked --doc; a normal library run does not execute them."],
+      "external_requirements": ["Host memory/secret-residency assessment is required for deployment-specific erasure guarantees."]
+    },
+    {
+      "id": "random-number-generator-testing",
+      "name": "Random Number Generator Testing",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "Bounded OS RNG smoke tests generate consistent X25519/ML-KEM/ML-DSA material and live authentication nonces without collisions in the selected samples.",
+      "protocol_contracts": [],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/crypto/session.rs", "name": "crypto::session::tests::os_rng_x25519_key_generation_smoke_has_consistent_distinct_public_keys"},
+        {"suite": "protocol_library", "file": "src/crypto/pq.rs", "name": "crypto::pq::tests::os_rng_mlkem_key_generation_and_encapsulation_smoke_is_consistent"},
+        {"suite": "protocol_library", "file": "src/crypto/identity.rs", "name": "crypto::identity::tests::os_rng_identity_key_generation_and_hedged_signing_smoke_is_consistent"},
+        {"suite": "protocol_library", "file": "src/crypto/auth.rs", "name": "crypto::auth::tests::os_rng_auth_nonce_smoke_keeps_live_timestamps_and_distinct_nonces"}
+      ],
+      "analyses": ["Cargo.toml"],
+      "limitations": ["Eight X25519, four ML-KEM, three ML-DSA key pairs and 64 nonces are smoke samples. They are not entropy estimation, a DRBG validation, a prediction-resistance test or evidence that the host RNG is uncompromised."],
+      "external_requirements": ["Entropy-source/DRBG assurances require the actual OS/hardware source and its applicable validation evidence."]
+    },
+    {
+      "id": "initialization-vector-nonce-reuse-testing",
+      "name": "Initialization Vector / Nonce Reuse Testing",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "Serial/parallel record reservations and QUIC protected packet numbers do not reuse an issued nonce, wrap budgets or roll back failure consumption; a new key establishes a new epoch.",
+      "protocol_contracts": ["records-nonce-budget", "records-batch-failure", "quic-replay"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "both_record_suites_advance_nonces_reject_replay_and_rekey_to_a_new_key"}
+      ],
+      "analyses": ["formal/README.md", "src/crypto/session.rs"],
+      "limitations": ["Models and generated histories have documented bounds. Reusing identical keys/state outside these session constructors or after external process-state rollback is not ruled out by finite execution tests."],
+      "external_requirements": []
+    },
+    {
+      "id": "cryptographic-parameter-validation",
+      "name": "Cryptographic Parameter Validation",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "Degenerate X25519, empty PSKs, malformed KEM lengths, unsupported suite tags and changed AEAD parameters fail before accepted session material or plaintext is returned.",
+      "protocol_contracts": ["degenerate-x25519", "pq-rekey", "command-key-exchange", "quic-psk-admission"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "malformed_crypto_parameters_fail_before_producing_session_material"},
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "published_aead_vectors_bind_every_key_nonce_and_aad_bit"}
+      ],
+      "analyses": ["src/crypto/session.rs", "src/crypto/pq.rs"],
+      "limitations": ["ML-KEM implicit rejection intentionally returns a pseudorandom secret for a well-sized invalid ciphertext; the rejection is tested at derived-key/record authentication rather than assuming every corruption is a parse error."],
+      "external_requirements": []
+    },
+    {
+      "id": "cryptographic-error-handling-testing",
+      "name": "Cryptographic Error Handling Testing",
+      "group": "cryptography",
+      "mode": "automated",
+      "claim": "Malformed/tampered crypto inputs do not publish plaintext or usable session state; implicit KEM rejection yields incompatible record keys and failed parallel records permanently poison further publication.",
+      "protocol_contracts": ["records-batch-failure", "quic-finished-authentication", "quic-compressed-certificate", "http3-stream-framing"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "published_aead_vectors_reject_every_bit_change_and_truncation_without_output"},
+        {"suite": "protocol_library", "file": "src/crypto/pq.rs", "name": "crypto::pq::tests::mlkem_implicit_rejection_separates_epoch_keys_and_rejects_records"}
+      ],
+      "analyses": ["tests/security_fault_injection.rs", "tests/security_plaintext_allocation.rs"],
+      "limitations": ["The controlled failure paths do not cover arbitrary hardware faults, every panic or all allocation/lifetime behavior."],
+      "external_requirements": []
+    },
+    {
+      "id": "side-channel-analysis",
+      "name": "Side-channel Analysis",
+      "group": "cryptography",
+      "mode": "statistical",
+      "claim": "The existing feature-gated timing experiment compares selected attacker-reachable inbound rejection shapes with calibrated controls; secret-container checks separately limit direct Debug/API disclosure.",
+      "protocol_contracts": ["carrier-auth"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/handshake/server.rs", "name": "handshake::server::tests::rejection_path_timing_is_constant_dudect"}
+      ],
+      "analyses": [".github/workflows/dudect.yml", "src/handshake/server.rs", "docs/security/threat-model.md"],
+      "limitations": ["The timing selector requires --features dudect and a serial statistical run; a featureless library execution is not evidence that it ran.", "Selected wall-clock observations do not measure cache, branch predictor, power/EM, speculative-execution or every primitive's secret-dependent behavior."],
+      "external_requirements": ["Deployment-specific hardware/native-assembly side-channel analysis and controlled measurements remain required for broader resistance claims."]
+    },
+    {
+      "id": "timing-attack-testing",
+      "name": "Timing Attack Testing",
+      "group": "cryptography",
+      "mode": "statistical",
+      "claim": "A feature-enabled serial dudect-style experiment tests observed rejection latency against calibrated controls for the selected malformed/authentication failure classes.",
+      "protocol_contracts": ["carrier-auth", "camouflage-splice"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/handshake/server.rs", "name": "handshake::server::tests::rejection_path_timing_is_constant_dudect"},
+        {"suite": "protocol_library", "file": "src/handshake/server.rs", "name": "handshake::server::tests::dudect_t_gate_is_non_vacuous"}
+      ],
+      "analyses": [".github/workflows/dudect.yml"],
+      "limitations": ["Sample counts, thresholds, CPU, build profile and noise bounds must accompany results. Passing this detector does not establish timing equality or exclude smaller/stronger timing attacks."],
+      "external_requirements": ["Independent timing experiments on supported release CPUs and realistic remote paths are needed for deployment conclusions."]
+    },
+    {
+      "id": "constant-time-implementation-verification",
+      "name": "Constant-time Implementation Verification",
+      "group": "cryptography",
+      "mode": "statistical",
+      "claim": "Selected rejection paths have operation-count/control checks and a wall-clock regression experiment; no whole-module constant-time theorem is claimed.",
+      "protocol_contracts": ["carrier-auth"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/handshake/server.rs", "name": "handshake::server::tests::rejection_path_timing_is_constant_dudect"},
+        {"suite": "protocol_library", "file": "src/handshake/server.rs", "name": "handshake::server::tests::dudect_t_gate_is_non_vacuous"}
+      ],
+      "analyses": [".github/workflows/dudect.yml", "src/crypto/mldsa/mod.rs", "Cargo.toml"],
+      "limitations": ["Constant-time primitives and subtle comparisons do not prove the surrounding control flow constant-time. Native crypto assembly, compiler transformations and ML-DSA signing rejection loops require separate assessment."],
+      "external_requirements": ["A stronger constant-time claim requires explicit source/assembly information-flow analysis and target-specific validation beyond sampled timing."]
+    },
+    {
+      "id": "replay-attack-testing",
+      "name": "Replay Attack Testing",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Freshness, committed/pending carrier replay, record nonce reuse and QUIC packet replay are rejected at their actual gates, including bounded persistence/restart cases.",
+      "protocol_contracts": ["replay-gates", "records-aead", "quic-replay", "zero-rtt"],
+      "tests": [],
+      "analyses": ["formal/README.md", "docs/security/threat-model.md"],
+      "limitations": ["QUIC marker/ticket guard persistence is asynchronous; a crash before persistence can reopen the newest decision across restart. Tests do not remove that documented durability window."],
+      "external_requirements": []
+    },
+    {
+      "id": "man-in-the-middle-attack-testing",
+      "name": "Man-in-the-Middle Attack Testing (MITM)",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Wrong origin trust/name, static-DH pin, PSK, ML-DSA pin and transcript/PQ message binding fail before a target is used; symbolic checks also allow an active network attacker.",
+      "protocol_contracts": ["tls-trust", "carrier-auth", "identity-binding", "udp-exporter"],
+      "tests": [],
+      "analyses": ["verification/proverif/rekey_identity.pv", "verification/proverif/README.md"],
+      "limitations": ["The TCP origin chain and pinned ParallaX identity are distinct trust boundaries. The QUIC cover certificate is intentionally not an independent web-PKI authentication boundary; its session binding is checked through the TCP exporter and identity."],
+      "external_requirements": []
+    },
+    {
+      "id": "downgrade-attack-testing",
+      "name": "Downgrade Attack Testing",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "TLS requires its supported TLS 1.3 selection, authenticated cipher-suite bytes remain identity-bound, and authentic QUIC packets carrying a different version cannot commit state.",
+      "protocol_contracts": ["tls-server-hello", "command-key-exchange", "quic-packet"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::authenticated_wrong_version_packets_do_not_commit_and_v1_recovers"}
+      ],
+      "analyses": ["verification/proverif/run.py", "verification/proverif/README.md"],
+      "limitations": ["The symbolic suite-unbound control validates binding sensitivity; it is not an executable downgrade against the full encrypted protocol. Deliberate UDP decline to authenticated TCP remains supported behavior."],
+      "external_requirements": []
+    },
+    {
+      "id": "forward-secrecy-verification",
+      "name": "Forward Secrecy Verification",
+      "group": "protocol",
+      "mode": "symbolic",
+      "claim": "The mapped two-phase symbolic rekey model checks that completed phase-zero application secrets stay secret after phase-one server signing-key disclosure, with PSK and epoch-zero root exposed from the start.",
+      "protocol_contracts": ["pq-rekey", "identity-binding"],
+      "tests": [],
+      "analyses": ["verification/proverif/compromise.py", "verification/proverif/test_compromise.py", "verification/proverif/README.md", "verification/proverif/source_contracts.json"],
+      "limitations": ["Unfinished phase-zero roles are discarded at the global transition. Concurrent corruption, sessions continuing across disclosure, secure erasure and a computational hybrid/full-implementation theorem are not established.", "The negative controls must detect actual traffic-key disclosure and signing-key disclosure before authentication, while retaining reachable acceptance and disclosure."],
+      "external_requirements": []
+    },
+    {
+      "id": "mutual-authentication-verification",
+      "name": "Mutual Authentication Verification",
+      "group": "protocol",
+      "mode": "policy_boundary",
+      "claim": "Production admission authenticates possession of the shared PSK while the client authenticates a pinned server identity; tests cover these two distinct gates.",
+      "protocol_contracts": ["carrier-auth", "identity-binding", "tls-finished", "quic-finished-authentication"],
+      "tests": [],
+      "analyses": ["verification/proverif/README.md", "SPEC.md"],
+      "limitations": ["A shared PSK authenticates group membership, not a unique client identity. The symbolic identity model deliberately exposes that PSK and does not claim client-to-server authentication or a mutual-authentication theorem."],
+      "external_requirements": ["Individual-client mutual authentication would require a separately specified credential/protocol design and its own validation."]
+    },
+    {
+      "id": "key-confirmation-testing",
+      "name": "Key Confirmation Testing",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Actual TLS Finished checks, matching exporter results, authenticated UDP probes and exact relay DONE records validate the implemented peer-key confirmation gates.",
+      "protocol_contracts": ["tls-finished", "quic-finished-authentication", "quic-psk-admission", "udp-exporter", "udp-probe", "quic-relay-done"],
+      "tests": [],
+      "analyses": ["verification/proverif/README.md"],
+      "limitations": ["Derived-key correspondence in the symbolic rekey slice is not by itself a proof of mutual explicit key confirmation for every protocol stage."],
+      "external_requirements": []
+    },
+    {
+      "id": "authentication-and-key-exchange-security-analysis",
+      "name": "Authentication and Key Exchange (AKE) Security Analysis",
+      "group": "protocol",
+      "mode": "symbolic",
+      "claim": "The mapped ProVerif slice checks injective pinned-server correspondence, client-direction derived-key agreement and application secrecy against an active symbolic network attacker, with accepting executions required.",
+      "protocol_contracts": ["pq-rekey", "identity-binding", "quic-finished-authentication"],
+      "tests": [],
+      "analyses": ["verification/proverif/rekey_identity.pv", "verification/proverif/run.py", "verification/proverif/README.md", "verification/proverif/source_contracts.json"],
+      "limitations": ["Perfect-cryptography constructors, fresh ephemeral secrets and trusted pins are assumptions. Initial carrier/TLS agreement, concrete primitive security, all state-machine stages and arbitrary corruption are not proved by this slice."],
+      "external_requirements": []
+    },
+    {
+      "id": "key-compromise-impersonation-analysis",
+      "name": "Key Compromise Impersonation (KCI) Analysis",
+      "group": "protocol",
+      "mode": "symbolic",
+      "claim": "The client-side pinned-server correspondence is checked even when the shared PSK and epoch-zero root are public; the early-signing-disclosure control must instead expose impersonation and secrecy attacks.",
+      "protocol_contracts": ["carrier-auth", "identity-binding"],
+      "tests": [],
+      "analyses": ["verification/proverif/rekey_identity.pv", "verification/proverif/compromise.py", "verification/proverif/README.md"],
+      "limitations": ["This is a narrow client-side check after shared-PSK compromise, not a general KCI theorem. The server-side individual-client authentication direction is not modeled; shared credentials cannot identify an individual client."],
+      "external_requirements": ["A full two-direction KCI analysis requires an explicit individual-client credential model and corruption policy."]
+    },
+    {
+      "id": "session-key-independence-verification",
+      "name": "Session Key Independence Verification",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Independent derivation answers and fresh production PQ sessions agree within a session while rejecting cross-session, direction, epoch and substream record use.",
+      "protocol_contracts": ["pq-rekey", "records-aead", "udp-exporter"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "derived_keys_separate_session_direction_epoch_substream_and_hybrid_components"},
+        {"suite": "protocol_library", "file": "src/crypto/pq.rs", "name": "crypto::pq::tests::fresh_pq_sessions_agree_locally_but_reject_cross_session_and_direction_records"}
+      ],
+      "analyses": ["src/crypto/session.rs", "src/crypto/pq.rs"],
+      "limitations": ["Concrete distinctness/authentication checks are not a computational key-independence theorem or a proof of security after arbitrary session-state disclosure."],
+      "external_requirements": []
+    },
+    {
+      "id": "protocol-state-machine-testing",
+      "name": "Protocol State Machine Testing",
+      "group": "protocol",
+      "mode": "symbolic",
+      "claim": "Finite protocol models and production transition tests check admission/replay, key epochs, identity, reassembly, MUX ownership/half-close, QUIC handshake/keys/close and UDP retention ordering.",
+      "protocol_contracts": ["initial-payload", "replay-gates", "tls-drain", "identity-reassembly", "command-chunks", "mux-lifecycle", "mux-isolation", "quic-finished-authentication", "quic-key-update-close", "quic-relay-done"],
+      "tests": [],
+      "analyses": ["formal/plx_formal.py", "formal/README.md", "verification/PROTOCOL.md"],
+      "limitations": ["Finite domains and source-order correspondence are documented; these models are not a refinement proof of all Rust, OS and scheduler executions."],
+      "external_requirements": []
+    },
+    {
+      "id": "protocol-version-negotiation-testing",
+      "name": "Protocol Version Negotiation Testing",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "TLS version/session-ID/extension selections are validated; authenticated packets with unsupported QUIC versions do not consume packet numbers or other receive state, and supported v1 traffic recovers.",
+      "protocol_contracts": ["tls-server-hello", "tls-retry", "quic-packet"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::authenticated_wrong_version_packets_do_not_commit_and_v1_recovers"}
+      ],
+      "analyses": ["src/transport/udp/quic/mod.rs"],
+      "limitations": ["The implementation supports its specified QUIC v1 behavior; these rejection checks do not claim multi-version interoperability or a complete version-negotiation extension."],
+      "external_requirements": []
+    },
+    {
+      "id": "message-integrity-verification",
+      "name": "Message Integrity Verification",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Ciphertext/tag/AAD changes, reflected directions, altered identity-bound transcript fields, malformed lengths and incomplete stream frames cannot become accepted plaintext or a successful handshake/close.",
+      "protocol_contracts": ["records-aead", "identity-binding", "command-key-exchange", "command-mux", "command-udp", "quic-frame", "quic-packet-crypto", "http3-stream-framing", "quic-relay-done"],
+      "tests": [
+        {"suite": "crypto_validation", "file": "tests/crypto_validation.rs", "name": "published_aead_vectors_reject_every_bit_change_and_truncation_without_output"}
+      ],
+      "analyses": ["verification/PROTOCOL.md"],
+      "limitations": ["Integrity checks cover the specified authenticated fields; transport metadata, lengths and timing are not made confidential by authenticating the payload."],
+      "external_requirements": []
+    },
+    {
+      "id": "certificate-chain-validation-testing",
+      "name": "Certificate Chain Validation Testing",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "The binary TCP camouflage client checks trust/name, validity period, usage, signature and intermediate-chain completeness against local CA fixtures, with a valid intermediate-chain positive control.",
+      "protocol_contracts": ["tls-trust", "tls-finished", "quic-compressed-certificate"],
+      "tests": [
+        {"suite": "protocol_e2e", "file": "tests/protocol_e2e.rs", "name": "binary_expired_origin_certificate_is_rejected_before_target_dial"},
+        {"suite": "protocol_e2e", "file": "tests/protocol_e2e.rs", "name": "binary_not_yet_valid_origin_certificate_is_rejected_before_target_dial"},
+        {"suite": "protocol_e2e", "file": "tests/protocol_e2e.rs", "name": "binary_wrong_origin_certificate_eku_is_rejected_before_target_dial"},
+        {"suite": "protocol_e2e", "file": "tests/protocol_e2e.rs", "name": "binary_forged_origin_certificate_signature_is_rejected_before_target_dial"},
+        {"suite": "protocol_e2e", "file": "tests/protocol_e2e.rs", "name": "binary_missing_origin_intermediate_is_rejected_before_target_dial"},
+        {"suite": "protocol_e2e", "file": "tests/protocol_e2e.rs", "name": "binary_valid_intermediate_origin_chain_roundtrips"}
+      ],
+      "analyses": ["src/tls/safari26.rs", "src/tls/quic/verify.rs", "src/transport/udp/mod.rs"],
+      "limitations": ["QUIC intentionally accepts its cover certificate and relies on session exporter/PQ identity binding; these web-PKI chain claims concern the TCP origin verifier. Certificate revocation is a separate unsupported policy boundary."],
+      "external_requirements": []
+    },
+    {
+      "id": "certificate-revocation-checking",
+      "name": "Certificate Revocation Checking",
+      "group": "protocol",
+      "mode": "policy_boundary",
+      "claim": "The current TCP web-PKI verification call supplies no CRL/OCSP revocation information; this inventory records that absence rather than treating ordinary chain validation as revocation checking.",
+      "protocol_contracts": ["tls-trust"],
+      "tests": [],
+      "analyses": ["src/tls/safari26.rs", "src/tls/quic/verify.rs", "src/transport/udp/mod.rs"],
+      "limitations": ["CRL/OCSP revocation enforcement and freshness/fail-open policy are not implemented. QUIC's cover-certificate acceptance also supplies no independent revocation guarantee."],
+      "external_requirements": ["Revocation support needs an explicit trust/revocation source, freshness and failure policy, privacy/network-access design and revoked/stale/unavailable-source tests before an enforcement claim."]
+    },
+    {
+      "id": "early-data-zero-rtt-replay-analysis",
+      "name": "Early Data / 0-RTT Replay Analysis",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Real resumption accepts fresh early data; used tickets fall back to 1-RTT, invalid PSK/binder offers cannot consume the single-use guard, and the documented persistence/restart path is exercised.",
+      "protocol_contracts": ["zero-rtt", "quic-psk-admission", "replay-gates"],
+      "tests": [],
+      "analyses": ["formal/README.md", "docs/security/threat-model.md", "src/transport/udp/zero_rtt.rs"],
+      "limitations": ["Asynchronous marker/ticket persistence has a documented crash-before-write window. TLS 0-RTT does not inherit a blanket replay-freedom or forward-secrecy guarantee from ordinary 1-RTT tests."],
+      "external_requirements": []
+    },
+    {
+      "id": "packet-reordering-testing",
+      "name": "Packet Reordering Testing",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Reordered authenticated packet/key phases and reverse-order stream fragments preserve reassembly, replay rejection and bounded receive-state accounting.",
+      "protocol_contracts": ["quic-replay", "quic-recovery", "quic-key-update-close"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::key_phase_loss_reordering_replay_and_fixed_retirement"},
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::reverse_order_tiny_fragments_reassemble_without_duplicate_growth"}
+      ],
+      "analyses": ["src/transport/udp/quic/netsim.rs"],
+      "limitations": ["Controlled traces and generated histories do not enumerate every Internet loss/reordering schedule, path MTU or platform socket behavior."],
+      "external_requirements": []
+    },
+    {
+      "id": "duplicate-packet-handling-testing",
+      "name": "Duplicate Packet Handling Testing",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Receive-range eviction does not reopen old packet numbers, and duplicate out-of-order stream fragments cannot deliver duplicate application bytes or grow state without the tested bounds.",
+      "protocol_contracts": ["quic-replay", "quic-recovery"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::duplicate_out_of_order_stream_fragments_are_bounded"},
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::reverse_order_tiny_fragments_reassemble_without_duplicate_growth"}
+      ],
+      "analyses": ["src/transport/udp/quic/spaces.rs"],
+      "limitations": ["These bounded duplicate/replay traces are distinct from a full packet-loss/reordering performance evaluation."],
+      "external_requirements": []
+    },
+    {
+      "id": "connection-migration-security-testing",
+      "name": "Connection Migration Security Testing",
+      "group": "protocol",
+      "mode": "policy_boundary",
+      "claim": "The current endpoint retains four-tuple ownership: authenticated packets from a different source tuple cannot take over an existing connection, while its original tuple remains usable.",
+      "protocol_contracts": ["quic-packet-crypto", "quic-replay"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/endpoint.rs", "name": "transport::udp::quic::endpoint::tests::authenticated_packets_from_a_different_tuple_cannot_take_over_connection"}
+      ],
+      "analyses": ["src/transport/udp/quic/mod.rs", "src/transport/udp/quic/endpoint.rs"],
+      "limitations": ["Connection migration, NAT rebinding and PATH_CHALLENGE/PATH_RESPONSE path validation are not supported. Tuple-isolation checks do not establish secure migration support."],
+      "external_requirements": ["Enabling migration requires a separately specified path-validation/address-ownership design and migration/rebinding attack tests."]
+    },
+    {
+      "id": "anti-amplification-verification",
+      "name": "Anti-Amplification Verification",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "A real resumed 0-RTT application flight does not validate the peer address or lift the server's three-times received-byte transmit bound; a later valid handshake permits remaining output.",
+      "protocol_contracts": ["quic-psk-admission", "zero-rtt"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::valid_zero_rtt_does_not_validate_address_or_lift_amplification_limit"}
+      ],
+      "analyses": ["src/transport/udp/quic/conn.rs"],
+      "limitations": ["The test checks the QUIC connection's encoded-byte accounting and address-validation transition; it does not measure whole-host reflection bandwidth, arbitrary IP spoofing or infrastructure rate limits."],
+      "external_requirements": []
+    },
+    {
+      "id": "denial-of-service-resistance-testing",
+      "name": "Denial-of-Service Resistance Testing",
+      "group": "protocol",
+      "mode": "automated",
+      "claim": "Known malformed/resource-pressure paths enforce replay/source admission, bounded identity/fragment/frame allocation, per-connection/endpoint flow budgets and sibling-stream isolation.",
+      "protocol_contracts": ["replay-gates", "identity-reassembly", "command-chunks", "quic-flow-control", "mux-isolation", "quic-compressed-certificate", "http3-stream-framing"],
+      "tests": [
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/endpoint.rs", "name": "transport::udp::quic::endpoint::tests::splice_and_pending_admission_is_bounded_per_source"},
+        {"suite": "protocol_library", "file": "src/transport/udp/quic/conn.rs", "name": "transport::udp::quic::conn::tests::endpoint_receive_budget_is_shared_and_released_on_read_reset_and_drop"}
+      ],
+      "analyses": ["docs/security/threat-model.md", "verification/concurrency/README.md"],
+      "limitations": ["Finite allocation/admission/scheduling controls are not an availability guarantee against volumetric traffic, authenticated abusive peers, host resource exhaustion or every network schedule."],
+      "external_requirements": ["Deployment capacity and volumetric resistance require controlled load measurements on the actual host/network budget."]
+    },
+    {
+      "id": "traffic-analysis",
+      "name": "Traffic Analysis",
+      "group": "privacy",
+      "mode": "statistical",
+      "claim": "The traffic analyzer extracts bounded observable sizes, directions and timing from complete hash-checked captures and evaluates independent held-out groups with uncertainty estimates.",
+      "protocol_contracts": ["records-padding", "camouflage-splice"],
+      "tests": [
+        {"suite": "distinguisher_battery", "file": "tests/distinguisher_battery.rs", "name": "ks_separates_known_distributions"},
+        {"suite": "distinguisher_battery", "file": "tests/distinguisher_battery.rs", "name": "ljung_box_detects_autocorrelation"}
+      ],
+      "analyses": ["scripts/traffic_lab/analyze.py", "scripts/traffic_lab/test_analyze.py", "scripts/traffic_lab/README.md"],
+      "limitations": ["Analyzer/mechanical tests are not measured traffic privacy. No newly captured representative corpus or deployed-censor result is supplied by passing those tests."],
+      "external_requirements": ["Evaluate fresh independent browser/proxy captures with matched workloads, sites, days, networks and vantage points; retain hashes, controls, holdouts and confidence intervals."]
+    },
+    {
+      "id": "traffic-fingerprinting",
+      "name": "Traffic Fingerprinting",
+      "group": "privacy",
+      "mode": "statistical",
+      "claim": "Known ACK/record-size/cadence perturbations exercise detector sensitivity, while corpus analysis fits features/models on training captures and calibrates/test-evaluates separate groups.",
+      "protocol_contracts": ["camouflage-splice", "http2-carrier", "http3-settings"],
+      "tests": [
+        {"suite": "distinguisher_battery", "file": "tests/distinguisher_battery.rs", "name": "detects_1to1_ack_pathology"},
+        {"suite": "distinguisher_battery", "file": "tests/distinguisher_battery.rs", "name": "detects_record_resize"},
+        {"suite": "distinguisher_battery", "file": "tests/distinguisher_battery.rs", "name": "detects_fixed_cadence_beacon"}
+      ],
+      "analyses": ["scripts/traffic_lab/analyze.py", "scripts/traffic_lab/README.md", "tests/distinguisher/mod.rs"],
+      "limitations": ["Fixture parity or a chance score from selected models cannot exclude stronger/adaptive classifiers or establish traffic indistinguishability."],
+      "external_requirements": ["A fingerprinting conclusion needs real independent holdout traffic and explicitly reported detector family, false-positive rate and deployment population."]
+    },
+    {
+      "id": "website-fingerprinting",
+      "name": "Website Fingerprinting",
+      "group": "privacy",
+      "mode": "statistical",
+      "claim": "The website experiment classifies whole held-out sessions with train-only standardization/centroids and reports accuracy, chance and confusion rather than a privacy PASS.",
+      "protocol_contracts": [],
+      "tests": [],
+      "analyses": ["scripts/traffic_lab/privacy.py", "scripts/traffic_lab/test_privacy.py", "scripts/traffic_lab/README.md"],
+      "limitations": ["Synthetic known-site controls validate the machinery only. The repository does not provide a new representative corpus of complete rendered website sessions or establish website-fingerprinting resistance."],
+      "external_requirements": ["Provide independent complete sessions from at least two sites with the tool's per-site group minimum, strict train/test separation and truthful measurement provenance; browser fetch-only workloads cannot stand in for full rendered-site visits."]
+    },
+    {
+      "id": "correlation-attack-analysis",
+      "name": "Correlation Attack Analysis",
+      "group": "privacy",
+      "mode": "statistical",
+      "claim": "The two-vantage correlation experiment ranks independent traces using direction/byte time bins and bounded-lag Pearson correlation, preserving ties and checking known/shuffled pairing controls.",
+      "protocol_contracts": [],
+      "tests": [],
+      "analyses": ["scripts/traffic_lab/privacy.py", "scripts/traffic_lab/test_privacy.py", "scripts/traffic_lab/README.md"],
+      "limitations": ["Machinery controls are not a real two-vantage attack measurement. A low score for this correlator does not imply anonymity or resistance to an observer of both endpoints."],
+      "external_requirements": ["Provide separately captured ingress/egress vantage traces, independent sessions, truthful pairing labels, clock/provenance information and held-out evaluation; one trace copied to both sides is not evidence."]
+    },
+    {
+      "id": "metadata-leakage-analysis",
+      "name": "Metadata Leakage Analysis",
+      "group": "privacy",
+      "mode": "automated",
+      "claim": "Production encrypted CONNECT records conceal the selected cleartext destination/payload markers while server-side decoding recovers their exact fields; shaping checks place the selected small requests in configured browser record bands.",
+      "protocol_contracts": ["records-aead", "records-padding", "command-connect"],
+      "tests": [
+        {"suite": "privacy_validation", "file": "tests/privacy_validation.rs", "name": "encrypted_connect_hides_metadata_and_recovers_exact_server_fields"},
+        {"suite": "privacy_validation", "file": "tests/privacy_validation.rs", "name": "connect_shaping_keeps_small_domain_and_payload_lengths_in_browser_bands"}
+      ],
+      "analyses": ["scripts/traffic_lab/analyze.py", "docs/security/threat-model.md"],
+      "limitations": ["Needle absence in controlled ciphertext is not a noninterference theorem. Proxy/origin IPs, cover SNI, record sizes, timing, traffic volume and host/operator logs remain separate visible metadata."],
+      "external_requirements": ["Broader metadata conclusions require real packet/log capture and a declared observer model."]
+    },
+    {
+      "id": "dns-leak-testing",
+      "name": "DNS Leak Testing",
+      "group": "privacy",
+      "mode": "policy_boundary",
+      "claim": "An unresolved SOCKS DOMAIN can complete through the actual proxy without successful client-side target resolution; independent encrypted-CONNECT decoding confirms exact domain preservation.",
+      "protocol_contracts": ["socks-addresses", "command-connect"],
+      "tests": [
+        {"suite": "protocol_e2e", "file": "tests/protocol_e2e.rs", "name": "binary_socks_invalid_domain_is_forwarded_without_client_resolution"},
+        {"suite": "privacy_validation", "file": "tests/privacy_validation.rs", "name": "encrypted_connect_hides_metadata_and_recovers_exact_server_fields"}
+      ],
+      "analyses": ["src/client/socks.rs", "src/client/runtime.rs", "README.md"],
+      "limitations": ["The invalid-domain fixture proves no successful target lookup is required; by itself it cannot detect an unnecessary DNS query whose failure is ignored.", "SOCKS only covers applications using remote-domain requests. The app may resolve before SOCKS, proxy server_addr resolution is separate, and no TUN/system DNS interception is provided."],
+      "external_requirements": ["A zero-target-DNS-query conclusion requires an isolated observer/DNS sink or packet capture covering the actual client process and configured app flow; whole-system DNS leak prevention requires separately specified controls."]
+    },
+    {
+      "id": "ip-leak-testing",
+      "name": "IP Leak Testing",
+      "group": "privacy",
+      "mode": "policy_boundary",
+      "claim": "When the configured proxy is unavailable, an explicit SOCKS flow cannot silently fall back to a direct target connection, checked by an owned target listener's accept count.",
+      "protocol_contracts": ["egress-policy", "socks-addresses"],
+      "tests": [
+        {"suite": "protocol_e2e", "file": "tests/protocol_e2e.rs", "name": "binary_unavailable_proxy_never_connects_directly_to_target"}
+      ],
+      "analyses": ["src/client/runtime.rs", "README.md"],
+      "limitations": ["This is a failed-SOCKS-flow direct-connect test. It is not a system kill switch, TUN routing policy, WebRTC/UDP/QUIC browser leak test or proof that unrelated applications never expose the host IP."],
+      "external_requirements": ["Whole-device IP leak prevention needs explicit OS/application routing and failure-policy controls plus separate IPv4/IPv6/DNS/UDP/WebRTC capture tests."]
+    },
+    {
+      "id": "protocol-identification-testing",
+      "name": "Protocol Identification Testing",
+      "group": "privacy",
+      "mode": "statistical",
+      "claim": "TLS/H2/H3 wire-shape checks and captured baseline/distinguisher machinery expose known protocol-identification features, with independent held-out corpus evaluation available for measured conclusions.",
+      "protocol_contracts": ["camouflage-splice", "http2-carrier", "http3-framing", "http3-settings", "qpack-fields"],
+      "tests": [
+        {"suite": "distinguisher_battery", "file": "tests/distinguisher_battery.rs", "name": "missing_or_invalid_evidence_cannot_report_chance_auc_or_ks_null"}
+      ],
+      "analyses": ["tests/ja4_census_oracle.rs", "tests/gfw_sim/detection/tls_fingerprint.rs", "scripts/traffic_lab/analyze.py", "scripts/traffic_lab/README.md"],
+      "limitations": ["Matching selected templates/fixtures and rejecting malformed inputs do not establish that the complete deployed protocol is unidentified by population or adaptive detectors."],
+      "external_requirements": ["Measure protocol identification on fresh matched normal/proxy traffic with independent negative controls and held-out browser/version/network populations."]
+    },
+    {
+      "id": "active-probing-resistance-testing",
+      "name": "Active Probing Resistance Testing",
+      "group": "privacy",
+      "mode": "automated",
+      "claim": "Known unauthenticated, wrong-credential and malformed admissions preserve origin splice behavior without target dial, and authenticated recovery remains usable; timing is a separate statistical check.",
+      "protocol_contracts": ["carrier-auth", "replay-gates", "camouflage-splice", "tls-trust"],
+      "tests": [],
+      "analyses": ["tests/security_listener.rs", ".github/workflows/dudect.yml", "docs/security/threat-model.md"],
+      "limitations": ["The probe shapes and owned local origins are finite. Their behavior does not establish indistinguishability from every live origin, network fault, timing attack or deployed censor."],
+      "external_requirements": ["Operational active-probe resistance needs authorized real-path measurements with matched origin/error/timing controls."]
+    },
+    {
+      "id": "traffic-classification-evaluation",
+      "name": "Traffic Classification Evaluation",
+      "group": "privacy",
+      "mode": "statistical",
+      "claim": "Classifier tooling separates whole capture groups across train/calibration/test, excludes identifier metadata as features, calibrates only on normal calibration traffic and reports AUC/TPR/FPR with uncertainty.",
+      "protocol_contracts": [],
+      "tests": [
+        {"suite": "distinguisher_battery", "file": "tests/distinguisher_battery.rs", "name": "auc_is_one_for_separable_and_half_for_identical"},
+        {"suite": "distinguisher_battery", "file": "tests/distinguisher_battery.rs", "name": "roc_auc_handles_ties_and_perfect_ranking"}
+      ],
+      "analyses": ["scripts/traffic_lab/analyze.py", "scripts/traffic_lab/test_analyze.py", "scripts/traffic_lab/privacy.py", "scripts/traffic_lab/README.md"],
+      "limitations": ["Synthetic controls and analysis integrity tests validate mechanics; they cannot supply missing real captures or turn evaluated/insufficient_evidence into a security PASS. Optional backend absence and insufficient group/FPR support remain explicit."],
+      "external_requirements": ["Retain real independent capture artifacts, manifest hashes, implementation/browser versions, dataset/holdout provenance, model versions, seed, thresholds and confidence intervals for any traffic-classification claim."]
+    }
+  ]
+}

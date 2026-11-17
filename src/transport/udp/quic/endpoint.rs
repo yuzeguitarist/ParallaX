@@ -2314,6 +2314,114 @@ mod tests {
         assert!(driver.dirty.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn authenticated_packets_from_a_different_tuple_cannot_take_over_connection() {
+        use super::super::frame::Frame;
+        use super::super::transport_params::TransportParameters;
+
+        // One dual-stack receiving socket makes both an IP change (::1 versus
+        // IPv4-mapped loopback) and a port-only change real kernel UDP inputs.
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        socket.set_only_v6(false).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+            .bind(&"[::]:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let mut driver = test_driver(None).await;
+        driver.socket = Arc::new(UdpSocket::from_std(socket.into()).unwrap());
+        let port = driver.socket.local_addr().unwrap().port();
+        let destination_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
+        let destination_v4 = SocketAddr::from(([127, 0, 0, 1], port));
+        let original = UdpSocket::bind("[::1]:0").await.unwrap();
+        let changed_port = UdpSocket::bind("[::1]:0").await.unwrap();
+        let changed_ip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = original.local_addr().unwrap();
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        driver.on_connect(ConnectRequest {
+            addr: peer,
+            server_name: "example.com".to_owned(),
+            config: client_config(),
+            ticket: None,
+            now_ms: 0,
+            dcid: None,
+            reply,
+        });
+        let client = receive.await.unwrap().unwrap();
+        let config = server_config();
+        let scid = ConnectionId::new(&[0xbb; 4]);
+        let mut server = Core::new_server(
+            config.cert_chain.clone(),
+            &config.signing_key_pkcs8,
+            config.alpn_protocols.clone(),
+            TransportParameters::server(scid.as_slice()).encode_server(),
+            scid,
+        )
+        .unwrap();
+        let now = Instant::now();
+        for _ in 0..32 {
+            let mut moved = false;
+            while let Some(datagram) = client.core.lock().unwrap().poll_transmit(now) {
+                server.handle_datagram(&datagram, now).unwrap();
+                moved = true;
+            }
+            while let Some(datagram) = server.poll_transmit(now) {
+                driver.on_datagram(&datagram, peer, 0);
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        driver.dirty.lock().unwrap().clear();
+        let stream = server.open_uni();
+        let payload = b"a correctly authenticated packet stays bound to its tuple";
+        let packet = server.test_data_packet(&[Frame::Stream {
+            id: stream,
+            offset: 0,
+            fin: true,
+            data: payload,
+        }]);
+        let mut received = [0; MAX_UDP_PAYLOAD];
+        for (sender, destination) in [
+            (&changed_port, destination_v6),
+            (&changed_ip, destination_v4),
+            (&original, destination_v6),
+        ] {
+            sender.send_to(&packet, destination).await.unwrap();
+            let (len, source) = tokio::time::timeout(
+                Duration::from_secs(2),
+                driver.socket.recv_from(&mut received),
+            )
+            .await
+            .expect("loopback datagram reaches the endpoint socket")
+            .unwrap();
+            assert_eq!(&received[..len], packet);
+            driver.on_datagram(&received[..len], source, 0);
+            assert_eq!(driver.conns.len(), 1);
+            assert!(driver.pending.is_empty() && driver.splices.is_empty());
+            let mut core = client.core.lock().unwrap();
+            if source != peer {
+                assert!(core.accept_uni().is_none());
+                assert!(core.read_stream(stream).is_empty());
+                assert!(!driver.dirty.lock().unwrap().contains(&peer));
+            } else {
+                assert_eq!(core.accept_uni(), Some(stream));
+                assert_eq!(core.read_stream(stream), payload);
+                assert!(driver.dirty.lock().unwrap().contains(&peer));
+            }
+            assert!(!core.is_closed());
+        }
+        // The final delivery reuses the exact ciphertext/PN sent by both wrong
+        // tuples, proving neither attempted migration consumed its receive state.
+        assert_eq!(client.peer, peer);
+    }
+
     /// Build a test `ServerConfig` with a fresh ECDSA key and the standard test
     /// cert/ALPN, varying only the two fields the individual builders care about.
     /// The authorized-SNI allowlist is `["example.com"]` — the SNI every marker test

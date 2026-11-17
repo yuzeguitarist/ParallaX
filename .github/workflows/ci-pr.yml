@@ -119,6 +119,8 @@ jobs:
           python3 -m unittest discover -s scripts/verification -p 'test_*.py'
           python3 scripts/verification/check_spec.py
           python3 scripts/verification/protocol_contracts.py --check
+          python3 scripts/verification/security_catalog.py --check
+          python3 scripts/security/test_timing.py
           python3 scripts/wiki_sync/test_convert.py
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -154,6 +156,7 @@ jobs:
             --bins \
             --test chaos_liveness \
             --test ci_test_allowlist_complete \
+            --test crypto_validation \
             --test deploy_seal_interruption \
             --test distinguisher_battery \
             --test e2e_tunnel_roundtrip \
@@ -164,6 +167,7 @@ jobs:
             --test mldsa_differential \
             --test no_timeout_ratchet \
             --test prober_loop \
+            --test privacy_validation \
             --test protocol_carrier \
             --test protocol_differential \
             --test protocol_e2e \

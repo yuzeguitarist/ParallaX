@@ -84,11 +84,12 @@ behavior.
   ML-KEM, X25519, SHA-256, HKDF, AEAD, constant-time code, memory erasure or a
   computational guarantee when one hybrid component is broken.
 - Only the client-direction secret-release path is modeled. Individual-client
-  authentication is not claimed with the PSK exposed. Existing-session state
-  compromise, signing-key compromise, component-compromise variants, forward
-  secrecy after later disclosure, and post-compromise recovery remain separate
-  work. No anonymity, availability or traffic-indistinguishability result is
-  claimed.
+  authentication is not claimed with the PSK exposed. The separate
+  [ordered-disclosure checks](#ordered-credential-disclosure) cover completed
+  sessions under later signing-key disclosure and explicit compromise controls.
+  Arbitrary concurrent corruption, hybrid-component compromise and
+  post-compromise recovery remain separate work. No anonymity, availability or
+  traffic-indistinguishability result is claimed.
 
 ## Mapping to production ownership
 
@@ -138,3 +139,52 @@ All variants must retain a reachable client acceptance and produce conclusive
 results. The full generated weakened models and actual attack traces are saved;
 syntactic query rewrites or a verifier's inability to prove a result do not
 count as detected attacks.
+
+## Ordered credential disclosure
+
+Run the additional compromise models with the same pinned verifier:
+
+```sh
+python3 -B verification/proverif/compromise.py --proverif /path/to/proverif
+```
+
+The runner derives three variants from the exact same source-mapped baseline;
+it preserves all six original baseline/control runs and their query checker.
+Each additional model has the same six queries: injective pinned-server
+correspondence, injective derived-key agreement, application secrecy separately
+in phases zero and one, and reachable acceptance and credential disclosure.
+Missing, duplicate, unproved, wrong-phase or unrelated-secret results fail.
+Reports under `target/proverif/compromise/` retain complete models/traces,
+source regions, source revision/dirty state and verifier/model hashes.
+
+| Model | Required conclusion |
+| --- | --- |
+| `late_signing_disclosure` | A later server identity-signing-key disclosure preserves both correspondences and application secrecy in both phases. |
+| `late_session_disclosure` | Disclosing the actual accepted client traffic key in phase one reveals the application secret then, while phase-zero secrecy and both correspondences still hold. |
+| `early_signing_disclosure` | Disclosing the signing key before the exchange enables concrete authentication, agreement and secrecy attacks. |
+
+All cases must retain reachable acceptance and disclosure. The session-key
+control releases the key used by the model's ciphertext after the client's
+successful identity check; it does not simply print the queried secret. The
+early-signing control confirms that the model depends on the pinned credential
+remaining secret during authentication. These are modeled compromises, not
+reports of exploitable vulnerabilities in an uncompromised implementation.
+
+This uses the verifier's [global phase semantics](https://bblanche.gitlabpages.inria.fr/proverif/manual.pdf),
+section 4.1.6: phase-zero protocol roles stop at the phase transition, and
+unfinished roles are discarded. Honest client sessions whose application
+ciphertexts were sent before the transition are covered. Honest clients do not
+continue authentication after the signing-key disclosure; sessions crossing
+that boundary, concurrent corruption and later new sessions are outside this
+claim. The PSK and epoch-zero root are already public from the start, so the
+result does not depend on hiding them. The initial static-DH secret is not
+modeled separately from that exposed initial root.
+
+The baseline's server correspondence despite PSK exposure provides a narrow
+client-side impersonation check after compromise of the shared PSK. It is not
+a general KCI theorem: the server-side client-authentication direction is not
+modeled, and a shared PSK identifies membership of its group rather than an
+individual client. Derived-key agreement is not a model of mutual explicit key
+confirmation. Neither these models nor the runtime tests establish secure
+erasure, a computational hybrid-composition bound, or forward secrecy for the
+entire implementation.

@@ -121,6 +121,24 @@ impl Drop for Binary {
 }
 
 fn local_pki(root_name: &str) -> (Arc<rustls::ServerConfig>, String, CertificateDer<'static>) {
+    local_pki_with_policy(root_name, CertificatePolicy::Direct)
+}
+
+#[derive(Clone, Copy)]
+enum CertificatePolicy {
+    Direct,
+    Expired,
+    NotYetValid,
+    ClientAuthOnly,
+    ForgedIssuerSignature,
+    Intermediate,
+    MissingIntermediate,
+}
+
+fn local_pki_with_policy(
+    root_name: &str,
+    policy: CertificatePolicy,
+) -> (Arc<rustls::ServerConfig>, String, CertificateDer<'static>) {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.distinguished_name.push(DnType::CommonName, root_name);
@@ -132,7 +150,53 @@ fn local_pki(root_name: &str) -> (Arc<rustls::ServerConfig>, String, Certificate
     leaf.is_ca = IsCa::ExplicitNoCa;
     leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    match policy {
+        CertificatePolicy::Expired => {
+            leaf.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            leaf.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
+        CertificatePolicy::NotYetValid => {
+            leaf.not_before = rcgen::date_time_ymd(2099, 1, 1);
+            leaf.not_after = rcgen::date_time_ymd(2100, 1, 1);
+        }
+        CertificatePolicy::ClientAuthOnly => {
+            leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        }
+        _ => {}
+    }
+    let chain = if matches!(
+        policy,
+        CertificatePolicy::Intermediate | CertificatePolicy::MissingIntermediate
+    ) {
+        let intermediate_key = KeyPair::generate().unwrap();
+        let mut intermediate = CertificateParams::new(Vec::<String>::new()).unwrap();
+        intermediate
+            .distinguished_name
+            .push(DnType::CommonName, "ParallaX E2E Intermediate");
+        intermediate.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        intermediate.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let intermediate = intermediate
+            .signed_by(&intermediate_key, &ca, &ca_key)
+            .unwrap();
+        let leaf = leaf
+            .signed_by(&leaf_key, &intermediate, &intermediate_key)
+            .unwrap();
+        let mut chain = vec![leaf.der().clone()];
+        if matches!(policy, CertificatePolicy::Intermediate) {
+            chain.push(intermediate.der().clone());
+        }
+        chain
+    } else {
+        let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        let mut der = leaf.der().to_vec();
+        if matches!(policy, CertificatePolicy::ForgedIssuerSignature) {
+            // Corrupt a value byte of the issuer's final ECDSA signature while
+            // preserving the leaf key, issuer name and DER framing. The TLS
+            // CertificateVerify signature still uses the correct leaf key.
+            *der.last_mut().unwrap() ^= 1;
+        }
+        vec![CertificateDer::from(der)]
+    };
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
@@ -140,7 +204,7 @@ fn local_pki(root_name: &str) -> (Arc<rustls::ServerConfig>, String, Certificate
     .unwrap()
     .with_no_client_auth()
     .with_single_cert(
-        vec![leaf.der().clone()],
+        chain,
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
     )
     .unwrap();
@@ -240,6 +304,16 @@ async fn connect_socks_inner(
     atyp: u8,
     initial_payload: &[u8],
 ) -> TcpStream {
+    connect_socks_request(local, target, atyp, initial_payload, None).await
+}
+
+async fn connect_socks_request(
+    local: SocketAddr,
+    target: SocketAddr,
+    atyp: u8,
+    initial_payload: &[u8],
+    domain: Option<&str>,
+) -> TcpStream {
     let mut app = TcpStream::connect(local).await.unwrap();
     // Fragment negotiation and use the DOMAIN address form, rather than calling
     // a protocol helper. The actual SOCKS listener must parse these wire bytes.
@@ -256,7 +330,9 @@ async fn connect_socks_inner(
             std::net::IpAddr::V6(_) => unreachable!("IPv6 targets require SOCKS ATYP 4 or DOMAIN"),
         },
         3 => {
-            let host = target.ip().to_string();
+            let host = domain
+                .map(str::to_owned)
+                .unwrap_or_else(|| target.ip().to_string());
             request.push(u8::try_from(host.len()).unwrap());
             request.extend_from_slice(host.as_bytes());
         }
@@ -394,11 +470,29 @@ enum Case {
     WrongOriginName,
     OriginSplice,
     SocksBoundaries,
+    ExpiredCertificate,
+    FutureCertificate,
+    WrongCertificateEku,
+    ForgedCertificate,
+    MissingIntermediate,
+    ValidIntermediate,
+    InvalidDomain,
+    ProxyUnavailable,
 }
 
 async fn scenario(case: Case) {
     let dir = tempfile::tempdir().unwrap();
-    let (origin_config, ca, ca_der) = local_pki("ParallaX E2E Trusted Root");
+    let certificate_policy = match case {
+        Case::ExpiredCertificate => CertificatePolicy::Expired,
+        Case::FutureCertificate => CertificatePolicy::NotYetValid,
+        Case::WrongCertificateEku => CertificatePolicy::ClientAuthOnly,
+        Case::ForgedCertificate => CertificatePolicy::ForgedIssuerSignature,
+        Case::MissingIntermediate => CertificatePolicy::MissingIntermediate,
+        Case::ValidIntermediate => CertificatePolicy::Intermediate,
+        _ => CertificatePolicy::Direct,
+    };
+    let (origin_config, ca, ca_der) =
+        local_pki_with_policy("ParallaX E2E Trusted Root", certificate_policy);
     let ca_path = dir.path().join("ca.pem");
     write_private(&ca_path, ca.as_bytes());
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -580,6 +674,57 @@ server_identity_public_key = "{}"
     drop(invalid);
     assert_eq!(target_accepts.load(Ordering::SeqCst), 0);
 
+    if matches!(case, Case::ProxyUnavailable) {
+        // Remove only the owned proxy server. The requested target listener is
+        // still accepting, so any direct-connect fallback is observable.
+        drop(server);
+        let mut app = connect_socks(client_addr, target_addr).await;
+        let _ = app
+            .write_all(b"direct fallback must never receive these bytes")
+            .await;
+        let mut byte = [0];
+        assert!(matches!(
+            timeout(STEP, app.read(&mut byte))
+                .await
+                .expect("unavailable proxy must fail within its connect deadline"),
+            Ok(0) | Err(_)
+        ));
+        sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            target_accepts.load(Ordering::SeqCst),
+            0,
+            "proxy failure must not dial the reachable SOCKS target directly"
+        );
+        assert!(client.child.try_wait().unwrap().is_none());
+        drop(client);
+        fixtures.shutdown().await;
+        return;
+    }
+
+    if matches!(case, Case::InvalidDomain) {
+        let domain = format!("unresolvable-client-target-{}.invalid", target_addr.port());
+        let payload =
+            b"SOCKS domain crosses the authenticated carrier without mandatory client DNS";
+        let mut app = timeout(
+            STEP,
+            connect_socks_request(client_addr, target_addr, 3, payload, Some(&domain)),
+        )
+        .await
+        .unwrap();
+        app.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        timeout(STEP, app.read_to_end(&mut echoed))
+            .await
+            .expect("the fixed server target must receive the unresolvable SOCKS-domain session")
+            .unwrap();
+        assert_eq!(echoed, payload);
+        assert_eq!(target_accepts.load(Ordering::SeqCst), 1);
+        drop(client);
+        drop(server);
+        fixtures.shutdown().await;
+        return;
+    }
+
     if matches!(case, Case::OriginSplice) {
         browser_tls_echo(server_addr, ca_der).await;
         server.wait_for("AuthFailed").await;
@@ -601,7 +746,18 @@ server_identity_public_key = "{}"
         case,
         Case::WrongPsk | Case::WrongX25519 | Case::UntrustedOrigin | Case::WrongOriginName
     );
-    if matches!(case, Case::WrongIdentity | Case::DeniedTarget) || failed_then_recover {
+    let certificate_failure = match case {
+        Case::ExpiredCertificate => Some("CertExpired"),
+        Case::FutureCertificate => Some("CertNotValidYet"),
+        Case::WrongCertificateEku => Some("RequiredEkuNotFound"),
+        Case::ForgedCertificate => Some("InvalidSignatureForPublicKey"),
+        Case::MissingIntermediate => Some("UnknownIssuer"),
+        _ => None,
+    };
+    if matches!(case, Case::WrongIdentity | Case::DeniedTarget)
+        || failed_then_recover
+        || certificate_failure.is_some()
+    {
         let mut app = connect_socks(client_addr, target_addr).await;
         let _ = app.write_all(b"must never reach target").await;
         let mut byte = [0];
@@ -625,7 +781,9 @@ server_identity_public_key = "{}"
                 .contains("authenticated pre-data mode started"));
         } else {
             client.wait_for("TLS certificate verification failed").await;
-            let reason = if matches!(case, Case::UntrustedOrigin) {
+            let reason = if let Some(reason) = certificate_failure {
+                reason
+            } else if matches!(case, Case::UntrustedOrigin) {
                 "UnknownIssuer"
             } else {
                 "CertNotValidForName"
@@ -810,4 +968,52 @@ async fn binary_unauthenticated_tls_splice_preserves_origin_and_recovers() {
 #[ignore = "requires loopback TCP sockets and shipped child binaries"]
 async fn binary_malformed_socks_stays_local_then_valid_requests_recover() {
     scenario(Case::SocksBoundaries).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_expired_origin_certificate_is_rejected_before_target_dial() {
+    scenario(Case::ExpiredCertificate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_not_yet_valid_origin_certificate_is_rejected_before_target_dial() {
+    scenario(Case::FutureCertificate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_wrong_origin_certificate_eku_is_rejected_before_target_dial() {
+    scenario(Case::WrongCertificateEku).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_forged_origin_certificate_signature_is_rejected_before_target_dial() {
+    scenario(Case::ForgedCertificate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_missing_origin_intermediate_is_rejected_before_target_dial() {
+    scenario(Case::MissingIntermediate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_valid_intermediate_origin_chain_roundtrips() {
+    scenario(Case::ValidIntermediate).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_socks_invalid_domain_is_forwarded_without_client_resolution() {
+    scenario(Case::InvalidDomain).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback TCP sockets and shipped child binaries"]
+async fn binary_unavailable_proxy_never_connects_directly_to_target() {
+    scenario(Case::ProxyUnavailable).await;
 }

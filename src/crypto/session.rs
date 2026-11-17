@@ -57,9 +57,20 @@ impl fmt::Debug for X25519KeyPair {
 // the live secret key bytes in variable time, which is fine for `assert_eq!` in
 // tests but would be a timing side-channel if a production path ever compared
 // two `SessionKeys`. Gating the impls makes such a comparison a compile error in
-// a non-test build (verified by `cargo build` / `cargo clippy`, which compile the
-// production crate without these impls). If a production path ever needs secret
-// equality, implement it explicitly via `subtle::ConstantTimeEq` instead.
+// a non-test build (checked by the compile-fail doctest below). If a production
+// path ever needs secret equality, use `subtle::ConstantTimeEq` instead.
+/// Secret-bearing session material has no ordinary equality operation in the
+/// production API. Callers can inspect public session metadata:
+///
+/// ```
+/// use parallax::crypto::session::SessionKeys;
+/// fn epoch(keys: &SessionKeys) -> u64 { keys.epoch }
+/// ```
+///
+/// ```compile_fail,E0369
+/// use parallax::crypto::session::SessionKeys;
+/// fn ordinary_equality(a: &SessionKeys, b: &SessionKeys) -> bool { a == b }
+/// ```
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct SessionKeys {
@@ -1381,12 +1392,63 @@ mod tests {
         // `SessionKeys: PartialEq/Eq` exists ONLY under cfg(test) (the derived `==`
         // is variable-time over live secret bytes). This test pins that the
         // test-gated impls still exist so `assert_eq!` keeps working in tests; the
-        // complementary check — that equality is UNAVAILABLE in production — is the
-        // non-test compile itself (`cargo build` / `cargo clippy`), where any
-        // production `==` over `SessionKeys` is now a compile error.
+        // complementary production check is the compile-fail doctest on the type,
+        // paired with a positive control that resolves the same public API.
         let keys = session_keys_fixture();
         let same = keys.clone();
         assert_eq!(keys, same);
+    }
+
+    #[test]
+    fn session_and_x25519_secret_containers_live_wipe_and_redact_debug() {
+        fn drops_zeroized<T: ZeroizeOnDrop>() {}
+        drops_zeroized::<SessionKeys>();
+        drops_zeroized::<X25519KeyPair>();
+        let mut keys = SessionKeys {
+            client_key: [0xa1; KEY_LEN],
+            server_key: [0xa2; KEY_LEN],
+            client_nonce: [0xa3; NONCE_LEN],
+            server_nonce: [0xa4; NONCE_LEN],
+            chain_secret: [0xa5; KEY_LEN],
+            epoch: 9,
+            transcript_hash: [3; KEY_LEN],
+            x25519_shared_secret: [0xa6; KEY_LEN],
+        };
+        let debug = format!("{keys:?}");
+        assert_eq!(debug.matches("<redacted>").count(), 6);
+        for secret_byte in 0xa1_u8..=0xa6 {
+            assert!(!debug.contains(&format!("[{secret_byte},")));
+        }
+        keys.zeroize();
+        for bytes in [
+            keys.client_key.as_slice(),
+            keys.server_key.as_slice(),
+            keys.client_nonce.as_slice(),
+            keys.server_nonce.as_slice(),
+            keys.chain_secret.as_slice(),
+            keys.transcript_hash.as_slice(),
+            keys.x25519_shared_secret.as_slice(),
+        ] {
+            assert!(bytes.iter().all(|&byte| byte == 0));
+        }
+        assert_eq!(keys.epoch, 0);
+        let mut x25519 = X25519KeyPair::generate();
+        assert_eq!(format!("{x25519:?}").matches("<redacted>").count(), 1);
+        x25519.zeroize();
+        assert_eq!(x25519.private, [0; KEY_LEN]);
+        assert_eq!(x25519.public, [0; KEY_LEN]);
+    }
+
+    #[test]
+    fn os_rng_x25519_key_generation_smoke_has_consistent_distinct_public_keys() {
+        // Eight live OS draws detect constant/reused-key regressions; this is
+        // not a statistical entropy assessment or a proof about the OS CSPRNG.
+        let mut public_keys = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let keys = X25519KeyPair::generate();
+            assert_eq!(keys.public, x25519_public_from_private(&keys.private));
+            assert!(public_keys.insert(keys.public));
+        }
     }
 
     #[test]
