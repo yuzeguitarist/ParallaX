@@ -120,6 +120,38 @@ def rust_index(text: str, prefix: str) -> tuple[set[str], set[str], set[str]]:
     return functions, constants, tests
 
 
+def cfg_in_production(expression: str) -> bool | None:
+    """Evaluate test=false; unknown cfg predicates may be either true or false."""
+    expression = expression.strip()
+    if expression == "test":
+        return False
+    operator = re.fullmatch(r"(all|any|not)\s*\((.*)\)", expression, re.DOTALL)
+    if not operator:
+        return None
+    arguments, start, depth = [], 0, 0
+    body = operator[2]
+    for index, char in enumerate(body):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif char == "," and depth == 0:
+            arguments.append(body[start:index].strip())
+            start = index + 1
+    if depth or any(not argument for argument in arguments):
+        return None
+    if body[start:].strip():
+        arguments.append(body[start:].strip())
+    values = [cfg_in_production(argument) for argument in arguments]
+    if operator[1] == "not":
+        return not values[0] if len(values) == 1 and values[0] is not None else None
+    if operator[1] == "all":
+        return False if False in values else None if None in values else True
+    return True if True in values else None if None in values else False
+
+
 def production_index(text: str) -> tuple[set[str], set[str]]:
     """Index lexical production definitions, including their concrete impl owner.
 
@@ -133,8 +165,9 @@ def production_index(text: str) -> tuple[set[str], set[str]]:
     masked = list(code)
     for match in attributed.finditer(code):
         attrs = match["attrs"]
-        test_only = re.search(r"#\[\s*(?:tokio::)?test\s*(?:\(|\])", attrs) or re.search(
-            r"#\[\s*cfg\s*\(\s*(?:test\s*\)|all\s*\([^()]*\btest\b)", attrs)
+        test_only = re.search(r"#\[\s*(?:tokio::)?test\s*(?:\(|\])", attrs) or any(
+            cfg_in_production(expression) is False for expression in re.findall(
+                r"#\[\s*cfg\s*\((.*?)\)\s*\]", attrs, re.DOTALL))
         if not test_only:
             continue
         # Find the item's body or terminator, ignoring delimiters in its type

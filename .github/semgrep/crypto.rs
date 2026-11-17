@@ -222,6 +222,31 @@ impl DataRecordCodec {
         match segment {
             Ok(value) => sealed.push(value),
             Err(err) => {
+                drop(unwind_guard);
+                self.aead.poison();
+                // ok: parallax-poison-failed-seal-worker
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn seal_records_into_parallel(&mut self) -> Result<(), Error> {
+        match segment {
+            Ok(value) => sealed.push(value),
+            Err(err) => {
+                drop(unwind_guard);
+                // ruleid: parallax-poison-failed-seal-worker
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn seal_records_into_parallel(&mut self) -> Result<(), Error> {
+        match segment {
+            Ok(value) => sealed.push(value),
+            Err(err) => {
                 // ruleid: parallax-poison-failed-seal-worker
                 return Err(err);
             }

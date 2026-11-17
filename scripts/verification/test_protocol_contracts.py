@@ -157,6 +157,31 @@ fn production_only() {}
                 # removed concrete production implementation's reference.
                 self.assertIn(missing.split("::")[-1], contracts.rust_index(changed, "")[0])
 
+    def test_nested_cfg_excludes_only_conditions_impossible_without_test(self):
+        conditions = {
+            "test": False,
+            "any(test)": False,
+            "all(test, feature = \"production\")": False,
+            "all(unix, any(test))": False,
+            "not(not(test))": False,
+            "any(all(test, unix), all(windows, test),)": False,
+            "any()": False,
+            "not(test)": True,
+            "not(all(test, unix))": True,
+            "all()": True,
+            "any(test, feature = \"production\")": None,
+            "all(not(test), feature = \"production\")": None,
+            "not(any(test, unix))": None,
+            "target_os = \"test\"": None,
+            "unknown(test)": None,
+        }
+        for expression, expected in conditions.items():
+            with self.subTest(expression=expression):
+                self.assertIs(contracts.cfg_in_production(contracts.rust_code(expression)), expected)
+                source = f"#[cfg({expression})]\nmod conditional {{ fn helper() {{}} }}"
+                functions, _ = contracts.production_index(source)
+                self.assertEqual("helper" in functions, expected is not False)
+
     def test_ledger_rejects_removed_h3_implementations_despite_surviving_helpers(self):
         original_file = contracts.relative_file
         source = (ROOT / "src/transport/leg.rs").read_text()
@@ -166,6 +191,7 @@ fn production_only() {}
                 start = source.index("impl<R> AsyncRead for H3DataFrameReader<R>" if symbol == "poll_read"
                                      else "impl LegReader for H3DataFrameLegReader")
                 changed = source[:start] + source[start:].replace(f"fn {symbol}(", f"fn removed_{symbol}(", 1)
+                changed = changed.replace("#[cfg(test)]", "#[cfg(any(test))]")
                 fixture.write_text(changed)
                 self.assertIn(symbol, contracts.rust_index(changed, "transport::leg")[0])
                 with self.subTest(symbol=symbol), \
