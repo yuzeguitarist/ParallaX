@@ -147,18 +147,19 @@ async fn server_mux_upstream_task(
         drop(connect_payload);
         crate::process_hardening::exclude_from_core_dump("mux.upstream.initial_payload", &initial);
 
-        let mut target = match connect_outbound_target(&target_addr, target_source).await {
-            Ok(target) => target,
-            Err(_) => {
-                tracing::debug!(
-                    cid = ctx.cid,
-                    stream_id,
-                    "mux outbound connect failed; resetting stream"
-                );
-                let _ = downlink.reset().await;
-                return;
-            }
-        };
+        let mut target =
+            match connect_outbound_target(&target_addr, target_source, &ctx.nat64_prefixes).await {
+                Ok(target) => target,
+                Err(_) => {
+                    tracing::debug!(
+                        cid = ctx.cid,
+                        stream_id,
+                        "mux outbound connect failed; resetting stream"
+                    );
+                    let _ = downlink.reset().await;
+                    return;
+                }
+            };
         if tune_tcp_stream(&target).is_err() {
             tracing::debug!(
                 cid = ctx.cid,

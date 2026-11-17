@@ -13,18 +13,17 @@ use zeroize::Zeroizing;
 
 use rand::{
     rngs::{OsRng, StdRng},
-    SeedableRng,
+    Rng, SeedableRng,
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{
-        lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
     sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
-    time::{sleep, timeout, timeout_at, Instant},
+    time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
 
 use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;
@@ -58,7 +57,7 @@ use crate::{
         },
         tcp::{
             connect_tuned_tcp_any, drain_ready_tcp_read, is_fd_exhaustion_error,
-            is_transient_accept_error, relay_connection_limit, tune_tcp_stream,
+            is_transient_accept_error, relay_connection_limit, resolve_tcp_host, tune_tcp_stream,
         },
     },
 };
@@ -537,9 +536,23 @@ struct MuxPoolState {
     /// Fired whenever a build finishes (success or failure) so parked waiters
     /// re-check the pool. Lazily created; shared by all current waiters.
     build_notify: Option<Arc<Notify>>,
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
 }
 
 impl MuxPoolState {
+    fn record_build_result(&mut self, succeeded: bool) {
+        if succeeded {
+            self.consecutive_failures = 0;
+            self.retry_at = None;
+        } else {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            let base_ms = 250u64 << self.consecutive_failures.saturating_sub(1).min(5);
+            let wait_ms = rand::thread_rng().gen_range(base_ms * 3 / 4..=base_ms * 5 / 4);
+            self.retry_at = Some(Instant::now() + Duration::from_millis(wait_ms));
+        }
+    }
+
     /// Returns the shared build-completion `Notify`, creating it on first use.
     fn build_wakeup(&mut self) -> Arc<Notify> {
         Arc::clone(
@@ -897,6 +910,26 @@ fn reserve_slot(sessions: &[ClientMuxHandle]) -> Option<(ClientMuxHandle, OwnedS
     None
 }
 
+fn retryable_mux_build_error(err: &ClientRuntimeError) -> bool {
+    let io = match err {
+        ClientRuntimeError::Io(io) | ClientRuntimeError::Safari26Tls(Safari26TlsError::Io(io)) => {
+            io
+        }
+        _ => return false,
+    };
+    matches!(
+        io.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+    )
+}
+
 impl ClientMuxPool {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -953,6 +986,11 @@ impl ClientMuxPool {
             if let Some(reserved) = reserve_slot(&state.sessions) {
                 return Ok(reserved);
             }
+            if let Some(retry_at) = state.retry_at.filter(|until| *until > Instant::now()) {
+                drop(state);
+                sleep_until(retry_at).await;
+                continue;
+            }
             // No free slot. While the pool is EMPTY, single-flight the first
             // session so a cold-start burst COALESCES onto it (mux's whole point:
             // many substreams share one session) instead of every connection
@@ -982,7 +1020,9 @@ impl ClientMuxPool {
                         // re-checks existing sessions first, so a slot another build
                         // just freed is still preferred over another handshake.
                         build_attempts += 1;
-                        if build_attempts >= MUX_ACQUIRE_MAX_BUILD_ATTEMPTS {
+                        if build_attempts >= MUX_ACQUIRE_MAX_BUILD_ATTEMPTS
+                            || !retryable_mux_build_error(&err)
+                        {
                             return Err(err);
                         }
                         tracing::debug!(
@@ -1019,6 +1059,7 @@ impl ClientMuxPool {
         let result = self.spawn_build().await;
         let mut state = self.inner.lock().await;
         state.builds_in_flight -= 1;
+        state.record_build_result(result.is_ok());
         let outcome = match result {
             Ok(handle) => {
                 // A fresh session always has free slots, so this cannot fail.
@@ -1058,12 +1099,18 @@ impl ClientMuxPool {
             if !state.sessions.is_empty() {
                 return Ok(());
             }
+            if let Some(retry_at) = state.retry_at.filter(|until| *until > Instant::now()) {
+                drop(state);
+                sleep_until(retry_at).await;
+                continue;
+            }
             if state.builds_in_flight == 0 {
                 state.builds_in_flight += 1;
                 drop(state);
                 let result = self.spawn_build().await;
                 let mut state = self.inner.lock().await;
                 state.builds_in_flight -= 1;
+                state.record_build_result(result.is_ok());
                 let outcome = match result {
                     Ok(handle) => {
                         state.sessions.push(handle);
@@ -2167,6 +2214,8 @@ async fn run_client_udp_probe(
         let nonce = match crate::transport::udp::probe::probe_client_send_request_early(
             &mut relay_send,
             sni,
+            psk,
+            &offer.offer_id,
         )
         .await
         {
@@ -2605,7 +2654,7 @@ async fn resolve_client_server_addr(
     }
 
     let mut addrs = Vec::new();
-    for addr in lookup_host(server_addr).await? {
+    for addr in resolve_tcp_host(server_addr).await? {
         if !addrs.contains(&addr) {
             addrs.push(addr);
         }
@@ -3128,8 +3177,16 @@ async fn client_exchange_quic_done(
 ) -> Result<(), ClientRuntimeError> {
     // Seal our DONE on the client->server (send) codec -- its next sequence
     // number -- and write it over the reliable TCP control stream.
-    let done = seal_to_server
-        .seal(QUIC_RELAY_DONE_MARKER, &mut OsRng)
+    let mut done = Vec::new();
+    let pad = crate::protocol::command::control_frame_shaping_pad(
+        QUIC_RELAY_DONE_MARKER.len(),
+        seal_to_server
+            .max_plaintext_len()
+            .saturating_sub(QUIC_RELAY_DONE_MARKER.len()),
+        &mut OsRng,
+    );
+    seal_to_server
+        .seal_into_exact_padded(QUIC_RELAY_DONE_MARKER, pad, &mut OsRng, &mut done)
         .map_err(ClientHandshakeError::from)?;
     // Bound the DONE write+flush with the same backstop as the DONE read below: a
     // peer that stops reading the reliable TCP control stream during teardown must
@@ -3460,14 +3517,20 @@ where
                 let _ = local_write.shutdown().await;
                 return Ok(open_from_server);
             }
-            Some(err) => return Err(ClientRuntimeError::Io(err)),
+            Some(err) => {
+                abort_client_download(local_write);
+                return Err(ClientRuntimeError::Io(err));
+            }
             None => match server_records.read_record_into(&mut server_record).await {
                 Ok(()) => {}
                 Err(err) if server_records.is_clean_close(&err) => {
                     let _ = local_write.shutdown().await;
                     return Ok(open_from_server);
                 }
-                Err(err) => return Err(ClientRuntimeError::Io(err)),
+                Err(err) => {
+                    abort_client_download(local_write);
+                    return Err(ClientRuntimeError::Io(err));
+                }
             },
         }
         log_record_read(cid, "server->client", "client-outer-reader", &server_record);
@@ -3780,13 +3843,24 @@ async fn client_mux_download_loop(
             break;
         }
     }
-    let _ = local_write.shutdown().await;
     let outcome = if local_write_failed {
         DownloadOutcome::Reset
     } else {
         terminal.outcome()
     };
+    if matches!(outcome, DownloadOutcome::Fin) {
+        let _ = local_write.shutdown().await;
+    } else {
+        abort_client_download(local_write);
+    }
     let _ = outcome_tx.send(outcome);
+}
+
+fn abort_client_download(local_write: OwnedWriteHalf) {
+    let _ = socket2::SockRef::from(local_write.as_ref()).set_linger(Some(Duration::ZERO));
+    // OwnedWriteHalf's ordinary drop shuts down the write direction, emitting
+    // FIN before the upload half closes. Leave it open for the abortive close.
+    local_write.forget();
 }
 
 /// Keeps the reader's unanswered-Open set (stream id -> `relay_now_millis()` when
@@ -4618,6 +4692,30 @@ fn is_peer_idle_close(conn: &crate::transport::udp::quic::endpoint::Connection) 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn mux_build_failures_share_a_jittered_cooldown_and_reset_on_success() {
+        let mut state = MuxPoolState::default();
+        state.record_build_result(false);
+        let first = state.retry_at.unwrap().duration_since(Instant::now());
+        assert!((Duration::from_millis(187)..=Duration::from_millis(312)).contains(&first));
+        state.record_build_result(false);
+        let second = state.retry_at.unwrap().duration_since(Instant::now());
+        assert!((Duration::from_millis(375)..=Duration::from_millis(625)).contains(&second));
+        state.record_build_result(true);
+        assert!(state.retry_at.is_none());
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(retryable_mux_build_error(&ClientRuntimeError::Io(
+            io::Error::from(io::ErrorKind::TimedOut)
+        )));
+        assert!(!retryable_mux_build_error(
+            &ClientRuntimeError::MissingClient
+        ));
+        assert!(!retryable_mux_build_error(
+            &ClientRuntimeError::Safari26Tls(Safari26TlsError::Certificate(
+                "bad certificate".into()
+            ))
+        ));
+    }
     use std::{io::Cursor, sync::Arc};
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -6418,6 +6516,55 @@ mod tests {
         feeder.abort();
         drop(app_side);
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn client_mux_download_preserves_reset_versus_fin_on_local_socket() {
+        for outcome in [DownloadOutcome::Reset, DownloadOutcome::Fin] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (app, proxy) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let mut app = app.unwrap();
+            let (proxy_read, proxy_write) = proxy.unwrap().0.into_split();
+            let (events_tx, events_rx) = mpsc::channel(1);
+            let terminal = StreamTerminal::new();
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            let task = tokio::spawn(client_mux_download_loop(
+                proxy_write,
+                events_rx,
+                terminal.clone(),
+                outcome_tx,
+                Duration::from_secs(5),
+            ));
+            events_tx
+                .send(DownloadEvent(b"tail".to_vec()))
+                .await
+                .unwrap();
+            let mut tail = [0; 4];
+            app.read_exact(&mut tail).await.unwrap();
+            assert_eq!(&tail, b"tail");
+            terminal.set(outcome);
+            drop(events_tx);
+            task.await.unwrap();
+            assert!(matches!(
+                (outcome_rx.await.unwrap(), outcome),
+                (DownloadOutcome::Fin, DownloadOutcome::Fin)
+                    | (DownloadOutcome::Reset, DownloadOutcome::Reset)
+            ));
+            drop(proxy_read);
+            let close = timeout(Duration::from_secs(5), app.read(&mut [0; 1]))
+                .await
+                .unwrap();
+            match outcome {
+                DownloadOutcome::Fin => assert_eq!(close.unwrap(), 0),
+                DownloadOutcome::Reset => {
+                    assert_eq!(close.unwrap_err().kind(), io::ErrorKind::ConnectionReset)
+                }
+            }
+        }
     }
 
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
@@ -8501,6 +8648,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: Some(target_addr.to_string()),
+            nat64_prefixes: vec![],
             private_key: STANDARD.encode(server_keys.private).into(),
             identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
             replay_cache_path,

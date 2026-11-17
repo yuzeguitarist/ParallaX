@@ -448,7 +448,7 @@ pub(crate) async fn run_with_plan(
         // release the QUIC carrier. The DONE continues the TCP-run's AEAD sequence.
         if quic_run.is_ok() {
             quic_writer.0.finish();
-            let done = data_session.seal_payload(SPEED_QUIC_DONE_MARKER, &mut OsRng)?;
+            let done = data_session.seal_payload_band_shaped(SPEED_QUIC_DONE_MARKER, &mut OsRng)?;
             tcp_writer.write_records(&done).await?;
         }
         let _ = quic_reader;
@@ -1249,6 +1249,7 @@ mod tests {
                 listen: "127.0.0.1:8443".parse::<SocketAddr>().unwrap(),
                 fallback_addr: "fallback.example:443".to_owned(),
                 data_target: None,
+                nat64_prefixes: vec![],
                 private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
                 identity_secret_key: STANDARD
                     .encode(vec![0_u8; mldsa::secret_key_bytes()])

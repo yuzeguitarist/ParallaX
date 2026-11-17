@@ -14,6 +14,7 @@
 //! land in later slices; a lossless loopback completes without them.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -462,6 +463,59 @@ const MAX_STREAM_PENDING_FRAGMENTS: usize = 4096;
 /// [`CONN_RECV_WINDOW`] (16 MiB) is never engaged. This aggregate budget
 /// restores the connection-level bound the flow-control design assumes.
 const MAX_CONN_REASSEMBLY: usize = CONN_RECV_WINDOW as usize;
+// Includes a sparsely occupied BTreeMap node, the Vec header, and allocator slack.
+const FRAGMENT_MEMORY_OVERHEAD: usize = 512;
+fn fragment_charge(bytes: usize) -> usize {
+    bytes * 2 + FRAGMENT_MEMORY_OVERHEAD
+}
+// Vec growth can retain almost twice its length, with an eight-byte minimum.
+fn readable_charge(bytes: usize) -> usize {
+    if bytes == 0 {
+        0
+    } else {
+        bytes * 2 + 8
+    }
+}
+pub(super) const ENDPOINT_REASSEMBLY_BUDGET: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+struct ReceiveReservation {
+    shared: Arc<AtomicUsize>,
+    used: usize,
+}
+
+impl ReceiveReservation {
+    fn reserve(&mut self, bytes: usize) -> bool {
+        let mut used = self.shared.load(Ordering::Acquire);
+        loop {
+            let Some(next) = used
+                .checked_add(bytes)
+                .filter(|next| *next <= ENDPOINT_REASSEMBLY_BUDGET)
+            else {
+                return false;
+            };
+            match self
+                .shared
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
+        self.used += bytes;
+        true
+    }
+    fn release(&mut self, bytes: usize) {
+        self.shared.fetch_sub(bytes, Ordering::AcqRel);
+        self.used -= bytes;
+    }
+}
+
+impl Drop for ReceiveReservation {
+    fn drop(&mut self) {
+        self.shared.fetch_sub(self.used, Ordering::AcqRel);
+    }
+}
 
 /// RFC 9000 §18.2 default `ack_delay_exponent`. The peer scales its ACK `delay`
 /// field by `2^exponent` microseconds; we decode with the default (neither we nor
@@ -736,7 +790,8 @@ struct Stream {
     // Receive half (bytes this endpoint receives on the stream).
     recv: Vec<u8>,
     recv_off: u64,
-    recv_pending: Vec<(u64, Vec<u8>)>,
+    recv_pending: BTreeMap<u64, Vec<u8>>,
+    recv_pending_bytes: usize,
     /// Highest offset+len received (flow-control credit the peer has consumed).
     recv_high: u64,
     /// Bytes the app has read (drives the receive-window extension).
@@ -790,6 +845,7 @@ const STREAM_RECV_WINDOW: u64 = 2 * 1024 * 1024;
 /// finding #28). Sized to the per-stream receive window so a well-behaved peer
 /// can keep a full window in flight.
 pub(super) const STREAM_SEND_BUFFER: usize = 2 * 1024 * 1024;
+const CONN_SEND_BUFFER: usize = 16 * 1024 * 1024;
 
 /// Initial connection-level receive window we advertise (MAX_DATA); extended as
 /// the app reads across all streams. Matches the Safari `initial_max_data` value.
@@ -1019,6 +1075,8 @@ pub struct Connection {
     /// `recv_pending` (bounded by [`MAX_CONN_REASSEMBLY`]): incremented on push,
     /// decremented as `drain_contiguous` drains/evicts fragments.
     recv_pending_total: usize,
+    receive_memory: ReceiveReservation,
+    send_buffered_total: usize,
     /// A grown connection window owes the peer a MAX_DATA update.
     need_max_data: bool,
     /// Whether the peer's transport-parameter flow-control limits have been applied.
@@ -1141,6 +1199,8 @@ impl Connection {
             recv_data_total: 0,
             recv_data_consumed: 0,
             recv_pending_total: 0,
+            receive_memory: ReceiveReservation::default(),
+            send_buffered_total: 0,
             need_max_data: false,
             peer_flow_applied: false,
             peer_msd_bidi_local: 0,
@@ -1291,6 +1351,18 @@ impl Connection {
         self.tls.client_hello_processed()
     }
 
+    pub fn authorize_client_hello(&mut self) -> Result<(), QuicTlsError> {
+        self.tls.authorize_client_hello()?;
+        self.prevalidate_peer_transport_params()?;
+        self.pump_write();
+        Ok(())
+    }
+
+    pub(super) fn set_receive_budget(&mut self, shared: Arc<AtomicUsize>) {
+        assert_eq!(self.receive_memory.used, 0);
+        self.receive_memory.shared = shared;
+    }
+
     /// Whether 0-RTT keys are installed on this connection. On a resuming CLIENT
     /// this is set at construction (it can send early data); on the SERVER it is set
     /// only after it ACCEPTED a resumed ticket's 0-RTT (and can decrypt early data),
@@ -1423,18 +1495,25 @@ impl Connection {
     /// the peer reset before sending a byte (a cancelled HTTP/3 request stream,
     /// which Safari opens and cancels ahead of its real request) carries nothing to
     /// serve, so it is skipped rather than handed to the application.
+    #[cfg(test)]
     pub fn accept_bi(&mut self) -> Option<u64> {
+        self.accept_bi_with_progress().0
+    }
+
+    pub(super) fn accept_bi_with_progress(&mut self) -> (Option<u64>, bool) {
+        let mut discarded = false;
         while let Some(id) = self.accept_bidi.pop_front() {
             let cancelled_empty = self
                 .streams
                 .get(&id)
                 .is_some_and(|s| s.recv_reset.is_some() && s.recv_high == 0);
             if !cancelled_empty {
-                return Some(id);
+                return (Some(id), discarded);
             }
             self.discard_stream_recv(id);
+            discarded = true;
         }
-        None
+        (None, discarded)
     }
 
     /// Take the id of the next peer-initiated unidirectional stream, if any.
@@ -1444,11 +1523,18 @@ impl Connection {
 
     /// Queue application bytes on stream `id`; they are packetized into 1-RTT STREAM
     /// frames once the handshake installs Data keys. Creates the stream if absent.
+    /// A direct call exceeding the aggregate budget closes the connection; async
+    /// callers use stream_send_capacity for lossless backpressure.
     pub fn send_stream(&mut self, id: u64, data: &[u8]) {
+        if data.len() > CONN_SEND_BUFFER.saturating_sub(self.send_buffered_total) {
+            self.close_transport(0x01, 0x08, b"stream send buffer exceeded");
+            return;
+        }
         self.create_local_stream(id);
         if let Some(s) = self.streams.get_mut(&id) {
             if !s.fin && s.reset.is_none() {
                 s.send.extend_from_slice(data);
+                self.send_buffered_total += data.len();
             }
         }
     }
@@ -1459,7 +1545,9 @@ impl Connection {
     /// reclaims buffer space, instead of buffering without bound (finding #28).
     pub fn stream_send_capacity(&self, id: u64) -> usize {
         let buffered = self.streams.get(&id).map_or(0, |s| s.send.len());
-        STREAM_SEND_BUFFER.saturating_sub(buffered)
+        STREAM_SEND_BUFFER
+            .saturating_sub(buffered)
+            .min(CONN_SEND_BUFFER.saturating_sub(self.send_buffered_total))
     }
 
     pub fn stream_send_finished(&self, id: u64) -> bool {
@@ -1485,6 +1573,9 @@ impl Connection {
             if s.reset.is_none() {
                 s.reset = Some(error_code);
                 s.retransmit.clear();
+                self.send_buffered_total -= s.send.len();
+                s.send = Vec::new();
+                s.send_base = s.send_off;
             }
         }
     }
@@ -1532,6 +1623,7 @@ impl Connection {
             return Vec::new();
         };
         let data = std::mem::take(&mut s.recv);
+        self.receive_memory.release(readable_charge(data.len()));
         let n = data.len() as u64;
         s.recv_consumed += n;
         s.recv_credited += n;
@@ -1614,7 +1706,9 @@ impl Connection {
         {
             return;
         }
-        self.streams.remove(&id);
+        if let Some(s) = self.streams.remove(&id) {
+            self.send_buffered_total -= s.send.len();
+        }
         self.accept_bidi.retain(|&queued| queued != id);
         self.accept_uni.retain(|&queued| queued != id);
         if peer {
@@ -1744,6 +1838,7 @@ impl Connection {
                     .extend_from_slice(&buf);
             }
             match kc {
+                Some(KeyChange::RejectZeroRtt) => self.reject_zero_rtt(),
                 Some(KeyChange::ZeroRtt { keys }) => {
                     // 0-RTT write keys (client resumption). Stored for the 0-RTT
                     // send path; the CRYPTO write_level stays in its current space.
@@ -1771,6 +1866,21 @@ impl Connection {
                 }
             }
         }
+    }
+
+    fn reject_zero_rtt(&mut self) {
+        self.zero_rtt_keys = None;
+        // HRR arrives before 1-RTT keys: all outstanding application-space
+        // packets are rejected early data. Preserve their stream offsets and
+        // replay the ranges under 1-RTT once those keys are available.
+        let sent = std::mem::take(&mut self.spaces[SPACE_DATA].sent_content);
+        for (pn, content) in sent {
+            self.spaces[SPACE_DATA].sent.discard(pn);
+            self.unindex_sent_stream_ranges(&content);
+            self.requeue(SPACE_DATA, content);
+        }
+        self.spaces[SPACE_DATA].loss_time = None;
+        self.spaces[SPACE_DATA].last_ack_eliciting = None;
     }
 
     fn retire_data_connection(&mut self, reason: &[u8]) {
@@ -2159,7 +2269,45 @@ impl Connection {
                     && (!sp.retransmit_crypto.is_empty()
                         || sp.crypto_send_off < sp.crypto_send.len())
                 {
-                    let dg = self.build_crypto_packet(space, now);
+                    let initial_bytes =
+                        self.spaces[SPACE_INITIAL].retransmit_crypto.first().map_or(
+                            self.spaces[SPACE_INITIAL].crypto_send.len()
+                                - self.spaces[SPACE_INITIAL].crypto_send_off,
+                            |(_, len)| *len as usize,
+                        );
+                    let coalesce = space == SPACE_INITIAL
+                        && self.side == Side::Server
+                        && initial_bytes <= MAX_DATAGRAM - 128
+                        && self.spaces[SPACE_HANDSHAKE].keys.is_some()
+                        && (!self.spaces[SPACE_HANDSHAKE].retransmit_crypto.is_empty()
+                            || self.spaces[SPACE_HANDSHAKE].crypto_send_off
+                                < self.spaces[SPACE_HANDSHAKE].crypto_send.len());
+                    // Reserve room for the next long-header packet rather than
+                    // padding a public-key Initial to the datagram minimum.
+                    let cap = if space == SPACE_INITIAL && !coalesce {
+                        MIN_INITIAL_DATAGRAM
+                    } else {
+                        MAX_DATAGRAM
+                    };
+                    let mut dg = self.build_crypto_packet(
+                        space,
+                        now,
+                        cap,
+                        if space == SPACE_INITIAL && !coalesce {
+                            MIN_INITIAL_DATAGRAM
+                        } else {
+                            0
+                        },
+                    );
+                    if coalesce {
+                        let handshake = self.build_crypto_packet(
+                            SPACE_HANDSHAKE,
+                            now,
+                            MAX_DATAGRAM - dg.len(),
+                            MIN_INITIAL_DATAGRAM.saturating_sub(dg.len()),
+                        );
+                        dg.extend(handshake);
+                    }
                     self.probe_pending = self.probe_pending.saturating_sub(1);
                     return Some(dg);
                 }
@@ -2875,6 +3023,18 @@ impl Connection {
         self.seal_data_packet(frames, true, SentContent::default(), Instant::now())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_cancelled_stream_waits_for_accept(&self, id: u64) -> bool {
+        self.streams.get(&id).is_some_and(|s| {
+            s.reset_acked && s.recv_reset.is_some() && s.recv_high == 0 && !s.recv_released
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_peer_bidi_limit(&self) -> u64 {
+        self.send_max_streams[0]
+    }
+
     /// Build a 1-RTT packet carrying HANDSHAKE_DONE (RFC 9001 §4.1.2). Ack-eliciting
     /// and tracked so it is resent if lost; clears the pending flag. PADDING brings
     /// the payload up to the 4 bytes header protection needs for its sample (RFC
@@ -3029,7 +3189,13 @@ impl Connection {
         datagram
     }
 
-    fn build_crypto_packet(&mut self, space: usize, now: Instant) -> Vec<u8> {
+    fn build_crypto_packet(
+        &mut self,
+        space: usize,
+        now: Instant,
+        cap: usize,
+        min_size: usize,
+    ) -> Vec<u8> {
         let pn = self.allocate_packet_number(space);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let tag_len = self.spaces[space]
@@ -3045,21 +3211,30 @@ impl Connection {
 
         // A lost CRYPTO range is resent verbatim (it was already sized to fit a
         // packet); otherwise carve the next fresh chunk under the datagram budget.
+        let crypto_budget = |off: usize| {
+            let crypto_hdr = 1 + super::varint::size(off as u64) + 2;
+            let cap = if space == SPACE_INITIAL && self.side == Side::Client {
+                MIN_INITIAL_DATAGRAM.min(cap)
+            } else {
+                cap
+            };
+            let budget = cap.saturating_sub(pn_offset + pn_len + tag_len + crypto_hdr);
+            if space == SPACE_INITIAL && self.side == Side::Client {
+                budget.min(SAFARI_INITIAL_CRYPTO_CHUNK)
+            } else {
+                budget
+            }
+        };
         let (offset, end, is_retransmit) =
             if let Some(&(off, len)) = self.spaces[space].retransmit_crypto.first() {
-                (off as usize, (off + len) as usize, true)
+                (
+                    off as usize,
+                    off as usize + (len as usize).min(crypto_budget(off as usize)),
+                    true,
+                )
             } else {
                 let off = self.spaces[space].crypto_send_off;
-                let crypto_hdr = 1 + super::varint::size(off as u64) + 2;
-                let cap = if space == SPACE_INITIAL {
-                    MIN_INITIAL_DATAGRAM
-                } else {
-                    MAX_DATAGRAM
-                };
-                let mut budget = cap.saturating_sub(pn_offset + pn_len + tag_len + crypto_hdr);
-                if space == SPACE_INITIAL && self.side == Side::Client {
-                    budget = budget.min(SAFARI_INITIAL_CRYPTO_CHUNK);
-                }
+                let budget = crypto_budget(off);
                 let remaining = self.spaces[space].crypto_send.len() - off;
                 (off, off + remaining.min(budget.max(1)), false)
             };
@@ -3071,9 +3246,8 @@ impl Connection {
             };
             let mut payload = Vec::new();
             crypto.encode(&mut payload);
-            let frames = if space == SPACE_INITIAL {
-                let pad = MIN_INITIAL_DATAGRAM
-                    .saturating_sub(pn_offset + pn_len + payload.len() + tag_len);
+            let frames = if min_size != 0 {
+                let pad = min_size.saturating_sub(pn_offset + pn_len + payload.len() + tag_len);
                 if pad > 0 {
                     vec![crypto, Frame::Padding(pad)]
                 } else {
@@ -3094,7 +3268,13 @@ impl Connection {
         };
         self.record_sent(space, pn, datagram.len(), true, content, now);
         if is_retransmit {
-            self.spaces[space].retransmit_crypto.remove(0);
+            let (off, len) = self.spaces[space].retransmit_crypto[0];
+            let sent = (end - offset) as u64;
+            if sent == len {
+                self.spaces[space].retransmit_crypto.remove(0);
+            } else {
+                self.spaces[space].retransmit_crypto[0] = (off + sent, len - sent);
+            }
         } else {
             self.spaces[space].crypto_send_off = end;
         }
@@ -3992,6 +4172,9 @@ impl Connection {
         let Some(s) = self.streams.get_mut(&id) else {
             return;
         };
+        if s.reset.is_some() {
+            return;
+        }
         let mut low = s.send_off;
         for &(off, _, _) in &s.retransmit {
             low = low.min(off);
@@ -4004,6 +4187,7 @@ impl Connection {
             return;
         }
         s.send.drain(..reclaim);
+        self.send_buffered_total -= reclaim;
         s.send_base = low;
     }
 
@@ -4218,15 +4402,23 @@ impl Connection {
                 // would otherwise consume reassembly budget at zero flow-control
                 // cost. Partial overlaps still buffer (they may fill gaps).
                 if s.recv_pending
-                    .iter()
-                    .any(|(o, d)| *o <= offset && *o + d.len() as u64 >= end)
+                    .range(..=offset)
+                    .next_back()
+                    .is_some_and(|(o, d)| *o + d.len() as u64 >= end)
                 {
                     return Ok(());
                 }
-                let buffered: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
-                if buffered + data.len() > MAX_STREAM_REASSEMBLY
-                    || s.recv_pending.len() >= MAX_STREAM_PENDING_FRAGMENTS
-                    || self.recv_pending_total + data.len() > MAX_CONN_REASSEMBLY
+                let charge = fragment_charge(data.len());
+                let replaced_len = s.recv_pending.get(&offset).map_or(0, |d| d.len());
+                let replaced = if replaced_len == 0 {
+                    0
+                } else {
+                    fragment_charge(replaced_len)
+                };
+                if s.recv_pending_bytes + data.len() - replaced_len > MAX_STREAM_REASSEMBLY
+                    || (replaced == 0 && s.recv_pending.len() >= MAX_STREAM_PENDING_FRAGMENTS)
+                    || self.recv_pending_total + charge - replaced > MAX_CONN_REASSEMBLY
+                    || !self.receive_memory.reserve(charge)
                 {
                     return Err(transport_error(
                         0x01,
@@ -4234,19 +4426,47 @@ impl Connection {
                         "stream reassembly buffer exceeded",
                     ));
                 }
-                self.recv_pending_total += data.len();
-                s.recv_pending.push((offset, data.to_vec()));
+                self.recv_pending_total += charge - replaced;
+                s.recv_pending_bytes += data.len();
+                if let Some(old) = s.recv_pending.insert(offset, data.to_vec()) {
+                    s.recv_pending_bytes -= old.len();
+                    self.receive_memory.release(replaced);
+                }
             }
             return Ok(());
         }
-        let freed = drain_contiguous(
-            &mut s.recv_pending,
-            &mut s.recv_off,
-            offset,
-            data,
-            &mut s.recv,
-        );
+        let new_bytes = end.saturating_sub(s.recv_off) as usize;
+        let reserved = new_bytes * 2 + usize::from(s.recv.is_empty() && new_bytes != 0) * 8;
+        if !self.receive_memory.reserve(reserved) {
+            return Err(transport_error(
+                0x01,
+                0x08,
+                "endpoint receive memory budget exceeded",
+            ));
+        }
+        let before = s.recv.len();
+        let skip = (s.recv_off - offset) as usize;
+        if skip < data.len() {
+            s.recv.extend_from_slice(&data[skip..]);
+            s.recv_off = end;
+        }
+        let mut freed = 0;
+        while let Some((&start, _)) = s.recv_pending.first_key_value() {
+            if start > s.recv_off {
+                break;
+            }
+            let (_, fragment) = s.recv_pending.pop_first().unwrap();
+            let skip = (s.recv_off - start) as usize;
+            if skip < fragment.len() {
+                s.recv.extend_from_slice(&fragment[skip..]);
+                s.recv_off += (fragment.len() - skip) as u64;
+            }
+            s.recv_pending_bytes -= fragment.len();
+            freed += fragment_charge(fragment.len());
+        }
         self.recv_pending_total -= freed;
+        self.receive_memory
+            .release(reserved + freed - (readable_charge(s.recv.len()) - readable_charge(before)));
         Ok(())
     }
 
@@ -4332,12 +4552,14 @@ impl Connection {
         // longer be reassembled, and the tail up to `final_size` — is now
         // undeliverable, so `read_stream` will never credit it.
         let still_readable = s.recv.len() as u64;
-        let stranded_fragments: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
+        let stranded_fragments =
+            s.recv_pending_bytes * 2 + s.recv_pending.len() * FRAGMENT_MEMORY_OVERHEAD;
         if first_reset {
             // No further STREAM frames can arrive (the final size is fixed), so the
             // gaps in front of these fragments will never fill: they are dead weight
             // on the reassembly budget as well as on flow control.
-            s.recv_pending = Vec::new();
+            s.recv_pending = BTreeMap::new();
+            s.recv_pending_bytes = 0;
         }
         // Credit up to `final_size - still_readable`, minus whatever this stream has
         // already released, so the release is exact and cannot double-count.
@@ -4350,6 +4572,7 @@ impl Connection {
         self.recv_data_total += delta;
         if first_reset {
             self.recv_pending_total = self.recv_pending_total.saturating_sub(stranded_fragments);
+            self.receive_memory.release(stranded_fragments);
             // RFC 9000 §4.5: the reset's bytes count as delivered for flow control.
             // Reclaiming them keeps MAX_DATA moving; without this a peer that resets
             // streams at their full final size permanently freezes the connection
@@ -4395,10 +4618,14 @@ impl Connection {
         let credit = s.recv_high.saturating_sub(s.recv_credited);
         s.recv_credited = s.recv_high;
         s.recv_released = true;
+        let readable = readable_charge(s.recv.len());
         s.recv = Vec::new();
-        let stranded_fragments: usize = s.recv_pending.iter().map(|(_, d)| d.len()).sum();
-        s.recv_pending = Vec::new();
+        let stranded_fragments =
+            s.recv_pending_bytes * 2 + s.recv_pending.len() * FRAGMENT_MEMORY_OVERHEAD;
+        s.recv_pending = BTreeMap::new();
+        s.recv_pending_bytes = 0;
         self.recv_pending_total = self.recv_pending_total.saturating_sub(stranded_fragments);
+        self.receive_memory.release(readable + stranded_fragments);
         self.credit_connection_window(credit);
         self.retire_stream(id);
     }
@@ -4988,6 +5215,50 @@ mod tests {
         tp.initial_max_streams_bidi = MAX_PEER_STREAMS as u64;
         tp.initial_max_streams_uni = MAX_PEER_STREAMS as u64;
         tp.encode_server()
+    }
+
+    #[test]
+    fn server_initial_crypto_uses_coalesced_handshake_padding() {
+        let dcid = ConnectionId::new(&[0x74; 8]);
+        let mut client =
+            Connection::new_client(client_config(), "example.com", dcid, ConnectionId::new(&[]))
+                .unwrap();
+        let mut server = reassembly_test_server();
+        let now = Instant::now();
+        while let Some(datagram) = client.poll_transmit(now) {
+            server.handle_datagram(&datagram, now).unwrap();
+        }
+        let keys = initial_keys(dcid.as_slice(), Side::Server);
+        let mut coalesced = false;
+        let mut largest = None;
+        while let Some(datagram) = server.poll_transmit(now) {
+            if packet::first_packet_space(&datagram) == Some(PacketSpace::Initial) {
+                let len = packet::long_packet_len(&datagram).unwrap();
+                let mut initial = datagram[..len].to_vec();
+                let (header, body) = open_packet(&keys.local, &mut initial, 0, largest).unwrap();
+                largest = Some(header.packet_number());
+                for frame in Iter::new(&initial[body]) {
+                    if let Frame::Padding(bytes) = frame.unwrap() {
+                        assert!(
+                            bytes < 32,
+                            "the public Initial must not contain the old large fixed padding run"
+                        );
+                    }
+                }
+                if packet::first_packet_space(&datagram[len..]) == Some(PacketSpace::Handshake) {
+                    coalesced = true;
+                    assert!(
+                        datagram.len() >= MIN_INITIAL_DATAGRAM && datagram.len() <= MAX_DATAGRAM
+                    );
+                }
+            }
+            client.handle_datagram(&datagram, now).unwrap();
+        }
+        assert!(coalesced);
+        assert!(
+            !client.is_handshaking(),
+            "coalescing must complete TLS without artificial packet loss"
+        );
     }
 
     #[test]
@@ -7323,11 +7594,16 @@ mod tests {
             while let Some(packet) = client.poll_transmit(now) {
                 server.handle_datagram(&packet, now).unwrap();
             }
-            while let Some(packet) = server.poll_transmit(now) {
-                if packet::first_packet_space(&packet) == Some(PacketSpace::Handshake) {
-                    break; // withhold the server's Finished flight
+            'server_flight: while let Some(packet) = server.poll_transmit(now) {
+                let mut remaining = packet.as_slice();
+                while !remaining.is_empty() {
+                    if packet::first_packet_space(remaining) == Some(PacketSpace::Handshake) {
+                        break 'server_flight; // withhold the server's Finished flight
+                    }
+                    let len = packet::long_packet_len(remaining).unwrap_or(remaining.len());
+                    client.handle_datagram(&remaining[..len], now).unwrap();
+                    remaining = &remaining[len..];
                 }
-                client.handle_datagram(&packet, now).unwrap();
             }
             assert!(client.is_handshaking());
             let state = client.key_phase;
@@ -9464,6 +9740,135 @@ mod tests {
     }
 
     #[test]
+    fn reverse_order_tiny_fragments_reassemble_without_duplicate_growth() {
+        let mut server = reassembly_test_server();
+        for offset in (1..=2048).rev() {
+            server.recv_stream(0, offset, false, b"x").unwrap();
+            server.recv_stream(0, offset, false, b"x").unwrap();
+        }
+        assert_eq!(server.streams[&0].recv_pending.len(), 2048);
+        assert_eq!(server.recv_pending_total, 2048 * fragment_charge(1));
+        server.recv_stream(0, 0, false, b"x").unwrap();
+        assert!(server.streams[&0].recv_pending.is_empty());
+        assert_eq!(server.recv_pending_total, 0);
+        assert_eq!(server.read_stream(0), vec![b'x'; 2049]);
+        assert_eq!(server.receive_memory.used, 0);
+    }
+
+    fn reassembly_test_server() -> Connection {
+        Connection::new_server(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0x6d; 4]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tiny_fragment_metadata_counts_against_the_connection_budget() {
+        let mut server = reassembly_test_server();
+        let mut rejected = false;
+        'streams: for stream in 0..64 {
+            for fragment in 0..MAX_STREAM_PENDING_FRAGMENTS {
+                if server
+                    .recv_stream(stream * 4, (fragment as u64 + 1) * 2, false, b"x")
+                    .is_err()
+                {
+                    rejected = true;
+                    break 'streams;
+                }
+            }
+        }
+        assert!(
+            rejected,
+            "metadata, rather than just payload, must exhaust the budget"
+        );
+        let payload: usize = server.streams.values().map(|s| s.recv_pending_bytes).sum();
+        assert!(payload < MAX_CONN_REASSEMBLY / 2);
+        assert!(server.recv_pending_total <= MAX_CONN_REASSEMBLY);
+        assert_eq!(server.receive_memory.used, server.recv_pending_total);
+    }
+
+    #[test]
+    fn endpoint_receive_budget_is_shared_and_released_on_read_reset_and_drop() {
+        let shared = Arc::new(AtomicUsize::new(
+            ENDPOINT_REASSEMBLY_BUDGET - readable_charge(1),
+        ));
+        let mut first = reassembly_test_server();
+        let mut second = reassembly_test_server();
+        first.set_receive_budget(shared.clone());
+        second.set_receive_budget(shared.clone());
+        first.recv_stream(0, 0, false, b"a").unwrap();
+        assert!(second.recv_stream(0, 0, false, b"b").is_err());
+        assert_eq!(first.read_stream(0), b"a");
+        second.recv_stream(0, 0, false, b"b").unwrap();
+        drop(second);
+        assert_eq!(
+            shared.load(Ordering::Acquire),
+            ENDPOINT_REASSEMBLY_BUDGET - readable_charge(1)
+        );
+        shared.store(0, Ordering::Release);
+        first.recv_stream(0, 3, false, b"fragment").unwrap();
+        assert_eq!(shared.load(Ordering::Acquire), fragment_charge(8));
+        first.recv_reset_stream(0, 1, 11).unwrap();
+        assert_eq!(shared.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn aggregate_send_budget_and_reset_reclaim_apply_across_streams() {
+        let mut server = reassembly_test_server();
+        let payload = vec![0xab; STREAM_SEND_BUFFER];
+        for stream in 0..CONN_SEND_BUFFER / STREAM_SEND_BUFFER {
+            server.send_stream(stream as u64 * 4 + 1, &payload);
+        }
+        assert_eq!(server.send_buffered_total, CONN_SEND_BUFFER);
+        assert_eq!(server.stream_send_capacity(33), 0);
+        server.reset_stream(1, 7);
+        assert!(
+            server.streams.contains_key(&1),
+            "reset ACK/receive FIN are still pending"
+        );
+        assert_eq!(server.streams[&1].send.capacity(), 0);
+        assert_eq!(server.stream_send_capacity(33), STREAM_SEND_BUFFER);
+        server.send_stream(33, &payload);
+        assert_eq!(server.send_buffered_total, CONN_SEND_BUFFER);
+        server.send_stream(37, b"over budget");
+        assert!(
+            server.is_closed(),
+            "direct core callers cannot bypass aggregate backpressure"
+        );
+    }
+
+    #[test]
+    fn hrr_requeues_sent_early_ranges_and_stops_early_transmission() {
+        let (ticket, _) = ack_parameter_resumption_ticket();
+        let mut client = Connection::new_client_resumption(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0x91; 8]),
+            ConnectionId::new(&[]),
+            &ticket,
+            1_000_000,
+        )
+        .unwrap();
+        let id = client.open_bi();
+        client.send_stream(id, b"early request");
+        let now = Instant::now();
+        while client.poll_transmit(now).is_some() {}
+        assert!(!client.spaces[SPACE_DATA].sent_content.is_empty());
+        let send_off = client.streams[&id].send_off;
+        client.reject_zero_rtt();
+        assert!(client.zero_rtt_keys.is_none());
+        assert!(client.spaces[SPACE_DATA].sent_content.is_empty());
+        assert_eq!(client.spaces[SPACE_DATA].sent.in_flight(), 0);
+        assert_eq!(client.streams[&id].send_off, send_off);
+        assert_eq!(client.streams[&id].retransmit, vec![(0, 13, false)]);
+        assert!(client.poll_transmit(now).is_none());
+    }
+
+    #[test]
     fn duplicate_out_of_order_stream_fragments_are_bounded() {
         // Each duplicate of a future-offset fragment leaves the flow-control high
         // watermark unchanged (delta 0), so flow control never bounds it. It is
@@ -9486,7 +9891,7 @@ mod tests {
             1,
             "duplicate out-of-order fragments are dropped, not buffered"
         );
-        assert_eq!(server.recv_pending_total, chunk.len());
+        assert_eq!(server.recv_pending_total, fragment_charge(chunk.len()));
         // The retained copy still reassembles once the gap is filled.
         server
             .recv_stream(0, 0, false, &vec![0xCC; 10_000])
@@ -9541,7 +9946,7 @@ mod tests {
         let buffered: usize = server
             .streams
             .values()
-            .flat_map(|s| s.recv_pending.iter().map(|(_, d)| d.len()))
+            .flat_map(|s| s.recv_pending.values().map(|d| fragment_charge(d.len())))
             .sum();
         assert_eq!(
             buffered, server.recv_pending_total,

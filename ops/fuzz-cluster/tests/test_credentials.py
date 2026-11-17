@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -59,7 +60,17 @@ elif name == "tar":
     os.execv(os.environ["TEST_TAR"], ["tar", *args])
 elif name == "gh" and args and args[0] == "auth":
     os.execv(os.environ["TEST_GH"], ["gh", *args])
-elif name == "id": print("0")
+elif name == "runuser":
+    os.environ["TEST_DROPPED"] = "1"
+    os.execvp(args[args.index("--") + 1], args[args.index("--") + 1:])
+elif name == "id":
+    if args == ["-un"]: print("plxfuzz")
+    else: print(os.getuid() if args == ["-u", "plxfuzz"] or os.environ.get("TEST_DROPPED") else "0")
+elif name == "stat":
+    stat = pathlib.Path(args[-1]).stat()
+    if args[1] == "%u": print(0 if "operator" in str(pathlib.Path(args[-1])) else stat.st_uid)
+    elif args[1] == "%a": print(oct(stat.st_mode & 0o7777)[2:])
+    else: print(int(stat.st_mtime))
 '''
 
 
@@ -72,6 +83,7 @@ class CredentialTests(unittest.TestCase):
         self.home = self.root / "home"
         self.etc = self.root / "etc/plxfuzz"
         self.mockbin = self.home / ".cargo/bin"
+        self.operator = self.root / "operator"
         self.mockbin.mkdir(parents=True)
         self.env = os.environ.copy()
         for name in list(self.env):
@@ -90,7 +102,7 @@ class CredentialTests(unittest.TestCase):
         mock.write_text(MOCK)
         mock.chmod(0o755)
         for name in ("sudo", "install", "git", "gh", "id", "useradd", "usermod",
-                     "chown", "apt-get", "systemctl", "journalctl", "rustup", "cargo", "tar"):
+                     "chown", "apt-get", "systemctl", "journalctl", "rustup", "cargo", "tar", "stat", "runuser"):
             (self.mockbin / name).symlink_to(mock.name)
         self.seed = self.root / "seed"
         self.git("init", "-q", "-b", "main", str(self.seed))
@@ -126,10 +138,19 @@ class CredentialTests(unittest.TestCase):
         self.git("-C", str(self.seed), "commit", "-qm", message)
 
     def script(self, relative):
-        return ((PACKAGE / relative).read_text()
+        source = ((PACKAGE / relative).read_text()
                 .replace("/var/lib/plxfuzz", str(self.home))
+                .replace("/usr/local/lib/plxfuzz", str(self.operator))
+                .replace("/var/tmp/plxfuzz-ops.", str(self.root / "plxfuzz-ops."))
                 .replace("/etc/", str(self.root / "etc") + "/")
                 .replace('PINNED_COMMIT="d240e663"', f'PINNED_COMMIT="{self.pin}"'))
+        # Keep the production environment-isolation boundary, but substitute the
+        # local trusted fixture remote and explicitly declared test tool mocks.
+        assignments = " ".join(f"{key}={shlex.quote(value)}" for key, value in self.env.items()
+                               if key.startswith("TEST_"))
+        return (source.replace("env -i PATH=/usr/bin:/bin", f"env -i {assignments} PATH={self.mockbin}:/usr/bin:/bin")
+                .replace('fetch --depth 1 "$REPO_URL" "$OPS_REV"',
+                         f'fetch --depth 1 {shlex.quote(self.remote.as_uri())} "$OPS_REV"'))
 
     def bootstrap(self):
         self.env["PLXFUZZ_PAT"] = TOKEN
@@ -171,7 +192,7 @@ class CredentialTests(unittest.TestCase):
         source = self.home / "src"
         self.assert_clean_remote(source)
         self.assertEqual(self.git("-C", str(source), "rev-parse", "HEAD").stdout.strip(), self.pin)
-        self.assertEqual((self.home / "bin/status.sh").read_bytes(), (PACKAGE / "bin/status.sh").read_bytes())
+        self.assertEqual((self.operator / "status.sh").read_bytes(), (PACKAGE / "bin/status.sh").read_bytes())
         self.assertIn("old-pinned-operator", (source / "ops/fuzz-cluster/bin/status.sh").read_text())
         # A fresh service process has only its token environment and HOME, with
         # no bootstrap shell/PAT variables or persisted gh login.
@@ -200,7 +221,7 @@ class CredentialTests(unittest.TestCase):
     def test_operator_archive_handles_consumer_early_close(self):
         self.env["TEST_ARCHIVE_MODE"] = "padding"
         self.bootstrap()
-        self.assertEqual((self.home / "bin/status.sh").read_bytes(), (PACKAGE / "bin/status.sh").read_bytes())
+        self.assertEqual((self.operator / "status.sh").read_bytes(), (PACKAGE / "bin/status.sh").read_bytes())
         self.assert_no_secret_argv()
 
     def test_operator_archive_failure_stops_before_install(self):
@@ -225,7 +246,7 @@ class CredentialTests(unittest.TestCase):
         self.assertIn(diagnostic, result.stderr)
         self.assertNotIn(TOKEN, result.stderr + result.stdout)
         self.assertNotIn("[9/11]", result.stdout)
-        self.assertFalse((self.home / "bin/status.sh").exists())
+        self.assertFalse((self.operator / "status.sh").exists())
         self.assert_no_secret_argv()
 
     def test_status_and_cmin_migrate_and_clone_without_secret_arguments(self):
@@ -265,6 +286,62 @@ class CredentialTests(unittest.TestCase):
         self.assertTrue((worktree / ".git").is_file())
         self.assertEqual(self.git("-C", str(worktree), "remote", "get-url", "origin").stdout.strip(), self.remote.as_uri())
         self.assert_no_secret_argv()
+
+    def test_bootstrap_ignores_cwd_and_service_owned_operator_code(self):
+        (self.root / "bash").write_text("pretend bootstrap")
+        (self.root / "bin").mkdir()
+        (self.root / "lib").mkdir()
+        marker = self.root / "untrusted-code-ran"
+        (self.root / "lib/shard-table.sh").write_text(f"touch {shlex.quote(str(marker))}\nexit 61\n")
+        source = self.home / "src"
+        self.git("clone", "-q", str(self.remote), str(source))
+        (source / "ops/fuzz-cluster/lib/shard-table.sh").write_text(
+            f"touch {shlex.quote(str(marker))}\nexit 62\n")
+        victim = self.root / "unrelated-directory"
+        victim.mkdir(mode=0o751)
+        (self.home / "logs").symlink_to(victim)
+        self.bootstrap()
+        self.assertFalse(marker.exists())
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o751)
+
+    def test_drain_drops_uid_before_any_service_helper(self):
+        self.bootstrap()
+        marker = self.root / "helper-context"
+        check = f'[ "${{TEST_DROPPED:-}}" = 1 ] || exit 63\nprintf dropped >> {shlex.quote(str(marker))}\n'
+        (self.operator / "lib/shard-table.sh").write_text(check)
+        for name in ("sync.sh", "status.sh"):
+            (self.operator / name).write_text(check)
+        source = self.script("bin/drain.sh").replace("VERIFY_TRIES=10", "VERIFY_TRIES=0")
+        (self.operator / "drain.sh").write_text(source)
+        result = subprocess.run(["bash", str(self.operator / "drain.sh")], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertEqual(marker.read_text(), "droppeddroppeddropped")
+
+    def test_status_tag_symlinks_cannot_redirect_heartbeat_writes(self):
+        self.bootstrap()
+        victim = self.root / "victim"
+        victim.write_text("sentinel")
+        dashboard = self.seed / "fuzz/dashboard"
+        dashboard.mkdir(parents=True)
+        (dashboard / "status-box-a.json").symlink_to(victim)
+        (dashboard / "status-box-b.json").write_text("peer heartbeat")
+        self.commit("malicious status leaf")
+        self.git("-C", str(self.seed), "tag", "-f", "fuzz-status")
+        self.git("-C", str(self.seed), "push", "-f", str(self.remote), "refs/tags/fuzz-status")
+        self.run_command(["bash", "-s"], input=self.script("bin/status.sh"), cwd=self.root)
+        self.assertEqual(victim.read_text(), "sentinel")
+        published = self.git("--git-dir", str(self.remote), "show", "fuzz-status:fuzz/dashboard/status-box-a.json").stdout
+        self.assertEqual(json.loads(published)["node"], "box-a")
+        self.assertEqual(self.git("--git-dir", str(self.remote), "show", "fuzz-status:fuzz/dashboard/status-box-b.json").stdout,
+                         "peer heartbeat")
+        shutil.rmtree(self.seed / "fuzz")
+        (self.seed / "fuzz").symlink_to(victim.parent)
+        self.commit("malicious status ancestor")
+        self.git("-C", str(self.seed), "tag", "-f", "fuzz-status")
+        self.git("-C", str(self.seed), "push", "-f", str(self.remote), "refs/tags/fuzz-status")
+        self.run_command(["bash", "-s"], input=self.script("bin/status.sh"), cwd=self.root)
+        self.assertEqual(victim.read_text(), "sentinel")
 
 
 if __name__ == "__main__":

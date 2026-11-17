@@ -18,6 +18,13 @@
 # (after the retry budget) tells the operator the drain could not be confirmed.
 set -uo pipefail
 
+# Only the systemd stop needs root. Drop privilege before reading service-owned
+# configuration, sourcing helpers, or executing companion scripts.
+if [ "$(id -u)" -eq 0 ]; then
+  systemctl stop 'plx-fuzz@*' || exit 1
+  exec runuser -u plxfuzz -- /bin/bash /usr/local/lib/plxfuzz/drain.sh
+fi
+
 ETC=/etc/plxfuzz
 STATE=/var/lib/plxfuzz/state
 SRC=/var/lib/plxfuzz/src
@@ -46,7 +53,7 @@ if ! declare -p ALL_TARGETS >/dev/null 2>&1; then
 fi
 type owner_box >/dev/null 2>&1 || owner_box() { :; }
 
-# Resolve sibling scripts (copied to /var/lib/plxfuzz/bin, else src tree).
+# Resolve sibling scripts (installed under /usr/local/lib/plxfuzz, else src tree).
 resolve() {
   local name="$1" c
   for c in "$SCRIPT_DIR/$name" "$SRC/ops/fuzz-cluster/bin/$name"; do
@@ -59,7 +66,10 @@ STATUS="$(resolve status.sh || true)"
 
 # --- 1. stop the fuzzers cleanly -------------------------------------------
 echo "drain[$NODE_ID]: stopping plx-fuzz@* (clean finish)"
-systemctl stop 'plx-fuzz@*' 2>/dev/null || true
+if [ "$(id -un)" != plxfuzz ]; then
+  echo "drain: run the installed /usr/local/lib/plxfuzz/drain.sh as root" >&2
+  exit 1
+fi
 
 # --- 2. final forced sync + status -----------------------------------------
 if [ -n "$SYNC" ]; then

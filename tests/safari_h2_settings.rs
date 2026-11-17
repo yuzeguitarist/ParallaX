@@ -43,34 +43,57 @@ async fn complete_handshake_acks_every_early_settings_frame() {
     std::io::Write::write_all(&mut ca_file, ca.pem().as_bytes()).unwrap();
     std::env::set_var("SSL_CERT_FILE", ca_file.path());
 
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(
-        vec![leaf.der().clone()],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
-    )
-    .unwrap();
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    config.send_tls13_tickets = 2;
-    // Test-only extraction exposes the receive sequence after the response. It
-    // verifies rustls actually accepted a KU response and reset receive keys;
-    // merely ACKing SETTINGS under the old keys cannot satisfy that assertion.
-    config.enable_secret_extraction = true;
-    let config = Arc::new(config);
-    for withhold_post_finished in [false, true] {
-        for key_update in [false, true] {
-            exercise_origin(config.clone(), withhold_post_finished, key_update).await;
+    for request_client_certificate in [false, true] {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap();
+        let builder = if request_client_certificate {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.der().clone()).unwrap();
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider,
+            )
+            .allow_unauthenticated()
+            .build()
+            .unwrap();
+            builder.with_client_cert_verifier(verifier)
+        } else {
+            builder.with_no_client_auth()
+        };
+        let mut config = builder
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        config.send_tls13_tickets = 2;
+        // Extraction proves the KU response reset receive keys before both ACKs.
+        config.enable_secret_extraction = true;
+        let config = Arc::new(config);
+        for (withhold_post_finished, partial_ticket) in
+            [(false, false), (true, false), (true, true)]
+        {
+            for key_update in [false, true] {
+                exercise_origin(
+                    config.clone(),
+                    withhold_post_finished,
+                    partial_ticket,
+                    key_update,
+                )
+                .await;
+            }
         }
+        exercise_bad_application_record(config).await;
     }
 }
 
 async fn exercise_origin(
     config: Arc<rustls::ServerConfig>,
     withhold_post_finished: bool,
+    partial_ticket: bool,
     key_update: bool,
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -86,10 +109,18 @@ async fn exercise_origin(
             server.read_tls(&mut Cursor::new(&wire[..n])).unwrap();
             server.process_new_packets().unwrap();
         }
+        assert!(server.peer_certificates().is_none());
 
         let mut plaintext = Vec::new();
+        let mut withheld_wire = Vec::new();
         if withhold_post_finished {
             assert!(server.wants_write(), "the genuine tickets are queued");
+            if partial_ticket {
+                while server.wants_write() {
+                    server.write_tls(&mut withheld_wire).unwrap();
+                }
+                stream.write_all(&withheld_wire[..3]).await.unwrap();
+            }
             // Do not flush even rustls's genuine NewSessionTickets until the
             // opening arrives. A client waiting 180ms for absent tickets fails
             // this deadline; TLS certificate verification remains production.
@@ -107,6 +138,12 @@ async fn exercise_origin(
             })
             .await
             .expect("client opening must not wait for post-Finished server data");
+            if partial_ticket {
+                // Loss/delay exceeding the former 180/250ms limits must not
+                // abort or discard the already consumed TLS record prefix.
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                stream.write_all(&withheld_wire[3..]).await.unwrap();
+            }
         }
 
         // Two SETTINGS follow genuine NewSessionTickets, including when the
@@ -182,9 +219,63 @@ async fn exercise_origin(
         .expect("TLS and HTTP/2 camouflage complete")
         .unwrap();
     assert_eq!(handshake.negotiated_alpn.as_deref(), Some(b"h2".as_slice()));
-    if withhold_post_finished {
+    if withhold_post_finished && !partial_ticket {
         assert_eq!(handshake.post_handshake_records, 0);
     }
+    origin.await.unwrap();
+}
+
+async fn exercise_bad_application_record(config: Arc<rustls::ServerConfig>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut server = rustls::ServerConnection::new(config).unwrap();
+        let mut wire = [0; 8192];
+        while server.is_handshaking() {
+            flush_tls(&mut server, &mut stream).await;
+            let n = stream.read(&mut wire).await.unwrap();
+            assert_ne!(n, 0);
+            server.read_tls(&mut Cursor::new(&wire[..n])).unwrap();
+            server.process_new_packets().unwrap();
+        }
+        std::io::Write::write_all(&mut server.writer(), b"corrupted cover response").unwrap();
+        let mut corrupted = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut corrupted).unwrap();
+        }
+        *corrupted.last_mut().unwrap() ^= 1;
+        stream.write_all(&corrupted).await.unwrap();
+        loop {
+            let n = timeout(Duration::from_secs(2), stream.read(&mut wire))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                n, 0,
+                "TLS error must send an encrypted fatal alert before close"
+            );
+            server.read_tls(&mut Cursor::new(&wire[..n])).unwrap();
+            match server.process_new_packets() {
+                Ok(_) => {}
+                Err(rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac)) => break,
+                Err(error) => panic!("unexpected client failure: {error}"),
+            }
+        }
+    });
+    let keys = X25519KeyPair::generate();
+    let session = Safari26TlsCamouflage
+        .start(
+            "example.com".to_owned(),
+            b"0123456789abcdef0123456789abcdef",
+            &keys.public,
+        )
+        .unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    assert!(matches!(
+        session.complete(&mut stream).await,
+        Err(parallax::tls::safari26::Safari26TlsError::Aead)
+    ));
     origin.await.unwrap();
 }
 

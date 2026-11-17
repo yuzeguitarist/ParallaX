@@ -605,7 +605,7 @@ mod zero_rtt_resumption {
                 .await
                 .expect("control stream (0-RTT)");
             let (mut send, mut recv) = conn.open_bi();
-            let nonce = probe_client_send_request_early(&mut send, "localhost")
+            let nonce = probe_client_send_request_early(&mut send, "localhost", ZR_PSK, ZR_CTX)
                 .await
                 .expect("send probe request (0-RTT)");
             conn.wait_established().await.expect("handshake completes");

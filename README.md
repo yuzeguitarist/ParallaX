@@ -173,6 +173,14 @@ curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 If you generated configs manually, use the path to your local
 `parallax.client.toml` instead.
 
+For an operator-specific NAT64 translator, including a more-specific prefix inside
+`64:ff9b:1::/48`, list its actual translation prefix in `[server]`, for example
+`nat64_prefixes = ["2606:4700:1234::/96"]`
+(replace this with your network's prefix). Client-selected destinations under
+these prefixes receive the same embedded IPv4 private/metadata checks as the
+built-in NAT64 prefixes. Supported prefix lengths are 32, 40, 48, 56, 64 and 96;
+prefixes with host bits set are rejected.
+
 ---
 
 ## CLI reference

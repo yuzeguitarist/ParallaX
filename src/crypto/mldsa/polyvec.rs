@@ -285,8 +285,8 @@ impl Polyveck {
     /// no whole-`Polyveck` Copy temporary is spilled just to satisfy the borrow
     /// checker.
     pub fn pointwise_poly_montgomery_assign(&mut self, a: &Poly) {
-        for i in 0..K {
-            self.vec[i].pointwise_montgomery_assign(a);
+        for p in self.vec.iter_mut() {
+            p.pointwise_montgomery_assign(a);
         }
     }
 
@@ -603,9 +603,8 @@ mod tests {
 
         // Bound check: every a0 is centered in (-GAMMA2, GAMMA2] (the wrap case
         // a1==0 allows a0 == -GAMMA2). This pins decompose's vector fan-out.
-        for i in 0..K {
-            for c in 0..N {
-                let a0 = w0.vec[i].coeffs[c];
+        for (i, p) in w0.vec.iter().enumerate() {
+            for (c, &a0) in p.coeffs.iter().enumerate() {
                 assert!(
                     a0 > -GAMMA2 - 1 && a0 <= GAMMA2,
                     "poly {i} coeff {c}: a0={a0} out of (-GAMMA2-1, GAMMA2]"

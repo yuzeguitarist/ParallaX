@@ -555,7 +555,12 @@ fn seal_config(
 
     // Remove the plaintext sidecars the secrets were read from: leaving them on
     // disk keeps the directory a bearer credential, which defeats sealing.
-    let removed = remove_referenced_sidecars(config, &config_dir, original.as_str());
+    let used_host_key = secret_store::host_key_path(host_key);
+    let removed = remove_referenced_sidecars(
+        &config_dir,
+        original.as_str(),
+        &[config, &bundle_path, &used_host_key],
+    );
 
     println!(
         "Sealed {} secret(s) into {}",
@@ -574,7 +579,6 @@ fn seal_config(
     // --host-key <custom>` records the path nowhere, so the server would fail to
     // start with a sealed config unless PARALLAX_HOST_KEY_FILE points operators
     // back at it.
-    let used_host_key = secret_store::host_key_path(host_key);
     let runtime_host_key = secret_store::host_key_path(None);
     let host_key_discoverable = match (
         used_host_key.canonicalize(),
@@ -604,7 +608,11 @@ fn seal_config(
 /// from. Parses the PRE-rewrite config text to recover the references (resolution
 /// has already erased them on the loaded `Config`). Best-effort and idempotent:
 /// a missing or undeletable sidecar is skipped. Returns the paths actually removed.
-fn remove_referenced_sidecars(config: &Path, config_dir: &Path, original: &str) -> Vec<PathBuf> {
+fn remove_referenced_sidecars(
+    config_dir: &Path,
+    original: &str,
+    retained: &[&Path],
+) -> Vec<PathBuf> {
     let Ok(unresolved) = toml::from_str::<Config>(original) else {
         return Vec::new();
     };
@@ -615,12 +623,8 @@ fn remove_referenced_sidecars(config: &Path, config_dir: &Path, original: &str) 
         } else {
             config_dir.join(&rel)
         };
-        // Never delete the config file itself (a self-referential sidecar).
-        let is_config = match (path.canonicalize(), config.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => path == config,
-        };
-        if is_config {
+        // Preserve files still needed by the sealed config, including aliases.
+        if retained.iter().any(|keep| same_file(&path, keep)) {
             continue;
         }
         if path.exists() && fs::remove_file(&path).is_ok() {
@@ -628,6 +632,22 @@ fn remove_referenced_sidecars(config: &Path, config_dir: &Path, original: &str) 
         }
     }
     removed
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
+            if left.dev() == right.dev() && left.ino() == right.ino() {
+                return true;
+            }
+        }
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 /// Build the reference a sealed config should use to find its bundle. A relative
@@ -1879,6 +1899,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn seal_preserves_host_key_aliases_and_inactive_server_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = HOST_KEY_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_init_config(
+            "example.com",
+            "203.0.113.10:443",
+            "0.0.0.0:443",
+            "127.0.0.1:1080",
+            dir.path(),
+            false,
+        )
+        .unwrap();
+        let host_key = dir.path().join("host.key");
+        secret_store::create_host_key(Some(&host_key)).unwrap();
+        let original_key = fs::read(&host_key).unwrap();
+        let alias = dir.path().join("host-alias.key");
+        fs::hard_link(&host_key, &alias).unwrap();
+        let config = dir.path().join("parallax.client.toml");
+        let mut value: toml::Value = fs::read_to_string(&config).unwrap().parse().unwrap();
+        value["crypto"]["psk"] = toml::Value::try_from(std::collections::BTreeMap::from([(
+            "file",
+            "./host-alias.key",
+        )]))
+        .unwrap();
+        let server_config: toml::Value =
+            fs::read_to_string(dir.path().join("parallax.server.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        value
+            .as_table_mut()
+            .unwrap()
+            .insert("server".into(), server_config["server"].clone());
+        fs::write(&config, toml::to_string(&value).unwrap()).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let inactive = dir.path().join(SERVER_SECRETS_FILE);
+        let inactive_bytes = fs::read(&inactive).unwrap();
+        seal_config(&config, None, Some(&host_key)).unwrap();
+        assert_eq!(fs::read(&host_key).unwrap(), original_key);
+        assert_eq!(fs::read(&alias).unwrap(), original_key);
+        assert_eq!(fs::read(&inactive).unwrap(), inactive_bytes);
+        std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
+        assert!(Config::load(&config).is_ok());
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn check_degrades_to_structure_only_when_host_key_unavailable() {
         // Regression for P2-9: a sealed config must still be checkable on a machine
         // that lacks the host key. `load_for_check` validates structure + perms and
@@ -1917,10 +1987,16 @@ mod tests {
         // Host key available: the full check resolves and validates the secrets.
         std::env::set_var(crate::secret_store::HOST_KEY_ENV, &host_key);
         let (_cfg, secrets_validated) = Config::load_for_check(&server_path).unwrap();
-        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
         assert!(
             secrets_validated,
             "with the host key, secrets must be validated"
         );
+        fs::set_permissions(&host_key, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            Config::load_for_check(&server_path),
+            Err(crate::config::ConfigError::SecretHostKeyPermissions { .. })
+        ));
+        assert!(check_config(server_path.clone()).is_err());
+        std::env::remove_var(crate::secret_store::HOST_KEY_ENV);
     }
 }

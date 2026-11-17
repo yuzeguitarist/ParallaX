@@ -525,6 +525,7 @@ fn swap(keys: Keys) -> Keys {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServerState {
     ExpectClientHello,
+    AwaitMarkerAuthorization,
     ExpectClientFinished,
     Complete,
 }
@@ -536,7 +537,8 @@ enum ServerState {
 pub struct ServerHandshake {
     alpn_protocols: Vec<Vec<u8>>,
     cert_chain: Arc<Vec<Vec<u8>>>,
-    signing_key: EcdsaKeyPair,
+    signing_key_pkcs8: Zeroizing<Vec<u8>>,
+    signing_key: Option<EcdsaKeyPair>,
     transport_params: Vec<u8>,
     suite: CipherSuite,
     schedule: Option<KeySchedule>,
@@ -587,6 +589,7 @@ pub struct ServerHandshake {
     /// a valid + fresh one whose SNI is authorized. Set during ClientHello processing
     /// when `marker_key` is set.
     marker_result: Option<crate::crypto::quic_marker::Marker>,
+    deferred_client_hello: Option<Vec<u8>>,
 }
 
 impl ServerHandshake {
@@ -601,13 +604,11 @@ impl ServerHandshake {
         transport_params: Vec<u8>,
         stek: Option<Zeroizing<[u8; 32]>>,
     ) -> Result<Self, QuicTlsError> {
-        let signing_key =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, signing_key_pkcs8)
-                .map_err(|_| QuicTlsError::Crypto("server ECDSA P-256 signing key".into()))?;
         Ok(Self {
             alpn_protocols,
             cert_chain,
-            signing_key,
+            signing_key_pkcs8: Zeroizing::new(signing_key_pkcs8.to_vec()),
+            signing_key: None,
             transport_params,
             suite: CipherSuite::Aes128GcmSha256,
             schedule: None,
@@ -631,6 +632,7 @@ impl ServerHandshake {
             marker_dcid: Vec::new(),
             authorized_sni: Vec::new(),
             marker_result: None,
+            deferred_client_hello: None,
         })
     }
 
@@ -672,6 +674,22 @@ impl ServerHandshake {
     /// ClientHello spans two Initials.
     pub(crate) fn client_hello_processed(&self) -> bool {
         self.state != ServerState::ExpectClientHello
+    }
+
+    pub(crate) fn authorize_client_hello(&mut self) -> Result<(), QuicTlsError> {
+        if self.state != ServerState::AwaitMarkerAuthorization || self.marker_result.is_none() {
+            return Err(QuicTlsError::Protocol(
+                "ClientHello marker not authorized".into(),
+            ));
+        }
+        let message = self
+            .deferred_client_hello
+            .take()
+            .expect("deferred ClientHello");
+        let summary = parse_client_hello(&message[4..])?;
+        self.continue_client_hello(&message, summary)?;
+        self.state = ServerState::ExpectClientFinished;
+        Ok(())
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -793,7 +811,9 @@ impl ServerHandshake {
         match (self.state, msg_type) {
             (ServerState::ExpectClientHello, HANDSHAKE_CLIENT_HELLO) => {
                 self.process_client_hello(message)?;
-                self.state = ServerState::ExpectClientFinished;
+                if self.state == ServerState::ExpectClientHello {
+                    self.state = ServerState::ExpectClientFinished;
+                }
                 Ok(())
             }
             (ServerState::ExpectClientFinished, HANDSHAKE_FINISHED) => {
@@ -872,6 +892,21 @@ impl ServerHandshake {
             }
         }
 
+        if self.marker_key.is_some() {
+            // The endpoint must check first-sighting freshness before any hybrid
+            // KEX, signing, or single-use ticket consumption takes place.
+            self.deferred_client_hello = Some(message.to_vec());
+            self.state = ServerState::AwaitMarkerAuthorization;
+            return Ok(());
+        }
+        self.continue_client_hello(message, summary)
+    }
+
+    fn continue_client_hello(
+        &mut self,
+        message: &[u8],
+        summary: ClientHelloSummary,
+    ) -> Result<(), QuicTlsError> {
         let (server_share, shared) = server_hybrid_kex(&summary.hybrid_key_share)?;
 
         // Decide 0-RTT resumption BEFORE consuming `summary`: validate the offered
@@ -949,8 +984,19 @@ impl ServerHandshake {
             self.transcript.extend_from_slice(&cert);
             let hash_cert = self.suite.digest(&self.transcript);
             let content = certificate_verify_content(&hash_cert);
+            if self.signing_key.is_none() {
+                self.signing_key = Some(
+                    EcdsaKeyPair::from_pkcs8(
+                        &ECDSA_P256_SHA256_ASN1_SIGNING,
+                        &self.signing_key_pkcs8,
+                    )
+                    .map_err(|_| QuicTlsError::Crypto("server ECDSA P-256 signing key".into()))?,
+                );
+            }
             let signature = self
                 .signing_key
+                .as_ref()
+                .expect("signing key parsed")
                 .sign(&SystemRandom::new(), &content)
                 .map_err(|_| QuicTlsError::Crypto("CertificateVerify signing".into()))?;
             let cv = build_certificate_verify(SIG_SCHEME_ECDSA_P256, signature.as_ref());
@@ -1812,6 +1858,106 @@ mod tests {
     /// DCID. A marker minted by a client for DCID-A verifies only against a server
     /// that bound the SAME DCID; binding a different DCID (a captured marker lifted
     /// onto another routing identity) yields no marker (the endpoint then splices it).
+    #[test]
+    fn marker_authorization_precedes_kex_signing_and_single_use_ticket_consumption() {
+        use super::super::ticket::{seal_ticket, TicketState};
+        use crate::tls::quic::{
+            AcceptAnyServerCert, ClientConfig, ClientHandshake, ClientTicket, QuicMarkerConfig,
+            QUIC_VERSION_V1,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct CountGuard(AtomicUsize);
+        impl ZeroRttGuard for CountGuard {
+            fn accept_ticket(&self, _: &[u8], _: u64) -> bool {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+        }
+        let kp = X25519KeyPair::generate();
+        let psk = Zeroizing::new(vec![4; 32]);
+        let stek = Zeroizing::new([5; 32]);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ticket_psk = Zeroizing::new(vec![6; 32]);
+        let ticket = ClientTicket {
+            ticket: seal_ticket(
+                &stek,
+                &TicketState {
+                    suite: 0x1301,
+                    alpn: b"h3".to_vec(),
+                    psk: ticket_psk.clone(),
+                    issued_at: now,
+                    lifetime_secs: 3600,
+                },
+            )
+            .unwrap(),
+            psk: ticket_psk,
+            suite: 0x1301,
+            alpn: b"h3".to_vec(),
+            peer_transport_params: Vec::new(),
+            age_add: 0,
+            lifetime_secs: 3600,
+            received_at_ms: now * 1000,
+        };
+        let config = Arc::new(
+            ClientConfig::new(Arc::new(AcceptAnyServerCert), vec![b"h3".to_vec()]).with_marker(
+                QuicMarkerConfig {
+                    psk: psk.clone(),
+                    server_static_public: kp.public,
+                },
+            ),
+        );
+        let mut client = ClientHandshake::new_resumption(
+            config,
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![1, 2],
+            b"dcid",
+            &ticket,
+            now * 1000,
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_handshake(&mut hello);
+        let guard = Arc::new(CountGuard(AtomicUsize::new(0)));
+        let key =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        let mut server = ServerHandshake::new(
+            Arc::new(vec![vec![0x30, 0]]),
+            key.as_ref(),
+            vec![b"h3".to_vec()],
+            vec![1, 2],
+            Some(stek),
+        )
+        .unwrap();
+        server.set_zero_rtt_guard(guard.clone());
+        server.set_marker_key(
+            psk,
+            Zeroizing::new(kp.private),
+            b"dcid".to_vec(),
+            vec!["example.com".into()],
+        );
+        server.read_handshake(&hello).unwrap();
+        assert!(server.marker_result().is_some());
+        assert!(server.signing_key.is_none());
+        assert!(server.schedule.is_none());
+        assert!(server.pending_server_hello.is_none());
+        assert_eq!(
+            guard.0.load(Ordering::Acquire),
+            0,
+            "a flight discarded or spliced here must not burn its ticket"
+        );
+        server.authorize_client_hello().unwrap();
+        assert!(server.schedule.is_some());
+        assert!(server.pending_server_hello.is_some());
+        assert_eq!(guard.0.load(Ordering::Acquire), 1);
+        assert!(server.is_early_data_accepted());
+    }
+
     #[test]
     fn marker_is_bound_to_the_initial_dcid() {
         use crate::tls::quic::{
