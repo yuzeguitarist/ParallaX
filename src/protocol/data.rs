@@ -1338,7 +1338,7 @@ fn open_record_group(
     bounds: &[(usize, usize)],
 ) -> Result<Zeroizing<Vec<u8>>, DataRecordError> {
     let mut bytes = Zeroizing::new(bytes);
-    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
+    let mut output_len = 0;
     for (index, &(record_offset, total_len)) in bounds.iter().enumerate() {
         let sequence = base_sequence + index as u64;
         let ciphertext_start = record_offset + record::TLS_HEADER_LEN;
@@ -1368,9 +1368,19 @@ fn open_record_group(
                 return Err(err.into());
             }
         };
-        out.extend_from_slice(&bytes[ciphertext_start..ciphertext_start + unpadded_len]);
+        // Compact into the owned input: the destination ends before the next
+        // record, so unread ciphertext stays intact even when the ranges overlap.
+        bytes.copy_within(
+            ciphertext_start..ciphertext_start + unpadded_len,
+            output_len,
+        );
+        output_len += unpadded_len;
     }
-    Ok(out)
+    // Compaction leaves duplicate plaintext in the suffix. Wipe it while it is
+    // still live so truncation cannot hide it from Zeroizing's drop scrub.
+    bytes[output_len..].zeroize();
+    bytes.truncate(output_len);
+    Ok(bytes)
 }
 
 fn record_overhead(padding: &PaddingProfile) -> usize {
@@ -2677,6 +2687,117 @@ mod tests {
             .unwrap();
         assert_eq!(parallel_opened, payload);
         assert_eq!(parallel_dec.open(&tail).unwrap(), b"tail");
+    }
+
+    #[test]
+    fn open_record_group_reuses_input_allocation_with_empty_and_overlapping_records() {
+        for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            for padding in [
+                PaddingProfile::new(0, 0).unwrap(),
+                PaddingProfile::new(3, 128).unwrap(),
+            ] {
+                let key = [5; KEY_LEN];
+                let nonce = [6; NONCE_LEN];
+                let mut enc = DataRecordCodec::new(
+                    AeadCodec::new_with_suite(suite, key, nonce),
+                    padding,
+                    CLIENT_TO_SERVER_AAD,
+                );
+                let mut lens = variable_record_lens(enc.max_plaintext_len());
+                lens.insert(0, 0);
+                lens.insert(3, 0);
+                lens.push(0);
+                let payload = patterned_payload(lens.iter().sum());
+                let mut rng = StdRng::seed_from_u64(61);
+                let mut sealed = Vec::new();
+                enc.seal_records_into(&payload, &lens, &mut rng, &mut sealed)
+                    .unwrap();
+                let mut bounds = Vec::new();
+                let mut offset = 0;
+                while offset < sealed.len() {
+                    let header = record::parse_header(&sealed[offset..]).unwrap();
+                    bounds.push((offset, header.total_len));
+                    offset += header.total_len;
+                }
+                let input_ptr = sealed.as_ptr();
+                let input_capacity = sealed.capacity();
+                let opened = open_record_group(
+                    &enc.aead.cipher(),
+                    &nonce,
+                    CLIENT_TO_SERVER_AAD,
+                    0,
+                    sealed,
+                    &bounds,
+                )
+                .unwrap();
+                assert_eq!(opened.as_slice(), payload);
+                assert_eq!(opened.as_ptr(), input_ptr);
+                assert_eq!(opened.capacity(), input_capacity);
+            }
+        }
+    }
+
+    /// Release-only timing evidence for the production parallel-open path.
+    /// Run with `cargo test --release --locked --lib parallel_open_benchmark
+    /// -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "parallel-open timing benchmark; run in release with --ignored --nocapture"]
+    fn parallel_open_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        const BATCH_BYTES: usize = 256 * 1024;
+        // The ignored CI lane is a smoke check; release measurements stay fixed.
+        const BATCHES: usize = if cfg!(debug_assertions) { 16 } else { 256 };
+        const SAMPLES: usize = 7;
+        let pool = CryptoPool::new(4);
+        let payload = patterned_payload(BATCH_BYTES);
+        let padding = PaddingProfile::new(0, 1500).unwrap();
+
+        for suite in [CipherSuite::Aes256Gcm, CipherSuite::ChaCha20Poly1305] {
+            let mut enc = DataRecordCodec::new(
+                AeadCodec::new_with_suite(suite, [5; KEY_LEN], [6; NONCE_LEN]),
+                padding,
+                CLIENT_TO_SERVER_AAD,
+            );
+            let mut rng = StdRng::seed_from_u64(61);
+            let fixtures: Vec<Vec<u8>> = (0..BATCHES)
+                .map(|_| {
+                    let mut sealed = Vec::new();
+                    enc.seal_chunks_into_untracked(&payload, &mut rng, &mut sealed)
+                        .unwrap();
+                    sealed
+                })
+                .collect();
+            let mut opened = Vec::with_capacity(BATCH_BYTES);
+            let mut samples = Vec::with_capacity(SAMPLES);
+            // Discard the first pass to warm the worker pool and buffers.
+            for sample in 0..=SAMPLES {
+                let mut dec = DataRecordCodec::new(
+                    AeadCodec::new_with_suite(suite, [5; KEY_LEN], [6; NONCE_LEN]),
+                    padding,
+                    CLIENT_TO_SERVER_AAD,
+                );
+                let start = Instant::now();
+                for sealed in &fixtures {
+                    opened.clear();
+                    dec.open_concat_records_parallel(&pool, sealed, &mut opened)
+                        .unwrap();
+                    black_box(&opened);
+                }
+                let elapsed = start.elapsed();
+                assert_eq!(opened, payload);
+                if sample != 0 {
+                    samples.push(elapsed.as_secs_f64() * 1e9 / BATCHES as f64);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "parallel-open {suite:?}: 256 KiB, 4 workers, ns/batch samples={samples:?}, median={:.0}, MiB/s={:.1}",
+                samples[SAMPLES / 2],
+                BATCH_BYTES as f64 / (1024.0 * 1024.0)
+                    / (samples[SAMPLES / 2] / 1e9),
+            );
+        }
     }
 
     #[test]

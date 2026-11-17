@@ -3768,9 +3768,9 @@ impl Connection {
             self.peer_addr_validated = true;
         }
 
-        // Copy the decrypted frames out so the TLS engine can be mutated while we
-        // iterate.
-        let payload = pkt[range].to_vec();
+        // The packet buffer is independent of the connection, so frames can
+        // borrow it while the TLS and stream state are updated.
+        let payload = &pkt[range];
         // A packet is ack-eliciting (RFC 9002 §2) if it carries any frame other
         // than ACK / PADDING / CONNECTION_CLOSE — such a packet schedules an ACK.
         let mut ack_eliciting = false;
@@ -3782,7 +3782,7 @@ impl Connection {
         // fingerprints/interop breaks against a real
         // origin, but a ParallaX peer never sends them. See frame.rs's invariant note
         // before pointing this path at any non-ParallaX peer.
-        let mut frames = Iter::new(&payload);
+        let mut frames = Iter::new(payload);
         while let Some(frame) = frames.next() {
             let frame_type = frames.last_frame_type();
             let frame = frame.map_err(|e| {
@@ -8475,6 +8475,62 @@ mod tests {
             response,
             "client received the response"
         );
+    }
+
+    /// Isolates authenticated near-MTU packet processing from packet generation
+    /// and socket I/O. Run in release mode with --ignored --nocapture.
+    #[test]
+    #[ignore = "packet processing timing benchmark; run manually in release mode"]
+    fn packet_processing_benchmark() {
+        // The ignored CI lane is a smoke check; release measurements stay fixed.
+        const PACKETS: u64 = if cfg!(debug_assertions) { 256 } else { 20_000 };
+        const SAMPLES: usize = 7;
+        for suite in [
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..=SAMPLES {
+                let (mut client, mut server) = handshake_start(suite);
+                drive(&mut client, &mut server);
+                assert!(client.handshake_confirmed && server.handshake_confirmed);
+                let first = client.spaces[SPACE_DATA].send.peek();
+                let keys = &client.spaces[SPACE_DATA].keys.as_ref().unwrap().local;
+                let mut packets: Vec<_> = (first..first + PACKETS)
+                    .map(|pn| {
+                        let (_, pn_len) = packet::encode_packet_number(pn, None);
+                        seal_packet(
+                            keys,
+                            client.make_header(SPACE_DATA, pn, pn_len),
+                            &[Frame::Ping, Frame::Padding(1199)],
+                        )
+                    })
+                    .collect();
+                let now = Instant::now();
+                let failures = server.data_packets_open_failed;
+                let start = Instant::now();
+                for packet in &mut packets {
+                    server
+                        .process_packet(packet, EcnCodepoint::NotEct, now)
+                        .unwrap();
+                }
+                let ns_per_packet = start.elapsed().as_secs_f64() * 1e9 / PACKETS as f64;
+                assert_eq!(
+                    server.spaces[SPACE_DATA].recv.largest(),
+                    Some(first + PACKETS - 1)
+                );
+                assert_eq!(server.data_packets_open_failed, failures);
+                assert!(!server.is_closed());
+                if sample != 0 {
+                    samples.push(ns_per_packet);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "packet processing {suite:?}: 1200-byte payload, ns/packet samples={samples:?}, median={:.0}",
+                samples[SAMPLES / 2],
+            );
+        }
     }
 
     #[test]
