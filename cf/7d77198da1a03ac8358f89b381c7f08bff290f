@@ -1,0 +1,19 @@
+src/tls/safari26.rs
+  s_f083e143bb47dc::t_29c14ae7f61b20 4556-4561
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cf7d77198da1a03ac8358f89b381c7f08bff290f",
+  "prompts": {},
+  "sessions": {
+    "s_f083e143bb47dc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e7f0-2a67-7743-844b-46c5127778bb",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
