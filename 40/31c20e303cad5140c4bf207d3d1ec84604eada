@@ -1,0 +1,29 @@
+src/transport/udp/quic/conn.rs
+  s_0acd2adb357b18::t_733e83009094ae 318-357,359-360,362,2814,3111,3235,3403,3500,5016-5204,8748-8927
+src/transport/udp/quic/packet.rs
+  s_9d86f7f34b29a2::t_88af3dfad733e4 240-262,661-709
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4031c20e303cad5140c4bf207d3d1ec84604eada",
+  "prompts": {},
+  "sessions": {
+    "s_0acd2adb357b18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99c6c6d0-06d8-4e35-98e1-0e7efa510d42",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    },
+    "s_9d86f7f34b29a2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e824-9396-7963-935f-f54dc700c3aa",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
