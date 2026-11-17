@@ -3603,12 +3603,6 @@ impl Connection {
         if self.side == Side::Client && pspace == PacketSpace::ZeroRtt {
             return Ok(());
         }
-        // A known four-tuple still cannot change the connection's QUIC version.
-        // The version is plaintext AAD, so reject unsupported long headers before
-        // deriving keys, decrypting or committing authenticated receive state.
-        if pkt[0] & 0x80 != 0 && pkt.get(1..5) != Some(self.version.to_be_bytes().as_slice()) {
-            return Ok(());
-        }
         if self.closed.is_some() {
             return Ok(());
         }
@@ -3619,6 +3613,12 @@ impl Connection {
         }
         let space = space_index(pspace);
         if self.spaces[space].discarded {
+            return Ok(());
+        }
+        // A known four-tuple still cannot change the connection's QUIC version.
+        // The version is plaintext AAD, so reject unsupported long headers before
+        // deriving keys, decrypting or committing authenticated receive state.
+        if pkt[0] & 0x80 != 0 && pkt.get(1..5) != Some(self.version.to_be_bytes().as_slice()) {
             return Ok(());
         }
 
