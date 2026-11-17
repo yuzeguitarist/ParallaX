@@ -9,9 +9,7 @@
 //! header-protection masks use a raw single-block AES-ECB (`aes`) or a ChaCha20
 //! keystream (`chacha20`).
 
-use aes::Aes128;
-use aes::Aes256;
-use aes_gcm::{Aes128Gcm, Aes256Gcm};
+use aes::{Aes128Enc, Aes256Enc};
 use chacha20::ChaCha20;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -21,6 +19,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::suite::CipherSuite;
 use super::QuicTlsError;
+
+// GCM seal/open and header protection use only forward AES, without inverse round keys.
+type Aes128Gcm = aes_gcm::AesGcm<Aes128Enc, cipher::consts::U12>;
+type Aes256Gcm = aes_gcm::AesGcm<Aes256Enc, cipher::consts::U12>;
 
 /// AEAD tag length for every supported suite (RFC 9001 §5.3).
 pub const AEAD_TAG_LEN: usize = 16;
@@ -228,13 +230,13 @@ impl HeaderProtectionKey {
         let mut mask = [0_u8; MASK_LEN];
         match self.suite {
             CipherSuite::Aes128GcmSha256 => {
-                let cipher = Aes128::new(GenericArray::from_slice(&self.key));
+                let cipher = Aes128Enc::new(GenericArray::from_slice(&self.key));
                 let mut block = *GenericArray::from_slice(sample);
                 cipher.encrypt_block(&mut block);
                 mask.copy_from_slice(&block[..MASK_LEN]);
             }
             CipherSuite::Aes256GcmSha384 => {
-                let cipher = Aes256::new(GenericArray::from_slice(&self.key));
+                let cipher = Aes256Enc::new(GenericArray::from_slice(&self.key));
                 let mut block = *GenericArray::from_slice(sample);
                 cipher.encrypt_block(&mut block);
                 mask.copy_from_slice(&block[..MASK_LEN]);
@@ -306,6 +308,295 @@ impl HeaderProtectionKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the original full AES types independent of the production aliases.
+    fn legacy_encrypt(
+        key: &PacketKey,
+        packet_number: u64,
+        header: &[u8],
+        buf: &mut [u8],
+    ) -> Result<usize, QuicTlsError> {
+        if buf.len() < AEAD_TAG_LEN {
+            return Err(QuicTlsError::Crypto(
+                "packet buffer shorter than tag".into(),
+            ));
+        }
+        let split = buf.len() - AEAD_TAG_LEN;
+        let (plaintext, tag_out) = buf.split_at_mut(split);
+        let nonce = GenericArray::from_slice(&key.nonce(packet_number)[..]).to_owned();
+        let aead_err = || QuicTlsError::Crypto("AEAD seal failed".into());
+        let tag = match key.suite {
+            CipherSuite::Aes128GcmSha256 => aes_gcm::Aes128Gcm::new_from_slice(&key.key)
+                .map_err(|_| aead_err())?
+                .encrypt_in_place_detached(&nonce, header, plaintext)
+                .map_err(|_| aead_err())?,
+            CipherSuite::Aes256GcmSha384 => aes_gcm::Aes256Gcm::new_from_slice(&key.key)
+                .map_err(|_| aead_err())?
+                .encrypt_in_place_detached(&nonce, header, plaintext)
+                .map_err(|_| aead_err())?,
+            CipherSuite::ChaCha20Poly1305Sha256 => ChaCha20Poly1305::new_from_slice(&key.key)
+                .map_err(|_| aead_err())?
+                .encrypt_in_place_detached(&nonce, header, plaintext)
+                .map_err(|_| aead_err())?,
+        };
+        tag_out.copy_from_slice(&tag);
+        Ok(split)
+    }
+
+    fn current_encrypt(
+        key: &PacketKey,
+        packet_number: u64,
+        header: &[u8],
+        buf: &mut [u8],
+    ) -> Result<usize, QuicTlsError> {
+        key.encrypt_in_place(packet_number, header, buf)?;
+        Ok(buf.len() - AEAD_TAG_LEN)
+    }
+
+    fn legacy_decrypt(
+        key: &PacketKey,
+        packet_number: u64,
+        header: &[u8],
+        buf: &mut [u8],
+    ) -> Result<usize, QuicTlsError> {
+        if buf.len() < AEAD_TAG_LEN {
+            return Err(QuicTlsError::alert(
+                super::super::ALERT_BAD_RECORD_MAC,
+                "packet shorter than AEAD tag",
+            ));
+        }
+        let pt_len = buf.len() - AEAD_TAG_LEN;
+        let nonce = GenericArray::from_slice(&key.nonce(packet_number)[..]).to_owned();
+        let aead_err =
+            || QuicTlsError::alert(super::super::ALERT_BAD_RECORD_MAC, "AEAD open failed");
+        let (ciphertext, tag) = buf.split_at_mut(pt_len);
+        let tag = GenericArray::from_slice(tag);
+        match key.suite {
+            CipherSuite::Aes128GcmSha256 => aes_gcm::Aes128Gcm::new_from_slice(&key.key)
+                .map_err(|_| aead_err())?
+                .decrypt_in_place_detached(&nonce, header, ciphertext, tag)
+                .map_err(|_| aead_err())?,
+            CipherSuite::Aes256GcmSha384 => aes_gcm::Aes256Gcm::new_from_slice(&key.key)
+                .map_err(|_| aead_err())?
+                .decrypt_in_place_detached(&nonce, header, ciphertext, tag)
+                .map_err(|_| aead_err())?,
+            CipherSuite::ChaCha20Poly1305Sha256 => ChaCha20Poly1305::new_from_slice(&key.key)
+                .map_err(|_| aead_err())?
+                .decrypt_in_place_detached(&nonce, header, ciphertext, tag)
+                .map_err(|_| aead_err())?,
+        }
+        Ok(pt_len)
+    }
+
+    fn current_decrypt(
+        key: &PacketKey,
+        packet_number: u64,
+        header: &[u8],
+        buf: &mut [u8],
+    ) -> Result<usize, QuicTlsError> {
+        key.decrypt_in_place(packet_number, header, buf)
+            .map(|plaintext| plaintext.len())
+    }
+
+    fn legacy_mask(key: &HeaderProtectionKey, sample: &[u8]) -> [u8; MASK_LEN] {
+        let mut mask = [0; MASK_LEN];
+        match key.suite {
+            CipherSuite::Aes128GcmSha256 => {
+                let cipher = aes::Aes128::new(GenericArray::from_slice(&key.key));
+                let mut block = *GenericArray::from_slice(sample);
+                cipher.encrypt_block(&mut block);
+                mask.copy_from_slice(&block[..MASK_LEN]);
+            }
+            CipherSuite::Aes256GcmSha384 => {
+                let cipher = aes::Aes256::new(GenericArray::from_slice(&key.key));
+                let mut block = *GenericArray::from_slice(sample);
+                cipher.encrypt_block(&mut block);
+                mask.copy_from_slice(&block[..MASK_LEN]);
+            }
+            CipherSuite::ChaCha20Poly1305Sha256 => {
+                let counter = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                let nonce = GenericArray::from_slice(&sample[4..16]);
+                let mut cipher = ChaCha20::new(GenericArray::from_slice(&key.key), nonce);
+                cipher.seek(u64::from(counter) * 64);
+                cipher.apply_keystream(&mut mask);
+            }
+        }
+        mask
+    }
+
+    #[test]
+    fn packet_protection_matches_full_aes_bytes_errors_and_failed_buffers() {
+        let header = b"\xc3header-bytes";
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let secret = vec![0x42; suite.hash_len()];
+            let key = PacketKey::from_secret(suite, &secret).unwrap();
+            for packet_number in [0, 1, u32::MAX as u64, 1 << 32, u64::MAX] {
+                for len in [0, 1, 64, 1200, 16384] {
+                    let plaintext: Vec<_> = (0..len).map(|index| index as u8).collect();
+                    for aad in [header.as_slice(), &[]] {
+                        let mut actual = plaintext.clone();
+                        actual.resize(len + AEAD_TAG_LEN, 0);
+                        let mut expected = actual.clone();
+                        let result = current_encrypt(&key, packet_number, aad, &mut actual);
+                        let reference = legacy_encrypt(&key, packet_number, aad, &mut expected);
+                        assert_eq!(format!("{result:?}"), format!("{reference:?}"));
+                        assert_eq!(actual, expected);
+                        assert_eq!(result.unwrap(), len);
+                        let sealed = actual.clone();
+                        let result = current_decrypt(&key, packet_number, aad, &mut actual);
+                        let reference = legacy_decrypt(&key, packet_number, aad, &mut expected);
+                        assert_eq!(format!("{result:?}"), format!("{reference:?}"));
+                        assert_eq!(actual, expected);
+                        assert_eq!(&actual[..result.unwrap()], plaintext);
+
+                        for failure in 0..3 {
+                            let mut actual = sealed.clone();
+                            let mut expected = sealed.clone();
+                            let (pn, bad_aad) = match failure {
+                                0 => {
+                                    *actual.last_mut().unwrap() ^= 1;
+                                    *expected.last_mut().unwrap() ^= 1;
+                                    (packet_number, aad)
+                                }
+                                1 => (packet_number, b"different header".as_slice()),
+                                _ => (packet_number ^ 1, aad),
+                            };
+                            let result = current_decrypt(&key, pn, bad_aad, &mut actual);
+                            let reference = legacy_decrypt(&key, pn, bad_aad, &mut expected);
+                            assert!(result.is_err());
+                            assert_eq!(format!("{result:?}"), format!("{reference:?}"));
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                }
+            }
+            for len in 0..AEAD_TAG_LEN {
+                for (current, legacy) in [
+                    (
+                        current_encrypt as PacketOperation,
+                        legacy_encrypt as PacketOperation,
+                    ),
+                    (
+                        current_decrypt as PacketOperation,
+                        legacy_decrypt as PacketOperation,
+                    ),
+                ] {
+                    let mut actual = vec![0x5a; len];
+                    let mut expected = actual.clone();
+                    let result = current(&key, 7, header, &mut actual);
+                    let reference = legacy(&key, 7, header, &mut expected);
+                    assert!(result.is_err());
+                    assert_eq!(format!("{result:?}"), format!("{reference:?}"));
+                    assert_eq!(actual, expected);
+                }
+            }
+            let hp = HeaderProtectionKey::from_secret(suite, &secret).unwrap();
+            for seed in 0..64u8 {
+                let sample: [u8; SAMPLE_LEN] =
+                    std::array::from_fn(|index| seed.wrapping_add((index * 17) as u8));
+                assert_eq!(hp.mask(&sample), legacy_mask(&hp, &sample));
+            }
+        }
+    }
+
+    type PacketOperation = fn(&PacketKey, u64, &[u8], &mut [u8]) -> Result<usize, QuicTlsError>;
+
+    /// Same-process controls for per-packet cipher construction and protection.
+    /// Run in release mode with --ignored --nocapture.
+    #[test]
+    #[ignore = "key protection timing benchmark; run manually in release mode"]
+    fn packet_key_protection_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        const ITERATIONS: u64 = if cfg!(debug_assertions) { 32 } else { 10_000 };
+        const SAMPLES: usize = 7;
+        let header = b"\xc3header-bytes";
+        let packet_number = 0x1_0000_ffff;
+        let report = |suite: CipherSuite, name: &str, mut samples: Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "packet key {suite:?}, {name}: ns/op samples={samples:?}, median={:.0}",
+                samples[SAMPLES / 2],
+            );
+        };
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let secret = vec![0x42; suite.hash_len()];
+            let key = PacketKey::from_secret(suite, &secret).unwrap();
+            for len in [64, 1200] {
+                for open in [false, true] {
+                    let mut fixture = vec![0x5a; len + AEAD_TAG_LEN];
+                    if open {
+                        legacy_encrypt(&key, packet_number, header, &mut fixture).unwrap();
+                    }
+                    let operations: [PacketOperation; 2] = if open {
+                        [current_decrypt, legacy_decrypt]
+                    } else {
+                        [current_encrypt, legacy_encrypt]
+                    };
+                    let mut scratch = fixture.clone();
+                    let mut samples = [Vec::with_capacity(SAMPLES), Vec::with_capacity(SAMPLES)];
+                    for sample in 0..=SAMPLES {
+                        let order = if sample % 2 == 0 { [0, 1] } else { [1, 0] };
+                        for index in order {
+                            let start = Instant::now();
+                            for _ in 0..ITERATIONS {
+                                scratch.copy_from_slice(&fixture);
+                                black_box(
+                                    black_box(operations[index])(
+                                        &key,
+                                        packet_number,
+                                        header,
+                                        &mut scratch,
+                                    )
+                                    .unwrap(),
+                                );
+                            }
+                            let elapsed = start.elapsed().as_secs_f64() * 1e9 / ITERATIONS as f64;
+                            if sample != 0 {
+                                samples[index].push(elapsed);
+                            }
+                        }
+                    }
+                    let name = format!("{}-{len}", if open { "open" } else { "seal" });
+                    report(suite, &name, std::mem::take(&mut samples[0]));
+                    report(
+                        suite,
+                        &format!("{name}-legacy"),
+                        std::mem::take(&mut samples[1]),
+                    );
+                }
+            }
+            type MaskOperation = fn(&HeaderProtectionKey, &[u8]) -> [u8; MASK_LEN];
+            let hp = HeaderProtectionKey::from_secret(suite, &secret).unwrap();
+            let masks: [MaskOperation; 2] = [HeaderProtectionKey::mask, legacy_mask];
+            let mut samples = [Vec::with_capacity(SAMPLES), Vec::with_capacity(SAMPLES)];
+            let mut sample_bytes = [0x5a; SAMPLE_LEN];
+            for sample in 0..=SAMPLES {
+                let order = if sample % 2 == 0 { [0, 1] } else { [1, 0] };
+                for index in order {
+                    let start = Instant::now();
+                    for counter in 0..ITERATIONS {
+                        sample_bytes[..4].copy_from_slice(&(counter as u32).to_le_bytes());
+                        black_box(black_box(masks[index])(&hp, &sample_bytes));
+                    }
+                    let elapsed = start.elapsed().as_secs_f64() * 1e9 / ITERATIONS as f64;
+                    if sample != 0 {
+                        samples[index].push(elapsed);
+                    }
+                }
+            }
+            report(suite, "hp", std::mem::take(&mut samples[0]));
+            report(suite, "hp-legacy", std::mem::take(&mut samples[1]));
+        }
+    }
 
     // RFC 9001 Appendix A.2/A.3 client Initial vectors. DCID 8394c8f03e515708.
     const CLIENT_KEY: &str = "1f369613dd76d5467730efcbe3b1a22d";
