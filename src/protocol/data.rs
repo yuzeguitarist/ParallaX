@@ -1423,15 +1423,16 @@ fn open_record_group(
     bounds: &[(usize, usize)],
 ) -> Result<Zeroizing<Vec<u8>>, DataRecordError> {
     let mut bytes = Zeroizing::new(bytes);
+    // Protect both the in-place decryption ranges and the compacted prefix.
+    crate::process_hardening::exclude_transient_from_core_dump(
+        "data_record.open_concat_plaintext",
+        bytes.as_slice(),
+    );
     let mut output_len = 0;
     for (index, &(record_offset, total_len)) in bounds.iter().enumerate() {
         let sequence = base_sequence + index as u64;
         let ciphertext_start = record_offset + record::TLS_HEADER_LEN;
         let ciphertext_end = record_offset + total_len;
-        crate::process_hardening::exclude_transient_from_core_dump(
-            "data_record.open_concat_plaintext",
-            &bytes[ciphertext_start..ciphertext_end],
-        );
         let plaintext_len = match session::open_in_place_split_with(
             cipher,
             nonce_base,
