@@ -18,9 +18,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
-        lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
@@ -37,7 +36,7 @@ use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;
 use crate::{
     config::{
         decode_base64_secret, decode_key32_secret, decode_psk, Config, ConfigError, Mode,
-        ServerConfig, TcpMuxRecordProfile, TrafficConfig, UdpConfig,
+        Nat64Prefix, ServerConfig, TcpMuxRecordProfile, TrafficConfig, UdpConfig,
     },
     crypto::{
         auth::{
@@ -76,7 +75,10 @@ use crate::{
             log_record_read, parse_header, read_record, BufferedTlsRecordReader, TlsRecordReader,
             TLS_HEADER_LEN,
         },
-        server_hello::{parse_server_hello, ServerHello, ServerHelloError},
+        server_hello::{
+            is_compat_change_cipher_spec, parse_server_hello, parse_server_hello_records,
+            ServerHello, ServerHelloError, ServerHelloReassembly, MAX_CHANGE_CIPHER_SPEC_RECORDS,
+        },
     },
     traffic::{CoverTrafficProfile, PaddingProfile, TimingProfile, TrafficError},
     transport::{
@@ -86,8 +88,8 @@ use crate::{
         },
         tcp::{
             connect_tuned_tcp_any, connect_tuned_tcp_host, drain_ready_tcp_read,
-            is_fd_exhaustion_error, is_transient_accept_error, server_relay_connection_limit,
-            tune_tcp_stream,
+            is_fd_exhaustion_error, is_transient_accept_error, resolve_tcp_host,
+            server_relay_connection_limit, tune_tcp_stream,
         },
     },
 };
@@ -249,6 +251,11 @@ const PRE_PQ_FALLBACK_FORWARD_RECORD_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_
 /// two ends must share a unit), and the forward's final read is capped at the
 /// remaining budget so this end can never overshoot what the client tolerates.
 const PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT: usize = super::MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_BYTES;
+/// Keep room inside the shared ceiling to finish one origin record at cutover.
+const PRE_PQ_ORIGIN_RECORD_RESERVE: usize =
+    TLS_HEADER_LEN + crate::tls::record::MAX_TLS_RECORD_PAYLOAD + 256;
+const PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT: usize =
+    PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT - PRE_PQ_ORIGIN_RECORD_RESERVE;
 /// Ceiling on download frames one mux connection may hold queued toward the
 /// client, summed over its substreams: each substream gets an equal share (see
 /// [`server_mux_downlink`]), so the per-connection memory bound is the one the
@@ -573,6 +580,50 @@ struct AuthenticatedInbound {
 struct PendingReplayEntry {
     cache: Arc<Mutex<ReplayCache>>,
     entry: ReplayEntry,
+    source: Option<IpAddr>,
+    reserved: bool,
+    admission: Option<Arc<OwnedSemaphorePermit>>,
+}
+
+impl Drop for PendingReplayEntry {
+    fn drop(&mut self) {
+        if self.reserved {
+            match self.cache.try_lock() {
+                Ok(mut cache) => cache.release_pending(&self.entry.transcript_fingerprint),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                    .into_inner()
+                    .release_pending(&self.entry.transcript_fingerprint),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let cache = Arc::clone(&self.cache);
+                    let transcript = self.entry.transcript_fingerprint;
+                    let admission = self.admission.clone();
+                    // A journal fsync may own the cache lock. Cleanup must not
+                    // block the async executor behind that filesystem operation.
+                    tokio::task::spawn_blocking(move || {
+                        let _admission = admission;
+                        cache
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .release_pending(&transcript)
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn replay_source(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut bytes = v6.octets();
+                bytes[6..].fill(0);
+                IpAddr::V6(Ipv6Addr::from(bytes))
+            }
+        },
+        other => other,
+    }
 }
 
 enum ConnectionDecision {
@@ -673,8 +724,9 @@ async fn build_quic_carrier(
 {
     use crate::transport::udp::UdpTransportError;
     // The camouflage origin's HTTP/3 endpoint: the fallback host on UDP :443.
-    let origin_ip = lookup_host(&server.fallback_addr)
+    let origin_ip = resolve_tcp_host(&server.fallback_addr)
         .await?
+        .into_iter()
         .next()
         .ok_or_else(|| {
             UdpTransportError::Io(io::Error::new(
@@ -973,7 +1025,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     tracing::info!(
         connection_limit,
         "ParallaX server listening on {}",
-        server.listen
+        listener.local_addr()?
     );
 
     // Eagerly build the reject-path ballast context now (one X25519 keygen +
@@ -1018,10 +1070,8 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 );
                 // Relay to the camouflage origin (H-1) so a prober still sees the
                 // origin ServerHello and cannot count our cap by the missing one;
-                // bounded by the 64-relay concurrency ceiling, with idle drawn from
-                // the SAME band as a healthy splice (so the close time is not a probe-
-                // separable "box at cap" tell). At capacity, stop accepting until
-                // a slot opens; only this one socket waits outside the 64 slots.
+                // bounded by the shared fallback pool. If that reserve is full,
+                // close this socket without parking unrelated accepts.
                 drop(spawn_cap_shed_fallback(client, &server.fallback_addr).await);
                 continue;
             }
@@ -1036,9 +1086,8 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 );
                 // Relay to the camouflage origin (H-1) so a prober still sees the
                 // origin ServerHello and cannot count our cap by the missing one.
-                // Bounded by the 64-relay concurrency ceiling, with idle unified with
-                // the healthy splice band. Release the unused source admission
-                // before waiting in the accept loop for a cap-shed slot.
+                // Release the unused source admission before attempting the
+                // reserved fallback pool; saturation never waits in accept.
                 drop(source_permit);
                 drop(spawn_cap_shed_fallback(client, &server.fallback_addr).await);
                 continue;
@@ -1066,7 +1115,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 replay_cache,
                 &secrets,
                 cid,
-                &connection_permit,
+                connection_permit,
             )
             .await
             {
@@ -1181,7 +1230,7 @@ async fn handle_connection_with_replay(
     replay_cache: Arc<Mutex<ReplayCache>>,
     secrets: &ServerRuntimeSecrets,
     cid: u64,
-    admission: &Arc<OwnedSemaphorePermit>,
+    admission: Arc<OwnedSemaphorePermit>,
 ) -> Result<(), HandshakeServerError> {
     handle_connection_inner(
         client,
@@ -1207,7 +1256,7 @@ async fn handle_connection_inner(
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
     secrets: &ServerRuntimeSecrets,
     cid: u64,
-    admission: Option<&Arc<OwnedSemaphorePermit>>,
+    mut admission: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<(), HandshakeServerError> {
     tune_tcp_stream(&client)?;
     tracing::info!(
@@ -1230,50 +1279,72 @@ async fn handle_connection_inner(
                 predialed = predialed_origin.is_some(),
                 "falling back to camouflage origin before a complete ClientHello"
             );
-            relay_fallback_reusing_origin(client, &config.fallback_addr, prefix, predialed_origin)
-                .await?;
+            relay_admitted_fallback(
+                client,
+                &config.fallback_addr,
+                prefix,
+                predialed_origin,
+                &mut admission,
+            )
+            .await?;
             return Ok(());
         }
     };
     match decide_connection_inbound(&first_record, psk, &config.authorized_sni, server_private)? {
         ConnectionDecision::Fallback(reason) => {
             tracing::info!(cid, ?reason, "falling back to camouflage origin");
-            relay_fallback_reusing_origin(
+            relay_admitted_fallback(
                 client,
                 &config.fallback_addr,
                 first_record,
                 predialed_origin,
+                &mut admission,
             )
             .await?;
         }
         ConnectionDecision::Authenticated(authenticated) => {
-            // A pre-dial only happens when the peer stayed silent past
-            // FIRST_RECORD_PREDIAL_DELAY, which an authenticating client normally
-            // does not, so this is the rare slow-client case. `accept_authenticated`
-            // opens its own origin connection for the real ServerHello, so release
-            // the spare with the same FIN-first teardown every other origin
-            // connection gets — never a bare drop, which would RST.
-            //
-            // Detached on purpose: that teardown drains until the peer closes, up
-            // to GRACEFUL_FIN_DRAIN_BUDGET. Awaiting it here would charge a
-            // legitimate, already-authenticated client up to two seconds of extra
-            // handshake latency for cleanup it has no stake in.
-            if let Some(spare) = predialed_origin {
-                drop(release_predialed_origin(spare, admission.cloned()));
-            }
             let AuthenticatedInbound {
                 hello: client_hello,
                 x25519_shared_secret,
             } = authenticated;
-            let pending_replay = replay_cache.map(|cache| PendingReplayEntry {
-                cache,
-                entry: ReplayEntry {
-                    timestamp: client_hello.timestamp,
-                    nonce: client_hello.nonce,
-                    transcript_fingerprint: client_hello.transcript_fingerprint,
-                },
-            });
-            let handshake = accept_authenticated(
+            let entry = ReplayEntry {
+                timestamp: client_hello.timestamp,
+                nonce: client_hello.nonce,
+                transcript_fingerprint: client_hello.transcript_fingerprint,
+            };
+            let source = client.peer_addr().ok().map(|peer| replay_source(peer.ip()));
+            let pending_replay = if let Some(cache) = replay_cache {
+                let now = current_unix_timestamp()?;
+                let fresh = match cache.try_lock() {
+                    Ok(mut cache) => cache.reserve_pending(&entry, now),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        poisoned.into_inner().reserve_pending(&entry, now)
+                    }
+                    // Busy persistence is load-shed through the real origin;
+                    // never block the executor or leave a cancelled reservation.
+                    Err(std::sync::TryLockError::WouldBlock) => false,
+                };
+                if !fresh {
+                    return relay_admitted_fallback(
+                        client,
+                        &config.fallback_addr,
+                        first_record,
+                        predialed_origin,
+                        &mut admission,
+                    )
+                    .await;
+                }
+                Some(PendingReplayEntry {
+                    cache,
+                    entry,
+                    source,
+                    reserved: true,
+                    admission: admission.clone(),
+                })
+            } else {
+                None
+            };
+            let handshake = accept_authenticated_with_origin(
                 client,
                 config,
                 psk,
@@ -1281,6 +1352,7 @@ async fn handle_connection_inner(
                 x25519_shared_secret,
                 first_record,
                 client_hello,
+                predialed_origin,
             )
             .await?;
             tracing::info!(
@@ -1292,13 +1364,14 @@ async fn handle_connection_inner(
             run_authenticated_data_mode(
                 handshake,
                 config.data_target.as_deref(),
+                &config.nat64_prefixes,
                 secrets.identity_secret_key(),
                 psk,
                 traffic,
                 udp,
                 pending_replay,
                 cid,
-                admission,
+                admission.take(),
             )
             .await?;
         }
@@ -1393,12 +1466,23 @@ fn decide_connection_inbound(
     authorized_sni: &[String],
     server_private: &[u8; 32],
 ) -> Result<ConnectionDecision, HandshakeServerError> {
+    let dh = |peer: &[u8; 32]| -> zeroize::Zeroizing<[u8; 32]> {
+        #[cfg(test)]
+        REJECT_DH_OPS.fetch_add(1, Ordering::Relaxed);
+        zeroize::Zeroizing::new(x25519_shared_secret(server_private, peer))
+    };
+    let reject_unparsed = || {
+        let _ = dh(&[0x42; 32]);
+        let _ = dh(&[0x24; 32]);
+        reject_path_constant_work();
+        Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed))
+    };
     let parsed = match parse_client_hello(first_client_record) {
         Ok(parsed) => parsed,
-        Err(_) => return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed)),
+        Err(_) => return reject_unparsed(),
     };
     if !parsed.tls13_supported {
-        return Ok(ConnectionDecision::Fallback(FallbackReason::AuthFailed));
+        return reject_unparsed();
     }
     // Constant-time-by-op-count DH (M-2): the auth-failing path must perform a
     // FIXED number of X25519 ops regardless of ClientHello shape, else an off-path
@@ -1407,12 +1491,6 @@ fn decide_connection_inbound(
     // with discarded ballast so EVERY path runs exactly 2 ops (mask slot + auth
     // slot); ballast results are Zeroizing to match the real-DH zeroize discipline.
     // Auth semantics unchanged.
-    let dh = |peer: &[u8; 32]| -> zeroize::Zeroizing<[u8; 32]> {
-        #[cfg(test)]
-        REJECT_DH_OPS.fetch_add(1, Ordering::Relaxed);
-        zeroize::Zeroizing::new(x25519_shared_secret(server_private, peer))
-    };
-
     // v4 masked-stateful path. mask_ecdh = X25519(server_static, tls_ephemeral)
     // (the unmasked standalone key_share); distinct from the auth DH below (the
     // recovered ParallaX ephemeral). The mask-slot DH ALWAYS runs once — a real
@@ -1568,7 +1646,7 @@ fn authenticated_decision(
 }
 
 pub async fn accept_authenticated(
-    mut client: TcpStream,
+    client: TcpStream,
     config: &ServerConfig,
     psk: &[u8],
     server_public_key: [u8; 32],
@@ -1576,22 +1654,48 @@ pub async fn accept_authenticated(
     first_client_record: Vec<u8>,
     client_hello: AuthenticatedHello,
 ) -> Result<AuthenticatedHandshake, HandshakeServerError> {
+    accept_authenticated_with_origin(
+        client,
+        config,
+        psk,
+        server_public_key,
+        x25519_shared_secret,
+        first_client_record,
+        client_hello,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn accept_authenticated_with_origin(
+    mut client: TcpStream,
+    config: &ServerConfig,
+    psk: &[u8],
+    server_public_key: [u8; 32],
+    x25519_shared_secret: zeroize::Zeroizing<[u8; 32]>,
+    first_client_record: Vec<u8>,
+    client_hello: AuthenticatedHello,
+    origin: Option<PredialedOrigin>,
+) -> Result<AuthenticatedHandshake, HandshakeServerError> {
     // Dialing the fallback origin fails before we own it, so only `client` needs a
     // graceful FIN here (a bare `?`-drop with client RX queued would RST).
-    let mut fallback = match connect_tcp_with_timeout(&config.fallback_addr).await {
-        Ok(fallback) => fallback,
-        Err(err) => {
-            graceful_close_tcp_stream(client).await;
-            return Err(err);
-        }
-    };
+    let mut fallback =
+        match forward_first_record_to_origin(&config.fallback_addr, &first_client_record, origin)
+            .await
+        {
+            Ok(fallback) => fallback,
+            Err(err) => {
+                graceful_close_tcp_stream(client).await;
+                return Err(err);
+            }
+        };
     // From here both `client` and `fallback` are owned; every error must FIN BOTH
     // (never a bare drop → RST), even though the peer is already PSK-authenticated.
     // Run the fallible forward-and-derive body in a closure and close both on Err.
     let forward = async {
         tune_tcp_stream(&fallback)?;
-        write_all_with_handshake_timeout(&mut fallback, &first_client_record).await?;
-        let forwarded = read_forwarded_server_hello(&mut fallback).await?;
+        let forwarded = read_forwarded_server_hello(&mut fallback, &mut client).await?;
         Ok::<_, HandshakeServerError>(forwarded)
     }
     .await;
@@ -1689,11 +1793,37 @@ async fn relay_fallback_reusing_origin(
     relay_fallback_with_idle_timeout(client, fallback, fallback_idle_timeout()).await
 }
 
+async fn relay_admitted_fallback(
+    client: TcpStream,
+    fallback_addr: &str,
+    prefix: Vec<u8>,
+    origin: Option<PredialedOrigin>,
+    admission: &mut Option<Arc<OwnedSemaphorePermit>>,
+) -> Result<(), HandshakeServerError> {
+    // Fallback relays consume their reserved client/origin FD pool, leaving the
+    // authenticated session pool available even for indefinitely active probes.
+    let Ok(_slot) = CAP_SHED_FALLBACK_SLOTS.try_acquire() else {
+        if let Some(origin) = origin {
+            if let Some(origin) = origin.into_stream().await {
+                tokio::join!(
+                    graceful_close_tcp_stream(client),
+                    graceful_close_tcp_stream(origin)
+                );
+                return Ok(());
+            }
+        }
+        graceful_close_tcp_stream(client).await;
+        return Ok(());
+    };
+    drop(admission.take());
+    relay_fallback_reusing_origin(client, fallback_addr, prefix, origin).await
+}
+
 async fn connect_and_forward_to_fallback(
     fallback_addr: &str,
     first_client_record: &[u8],
 ) -> Result<TcpStream, HandshakeServerError> {
-    let mut fallback = connect_tcp_with_timeout(fallback_addr).await?;
+    let mut fallback = connect_fallback_with_timeout(fallback_addr).await?;
     tune_tcp_stream(&fallback)?;
     fallback.write_all(first_client_record).await?;
     Ok(fallback)
@@ -1711,14 +1841,15 @@ async fn forward_first_record_to_origin(
     first_client_record: &[u8],
     predialed_origin: Option<PredialedOrigin>,
 ) -> Result<TcpStream, HandshakeServerError> {
-    let predialed_origin = match predialed_origin {
-        Some(origin) => origin.into_stream().await,
-        None => None,
+    let (predialed_origin, forwarded) = match predialed_origin {
+        Some(PredialedOrigin::Forwarded(stream, forwarded)) => (Some(stream), forwarded),
+        Some(origin) => (origin.into_stream().await, 0),
+        None => (None, 0),
     };
     match predialed_origin {
         // Already connected and tuned by the pre-dial; only the replay is left.
         Some(mut fallback) => fallback
-            .write_all(first_client_record)
+            .write_all(&first_client_record[forwarded.min(first_client_record.len())..])
             .await
             .map(|()| fallback)
             .map_err(HandshakeServerError::Io),
@@ -1781,19 +1912,34 @@ async fn graceful_close_tcp_stream(mut stream: TcpStream) {
     graceful_fin_then_drain_stream(&mut stream).await;
 }
 
-/// Reserve the entire cap-shed lifetime before creating a task. When full, wait
-/// in the accept loop with its current socket, applying listener backpressure
-/// without another task or peer-EOF drain. Once admitted, use the same splice and
-/// FIN/drain as any other cap-shed connection, including already-queued input.
+/// Reserve the entire cap-shed lifetime before creating a task. Saturation
+/// closes only this socket with bounded work and never parks the accept loop.
 async fn spawn_cap_shed_fallback(
-    client: TcpStream,
+    mut client: TcpStream,
     fallback_addr: &str,
-) -> tokio::task::JoinHandle<()> {
-    let slot = CAP_SHED_FALLBACK_SLOTS
-        .acquire()
-        .await
-        .expect("cap-shed semaphore is never closed");
-    tokio::spawn(cap_shed_fallback(client, fallback_addr.to_owned(), slot))
+) -> Option<tokio::task::JoinHandle<()>> {
+    let slot = match CAP_SHED_FALLBACK_SLOTS.try_acquire() {
+        Ok(slot) => slot,
+        Err(_) => {
+            // Never park the listener behind a full fallback pool. FIN first;
+            // drain only bytes already ready, with a fixed work bound and no task.
+            let _ = client.shutdown().await;
+            let mut scratch = [0u8; 4096];
+            for _ in 0..4 {
+                match client.try_read(&mut scratch) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            drop(client);
+            return None;
+        }
+    };
+    Some(tokio::spawn(cap_shed_fallback(
+        client,
+        fallback_addr.to_owned(),
+        slot,
+    )))
 }
 
 /// Cap-rejection relay that stays indistinguishable from the origin (H-1) while
@@ -2059,12 +2205,60 @@ async fn graceful_close_pre_pq(
     .await;
 }
 
-async fn read_forwarded_server_hello(
+async fn read_forwarded_server_hello<
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+>(
+    fallback: &mut R,
+    client: &mut W,
+) -> Result<ForwardedServerHello, HandshakeServerError> {
+    timeout(HANDSHAKE_TIMEOUT, async {
+        let mut reassembly = ServerHelloReassembly::default();
+        let mut ccs_records = 0;
+        loop {
+            let record = read_record(fallback).await?;
+            if record[0] == 0x14 {
+                if reassembly.started() || !is_compat_change_cipher_spec(&record) {
+                    return Err(ServerHelloError::NotHandshakeRecord.into());
+                }
+                ccs_records += 1;
+                if ccs_records > MAX_CHANGE_CIPHER_SPEC_RECORDS {
+                    return Err(ServerHelloError::InvalidLength.into());
+                }
+                // Preserve the prefix on the wire, but keep it outside both
+                // endpoints' existing ServerHello transcript/hash input.
+                client.write_all(&record).await?;
+                continue;
+            }
+            // TLS 1.2 can coalesce its plaintext Certificate after ServerHello.
+            // Preserve the original first record for forwarding and strict-TLS
+            // rejection, while TLS 1.3 still requires an exact handshake message.
+            if !reassembly.started() {
+                if let Ok(parsed) = parse_server_hello(&record) {
+                    if !parsed.tls13_selected {
+                        return Ok(ForwardedServerHello {
+                            raw_record: record,
+                            parsed,
+                        });
+                    }
+                }
+            }
+            if reassembly.push_record(&record)? {
+                let raw_record = reassembly.into_records();
+                let parsed = parse_server_hello_records(&raw_record)?;
+                return Ok(ForwardedServerHello { raw_record, parsed });
+            }
+        }
+    })
+    .await
+    .map_err(|_| HandshakeServerError::Timeout)?
+}
+
+#[cfg(test)]
+pub(crate) async fn read_forwarded_server_hello_for_test(
     fallback: &mut TcpStream,
 ) -> Result<ForwardedServerHello, HandshakeServerError> {
-    let raw_record = read_first_record(fallback).await?;
-    let parsed = parse_server_hello(&raw_record)?;
-    Ok(ForwardedServerHello { raw_record, parsed })
+    read_forwarded_server_hello(fallback, &mut tokio::io::sink()).await
 }
 
 /// Adds a uniform `[0, jitter]` upward grace to `floor`. The floor is never
@@ -2165,13 +2359,6 @@ fn timeout_tuning() -> TimeoutTuning {
         .unwrap_or_else(TimeoutTuning::defaults)
 }
 
-async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeServerError> {
-    timeout(HANDSHAKE_TIMEOUT, read_record(stream))
-        .await
-        .map_err(|_| HandshakeServerError::Timeout)?
-        .map_err(HandshakeServerError::Io)
-}
-
 /// Bounds a handshake-phase write so an authenticated peer that stops reading
 /// cannot stall it indefinitely (pinning the slot/permits/fds between auth and
 /// data mode). Reuses HANDSHAKE_TIMEOUT, the established handshake-phase bound.
@@ -2190,11 +2377,13 @@ where
 
 /// An origin connection opened speculatively while waiting for the first record.
 ///
-/// Carries NO forwarded bytes either way, so it is equally usable by the splice
-/// path (forward the prefix onto it) and discardable by the authenticated path.
+/// Tracks any prefix already streamed so both authentication and fallback reuse
+/// one origin connection without duplicating bytes.
 enum PredialedOrigin {
     /// The dial completed before the read did.
     Ready(TcpStream),
+    /// Prefix bytes already streamed while inspecting an incomplete record.
+    Forwarded(TcpStream, usize),
     /// The read won while the dial was still in flight. Handed over rather than
     /// dropped so the splice path awaits THIS connect instead of starting a
     /// second one to the same origin.
@@ -2206,7 +2395,7 @@ impl PredialedOrigin {
     /// the caller falls back to dialing at give-up, the pre-existing behavior.
     async fn into_stream(self) -> Option<TcpStream> {
         match self {
-            Self::Ready(stream) => Some(stream),
+            Self::Ready(stream) | Self::Forwarded(stream, _) => Some(stream),
             Self::Pending(dial) => dial.await.ok(),
         }
     }
@@ -2246,160 +2435,142 @@ async fn read_first_client_record_predialing(
     client: &mut TcpStream,
     fallback_addr: &str,
 ) -> Result<FirstReadWithOrigin, HandshakeServerError> {
-    let read = read_first_client_record_with_timeout(client, first_record_wait_timeout());
-    tokio::pin!(read);
-
-    // Phase 1: the common case. A real client's ClientHello is already here, so
-    // this resolves long before the delay and nothing is dialed.
-    tokio::select! {
-        biased;
-        read = &mut read => {
-            return Ok(FirstReadWithOrigin { read: read?, predialed_origin: None });
-        }
-        _ = sleep(FIRST_RECORD_PREDIAL_DELAY) => {}
-    }
-
-    // Phase 2: silent so far. Start the origin's idle clock NOW, concurrently with
-    // the remaining client-facing budget, so the eventual close time is driven by
-    // the origin rather than by our local give-up.
-    //
-    // Keep the dial pinned so a winning read can hand the SAME in-flight future
-    // onward without abandoning/restarting it. Unlike a detached task, cancelling
-    // the owning connection immediately drops its pending sockets too.
-    //
-    // Socket setup must match `connect_and_forward_to_fallback` exactly, so a
-    // pre-dialed origin connection is byte-for-byte interchangeable with one
-    // dialed at give-up time.
+    let deadline = Instant::now() + first_record_wait_timeout();
+    let predial_at = Instant::now() + FIRST_RECORD_PREDIAL_DELAY;
+    let mut prefix = Vec::new();
+    let mut expected = TLS_HEADER_LEN;
+    let mut origin: Option<TcpStream> = None;
+    let mut forwarded = 0;
+    let mut dial_started = false;
+    let mut dial_done = false;
     let addr = fallback_addr.to_owned();
     let mut dial: Pin<Box<dyn Future<Output = Result<TcpStream, HandshakeServerError>> + Send>> =
         Box::pin(async move {
-            let stream = connect_tcp_with_timeout(&addr).await?;
+            let stream = connect_fallback_with_timeout(&addr).await?;
             tune_tcp_stream(&stream)?;
             Ok::<TcpStream, HandshakeServerError>(stream)
         });
-    let mut predialed_origin = None;
-    let mut dial_settled = false;
-
+    let mut scratch = [0u8; 16 * 1024 + 256];
+    let mut origin_reply = [0u8; 4096];
     loop {
+        if let Some(stream) = origin.as_mut() {
+            if forwarded < prefix.len() {
+                write_all_with_handshake_timeout(stream, &prefix[forwarded..]).await?;
+                forwarded = prefix.len();
+            }
+        }
+        let completed = prefix.len() >= expected;
+        if completed || Instant::now() >= deadline {
+            let valid_header = prefix.len() >= TLS_HEADER_LEN
+                && prefix[0] == 0x16
+                && prefix[1] == 3
+                && matches!(prefix[2], 1..=3)
+                && parse_header(&prefix).is_ok();
+            if completed && expected == TLS_HEADER_LEN && valid_header {
+                expected = parse_header(&prefix).expect("validated header").total_len;
+                if prefix.len() < expected {
+                    continue;
+                }
+            }
+            let read = if completed && valid_header && expected > TLS_HEADER_LEN {
+                FirstClientRead::Record(prefix)
+            } else {
+                FirstClientRead::FallbackPrefix(prefix)
+            };
+            let spare = origin
+                .map(|stream| PredialedOrigin::Forwarded(stream, forwarded))
+                .or_else(|| (dial_started && !dial_done).then_some(PredialedOrigin::Pending(dial)));
+            return Ok(FirstReadWithOrigin {
+                read,
+                predialed_origin: spare,
+            });
+        }
+        let read_len = (expected - prefix.len()).min(scratch.len());
         tokio::select! {
             biased;
-            read = &mut read => {
-                let read = match read {
-                    Ok(read) => read,
-                    Err(err) => {
-                        // The client failed/timed out before we could use the origin.
-                        // Keep cleanup within the connection's admission lifetime: a
-                        // detached cleanup could outlive and bypass cap-shed slots.
-                        let spare = predialed_origin.map(PredialedOrigin::Ready)
-                            .or((!dial_settled).then_some(PredialedOrigin::Pending(dial)));
-                        if let Some(spare) = spare {
-                            if let Some(spare) = spare.into_stream().await {
-                                graceful_close_tcp_stream(spare).await;
-                            }
-                        }
-                        return Err(err);
+            read = client.read(&mut scratch[..read_len]) => {
+                match read {
+                    Ok(0) => {
+                        let spare = origin.map(|stream| PredialedOrigin::Forwarded(stream, forwarded));
+                        return Ok(FirstReadWithOrigin { read: FirstClientRead::FallbackPrefix(prefix), predialed_origin: spare });
                     }
-                };
-                // Still connecting: pass the task on so whoever needs the origin
-                // awaits THIS dial rather than starting another.
-                let pending = (!dial_settled).then_some(dial);
+                    Ok(n) => {
+                        prefix.extend_from_slice(&scratch[..n]);
+                        // Inspect bytes already in the socket before starting a
+                        // dial; promptly arriving complete hellos keep the fast path.
+                        if prefix.len() < expected && !dial_started { dial_started = true; }
+                    }
+                    Err(err) => {
+                        if let Some(stream) = origin { graceful_close_tcp_stream(stream).await; }
+                        return Err(err.into());
+                    }
+                }
+            }
+            read = async { origin.as_mut().expect("guarded origin").read(&mut origin_reply).await }, if origin.is_some() => {
+                let n = read?;
+                if n > 0 { write_all_with_handshake_timeout(client, &origin_reply[..n]).await?; }
+                // Origin alerts and FIN must reach a partial-hello probe without
+                // waiting for the rest of the claimed record or our local timer.
                 return Ok(FirstReadWithOrigin {
-                    read,
-                    predialed_origin: predialed_origin.map(PredialedOrigin::Ready)
-                        .or(pending.map(PredialedOrigin::Pending)),
+                    read: FirstClientRead::FallbackPrefix(prefix),
+                    predialed_origin: origin.map(|stream| PredialedOrigin::Forwarded(stream, forwarded)),
                 });
             }
-            dialed = &mut dial, if !dial_settled => {
-                dial_settled = true;
-                // A dial error means no pre-dial and
-                // the splice path dials at give-up, exactly as before this change.
-                predialed_origin = dialed.ok();
+            dialed = &mut dial, if dial_started && !dial_done => {
+                dial_done = true;
+                origin = dialed.ok();
             }
+            _ = sleep_until(predial_at), if !dial_started => { dial_started = true; }
+            _ = sleep_until(deadline) => {}
         }
-    }
-}
-
-async fn read_first_client_record_with_timeout<R>(
-    stream: &mut R,
-    read_timeout: Duration,
-) -> Result<FirstClientRead, HandshakeServerError>
-where
-    R: AsyncRead + Unpin,
-{
-    let deadline = Instant::now() + read_timeout;
-    let mut header = [0_u8; TLS_HEADER_LEN];
-    let mut header_pos = 0;
-    while header_pos < TLS_HEADER_LEN {
-        let read = read_before_deadline(stream, &mut header[header_pos..], deadline).await;
-        match read {
-            Ok(Some(0)) if header_pos == 0 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "TLS record header ended early",
-                )
-                .into());
-            }
-            Ok(Some(0)) => {
-                return Ok(FirstClientRead::FallbackPrefix(
-                    header[..header_pos].to_vec(),
-                ));
-            }
-            Ok(Some(n)) => header_pos += n,
-            Ok(None) => {
-                return Ok(FirstClientRead::FallbackPrefix(
-                    header[..header_pos].to_vec(),
-                ));
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    let parsed = match parse_header(&header) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(FirstClientRead::FallbackPrefix(header.to_vec())),
-    };
-
-    let mut record = vec![0_u8; parsed.total_len];
-    record[..TLS_HEADER_LEN].copy_from_slice(&header);
-    let mut record_pos = TLS_HEADER_LEN;
-    while record_pos < parsed.total_len {
-        let read = read_before_deadline(stream, &mut record[record_pos..], deadline).await;
-        match read {
-            Ok(Some(0)) => {
-                return Ok(FirstClientRead::FallbackPrefix(
-                    record[..record_pos].to_vec(),
-                ))
-            }
-            Ok(Some(n)) => record_pos += n,
-            Ok(None) => {
-                return Ok(FirstClientRead::FallbackPrefix(
-                    record[..record_pos].to_vec(),
-                ))
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    Ok(FirstClientRead::Record(record))
-}
-
-async fn read_before_deadline<R>(
-    stream: &mut R,
-    buf: &mut [u8],
-    deadline: Instant,
-) -> Result<Option<usize>, io::Error>
-where
-    R: AsyncRead + Unpin,
-{
-    match timeout_at(deadline, stream.read(buf)).await {
-        Ok(read) => read.map(Some),
-        Err(_) => Ok(None),
     }
 }
 
 async fn connect_tcp_with_timeout(addr: &str) -> Result<TcpStream, HandshakeServerError> {
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     connect_future_with_timeout(connect_tuned_tcp_host(addr, deadline), HANDSHAKE_TIMEOUT).await
+}
+
+async fn connect_fallback_with_timeout(addr: &str) -> Result<TcpStream, HandshakeServerError> {
+    type CachedDns = HashMap<String, (Instant, Result<Vec<SocketAddr>, io::ErrorKind>)>;
+    static CACHE: OnceLock<tokio::sync::Mutex<CachedDns>> = OnceLock::new();
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    if let Ok(ip) = addr.parse::<SocketAddr>() {
+        return connect_tuned_tcp_any(&[ip], deadline)
+            .await
+            .map_err(Into::into);
+    }
+    let resolve = async {
+        // Only configured camouflage hosts enter this small cache. Holding the
+        // async lock through resolution coalesces even failed concurrent lookups.
+        let mut cache = CACHE.get_or_init(Default::default).lock().await;
+        cache.retain(|_, (until, _)| *until > Instant::now());
+        if !cache.contains_key(addr) {
+            let resolved = crate::transport::tcp::resolve_tcp_host(addr)
+                .await
+                .map_err(|err| err.kind());
+            let ttl = if resolved.is_ok() { 60 } else { 5 };
+            if cache.len() >= 64 {
+                cache.clear();
+            }
+            cache.insert(
+                addr.to_owned(),
+                (Instant::now() + Duration::from_secs(ttl), resolved),
+            );
+        }
+        cache
+            .get(addr)
+            .expect("cached lookup")
+            .1
+            .clone()
+            .map_err(|kind| io::Error::new(kind, "camouflage origin resolution failed"))
+    };
+    let addresses = timeout_at(deadline, resolve)
+        .await
+        .map_err(|_| HandshakeServerError::Timeout)??;
+    connect_tuned_tcp_any(&addresses, deadline)
+        .await
+        .map_err(Into::into)
 }
 
 async fn connect_future_with_timeout<F>(
@@ -2415,17 +2586,66 @@ where
         .map_err(HandshakeServerError::Io)
 }
 
+/// Tracks framing without buffering or re-segmenting the origin byte pump.
+#[derive(Default)]
+struct PrePqOriginBoundary {
+    header: [u8; TLS_HEADER_LEN],
+    header_pos: usize,
+    payload_remaining: usize,
+}
+
+impl PrePqOriginBoundary {
+    fn pending_bytes(&self) -> usize {
+        if self.payload_remaining > 0 {
+            self.payload_remaining
+        } else if self.header_pos > 0 {
+            TLS_HEADER_LEN - self.header_pos
+        } else {
+            0
+        }
+    }
+
+    fn advance(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            if self.payload_remaining > 0 {
+                let consumed = self.payload_remaining.min(bytes.len());
+                self.payload_remaining -= consumed;
+                bytes = &bytes[consumed..];
+                if self.payload_remaining == 0 {
+                    self.header_pos = 0;
+                }
+            } else {
+                let consumed = (TLS_HEADER_LEN - self.header_pos).min(bytes.len());
+                self.header[self.header_pos..self.header_pos + consumed]
+                    .copy_from_slice(&bytes[..consumed]);
+                self.header_pos += consumed;
+                bytes = &bytes[consumed..];
+                if self.header_pos == TLS_HEADER_LEN {
+                    self.payload_remaining = parse_header(&self.header)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                        .payload_len;
+                    if self.payload_remaining == 0 {
+                        self.header_pos = 0;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_authenticated_data_mode(
     mut handshake: AuthenticatedHandshake,
     fixed_data_target: Option<&str>,
+    nat64_prefixes: &[Nat64Prefix],
     identity_secret_key: Arc<crate::process_hardening::MaskedSecret>,
     sandwich_secret: &[u8],
     traffic: TrafficConfig,
     udp: &UdpConfig,
     mut pending_replay: Option<PendingReplayEntry>,
     cid: u64,
-    admission: Option<&Arc<OwnedSemaphorePermit>>,
+    mut admission: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<(), HandshakeServerError> {
     handshake.session_keys.protect_secret_memory();
     let padding = PaddingProfile::from_config(traffic)?;
@@ -2470,6 +2690,7 @@ async fn run_authenticated_data_mode(
     let mut client_camouflage_records_before_pq = 0usize;
     let mut client_camouflage_bytes_before_pq = 0usize;
     let mut fallback_bytes_before_pq = 0usize;
+    let mut origin_boundary = PrePqOriginBoundary::default();
     // The camouflage origin can finish its side (TLS `close_notify` + FIN) before
     // the authenticated client's PX1Q reaches us — a real origin closes a
     // completed HTTP/2 GET whenever it likes, and on a high-RTT link the client's
@@ -2531,6 +2752,25 @@ async fn run_authenticated_data_mode(
             read = client_records.read_record_into(&mut client_record) => {
                 match read {
                     Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                        let (client_buffer, mut pending) = client_records.into_pending_parts();
+                        pending.extend_from_slice(client_buffer.buffer());
+                        let client = client_buffer.into_inner().reunite(client_write)
+                            .expect("paired client halves");
+                        let (fallback_buffer, mut reply) = fallback_records.into_pending_parts();
+                        reply.extend_from_slice(fallback_buffer.buffer());
+                        let mut client = client;
+                        if !reply.is_empty() {
+                            write_all_with_handshake_timeout(&mut client, &reply).await?;
+                        }
+                        let fallback = fallback_buffer.into_inner().reunite(fallback_write)
+                            .expect("paired origin halves");
+                        // The provisional replay reservation also owns admission.
+                        // Release it before transferring to the fallback pool.
+                        drop(pending_replay.take());
+                        return relay_admitted_fallback(client, "", pending,
+                            Some(PredialedOrigin::Ready(fallback)), &mut admission).await;
+                    }
                     Err(err) if is_clean_close(&err) => return Ok(()),
                     Err(err) => return Err(HandshakeServerError::Io(err)),
                 };
@@ -2614,6 +2854,38 @@ async fn run_authenticated_data_mode(
                                 &mut fallback_write,
                             )
                             .await;
+                            return Ok(());
+                        }
+                        // PX1K is a new TLS record: first finish only the record
+                        // whose prefix the raw origin pump already forwarded.
+                        // The reserved headroom keeps this inside the unchanged
+                        // client/server camouflage byte ceiling.
+                        let finish_origin_record = async {
+                            while origin_boundary.pending_bytes() > 0 {
+                                let needed = origin_boundary.pending_bytes();
+                                if needed > PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT.saturating_sub(fallback_bytes_before_pq) {
+                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                        "camouflage byte budget exhausted inside origin record"));
+                                }
+                                let n = timeout_at(pre_pq_deadline,
+                                    fallback_records.get_mut().read(&mut fallback_relay_buf[..needed]))
+                                    .await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
+                                        "pre-PQ origin record completion timed out"))??;
+                                if n == 0 {
+                                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                                        "origin closed inside a camouflage record"));
+                                }
+                                origin_boundary.advance(&fallback_relay_buf[..n])?;
+                                timeout_at(pre_pq_deadline, client_write.write_all(&fallback_relay_buf[..n]))
+                                    .await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
+                                        "pre-PQ origin record forward timed out"))??;
+                                fallback_bytes_before_pq += n;
+                            }
+                            Ok::<(), io::Error>(())
+                        }.await;
+                        if let Err(err) = finish_origin_record {
+                            tracing::debug!(cid, error = %err, "incomplete origin record at PQ cutover; graceful teardown");
+                            graceful_close_pre_pq(client_records, client_write, fallback_records, fallback_write).await;
                             return Ok(());
                         }
                         let server_ephemeral = X25519KeyPair::generate();
@@ -2742,14 +3014,15 @@ async fn run_authenticated_data_mode(
                         )
                         .await?;
 
-                        drop(fallback_write);
+                        let origin = fallback_records.into_inner().into_inner()
+                            .reunite(fallback_write).expect("paired origin halves");
+                        drop(release_predialed_origin(PredialedOrigin::Ready(origin), admission.clone()));
                         // Release the fallback read half too: it owns the
                         // fallback origin's read-side fd, which is no longer
                         // needed once the client has switched to ParallaX data
                         // mode. Without this, the fd lingers for the entire
                         // proxied session (one extra fd per authenticated relay,
                         // beyond the 2 the connection limit budgets).
-                        drop(fallback_records);
                         // Bound the wait for the first data-mode record. Without a
                         // deadline, an authenticated client that completes the PQ
                         // rekey but never sends a CONNECT/data record pins this
@@ -3193,8 +3466,9 @@ async fn run_authenticated_data_mode(
                                             session_keys: &handshake.session_keys,
                                             traffic,
                                             fixed_data_target,
+                                            nat64_prefixes,
                                             cid,
-                                            admission,
+                                            admission: admission.as_ref(),
                                         },
                                         fallback_idle_timeout(),
                                     )
@@ -3217,6 +3491,7 @@ async fn run_authenticated_data_mode(
                                 first_frames,
                                 ServerMuxContext {
                                     fixed_data_target,
+                                    nat64_prefixes,
                                     timing,
                                     cover,
                                     chunk_size: max_plaintext_len(traffic.max_padding),
@@ -3225,7 +3500,7 @@ async fn run_authenticated_data_mode(
                                     // value can't inflate per-connection fd usage.
                                     max_streams: (traffic.max_concurrent_streams as usize)
                                         .min(SERVER_MUX_MAX_STREAMS),
-                                    admission,
+                                    admission: admission.as_ref(),
                                     cid,
                                     target_write_timeout: MUX_TARGET_WRITE_TIMEOUT,
                                     idle_timeout: fallback_idle_timeout(),
@@ -3238,7 +3513,7 @@ async fn run_authenticated_data_mode(
                         let (target_addr, target_source, initial_payload) =
                             resolve_connect_target(first_payload, fixed_data_target)?;
                         let mut target =
-                            connect_outbound_target(&target_addr, target_source).await?;
+                            connect_outbound_target(&target_addr, target_source, nat64_prefixes).await?;
                         tune_tcp_stream(&target)?;
                         if !initial_payload.is_empty() {
                             target.write_all(initial_payload).await?;
@@ -3363,15 +3638,15 @@ async fn run_authenticated_data_mode(
             // any already-buffered bytes first, so nothing the record path left
             // behind is lost (we never read records off this half again in pre-PQ).
             // The cap is byte-oriented to match (see PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT),
-            // and each read is capped at the remaining budget so the forward can never
-            // overshoot the client's equal residual byte budget mid-read.
+            // leaving one maximum-record reserve inside the shared ceiling so a
+            // record already started can finish before PX1K replaces the origin.
             read = fallback_records.get_mut().read({
-                let remaining = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
+                let remaining = PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT
                     .saturating_sub(fallback_bytes_before_pq)
                     .min(fallback_relay_buf.len());
                 &mut fallback_relay_buf[..remaining]
             }),
-                if fallback_open && fallback_bytes_before_pq < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT => {
+                if fallback_open && fallback_bytes_before_pq < PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT => {
                 let n = match read {
                     // Origin half-closed (FIN) or reset before PX1Q arrived. This is
                     // expected camouflage debris, not a failure: a real origin closes
@@ -3414,8 +3689,8 @@ async fn run_authenticated_data_mode(
                         forwarded_bytes = n,
                         "forwarding fallback camouflage bytes before ParallaX PQ rekey"
                     );
-                } else if before < PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
-                    && fallback_bytes_before_pq >= PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT
+                } else if before < PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT
+                    && fallback_bytes_before_pq >= PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT
                 {
                     tracing::warn!(
                         cid,
@@ -3424,6 +3699,7 @@ async fn run_authenticated_data_mode(
                         fallback_bytes_before_pq,
                         client_residual_byte_budget = CLIENT_RESIDUAL_CAMOUFLAGE_BYTE_BUDGET,
                         pre_pq_forward_byte_limit = PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT,
+                        stream_pause_byte_limit = PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT,
                         "pre-PQ fallback camouflage forward byte limit reached; pausing fallback \
                          reads until ParallaX PQ rekey"
                     );
@@ -3431,7 +3707,13 @@ async fn run_authenticated_data_mode(
                 match timeout_at(pre_pq_deadline, client_write.write_all(&fallback_relay_buf[..n]))
                     .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        if let Err(err) = origin_boundary.advance(&fallback_relay_buf[..n]) {
+                            tracing::debug!(cid, error = %err, "invalid origin record before PQ cutover; graceful teardown");
+                            graceful_close_pre_pq(client_records, client_write, fallback_records, fallback_write).await;
+                            return Ok(());
+                        }
+                    }
                     Ok(Err(err)) if is_write_peer_close(&err) => {
                         // The client closed; the fallback origin is still live, so
                         // drain->FIN both halves instead of a bare drop (RST tell),
@@ -3532,6 +3814,7 @@ fn resolve_connect_target<'a>(
 async fn connect_outbound_target(
     target_addr: &str,
     source: TargetSource,
+    nat64_prefixes: &[Nat64Prefix],
 ) -> Result<TcpStream, HandshakeServerError> {
     // Only an operator-fixed destination may reach a private/loopback address; a
     // client-chosen target is always screened against the public-address policy.
@@ -3543,14 +3826,17 @@ async fn connect_outbound_target(
     // substream tasks, so an unbounded `getaddrinfo` toward a blackholed resolver
     // could otherwise pin blocking-pool threads process-wide. The connect itself is
     // already `HANDSHAKE_TIMEOUT`-bounded below.
-    let addrs = timeout(HANDSHAKE_TIMEOUT, resolve_public_target_addrs(target_addr))
-        .await
-        .map_err(|_| {
-            HandshakeServerError::Io(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "target DNS resolve timed out",
-            ))
-        })??;
+    let addrs = timeout(
+        HANDSHAKE_TIMEOUT,
+        resolve_public_target_addrs(target_addr, nat64_prefixes),
+    )
+    .await
+    .map_err(|_| {
+        HandshakeServerError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "target DNS resolve timed out",
+        ))
+    })??;
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     connect_future_with_timeout(
         connect_tuned_tcp_any(addrs.as_slice(), deadline),
@@ -3561,20 +3847,18 @@ async fn connect_outbound_target(
 
 async fn resolve_public_target_addrs(
     target_addr: &str,
+    nat64_prefixes: &[Nat64Prefix],
 ) -> Result<Vec<SocketAddr>, HandshakeServerError> {
     // Map the resolver error to a host-free message too: std's getaddrinfo
     // wrapper does not normally echo the queried host, but the raw error would
     // otherwise be the one decrypted-target path left unscrubbed (this is logged
     // via `error = %err` on the connection-close line).
-    let addrs: Vec<SocketAddr> = lookup_host(target_addr)
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "client-selected target lookup failed",
-            )
-        })?
-        .collect();
+    let addrs = resolve_tcp_host(target_addr).await.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "client-selected target lookup failed",
+        )
+    })?;
     if addrs.is_empty() {
         // No host detail in the message: it is the client's decrypted destination
         // and the connection-close path logs errors via Display.
@@ -3584,20 +3868,33 @@ async fn resolve_public_target_addrs(
         )
         .into());
     }
-    validate_public_target_addrs(&addrs)?;
+    validate_public_target_addrs_with_nat64(&addrs, nat64_prefixes)?;
     Ok(addrs)
 }
 
+#[cfg(test)]
 fn validate_public_target_addrs(addrs: &[SocketAddr]) -> Result<(), HandshakeServerError> {
+    validate_public_target_addrs_with_nat64(addrs, &[])
+}
+
+fn validate_public_target_addrs_with_nat64(
+    addrs: &[SocketAddr],
+    nat64_prefixes: &[Nat64Prefix],
+) -> Result<(), HandshakeServerError> {
     for addr in addrs {
-        if is_denied_outbound_ip(addr.ip()) {
+        if is_denied_outbound_ip_with_nat64(addr.ip(), nat64_prefixes) {
             return Err(HandshakeServerError::OutboundTargetDenied);
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn is_denied_outbound_ip(ip: IpAddr) -> bool {
+    is_denied_outbound_ip_with_nat64(ip, &[])
+}
+
+fn is_denied_outbound_ip_with_nat64(ip: IpAddr, nat64_prefixes: &[Nat64Prefix]) -> bool {
     match ip {
         IpAddr::V4(ip) => is_denied_outbound_ipv4(ip),
         IpAddr::V6(ip) => {
@@ -3605,18 +3902,33 @@ fn is_denied_outbound_ip(ip: IpAddr) -> bool {
             // v4-compatible (::a.b.c.d) embeddings, so an embedded private/special
             // IPv4 is screened by the IPv4 policy. (::1 maps to 0.0.0.1, which the
             // IPv4 policy denies via the octets[0]==0 rule.)
-            if let Some(mapped) = ip.to_ipv4() {
-                return is_denied_outbound_ipv4(mapped);
+            if ip.to_ipv4().is_some_and(is_denied_outbound_ipv4) {
+                return true;
             }
-            ip.is_loopback()
+            if ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || is_ipv6_unique_local(ip)
                 || is_ipv6_unicast_link_local(ip)
+                || (ip.segments()[0] & 0xffc0) == 0xfec0
                 || is_ipv6_documentation(ip)
                 || is_ipv6_teredo(ip)
                 || is_ipv6_6to4(ip)
-                || is_ipv6_nat64(ip)
+            {
+                return true;
+            }
+            let mut explicit_match = false;
+            for prefix in nat64_prefixes {
+                if let Some(embedded) = prefix.embedded_ipv4(ip) {
+                    explicit_match = true;
+                    if is_denied_outbound_ipv4(embedded) {
+                        return true;
+                    }
+                }
+            }
+            // A configured translator determines its embedding layout. Do not
+            // decode the same address again using an implicit aggregate layout.
+            !explicit_match && is_ipv6_nat64(ip)
         }
     }
 }
@@ -3629,6 +3941,7 @@ fn is_denied_outbound_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()
         || ip.is_multicast()
         || ip.is_broadcast()
+        || ip == Ipv4Addr::new(168, 63, 129, 16)
         || octets[0] == 0
         || octets[0] >= 240
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
@@ -3671,6 +3984,10 @@ fn is_ipv6_6to4(ip: Ipv6Addr) -> bool {
 ///
 ///   * RFC 6052 well-known prefix `64:ff9b::/96`, and
 ///   * RFC 8215 local-use prefix `64:ff9b:1::/48`.
+///
+/// These are fallback layout defaults. A configured matching translator prefix
+/// supplies its actual layout; the local-use /48 aggregate alone does not define
+/// the embedded IPv4 location for every more-specific translator.
 ///
 /// For an address in EITHER prefix, the embedded IPv4 is extracted with the
 /// per-prefix-length layout of RFC 6052 §2.2 and re-screened through
@@ -3753,6 +4070,7 @@ async fn sign_server_identity_blocking(
 async fn insert_replay_entry_blocking(
     replay_cache: Arc<Mutex<ReplayCache>>,
     entry: ReplayEntry,
+    source: Option<IpAddr>,
 ) -> Result<bool, HandshakeServerError> {
     let outcome = tokio::task::spawn_blocking(move || {
         let now = current_unix_timestamp()?;
@@ -3760,10 +4078,13 @@ async fn insert_replay_entry_blocking(
         // panic while holding the cache lock must not take down every subsequent
         // authenticated handshake. The cache invariants are restored on each
         // insert, so proceeding on the recovered guard is safe.
-        replay_cache
+        let mut cache = replay_cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert_new_outcome(entry, now)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match source {
+            Some(source) => cache.insert_new_outcome_for_source(entry, now, source),
+            None => cache.insert_new_outcome(entry, now),
+        }
     })
     .await??;
     Ok(match outcome {
@@ -3793,7 +4114,12 @@ async fn commit_pending_replay_entry(
     let Some(pending) = pending_replay.take() else {
         return Ok(false);
     };
-    insert_replay_entry_blocking(pending.cache, pending.entry).await
+    insert_replay_entry_blocking(
+        Arc::clone(&pending.cache),
+        pending.entry.clone(),
+        pending.source,
+    )
+    .await
 }
 
 fn apply_server_pq_rekey(
@@ -4240,6 +4566,7 @@ const QUIC_RELAY_DONE_BACKSTOP: Duration = Duration::from_secs(120);
 #[derive(Clone, Copy)]
 struct ServerMuxContext<'a> {
     fixed_data_target: Option<&'a str>,
+    nat64_prefixes: &'a [Nat64Prefix],
     timing: TimingProfile,
     cover: CoverTrafficProfile,
     chunk_size: usize,
@@ -4339,7 +4666,7 @@ enum DownlinkControl {
     /// Discard everything still queued for this substream (client Reset, or shed).
     Purge(u32),
     /// A frame for a substream that has no queue: a refused Open, or the Reset that
-    /// follows a shed. Written ahead of substream data.
+    /// follows a shed. Scheduled alongside substream data.
     Frame(MuxFrame),
 }
 
@@ -4521,8 +4848,9 @@ struct ServerMuxScheduler {
     wake: Arc<Notify>,
     /// Substream queues in service order; the front is served next.
     queues: VecDeque<(u32, mpsc::Receiver<MuxFrame>)>,
-    /// Frames for queue-less substreams, written before substream data.
+    /// Frames for queue-less substreams, interleaved with substream data.
     unqueued: VecDeque<MuxFrame>,
+    prefer_unqueued: bool,
 }
 
 impl ServerMuxScheduler {
@@ -4544,7 +4872,13 @@ impl ServerMuxScheduler {
     }
 
     fn drain_control(&mut self) {
-        while self.control_open {
+        let mut remaining = SERVER_MUX_CONTROL_CHANNEL;
+        while self.control_open
+            && remaining > 0
+            && self.unqueued.len() < SERVER_MUX_FRAME_BATCH_LIMIT
+            && self.queues.len() < SERVER_MUX_DOWNLINK_FRAMES
+        {
+            remaining -= 1;
             match self.control.try_recv() {
                 Ok(control) => self.apply(control),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -4553,36 +4887,41 @@ impl ServerMuxScheduler {
         }
     }
 
-    /// Moves up to `max_frames` frames (stopping once `max_bytes` of payload is
-    /// reached) into `batch`: queue-less frames first, then ONE frame per
-    /// substream per turn, round-robin, resuming where the previous batch
-    /// stopped. Drained queues whose substream is gone are dropped.
+    /// Alternates queue-less controls with round-robin substream service so
+    /// refused Opens cannot starve data or collection of finished queues.
     fn fill(&mut self, batch: &mut Vec<MuxFrame>, max_frames: usize, max_bytes: usize) {
+        self.queues
+            .retain(|(_, queue)| !queue.is_closed() || !queue.is_empty());
         let mut bytes = 0;
         while batch.len() < max_frames && bytes < max_bytes {
-            let Some(frame) = self.unqueued.pop_front() else {
+            let frame = if self.prefer_unqueued {
+                self.unqueued.pop_front().or_else(|| self.next_queued())
+            } else {
+                self.next_queued().or_else(|| self.unqueued.pop_front())
+            };
+            let Some(frame) = frame else {
                 break;
             };
+            self.prefer_unqueued = !self.prefer_unqueued;
             bytes += frame.payload.len();
             batch.push(frame);
         }
-        // Stop after a full pass over the queues yields nothing.
-        let mut idle_turns = 0;
-        while batch.len() < max_frames && bytes < max_bytes && idle_turns < self.queues.len() {
-            let Some((stream_id, mut queue)) = self.queues.pop_front() else {
-                break;
-            };
+    }
+
+    fn next_queued(&mut self) -> Option<MuxFrame> {
+        for _ in 0..self.queues.len() {
+            let (stream_id, mut queue) = self.queues.pop_front()?;
             match queue.try_recv() {
                 Ok(frame) => {
-                    idle_turns = 0;
-                    bytes += frame.payload.len();
-                    batch.push(frame);
+                    self.queues.push_back((stream_id, queue));
+                    return Some(frame);
                 }
-                Err(mpsc::error::TryRecvError::Empty) => idle_turns += 1,
+                Err(mpsc::error::TryRecvError::Empty) => {}
                 Err(mpsc::error::TryRecvError::Disconnected) => continue,
             }
             self.queues.push_back((stream_id, queue));
         }
+        None
     }
 
     /// The reader is gone and everything it and the substreams queued is written.
@@ -4612,6 +4951,7 @@ fn server_mux_downlink(max_streams: usize) -> (ServerMuxDownlink, ServerMuxSched
             wake,
             queues: VecDeque::new(),
             unqueued: VecDeque::new(),
+            prefer_unqueued: true,
         },
     )
 }
@@ -4620,6 +4960,7 @@ fn server_mux_downlink(max_streams: usize) -> (ServerMuxDownlink, ServerMuxSched
 /// task, which outlives the borrowed reader-loop context.
 struct ServerMuxStreamContext {
     fixed_data_target: Option<String>,
+    nat64_prefixes: Vec<Nat64Prefix>,
     timing: TimingProfile,
     chunk_size: usize,
     cid: u64,
@@ -4666,18 +5007,19 @@ async fn server_mux_upstream_task(
         drop(connect_payload);
         crate::process_hardening::exclude_from_core_dump("mux.upstream.initial_payload", &initial);
 
-        let mut target = match connect_outbound_target(&target_addr, target_source).await {
-            Ok(target) => target,
-            Err(_) => {
-                tracing::debug!(
-                    cid = ctx.cid,
-                    stream_id,
-                    "mux outbound connect failed; resetting stream"
-                );
-                let _ = downlink.reset().await;
-                return;
-            }
-        };
+        let mut target =
+            match connect_outbound_target(&target_addr, target_source, &ctx.nat64_prefixes).await {
+                Ok(target) => target,
+                Err(_) => {
+                    tracing::debug!(
+                        cid = ctx.cid,
+                        stream_id,
+                        "mux outbound connect failed; resetting stream"
+                    );
+                    let _ = downlink.reset().await;
+                    return;
+                }
+            };
         if tune_tcp_stream(&target).is_err() {
             tracing::debug!(
                 cid = ctx.cid,
@@ -5062,7 +5404,7 @@ async fn server_exchange_quic_done(
     // Seal our DONE on the server->client (send) codec -- its next sequence
     // number -- and write it over the reliable TCP control stream.
     let mut rng = StdRng::from_entropy();
-    let done = server_seal.seal(QUIC_RELAY_DONE_MARKER, &mut rng)?;
+    let done = seal_control_frame_band_shaped(server_seal, QUIC_RELAY_DONE_MARKER, &mut rng)?;
     // Bound the DONE write+flush with the same backstop as the DONE read below: a
     // peer that completes its data directions but then stops reading the TCP
     // control stream must not pin the slot/fds/permits forever.
@@ -5219,6 +5561,7 @@ struct ServerMuxQuicContext<'a> {
     session_keys: &'a crate::crypto::session::SessionKeys,
     traffic: TrafficConfig,
     fixed_data_target: Option<&'a str>,
+    nat64_prefixes: &'a [Nat64Prefix],
     cid: u64,
     admission: Option<&'a Arc<OwnedSemaphorePermit>>,
 }
@@ -5346,6 +5689,7 @@ async fn run_authenticated_mux_quic_data_mode(
             };
         let traffic = context.traffic;
         let fixed_data_target = context.fixed_data_target.map(str::to_owned);
+        let nat64_prefixes = context.nat64_prefixes.to_vec();
         let cid = context.cid;
         let substream_conn = conn.clone();
         let admission = context.admission.cloned();
@@ -5360,6 +5704,7 @@ async fn run_authenticated_mux_quic_data_mode(
                 server_seal,
                 traffic,
                 fixed_data_target.as_deref(),
+                &nat64_prefixes,
                 cid,
                 stream_id,
             )
@@ -5384,6 +5729,7 @@ async fn serve_mux_quic_substream(
     server_seal: DataRecordCodec,
     traffic: TrafficConfig,
     fixed_data_target: Option<&str>,
+    nat64_prefixes: &[Nat64Prefix],
     cid: u64,
     stream_id: u64,
 ) -> Result<(), HandshakeServerError> {
@@ -5400,6 +5746,7 @@ async fn serve_mux_quic_substream(
         server_seal,
         traffic,
         fixed_data_target,
+        nat64_prefixes,
         cid,
         stream_id,
     )
@@ -5424,6 +5771,7 @@ async fn serve_mux_quic_substream_inner(
     server_seal: DataRecordCodec,
     traffic: TrafficConfig,
     fixed_data_target: Option<&str>,
+    nat64_prefixes: &[Nat64Prefix],
     cid: u64,
     stream_id: u64,
 ) -> Result<bool, HandshakeServerError> {
@@ -5477,7 +5825,7 @@ async fn serve_mux_quic_substream_inner(
     let first_range = client_open.open_in_place_payload_range(&mut first_record)?;
     let (target_addr, target_source, initial_payload) =
         resolve_connect_target(&mut first_record[first_range], fixed_data_target)?;
-    let mut target = connect_outbound_target(&target_addr, target_source).await?;
+    let mut target = connect_outbound_target(&target_addr, target_source, nat64_prefixes).await?;
     tune_tcp_stream(&target)?;
     if !initial_payload.is_empty() {
         target.write_all(initial_payload).await?;
@@ -5731,6 +6079,7 @@ async fn process_server_mux_frame(
                 mpsc::channel::<Zeroizing<Vec<u8>>>(SERVER_MUX_UPLOAD_CHANNEL);
             let stream_ctx = ServerMuxStreamContext {
                 fixed_data_target: context.fixed_data_target.map(str::to_owned),
+                nat64_prefixes: context.nat64_prefixes.to_vec(),
                 timing: context.timing,
                 chunk_size: context.chunk_size,
                 cid: context.cid,
@@ -7026,15 +7375,21 @@ where
     Writer: LegWriter,
     R: Rng + rand::RngCore + ?Sized,
 {
+    let phase_deadline = Instant::now()
+        + UPLOAD_RATE_GRACE
+        + Duration::from_secs(bytes.div_ceil(MIN_UPLOAD_BYTES_PER_SEC));
     let mut remaining = bytes;
     while remaining > 0 {
+        if Instant::now() >= phase_deadline {
+            return Err(HandshakeServerError::Timeout);
+        }
         let len = remaining.min(payload.len() as u64) as usize;
         // Stall backstop (M-8): a client that advertises a zero receive window and
         // stops draining would otherwise block this write forever, pinning the
         // slot, both fds, and the per-source/global permits. Mirrors the upload
         // phase's per-read idle timeout; reclaims the connection after `idle`.
         timeout(
-            idle,
+            idle.min(phase_deadline.saturating_duration_since(Instant::now())),
             write_server_data_records_chunked(
                 io.client_write,
                 io.server_seal,
@@ -7048,12 +7403,15 @@ where
         .map_err(|_| HandshakeServerError::Timeout)??;
         remaining -= len as u64;
     }
+    if Instant::now() >= phase_deadline {
+        return Err(HandshakeServerError::Timeout);
+    }
     let ack = ack.encode();
     // C6: band-shape the PX1*-done ack onto a CONNECT size band (reuses C3
     // shaping) instead of a tiny fixed control record. Keep the same idle stall
     // backstop the bulk download writes use.
     timeout(
-        idle,
+        idle.min(phase_deadline.saturating_duration_since(Instant::now())),
         write_server_control_frame_band_shaped(io.client_write, io.server_seal, &ack, io.rng),
     )
     .await
@@ -7155,7 +7513,12 @@ where
 
     let ack = ack.encode();
     // C6: band-shape the PX1*-done ack onto a CONNECT size band (reuses C3 shaping).
-    write_server_control_frame_band_shaped(io.client_write, io.server_seal, &ack, io.rng).await
+    timeout(
+        idle,
+        write_server_control_frame_band_shaped(io.client_write, io.server_seal, &ack, io.rng),
+    )
+    .await
+    .map_err(|_| HandshakeServerError::Timeout)?
 }
 
 /// Drains the client->server direction to the target. Returns the owned
@@ -7804,6 +8167,95 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+
+    #[tokio::test]
+    async fn fragmented_server_hello_preserves_forwarded_wire_bytes() {
+        let record = crate::tls::server_hello::tests::server_hello_fixture();
+        let wire =
+            crate::tls::server_hello::tests::fragment_handshake_record(&record, &[1, 3, 40, 55]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (reader, writer) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut reader = reader.unwrap();
+        let mut writer = writer.unwrap().0;
+        writer.write_all(&wire).await.unwrap();
+        drop(writer);
+        let forwarded = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink())
+            .await
+            .unwrap();
+        assert_eq!(forwarded.raw_record, wire);
+        assert_eq!(forwarded.parsed.random, [0x44; 32]);
+        assert!(forwarded.parsed.tls13_selected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fragmented_server_hello_uses_one_whole_handshake_deadline() {
+        let record = crate::tls::server_hello::tests::server_hello_fixture();
+        let wire = crate::tls::server_hello::tests::fragment_handshake_record(&record, &[2, 3]);
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&wire[..TLS_HEADER_LEN + 2]).await.unwrap();
+        let started = Instant::now();
+        let reading = tokio::spawn(async move {
+            read_forwarded_server_hello(&mut reader, &mut tokio::io::sink()).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(HANDSHAKE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!reading.is_finished());
+        writer
+            .write_all(&wire[TLS_HEADER_LEN + 2..2 * TLS_HEADER_LEN + 3])
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            reading.await.unwrap(),
+            Err(HandshakeServerError::Timeout)
+        ));
+        assert_eq!(Instant::now() - started, HANDSHAKE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn tls13_forwarder_rejects_coalesced_handshake_tail() {
+        let mut record = crate::tls::server_hello::tests::server_hello_fixture();
+        record.extend_from_slice(&[11, 0, 0, 0]);
+        let payload_len = (record.len() - TLS_HEADER_LEN) as u16;
+        record[3..5].copy_from_slice(&payload_len.to_be_bytes());
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(&record).await.unwrap();
+        let result = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink()).await;
+        assert!(matches!(
+            result,
+            Err(HandshakeServerError::ServerHello(
+                ServerHelloError::InvalidLength
+            ))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prefix_ccs_forwarding_write_uses_the_whole_handshake_deadline() {
+        let mut wire = crate::tls::record::change_cipher_spec();
+        wire.extend_from_slice(&server_hello_fixture());
+        let (mut origin, mut fallback) = tokio::io::duplex(1024);
+        origin.write_all(&wire).await.unwrap();
+        // One byte of capacity forces forwarding the six-byte CCS to block.
+        let (mut client_write, mut client_read) = tokio::io::duplex(1);
+        let started = Instant::now();
+        let reading = tokio::spawn(async move {
+            read_forwarded_server_hello(&mut fallback, &mut client_write).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(HANDSHAKE_TIMEOUT).await;
+        assert!(matches!(
+            reading.await.unwrap(),
+            Err(HandshakeServerError::Timeout)
+        ));
+        assert_eq!(Instant::now() - started, HANDSHAKE_TIMEOUT);
+        let mut first_byte = [0];
+        client_read.read_exact(&mut first_byte).await.unwrap();
+        assert_eq!(first_byte, [0x14]);
+    }
 
     #[derive(Default)]
     struct MuxRecordTestWriter {
@@ -8832,59 +9284,452 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_client_record_timeout_enters_fallback_without_close() {
-        let (_client, mut server_side) = tokio::io::duplex(8);
-
-        let read =
-            read_first_client_record_with_timeout(&mut server_side, Duration::from_millis(1))
-                .await
-                .unwrap();
-
-        assert_eq!(read, FirstClientRead::FallbackPrefix(Vec::new()));
-    }
-
-    #[tokio::test]
-    async fn first_client_record_invalid_header_preserves_probe_prefix() {
-        let (mut client, mut server_side) = tokio::io::duplex(8);
-        client
-            .write_all(&[0x16, 0x03, 0x03, 0xff, 0xff])
+    async fn first_client_record_streams_partial_prefix_and_origin_fin() {
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback = origin_listener.local_addr().unwrap().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
-
-        let read =
-            read_first_client_record_with_timeout(&mut server_side, Duration::from_millis(50))
+        let (mut server, _) = listener.accept().await.unwrap();
+        let inspector = tokio::spawn(async move {
+            read_first_client_record_predialing(&mut server, &fallback)
                 .await
-                .unwrap();
-
+                .unwrap()
+        });
+        let prefix = [0x16, 3, 3, 0, 64, 1];
+        peer.write_all(&prefix).await.unwrap();
+        let (mut origin, _) = timeout(Duration::from_secs(1), origin_listener.accept())
+            .await
+            .expect("partial record must dial without the 8s assembly wait")
+            .unwrap();
+        let mut received = [0; 6];
+        timeout(Duration::from_secs(1), origin.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, prefix);
+        origin.shutdown().await.unwrap();
+        let outcome = timeout(Duration::from_secs(1), inspector)
+            .await
+            .expect("origin EOF must end inspection immediately")
+            .unwrap();
         assert_eq!(
-            read,
-            FirstClientRead::FallbackPrefix(vec![0x16, 0x03, 0x03, 0xff, 0xff])
+            outcome.read,
+            FirstClientRead::FallbackPrefix(prefix.to_vec())
         );
     }
 
     #[tokio::test]
-    async fn first_client_record_timeout_is_total_not_per_read() {
-        let (mut client, mut server_side) = tokio::io::duplex(8);
-        client.write_all(&[0x16]).await.unwrap();
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(30)).await;
-            let _ = client.write_all(&[0x03]).await;
-            sleep(Duration::from_millis(30)).await;
-            let _ = client.write_all(&[0x03]).await;
+    async fn slow_complete_hello_reuses_streamed_origin_without_duplicate_bytes() {
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback = origin_listener.local_addr().unwrap().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let read_fallback = fallback.clone();
+        let inspector = tokio::spawn(async move {
+            read_first_client_record_predialing(&mut server, &read_fallback)
+                .await
+                .unwrap()
         });
-
-        let started = Instant::now();
-        let read =
-            read_first_client_record_with_timeout(&mut server_side, Duration::from_millis(50))
+        let hello = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        peer.write_all(&hello[..6]).await.unwrap();
+        let (mut origin, _) = timeout(Duration::from_secs(1), origin_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut prefix = [0; 6];
+        origin.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(prefix, hello[..6]);
+        peer.write_all(&hello[6..]).await.unwrap();
+        let outcome = inspector.await.unwrap();
+        assert_eq!(outcome.read, FirstClientRead::Record(hello.clone()));
+        let mut origin_connection =
+            forward_first_record_to_origin(&fallback, &hello, outcome.predialed_origin)
                 .await
                 .unwrap();
+        let mut tail = vec![0; hello.len() - 6];
+        origin.read_exact(&mut tail).await.unwrap();
+        assert_eq!(tail, hello[6..]);
+        let mut extra = [0];
+        assert!(
+            timeout(Duration::from_millis(20), origin.read(&mut extra))
+                .await
+                .is_err(),
+            "prefix must be forwarded exactly once"
+        );
+        origin_connection.shutdown().await.unwrap();
+    }
 
-        let FirstClientRead::FallbackPrefix(prefix) = read else {
-            panic!("slow first record should fall back");
+    #[tokio::test]
+    #[ignore = "requires loopback sockets and the process-global fallback budget; run serially"]
+    async fn fallback_transfer_releases_authenticated_admission_while_relay_is_live() {
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback = origin_listener.local_addr().unwrap().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let admissions = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
+        let relay = tokio::spawn(async move {
+            relay_admitted_fallback(server, &fallback, Vec::new(), None, &mut Some(admission))
+                .await
+                .unwrap();
+        });
+        let (origin, _) = timeout(Duration::from_secs(1), origin_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admissions.available_permits(), 1);
+        assert!(!relay.is_finished());
+        drop(peer);
+        drop(origin);
+        timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback sockets and the process-global fallback budget; run serially"]
+    async fn malformed_pre_pq_fallback_releases_replay_and_authenticated_admission() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (client, _) = listener.accept().await.unwrap();
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback = TcpStream::connect(origin_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut origin, _) = origin_listener.accept().await.unwrap();
+        let admissions = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
+        let cache = Arc::new(Mutex::new(ReplayCache::new(8)));
+        let now = current_unix_timestamp().unwrap();
+        let entry = ReplayEntry {
+            timestamp: now,
+            nonce: [7; 8],
+            transcript_fingerprint: [8; 32],
         };
-        assert!(!prefix.is_empty());
-        assert!(prefix.len() < TLS_HEADER_LEN);
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(cache.lock().unwrap().reserve_pending(&entry, now));
+        let pending = PendingReplayEntry {
+            cache: Arc::clone(&cache),
+            entry: entry.clone(),
+            source: None,
+            reserved: true,
+            admission: Some(Arc::clone(&admission)),
+        };
+        let handshake = AuthenticatedHandshake {
+            client,
+            fallback,
+            client_hello: AuthenticatedHello {
+                sni: "example.com".into(),
+                x25519_key_share: [2; 32],
+                timestamp: now,
+                nonce: entry.nonce,
+                transcript_fingerprint: entry.transcript_fingerprint,
+            },
+            server_hello: ServerHello {
+                record_len: 0,
+                random: [0; 32],
+                session_id_range: 0..0,
+                tls13_selected: true,
+            },
+            session_keys: expand_epoch_keys([3; 32], 0, [4; 32], [5; 32]).unwrap(),
+            server_public_key: [6; 32],
+        };
+        let relay = tokio::spawn(async move {
+            run_authenticated_data_mode(
+                handshake,
+                None,
+                &[],
+                Arc::new(crate::process_hardening::MaskedSecret::new(&[1; 32])),
+                PSK,
+                TrafficConfig::default(),
+                &UdpConfig::default(),
+                Some(pending),
+                1,
+                Some(admission),
+            )
+            .await
+            .unwrap();
+        });
+        let malformed = [0x17, 3, 3, 0xff, 0xff, 1, 2, 3];
+        peer.write_all(&malformed).await.unwrap();
+        let mut received = [0; 8];
+        timeout(Duration::from_secs(1), origin.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, malformed);
+        assert_eq!(
+            admissions.available_permits(),
+            1,
+            "provisional replay receipt must not retain authenticated admission during fallback"
+        );
+        assert!(!relay.is_finished());
+        assert!(
+            cache.lock().unwrap().reserve_pending(&entry, now),
+            "the provisional replay reservation must also release"
+        );
+        cache
+            .lock()
+            .unwrap()
+            .release_pending(&entry.transcript_fingerprint);
+        let alert = [0x15, 3, 3, 0, 2, 2, 50];
+        origin.write_all(&alert).await.unwrap();
+        let mut reply = [0; 7];
+        timeout(Duration::from_secs(1), peer.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, alert);
+        drop(peer);
+        drop(origin);
+        timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_pq_cutover_finishes_fragmented_origin_record_before_px1k() {
+        for (prefix_len, payload_len, truncate) in [
+            (2, 64, false),
+            (TLS_HEADER_LEN + 7, 64, false),
+            (TLS_HEADER_LEN + 64, 64, false),
+            (
+                PRE_PQ_FALLBACK_STREAM_BYTE_LIMIT,
+                crate::tls::record::MAX_TLS_RECORD_PAYLOAD + 256,
+                false,
+            ),
+            (TLS_HEADER_LEN + 7, 64, true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (client, _) = listener.accept().await.unwrap();
+            let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fallback = TcpStream::connect(origin_listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut origin, _) = origin_listener.accept().await.unwrap();
+            let cache = Arc::new(Mutex::new(ReplayCache::new(8)));
+            let admissions = Arc::new(Semaphore::new(1));
+            let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
+            let entry = ReplayEntry {
+                timestamp: current_unix_timestamp().unwrap(),
+                nonce: [17; 8],
+                transcript_fingerprint: [18; 32],
+            };
+            let keys = expand_epoch_keys([3; 32], 0, [4; 32], [5; 32]).unwrap();
+            let traffic = TrafficConfig::default();
+            let mut data_session = ClientDataSession::new(keys.clone(), traffic).unwrap();
+            let identity_keys = identity::keypair();
+            let identity_secret = Arc::new(crate::process_hardening::MaskedSecret::new(
+                &identity_keys.secret,
+            ));
+            let handshake = AuthenticatedHandshake {
+                client,
+                fallback,
+                client_hello: AuthenticatedHello {
+                    sni: "example.com".into(),
+                    x25519_key_share: [2; 32],
+                    timestamp: entry.timestamp,
+                    nonce: entry.nonce,
+                    transcript_fingerprint: entry.transcript_fingerprint,
+                },
+                server_hello: ServerHello {
+                    record_len: 0,
+                    random: [0; 32],
+                    session_id_range: 0..0,
+                    tls13_selected: true,
+                },
+                session_keys: keys,
+                server_public_key: [6; 32],
+            };
+            let pending = PendingReplayEntry {
+                cache: Arc::clone(&cache),
+                entry: entry.clone(),
+                source: None,
+                reserved: false,
+                admission: Some(Arc::clone(&admission)),
+            };
+            let relay = tokio::spawn(async move {
+                run_authenticated_data_mode(
+                    handshake,
+                    None,
+                    &[],
+                    identity_secret,
+                    PSK,
+                    traffic,
+                    &UdpConfig::default(),
+                    Some(pending),
+                    1,
+                    Some(admission),
+                )
+                .await
+            });
+
+            let mut camouflage_record = vec![0x17, 3, 3];
+            camouflage_record.extend_from_slice(&(payload_len as u16).to_be_bytes());
+            camouflage_record.resize(TLS_HEADER_LEN + payload_len, 0xa5);
+            let camouflage = camouflage_record.repeat(if prefix_len > camouflage_record.len() {
+                64
+            } else {
+                1
+            });
+            let offset = prefix_len % camouflage_record.len();
+            let tail_len = if offset == 0 {
+                0
+            } else {
+                camouflage_record.len() - offset
+            };
+            let boundary = prefix_len + tail_len;
+            assert!(boundary <= PRE_PQ_FALLBACK_FORWARD_BYTE_LIMIT);
+            let mut forwarded = vec![0; prefix_len];
+            let (sent, received) = timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    origin.write_all(&camouflage[..prefix_len]),
+                    peer.read_exact(&mut forwarded)
+                )
+            })
+            .await
+            .unwrap();
+            sent.unwrap();
+            received.unwrap();
+            assert_eq!(forwarded, camouflage[..prefix_len]);
+
+            let (pq_record, pending_rekey) = data_session
+                .build_pq_rekey_record(&mut StdRng::seed_from_u64(91))
+                .unwrap();
+            peer.write_all(&pq_record).await.unwrap();
+            // Replay commit proves the server consumed the complete data proof.
+            // The origin remainder stays unavailable until then, making the cutover
+            // occur inside an already-forwarded TLS record without scheduler races.
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let committed = {
+                        let mut cache = cache.lock().unwrap();
+                        let unseen = cache.reserve_pending(&entry, entry.timestamp);
+                        if unseen {
+                            cache.release_pending(&entry.transcript_fingerprint);
+                        }
+                        !unseen
+                    };
+                    if committed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("server did not consume the valid PX1Q proof");
+            if truncate {
+                origin.shutdown().await.unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    timeout(Duration::from_secs(5), peer.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0,
+                    "truncated origin record must close gracefully without emitting PX1K"
+                );
+                peer.shutdown().await.unwrap();
+                timeout(Duration::from_secs(5), relay)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(admissions.available_permits(), 1);
+                continue;
+            }
+            origin.write_all(&camouflage[prefix_len..]).await.unwrap();
+            let mut remainder = vec![0; tail_len];
+            timeout(Duration::from_secs(5), peer.read_exact(&mut remainder))
+                .await
+                .unwrap()
+                .unwrap();
+            if remainder != camouflage[prefix_len..boundary] {
+                relay.abort();
+                let _ = relay.await;
+                assert_eq!(
+                    remainder,
+                    camouflage[prefix_len..boundary],
+                    "PX1K must not replace the unfinished origin TLS record's payload"
+                );
+                return;
+            }
+            let first_record = timeout(Duration::from_secs(5), read_record(&mut peer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                first_record, camouflage_record,
+                "cutover must not forward the next origin record"
+            );
+            {
+                let mut records = std::io::Cursor::new(first_record).chain(&mut peer);
+                timeout(
+                    Duration::from_secs(5),
+                    crate::client::runtime::apply_server_key_exchange_after_residuals(
+                        &mut records,
+                        &mut data_session,
+                        &pending_rekey,
+                        PSK,
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            let mut proof = Vec::new();
+            loop {
+                let record = timeout(Duration::from_secs(5), read_record(&mut peer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let chunk = data_session.open_server_identity_chunk(&record).unwrap();
+                assert_eq!(chunk.offset as usize, proof.len());
+                proof.extend_from_slice(&chunk.bytes);
+                if proof.len() == chunk.total_len as usize {
+                    break;
+                }
+            }
+            data_session
+                .verify_server_identity_payload(&proof, &identity_keys.public, &[6; 32])
+                .unwrap();
+            origin.shutdown().await.unwrap();
+            drop(origin);
+            relay.abort();
+            let _ = relay.await;
+            timeout(Duration::from_secs(5), async {
+                while admissions.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("origin cleanup must release authenticated admission");
+        }
+    }
+
+    #[test]
+    fn pre_pq_origin_boundary_rejects_oversized_tail_header() {
+        let mut boundary = PrePqOriginBoundary::default();
+        boundary.advance(&[0x17, 3]).unwrap();
+        assert_eq!(boundary.pending_bytes(), 3);
+        assert_eq!(
+            boundary.advance(&[3, 0xff, 0xff]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]
@@ -8898,10 +9743,16 @@ mod tests {
         let mut first = Some(PendingReplayEntry {
             cache: Arc::clone(&cache),
             entry: entry.clone(),
+            source: None,
+            reserved: false,
+            admission: None,
         });
         let mut replayed = Some(PendingReplayEntry {
             cache: Arc::clone(&cache),
             entry,
+            source: None,
+            reserved: false,
+            admission: None,
         });
 
         assert!(commit_pending_replay_entry(&mut first).await.unwrap());
@@ -9521,29 +10372,32 @@ mod tests {
         );
     }
 
-    /// META-TEST (deterministic teeth for the constant-work guard): prove the
-    /// REJECT_DH_OPS counter is NOT vacuously pinned to 3. A genuinely different
-    /// path — an unparseable record short-circuits at `parse_client_hello` before
-    /// any DH — must read a DIFFERENT count (0). Without this, the constant-work
-    /// assertions above could pass against a broken/stuck counter; with it, we
-    /// know the counter discriminates and the `assert_eq!(.., 2)` guards bite.
+    /// Malformed records must spend the same reject budget as parsed hellos.
     #[test]
     #[ignore = "reads the process-global REJECT_DH_OPS counter; run serially"]
-    fn constant_work_counter_is_non_vacuous() {
+    fn constant_work_budget_covers_unparseable_records() {
         let server = X25519KeyPair::generate();
         let unparseable = dh_ops_for(b"this is not a TLS ClientHello", &server.private);
+        let mut tls12 = client_hello_fixture_no_key_share("example.com");
+        let version_ext = tls12
+            .windows(4)
+            .position(|bytes| bytes == [0, 0x2b, 0, 3])
+            .expect("fixture supported_versions extension");
+        tls12[version_ext + 1] = 0x2c;
+        assert!(!parse_client_hello(&tls12).unwrap().tls13_supported);
+        assert_eq!(dh_ops_for(&tls12, &server.private), 2);
         let valid_unauth = dh_ops_for(
             &client_hello_fixture_no_key_share("example.com"),
             &server.private,
         );
-        assert_eq!(unparseable, 0, "an unparseable record performs zero DH ops");
+        assert_eq!(unparseable, 2, "an unparseable record performs two DH ops");
         assert_eq!(
             valid_unauth, 2,
             "a parseable-but-unauthenticated record performs 2 DH ops"
         );
-        assert_ne!(
+        assert_eq!(
             unparseable, valid_unauth,
-            "the counter must discriminate, else the constant-work guards are vacuous"
+            "all rejection shapes must have the same DH work"
         );
     }
 
@@ -10643,12 +11497,17 @@ mod tests {
             "203.0.113.1:80",
             "240.0.0.1:80",
             "169.254.169.254:80",
+            "168.63.129.16:80",
+            "[::ffff:168.63.129.16]:80",
+            "[64:ff9b::a83f:8110]:80",
             "100.64.0.1:80",
             "[::1]:80",
             "[fc00::1]:80",
             "[fd00::1]:80",
             "[fe80::1]:80",
             "[febf::1]:80",
+            "[fec0::1]:80",
+            "[feff:ffff::1]:80",
             "[2001:db8::1]:80",
             "[2001::1]:80",
             "[2002:c000:0201::1]:80",
@@ -10667,12 +11526,123 @@ mod tests {
     fn client_selected_egress_policy_allows_public_addresses() {
         let allowed = [
             "93.184.216.34:443",
+            "168.63.129.15:443",
+            "168.63.129.17:443",
+            "[::ffff:168.63.129.17]:443",
             "[2606:2800:220:1:248:1893:25c8:1946]:443",
         ];
 
         for target in allowed {
             let addr: SocketAddr = target.parse().unwrap();
             validate_public_target_addrs(&[addr]).unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_nat64_prefixes_screen_every_rfc6052_layout() {
+        // Explicit RFC 6052 layouts: private destinations carry public-looking
+        // suffixes, and public destinations carry private-looking suffixes.
+        let cases = [
+            (
+                "2606:4700::/32",
+                "2606:4700:a00:1:0:0:5db8:d822",
+                "2606:4700:5db8:d822:0:0:0:1",
+            ),
+            (
+                "2606:4700:1200::/40",
+                "2606:4700:120a:0:1:0:5db8:d822",
+                "2606:4700:125d:b8d8:22:0:0:1",
+            ),
+            (
+                "2606:4700:1234::/48",
+                "2606:4700:1234:a00:0:100:5db8:d822",
+                "2606:4700:1234:5db8:d8:2200:0:1",
+            ),
+            (
+                "2606:4700:1234:5600::/56",
+                "2606:4700:1234:560a:0:1:5db8:d822",
+                "2606:4700:1234:565d:b8:d822:0:1",
+            ),
+            (
+                "2606:4700:1234:5678::/64",
+                "2606:4700:1234:5678:a:0:100:abcd",
+                "2606:4700:1234:5678:5d:b8d8:2200:1",
+            ),
+            (
+                "2606:4700:1234:5678:9abc:def0::/96",
+                "2606:4700:1234:5678:9abc:def0:a00:1",
+                "2606:4700:1234:5678:9abc:def0:5db8:d822",
+            ),
+            (
+                "64:ff9b:1:fffe::/96",
+                "64:ff9b:1:fffe::a00:1",
+                "64:ff9b:1:fffe::5db8:d822",
+            ),
+        ];
+        for (prefix, private, public) in cases {
+            let prefix: Nat64Prefix = prefix.parse().unwrap();
+            let private: Ipv6Addr = private.parse().unwrap();
+            let public: Ipv6Addr = public.parse().unwrap();
+            assert_eq!(
+                prefix.embedded_ipv4(private),
+                Some(Ipv4Addr::new(10, 0, 0, 1))
+            );
+            assert_eq!(
+                prefix.embedded_ipv4(public),
+                Some(Ipv4Addr::new(93, 184, 216, 34))
+            );
+            let private = SocketAddr::new(IpAddr::V6(private), 443);
+            let public = SocketAddr::new(IpAddr::V6(public), 443);
+            assert!(
+                validate_public_target_addrs_with_nat64(&[public, private], &[prefix]).is_err()
+            );
+            validate_public_target_addrs_with_nat64(&[public], &[prefix]).unwrap();
+            assert_eq!(prefix.embedded_ipv4("2607:4700::1".parse().unwrap()), None);
+        }
+    }
+
+    #[test]
+    fn configured_nat64_prefix_preserves_native_and_embedded_denials() {
+        let prefix: Nat64Prefix = "64:ff9b:1:fffe::/96".parse().unwrap();
+        for denied in [
+            "10.0.0.1:443",
+            "168.63.129.16:443",
+            "[::ffff:10.0.0.1]:443",
+            "[::ffff:168.63.129.16]:443",
+            "[64:ff9b:1:fffe::a9fe:a9fe]:443",
+            "[64:ff9b:1:fffe::a83f:8110]:443",
+        ] {
+            let address = denied.parse().unwrap();
+            assert!(
+                validate_public_target_addrs_with_nat64(&[address], &[prefix]).is_err(),
+                "{denied}"
+            );
+        }
+        // A configured public IPv4 embedding cannot override a native IPv6
+        // exclusion, even when that configured prefix matches exactly.
+        for (prefix, address) in [
+            ("fd00::/96", "fd00::5db8:d822"),
+            ("fe80::/96", "fe80::5db8:d822"),
+            ("fec0::/96", "fec0::5db8:d822"),
+        ] {
+            let prefix: Nat64Prefix = prefix.parse().unwrap();
+            let address = address.parse().unwrap();
+            assert_eq!(
+                prefix.embedded_ipv4(address),
+                Some(Ipv4Addr::new(93, 184, 216, 34))
+            );
+            assert!(validate_public_target_addrs_with_nat64(
+                &[SocketAddr::new(IpAddr::V6(address), 443)],
+                &[prefix]
+            )
+            .is_err());
+        }
+        // All explicit matching layouts retain their denials. Only an implicit
+        // built-in layout yields to the operator's configured interpretation.
+        let broad: Nat64Prefix = "64:ff9b:1::/48".parse().unwrap();
+        let public = "[64:ff9b:1:fffe::5db8:d822]:443".parse().unwrap();
+        for prefixes in [[prefix, broad], [broad, prefix]] {
+            assert!(validate_public_target_addrs_with_nat64(&[public], &prefixes).is_err());
         }
     }
 
@@ -10742,6 +11712,7 @@ mod tests {
         let idle = Duration::from_millis(100);
         let context = ServerMuxContext {
             fixed_data_target: None,
+            nat64_prefixes: &[],
             timing: TimingProfile::from_config(traffic),
             cover: CoverTrafficProfile::from_config(traffic),
             chunk_size: max_plaintext_len(0),
@@ -10854,6 +11825,7 @@ mod tests {
                 stream,
                 ServerMuxStreamContext {
                     fixed_data_target: Some(listener.local_addr().unwrap().to_string()),
+                    nat64_prefixes: vec![],
                     timing: TimingProfile::from_config(traffic),
                     chunk_size: max_plaintext_len(0),
                     cid: 1,
@@ -11133,6 +12105,7 @@ mod tests {
                 stream,
                 ServerMuxStreamContext {
                     fixed_data_target: Some(listener.local_addr().unwrap().to_string()),
+                    nat64_prefixes: vec![],
                     timing: TimingProfile::from_config(traffic),
                     chunk_size: max_plaintext_len(0),
                     cid: 1,
@@ -11194,6 +12167,7 @@ mod tests {
             stream,
             ServerMuxStreamContext {
                 fixed_data_target: Some(target),
+                nat64_prefixes: vec![],
                 timing: TimingProfile::from_config(TrafficConfig::default()),
                 chunk_size: max_plaintext_len(0),
                 cid: 1,
@@ -11292,6 +12266,7 @@ mod tests {
             stream,
             ServerMuxStreamContext {
                 fixed_data_target: Some(listener.local_addr().unwrap().to_string()),
+                nat64_prefixes: vec![],
                 timing: TimingProfile::from_config(traffic),
                 chunk_size: max_plaintext_len(traffic.max_padding),
                 cid: 1,
@@ -11359,6 +12334,7 @@ mod tests {
             stream_downlink,
             ServerMuxStreamContext {
                 fixed_data_target: Some(target_addr),
+                nat64_prefixes: vec![],
                 timing: TimingProfile::from_config(traffic),
                 chunk_size: max_plaintext_len(traffic.max_padding),
                 cid: 1,
@@ -11423,6 +12399,7 @@ mod tests {
         // live outbound target is needed to prove the refusal path.
         let context = ServerMuxContext {
             fixed_data_target: None,
+            nat64_prefixes: &[],
             timing: TimingProfile::from_config(traffic),
             cover: CoverTrafficProfile::from_config(traffic),
             chunk_size: max_plaintext_len(traffic.max_padding),
@@ -11466,6 +12443,7 @@ mod tests {
         let traffic = TrafficConfig::default();
         let context = ServerMuxContext {
             fixed_data_target: None,
+            nat64_prefixes: &[],
             timing: TimingProfile::from_config(traffic),
             cover: CoverTrafficProfile::from_config(traffic),
             chunk_size: max_plaintext_len(traffic.max_padding),
@@ -11536,6 +12514,7 @@ mod tests {
         assert_eq!(traffic.max_concurrent_streams, 4);
         let context = ServerMuxContext {
             fixed_data_target: Some(&target_addr),
+            nat64_prefixes: &[],
             timing: TimingProfile::from_config(traffic),
             cover: CoverTrafficProfile::from_config(traffic),
             chunk_size: max_plaintext_len(traffic.max_padding),
@@ -11997,6 +12976,69 @@ mod tests {
         assert_eq!(batch[0].stream_id, 1);
     }
 
+    #[tokio::test]
+    async fn mux_control_flood_stays_bounded_and_services_live_and_dead_queues() {
+        let (downlink, mut scheduler) = server_mux_downlink(4);
+        let live = downlink.register(1).await.unwrap();
+        live.send(MuxFrameKind::Data, b"live".to_vec())
+            .await
+            .unwrap();
+        let dead = downlink.register(3).await.unwrap();
+        drop(dead);
+        for id in 1..=SERVER_MUX_CONTROL_CHANNEL / 2 {
+            downlink
+                .reset_unregistered((id * 2 + 1) as u32)
+                .await
+                .unwrap();
+        }
+        scheduler.drain_control();
+        assert_eq!(scheduler.unqueued.len(), SERVER_MUX_FRAME_BATCH_LIMIT);
+        assert!(
+            !scheduler.control.is_empty(),
+            "backpressure stays in the bounded channel"
+        );
+        for _ in 0..3 {
+            scheduler.drain_control();
+            assert_eq!(scheduler.unqueued.len(), SERVER_MUX_FRAME_BATCH_LIMIT);
+        }
+        let mut batch = Vec::new();
+        scheduler.fill(&mut batch, 2, usize::MAX);
+        assert_eq!(batch[0].kind, MuxFrameKind::Reset);
+        assert_eq!(batch[1].payload, b"live");
+        assert!(scheduler.queues.iter().all(|(id, _)| *id != 3));
+
+        // A one-frame writer batch still alternates both classes across fills.
+        live.send(MuxFrameKind::Data, b"next".to_vec())
+            .await
+            .unwrap();
+        batch.clear();
+        scheduler.fill(&mut batch, 1, usize::MAX);
+        assert_eq!(batch[0].kind, MuxFrameKind::Reset);
+        batch.clear();
+        scheduler.fill(&mut batch, 1, usize::MAX);
+        assert_eq!(batch[0].payload, b"next");
+    }
+
+    #[tokio::test]
+    async fn mux_registration_backlog_stays_bounded_until_finished_queues_are_reaped() {
+        let (downlink, mut scheduler) = server_mux_downlink(1);
+        let mut producers = Vec::new();
+        for id in 1..=SERVER_MUX_DOWNLINK_FRAMES {
+            let (sender, queue) = mpsc::channel(1);
+            producers.push(sender);
+            scheduler.apply(DownlinkControl::Register(id as u32, queue));
+        }
+        let extra = downlink.register(u32::MAX).await.unwrap();
+        scheduler.drain_control();
+        assert_eq!(scheduler.queues.len(), SERVER_MUX_DOWNLINK_FRAMES);
+        assert_eq!(scheduler.control.len(), 1);
+        drop(producers);
+        scheduler.fill(&mut Vec::new(), 1, usize::MAX);
+        scheduler.drain_control();
+        assert_eq!(scheduler.queues.len(), 1);
+        drop(extra);
+    }
+
     /// A client Reset (or a shed) must drop the substream's queued download
     /// frames instead of writing them: the client has already discarded the
     /// stream, so writing its backlog would only delay every other substream
@@ -12123,6 +13165,7 @@ mod tests {
         let traffic = TrafficConfig::default();
         let context = ServerMuxContext {
             fixed_data_target: None,
+            nat64_prefixes: &[],
             timing: TimingProfile::from_config(traffic),
             cover: CoverTrafficProfile::from_config(traffic),
             chunk_size: max_plaintext_len(traffic.max_padding),
@@ -12375,6 +13418,7 @@ mod tests {
                 session_keys: &session_keys,
                 traffic: TrafficConfig::default(),
                 fixed_data_target: Some(&target_addr),
+                nat64_prefixes: &[],
                 cid: 1,
                 admission: Some(&admission),
             },
@@ -12537,6 +13581,312 @@ mod tests {
     /// A no-op `LegWriter`: the floor-trip path errors mid-loop before any write,
     /// so the sink is never exercised.
     struct NullLegWriter;
+
+    struct DelayedSpeedWriter(Duration);
+
+    impl LegWriter for DelayedSpeedWriter {
+        async fn write_records(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            if !self.0.is_zero() {
+                sleep(self.0).await;
+            }
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speed_phases_bound_trickle_download_and_blocked_upload_ack() {
+        for (upload, delay, should_timeout) in [
+            (false, Duration::from_secs(1), true),
+            (true, Duration::from_secs(3600), true),
+            (false, Duration::ZERO, false),
+            (true, Duration::ZERO, false),
+        ] {
+            let (sealer, mut client_open) = upload_floor_io_codecs();
+            let mut client_records = TrickleLegReader {
+                sealer,
+                rng: StdRng::seed_from_u64(71),
+                payload: Vec::new(),
+                advance_per_read: Duration::ZERO,
+                remaining: 0,
+            };
+            let mut client_write = DelayedSpeedWriter(delay);
+            let mut server_seal = DataRecordCodec::new(
+                AeadCodec::new([0x11; 32], [0x22; 12]),
+                PaddingProfile::new(0, 0).unwrap(),
+                SERVER_TO_CLIENT_AAD,
+            );
+            let mut rng = StdRng::seed_from_u64(72);
+            let mut scratch = RelaySealScratch::with_payload_capacity(max_plaintext_len(0));
+            let mut io = SpeedServerIo {
+                client_records: &mut client_records,
+                client_write: &mut client_write,
+                client_open: &mut client_open,
+                server_seal: &mut server_seal,
+                rng: &mut rng,
+                scratch: &mut scratch,
+                cid: 1,
+            };
+            let start = Instant::now();
+            let result = if upload {
+                read_speed_upload_phase(&mut io, 0, SpeedTestAck::upload_done(0)).await
+            } else {
+                write_speed_download_phase(
+                    &mut io,
+                    &[0],
+                    64,
+                    SpeedTestAck::download_done(64),
+                    Duration::from_secs(600),
+                )
+                .await
+            };
+            if should_timeout {
+                assert!(matches!(result, Err(HandshakeServerError::Timeout)));
+                assert!(start.elapsed() <= Duration::from_secs(if upload { 660 } else { 16 }));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ServerDonePeer {
+        WrongMarker,
+        BadAead,
+        Eof,
+        PartialEof,
+        GraceDone,
+        GraceMissing,
+        LiveMissing,
+    }
+
+    async fn server_done_exchange_case(case: ServerDonePeer) -> Result<(), HandshakeServerError> {
+        use crate::crypto::session::AeadCodec;
+        use crate::protocol::data::{CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD};
+        use crate::traffic::PaddingProfile;
+        use crate::transport::udp::test_support::loopback_pair;
+        use rand::rngs::OsRng;
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        fn codec(aad: &'static [u8]) -> DataRecordCodec {
+            DataRecordCodec::new(
+                AeadCodec::new([0x31; 32], [0x52; 12]),
+                PaddingProfile::new(0, 0).unwrap(),
+                aad,
+            )
+        }
+        let (_server_ep, _client_ep, client_conn, server_conn) =
+            timeout(Duration::from_secs(5), loopback_pair())
+                .await
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connected, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let (client_read, mut client_write) = connected.unwrap().into_split();
+        let (peer_read, mut peer_write) = accepted.unwrap().0.into_split();
+        let mut seal = codec(SERVER_TO_CLIENT_AAD);
+        let mut open = codec(CLIENT_TO_SERVER_AAD);
+        let mut peer_open = codec(SERVER_TO_CLIENT_AAD);
+        let mut peer_seal = codec(CLIENT_TO_SERVER_AAD);
+        // DONE must continue the relay's nonce counters in both directions.
+        assert_eq!(
+            peer_open
+                .open(&seal.seal(b"upload tail", &mut OsRng).unwrap())
+                .unwrap(),
+            b"upload tail"
+        );
+        assert_eq!(
+            open.open(&peer_seal.seal(b"download tail", &mut OsRng).unwrap())
+                .unwrap(),
+            b"download tail"
+        );
+        let mut client_records = TlsRecordReader::buffered(client_read);
+        let mut exchange = Box::pin(server_exchange_quic_done(
+            &server_conn,
+            &mut client_write,
+            &mut client_records,
+            &mut seal,
+            &mut open,
+            1,
+        ));
+        let mut peer_reader = TlsRecordReader::new(peer_read);
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut exchange => panic!("server concluded before the peer DONE: {result:?}"),
+                record = peer_reader.read_record() => {
+                    assert_eq!(peer_open.open(&record.unwrap()).unwrap(), QUIC_RELAY_DONE_MARKER);
+                }
+            }
+        }).await.expect("server must first send its correctly sequenced DONE");
+        let payload = if matches!(case, ServerDonePeer::WrongMarker) {
+            b"wrong marker".as_slice()
+        } else {
+            QUIC_RELAY_DONE_MARKER
+        };
+        let mut reply = peer_seal.seal(payload, &mut OsRng).unwrap();
+        match case {
+            ServerDonePeer::WrongMarker => peer_write.write_all(&reply).await.unwrap(),
+            ServerDonePeer::BadAead => {
+                *reply.last_mut().unwrap() ^= 1;
+                peer_write.write_all(&reply).await.unwrap();
+            }
+            ServerDonePeer::Eof => peer_write.shutdown().await.unwrap(),
+            ServerDonePeer::PartialEof => {
+                peer_write.write_all(&reply[..3]).await.unwrap();
+                peer_write.shutdown().await.unwrap();
+            }
+            ServerDonePeer::GraceDone | ServerDonePeer::GraceMissing => {
+                peer_write.write_all(&reply[..3]).await.unwrap();
+                tokio::select! {
+                    result = &mut exchange => panic!("partial DONE was accepted: {result:?}"),
+                    _ = sleep(Duration::from_millis(10)) => {}
+                }
+                client_conn.close(0u32.into(), b"done-test-peer-close");
+                timeout(
+                    Duration::from_secs(2),
+                    crate::transport::udp::endpoint::conn_closed(&server_conn),
+                )
+                .await
+                .unwrap();
+                // No complete record exists yet: this poll must take the closed
+                // arm and leave the production grace read pending.
+                std::future::poll_fn(|cx| {
+                    assert!(exchange.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                if matches!(case, ServerDonePeer::GraceDone) {
+                    peer_write.write_all(&reply[3..]).await.unwrap();
+                }
+            }
+            ServerDonePeer::LiveMissing => {
+                let (mut alive_send, _unused) = client_conn.open_bi();
+                alive_send.write_all(b"a").await.unwrap();
+                let (_unused, mut alive_recv) =
+                    timeout(Duration::from_secs(5), server_conn.accept_bi())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut byte = [0];
+                alive_recv.read_exact(&mut byte).await.unwrap();
+                tokio::time::pause();
+                let wall = std::time::Instant::now();
+                for _ in 0..=QUIC_RELAY_DONE_BACKSTOP.as_secs() {
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                    let state =
+                        std::future::poll_fn(|cx| Poll::Ready(exchange.as_mut().poll(cx))).await;
+                    assert!(
+                        !client_conn.is_closed() && !server_conn.is_closed(),
+                        "live QUIC must not substitute an idle/grace failure for the DONE backstop"
+                    );
+                    if let Poll::Ready(result) = state {
+                        return result;
+                    }
+                    alive_send.write_all(b"a").await.unwrap();
+                    let mut read = Box::pin(alive_recv.read_exact(&mut byte));
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut read => { result.unwrap(); break; }
+                            _ = tokio::task::yield_now() => {
+                                assert!(wall.elapsed() < Duration::from_secs(10), "QUIC liveness fixture stalled");
+                            }
+                        }
+                    }
+                }
+                panic!("missing DONE exceeded its absolute backstop");
+            }
+        }
+        timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("DONE result must be bounded")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn server_quic_done_rejects_wrong_marker_bad_aead_and_tcp_eof() {
+        for case in [
+            ServerDonePeer::WrongMarker,
+            ServerDonePeer::BadAead,
+            ServerDonePeer::Eof,
+            ServerDonePeer::PartialEof,
+        ] {
+            let error = server_done_exchange_case(case).await.unwrap_err();
+            match case {
+                ServerDonePeer::WrongMarker => assert!(
+                    matches!(error, HandshakeServerError::Io(e) if e.kind() == io::ErrorKind::InvalidData)
+                ),
+                ServerDonePeer::BadAead => assert!(matches!(
+                    error,
+                    HandshakeServerError::DataRecord(DataRecordError::Aead(_))
+                )),
+                _ => assert!(
+                    matches!(error, HandshakeServerError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn server_quic_done_grace_completes_only_a_valid_inflight_record() {
+        server_done_exchange_case(ServerDonePeer::GraceDone)
+            .await
+            .unwrap();
+        let error = server_done_exchange_case(ServerDonePeer::GraceMissing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HandshakeServerError::Io(e) if e.kind() == io::ErrorKind::ConnectionAborted)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets and paused-clock liveness pumping"]
+    async fn server_quic_done_missing_record_hits_backstop_while_quic_is_alive() {
+        let error = server_done_exchange_case(ServerDonePeer::LiveMissing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HandshakeServerError::Io(e) if e.kind() == io::ErrorKind::TimedOut && e.to_string() == "QUIC fast-plane teardown DONE backstop elapsed")
+        );
+    }
+
+    #[test]
+    fn quic_done_control_records_are_band_shaped_and_preserve_sequence() {
+        let mut seal = DataRecordCodec::new(
+            AeadCodec::new([0x11; 32], [0x22; 12]),
+            PaddingProfile::new(0, 0).unwrap(),
+            SERVER_TO_CLIENT_AAD,
+        );
+        let mut open = DataRecordCodec::new(
+            AeadCodec::new([0x11; 32], [0x22; 12]),
+            PaddingProfile::new(0, 0).unwrap(),
+            SERVER_TO_CLIENT_AAD,
+        );
+        let mut rng = StdRng::seed_from_u64(73);
+        let preceding = seal.seal(b"relay tail", &mut rng).unwrap();
+        assert_eq!(open.open(&preceding).unwrap(), b"relay tail");
+        let mut sizes = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let record =
+                seal_control_frame_band_shaped(&mut seal, QUIC_RELAY_DONE_MARKER, &mut rng)
+                    .unwrap();
+            let wire_len = record.len() - crate::tls::record::TLS_HEADER_LEN;
+            assert!(crate::protocol::command::connect_record_size_is_shaped(
+                wire_len
+            ));
+            sizes.insert(wire_len);
+            assert_eq!(open.open(&record).unwrap(), QUIC_RELAY_DONE_MARKER);
+        }
+        assert!(sizes.len() > 1);
+    }
 
     impl LegWriter for NullLegWriter {
         async fn write_records(&mut self, _bytes: &[u8]) -> io::Result<()> {
@@ -12793,7 +14143,6 @@ mod tests {
             .expect("silent peer must trigger the origin dial before the give-up wait")
             .expect("origin accept must succeed");
         let dialed_after = started.elapsed();
-        drop(accepted);
 
         assert!(
             dialed_after < FIRST_RECORD_WAIT_FLOOR,
@@ -12813,6 +14162,7 @@ mod tests {
             !reader.is_finished(),
             "the first-record read must keep its full budget after a pre-dial"
         );
+        drop(accepted);
         reader.abort();
     }
 
@@ -12903,6 +14253,7 @@ mod tests {
             let (server_side, _) = parallax_listener.accept().await.unwrap();
             spawn_cap_shed_fallback(server_side, &origin_addr_str)
                 .await
+                .unwrap()
                 .await
                 .unwrap();
         });
@@ -12928,96 +14279,37 @@ mod tests {
         relay_task.await.unwrap();
     }
 
-    /// All 64 admitted connections stay open, while the accept-loop admission
-    /// future holds just one additional socket and creates no task. Queued input
-    /// must survive saturation, then splice normally after a slot is released.
+    /// Saturation must neither spawn an over-budget relay nor park accept.
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets + mutates the process-global cap-shed budget"]
-    async fn cap_shed_saturation_waits_without_spawning_or_closing_socket() {
-        use std::os::fd::AsRawFd;
-
+    async fn cap_shed_saturation_does_not_block_the_listener() {
+        let slots: Vec<_> = (0..MAX_CONCURRENT_CAP_SHED_FALLBACKS)
+            .map(|_| try_enter_cap_shed_fallback().expect("free fallback slot"))
+            .collect();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let metrics = tokio::runtime::Handle::current().metrics();
-        let mut peers = Vec::new();
-        let mut admitted = Vec::new();
-        for _ in 0..MAX_CONCURRENT_CAP_SHED_FALLBACKS {
-            peers.push(TcpStream::connect(addr).await.unwrap());
-            let (server_side, _) = listener.accept().await.unwrap();
-            admitted.push(spawn_cap_shed_fallback(server_side, "127.0.0.1:9").await);
-        }
-        assert_eq!(
-            active_cap_shed_fallbacks(),
-            MAX_CONCURRENT_CAP_SHED_FALLBACKS
-        );
-
-        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin_addr = origin_listener.local_addr().unwrap().to_string();
-        let client_hello = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
-        let mut waiting_peer = TcpStream::connect(addr).await.unwrap();
-        waiting_peer.write_all(&client_hello).await.unwrap();
+        let mut rejected = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (server_side, _) = listener.accept().await.unwrap();
-        let fd = server_side.as_raw_fd();
-        let mut waiting = Box::pin(spawn_cap_shed_fallback(server_side, &origin_addr));
-        let tasks_before = metrics.num_alive_tasks();
-        let open_fds = || std::fs::read_dir("/dev/fd").unwrap().count();
-        let fds_before = open_fds();
-        let mut context = Context::from_waker(std::task::Waker::noop());
-        for _ in 0..16 {
-            assert!(waiting.as_mut().poll(&mut context).is_pending());
-            assert_eq!(metrics.num_alive_tasks(), tasks_before);
-            assert_eq!(open_fds(), fds_before);
-            // The only over-budget accepted fd remains live in this future;
-            // polling it neither accepts more sockets nor spawns a closer.
-            // SAFETY: F_GETFD accepts an integer fd without pointer arguments.
-            assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        }
-        let mut one = [0_u8; 1];
-        assert!(
-            timeout(Duration::from_millis(20), waiting_peer.read(&mut one))
-                .await
-                .is_err(),
-            "saturation must not FIN or reset a socket with a queued ClientHello",
-        );
-        assert_eq!(
-            active_cap_shed_fallbacks(),
-            MAX_CONCURRENT_CAP_SHED_FALLBACKS
-        );
-
-        peers[0].shutdown().await.unwrap();
-        timeout(Duration::from_secs(1), admitted.remove(0))
+        let close = timeout(
+            Duration::from_millis(100),
+            spawn_cap_shed_fallback(server_side, "127.0.0.1:9"),
+        )
+        .await
+        .expect("a full fallback pool must not park accept");
+        assert!(close.is_none(), "saturation must not spawn another task");
+        let mut byte = [0];
+        assert_eq!(rejected.read(&mut byte).await.unwrap(), 0);
+        let next = TcpStream::connect(listener.local_addr().unwrap())
             .await
-            .unwrap()
             .unwrap();
-        let relay = timeout(Duration::from_secs(1), waiting)
+        timeout(Duration::from_millis(100), listener.accept())
             .await
-            .expect("releasing a slot resumes accept-loop admission");
-        let (mut origin, _) = timeout(Duration::from_secs(2), origin_listener.accept())
-            .await
-            .unwrap()
+            .expect("unrelated connections remain acceptable")
             .unwrap();
-        assert_eq!(read_record(&mut origin).await.unwrap(), client_hello);
-        let server_hello = crate::tls::record::wrap_application_data(b"origin-server-hello")
-            .expect("test ServerHello fits");
-        origin.write_all(&server_hello).await.unwrap();
-        assert_eq!(read_record(&mut waiting_peer).await.unwrap(), server_hello);
-        waiting_peer.shutdown().await.unwrap();
-        origin.shutdown().await.unwrap();
-        assert_eq!(waiting_peer.read(&mut one).await.unwrap(), 0);
-        timeout(Duration::from_secs(1), relay)
-            .await
-            .unwrap()
-            .unwrap();
-
-        for task in &admitted {
-            task.abort();
-        }
-        for task in admitted {
-            let _ = task.await;
-        }
-        assert_eq!(active_cap_shed_fallbacks(), 0);
-        drop(peers);
+        drop(next);
+        drop(slots);
     }
 
     #[tokio::test]
@@ -13033,7 +14325,8 @@ mod tests {
             server_side,
             &origin_listener.local_addr().unwrap().to_string(),
         )
-        .await;
+        .await
+        .unwrap();
         let (mut origin, _) = timeout(Duration::from_secs(2), origin_listener.accept())
             .await
             .unwrap()
@@ -13085,7 +14378,9 @@ mod tests {
         let (server_side, _) = parallax_listener.accept().await.unwrap();
 
         let started = Instant::now();
-        let shed = spawn_cap_shed_fallback(server_side, &origin_addr).await;
+        let shed = spawn_cap_shed_fallback(server_side, &origin_addr)
+            .await
+            .unwrap();
 
         let accepted = timeout(Duration::from_secs(2), origin_listener.accept())
             .await
@@ -13330,8 +14625,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefix_ccs_is_forwarded_without_changing_server_hello_context() {
+        for fragmented in [false, true] {
+            let server_keys = X25519KeyPair::generate();
+            let identity_keys = identity::keypair();
+            let mut session = crate::tls::safari26::Safari26TlsCamouflage
+                .start("example.com".to_owned(), PSK, &server_keys.public)
+                .unwrap();
+            let first_client_record = session.client_hello_bytes().to_vec();
+            let client_hello = parse_client_hello(&first_client_record).unwrap();
+            let mut hello = server_hello_fixture();
+            let session_id = parse_server_hello(&hello).unwrap().session_id_range;
+            hello[session_id].copy_from_slice(&first_client_record[client_hello.session_id_range]);
+            let wire = if fragmented {
+                crate::tls::server_hello::tests::fragment_handshake_record(&hello, &[2, 40])
+            } else {
+                hello
+            };
+            let expected_hello = wire.clone();
+            let expected_first = first_client_record.clone();
+            let fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fallback_addr = fallback.local_addr().unwrap();
+            let origin = tokio::spawn(async move {
+                let (mut stream, _) = fallback.accept().await.unwrap();
+                assert_eq!(read_record(&mut stream).await.unwrap(), expected_first);
+                let prefix = crate::tls::record::change_cipher_spec().repeat(2);
+                stream.write_all(&[prefix, wire].concat()).await.unwrap();
+            });
+            let replay = tempfile::tempdir().unwrap();
+            let config = authenticated_server_config(
+                fallback_addr,
+                &server_keys,
+                &identity_keys,
+                replay.path().join("replay.cache"),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let expected_first = first_client_record.clone();
+            let accepted = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                accept_authenticated(
+                    stream,
+                    &config,
+                    PSK,
+                    server_keys.public,
+                    Zeroizing::new([0x42; 32]),
+                    expected_first,
+                    AuthenticatedHello {
+                        sni: "example.com".to_owned(),
+                        x25519_key_share: [0x22; 32],
+                        timestamp: 1_700_000_001,
+                        nonce: [7; 8],
+                        transcript_fingerprint: [8; 32],
+                    },
+                )
+                .await
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            // Observe one untouched prefix on the real socket; the real client
+            // reader then drops the other prefix before returning SH-only bytes.
+            assert_eq!(
+                read_record(&mut client).await.unwrap(),
+                crate::tls::record::change_cipher_spec()
+            );
+            let (received, events) = session
+                .read_server_hello_record_for_test(&mut client)
+                .await
+                .unwrap();
+            assert_eq!(received, expected_hello);
+            assert_eq!(events.len(), if fragmented { 4 } else { 2 });
+            assert_eq!(events[0].content_type, 0x14);
+            assert_eq!(events[0].len, 1);
+            let server = accepted.await.unwrap().unwrap();
+            let client_keys = crate::handshake::client::derive_session_keys_from_shared(
+                PSK,
+                &[0x42; 32],
+                &first_client_record,
+                &received,
+            )
+            .unwrap();
+            assert_eq!(
+                server.session_keys.transcript_hash,
+                client_keys.transcript_hash
+            );
+            assert_eq!(server.session_keys.client_key, client_keys.client_key);
+            assert_eq!(server.session_keys.server_key, client_keys.server_key);
+            origin.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn strict_tls13_rejection_relays_origin_server_hello_first() {
-        let tls12_server_hello = server_hello_fixture_with_tls12_selected();
+        for coalesced in [false, true] {
+            assert_legacy_server_hello_forwarding(true, coalesced).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn non_strict_tls13_accepts_coalesced_legacy_server_flight() {
+        for coalesced in [false, true] {
+            assert_legacy_server_hello_forwarding(false, coalesced).await;
+        }
+    }
+
+    async fn assert_legacy_server_hello_forwarding(strict_tls13: bool, coalesced: bool) {
+        let mut tls12_server_hello = server_hello_fixture_with_tls12_selected();
+        if coalesced {
+            let certificate = rcgen::generate_simple_self_signed(vec!["example.com".to_owned()])
+                .unwrap()
+                .cert
+                .der()
+                .to_vec();
+            let cert_len = certificate.len() as u32;
+            let mut message = vec![11]; // TLS 1.2 Certificate handshake message.
+            message.extend_from_slice(&(cert_len + 6).to_be_bytes()[1..]);
+            message.extend_from_slice(&(cert_len + 3).to_be_bytes()[1..]);
+            message.extend_from_slice(&cert_len.to_be_bytes()[1..]);
+            message.extend_from_slice(&certificate);
+            tls12_server_hello.extend_from_slice(&message);
+            let payload_len = (tls12_server_hello.len() - TLS_HEADER_LEN) as u16;
+            tls12_server_hello[3..5].copy_from_slice(&payload_len.to_be_bytes());
+        }
         let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fallback_addr = fallback_listener.local_addr().unwrap();
         let expected_first_client_record =
@@ -13347,15 +14761,17 @@ mod tests {
         let server_keys = X25519KeyPair::generate();
         let server_identity_keys = identity::keypair();
         let replay_cache_dir = tempfile::tempdir().unwrap();
-        let config = authenticated_server_config(
+        let mut config = authenticated_server_config(
             fallback_addr,
             &server_keys,
             &server_identity_keys,
             replay_cache_dir.path().join("parallax-replay.cache"),
         );
+        config.strict_tls13 = strict_tls13;
         let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let parallax_addr = parallax_listener.local_addr().unwrap();
         let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let expected_context = transcript_hash(&first_client_record, &tls12_server_hello);
         let accepted = tokio::spawn(async move {
             let (server_side, _) = parallax_listener.accept().await.unwrap();
             accept_authenticated(
@@ -13363,7 +14779,7 @@ mod tests {
                 &config,
                 &[0x5a_u8; 32],
                 server_keys.public,
-                zeroize::Zeroizing::new([0_u8; 32]),
+                zeroize::Zeroizing::new([0x42_u8; 32]),
                 first_client_record,
                 AuthenticatedHello {
                     sni: String::from("example.com"),
@@ -13380,8 +14796,14 @@ mod tests {
         let relayed = read_record(&mut client).await.unwrap();
         assert_eq!(relayed, tls12_server_hello);
 
-        let err = accepted.await.unwrap().unwrap_err();
-        assert!(matches!(err, HandshakeServerError::Tls13Required));
+        let result = accepted.await.unwrap();
+        if strict_tls13 {
+            assert!(matches!(result, Err(HandshakeServerError::Tls13Required)));
+        } else {
+            let handshake = result.unwrap();
+            assert!(!handshake.server_hello.tls13_selected);
+            assert_eq!(handshake.session_keys.transcript_hash, expected_context);
+        }
         fallback_task.await.unwrap();
     }
 
@@ -13459,6 +14881,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: None,
+            nat64_prefixes: vec![],
             private_key: STANDARD.encode(server_keys.private).into(),
             identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
             replay_cache_path,

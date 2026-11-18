@@ -143,6 +143,52 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn exporter_context_matches_independent_length_prefixed_hash() {
+        for len in [0usize, 1, 16, 255, 256, 1024] {
+            let context: Vec<_> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut message = b"ParallaX v1 TUDP auth context".to_vec();
+            message.extend_from_slice(&(len as u64).to_be_bytes());
+            message.extend_from_slice(&context);
+            let expected = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &message);
+            assert_eq!(exporter_context(&context).as_slice(), expected.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_exporter_tokens_cannot_transfer_between_sessions_or_offers() {
+        use crate::transport::udp::test_support::loopback_pair;
+
+        let (_s1, _c1, client1, server1) = loopback_pair().await;
+        let (_s2, _c2, client2, server2) = loopback_pair().await;
+        let first = export_udp_auth_token(&client1, PSK, b"offer-1").unwrap();
+        assert_eq!(
+            first,
+            export_udp_auth_token(&server1, PSK, b"offer-1").unwrap()
+        );
+        let second = export_udp_auth_token(&client2, PSK, b"offer-1").unwrap();
+        assert_eq!(
+            second,
+            export_udp_auth_token(&server2, PSK, b"offer-1").unwrap()
+        );
+        assert_ne!(
+            first, second,
+            "same offer cannot transfer to another TLS session"
+        );
+        assert_ne!(
+            first,
+            export_udp_auth_token(&server1, PSK, b"offer-2").unwrap()
+        );
+        assert_ne!(
+            first,
+            export_udp_auth_token(&server1, b"another PSK", b"offer-1").unwrap()
+        );
+        assert!(matches!(
+            export_udp_auth_token(&client1, b"", b"offer-1"),
+            Err(UdpAuthError::EmptyPsk)
+        ));
+    }
+
     /// M-15: guard against the stale "nothing calls these at runtime yet" doc
     /// claim returning — it misled reviewers into under-estimating the live QUIC
     /// attack surface (these helpers ARE driven by the runtime probe).

@@ -2,7 +2,8 @@ name: formal
 
 # Protocol state-machine check. The Python checker exhausts the models in
 # formal/plx_formal.py (session, QUIC handshake, 0-RTT, replay insert, UDP
-# probe, inbound gates, key install, QUIC close, BBR mode, first byte). TLC
+# probe, inbound gates, key install, QUIC close, BBR mode, first byte,
+# record-batch failure, framed/identity reassembly and MUX lifecycle). TLC
 # then checks the generated TLA+ with an independent engine. Correspondence
 # fails the job if the Rust control flow those models describe has moved.
 #
@@ -75,7 +76,7 @@ jobs:
         run: python3 -m unittest discover -s formal -p 'test_*.py'
 
       - name: Install Java
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '21'

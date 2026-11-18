@@ -34,6 +34,18 @@ pub struct MlKemKeyPair {
 // a timing side-channel if production ever compared two encapsulations. Gating
 // the impls makes such a comparison a compile error in a non-test build; use
 // `subtle::ConstantTimeEq` explicitly if a production path ever needs equality.
+/// Encapsulation exposes public ciphertext and a self-wiping shared secret, but
+/// deliberately has no ordinary production equality operation.
+///
+/// ```
+/// use parallax::crypto::pq::MlKemEncapsulation;
+/// fn ciphertext_len(value: &MlKemEncapsulation) -> usize { value.ciphertext.len() }
+/// ```
+///
+/// ```compile_fail,E0369
+/// use parallax::crypto::pq::MlKemEncapsulation;
+/// fn ordinary_equality(a: &MlKemEncapsulation, b: &MlKemEncapsulation) -> bool { a == b }
+/// ```
 #[derive(Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct MlKemEncapsulation {
@@ -239,9 +251,8 @@ mod tests {
         // `MlKemEncapsulation: PartialEq/Eq` exists ONLY under cfg(test) (the
         // derived `==` is variable-time over the live `shared_secret`). This pins
         // that the test-gated impls still exist for `assert_eq!`; the complementary
-        // guarantee — equality UNAVAILABLE in production — is the non-test compile
-        // itself (`cargo build` / `cargo clippy`), where any production `==` over
-        // `MlKemEncapsulation` is now a compile error.
+        // guarantee is checked by the production compile-fail doctest on the
+        // type, with a matching positive control for the public API.
         let keys = keypair();
         let enc = encapsulate(&keys.public).unwrap();
         let same = enc.clone();
@@ -257,6 +268,197 @@ mod tests {
         assert_eq!(keys.public.len(), public_key_bytes());
         assert_eq!(keys.secret.len(), secret_key_bytes());
         assert_eq!(enc.ciphertext.len(), ciphertext_bytes());
+    }
+
+    #[test]
+    fn mlkem_implicit_rejection_separates_epoch_keys_and_rejects_records() {
+        use crate::crypto::session::{expand_epoch_keys, AeadCodec};
+
+        let keys = keypair();
+        let unrelated = keypair();
+        let encapsulated = encapsulate(&keys.public).unwrap();
+        let accepted = decapsulate(&encapsulated.ciphertext, &keys.secret).unwrap();
+        assert_eq!(*accepted, *encapsulated.shared_secret);
+        let codec = |pq_secret: &[u8; 32]| {
+            let chain =
+                hybrid_sandwich_rekey(&[1; 32], &[2; 32], pq_secret, b"shared psk").unwrap();
+            let epoch = expand_epoch_keys(chain, 1, [3; 32], [2; 32]).unwrap();
+            AeadCodec::new(epoch.client_key, epoch.client_nonce)
+        };
+        let payload = b"must not authenticate after implicit rejection";
+        let ciphertext = codec(&accepted).seal(payload, b"client direction").unwrap();
+        assert_eq!(
+            codec(&accepted)
+                .open(&ciphertext, b"client direction")
+                .unwrap(),
+            payload
+        );
+        let wrong_key_secret = decapsulate(&encapsulated.ciphertext, &unrelated.secret).unwrap();
+        assert_ne!(*wrong_key_secret, *accepted);
+        assert!(codec(&wrong_key_secret)
+            .open(&ciphertext, b"client direction")
+            .is_err());
+        for offset in [0, ciphertext_bytes() / 2, ciphertext_bytes() - 1] {
+            let mut changed = encapsulated.ciphertext.clone();
+            changed[offset] ^= 1;
+            // ML-KEM implicit rejection returns a different secret for a
+            // correctly sized invalid ciphertext; requiring Err would be wrong.
+            let rejected = decapsulate(&changed, &keys.secret).unwrap();
+            assert_ne!(*rejected, *accepted);
+            assert!(codec(&rejected)
+                .open(&ciphertext, b"client direction")
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn mlkem_secret_containers_live_wipe_without_reading_dropped_storage() {
+        fn drops_zeroized<T: ZeroizeOnDrop>() {}
+        drops_zeroized::<MlKemKeyPair>();
+        drops_zeroized::<zeroize::Zeroizing<[u8; 32]>>();
+        let mut keys = keypair();
+        let mut encapsulated = encapsulate(&keys.public).unwrap();
+        assert!(format!("{encapsulated:?}").contains("shared_secret: \"<redacted>\""));
+        let public_ciphertext = encapsulated.ciphertext.clone();
+        encapsulated.shared_secret.zeroize();
+        assert_eq!(*encapsulated.shared_secret, [0; 32]);
+        assert_eq!(encapsulated.ciphertext, public_ciphertext);
+        // Vec::zeroize clears the live vectors; no freed or uninitialized bytes
+        // are inspected. The marker above guards their automatic drop contract.
+        keys.zeroize();
+        assert!(keys.secret.is_empty());
+        assert!(keys.public.is_empty());
+    }
+
+    #[test]
+    fn os_rng_mlkem_key_generation_and_encapsulation_smoke_is_consistent() {
+        let mut public_keys = std::collections::BTreeSet::new();
+        let mut ciphertexts = std::collections::BTreeSet::new();
+        // Four fresh key pairs/two encapsulations each are regression smoke,
+        // not an entropy-quality or collision-resistance proof.
+        for _ in 0..4 {
+            let keys = keypair();
+            assert!(public_keys.insert(keys.public.clone()));
+            for _ in 0..2 {
+                let encapsulated = encapsulate(&keys.public).unwrap();
+                let secret = decapsulate(&encapsulated.ciphertext, &keys.secret).unwrap();
+                assert_eq!(*secret, *encapsulated.shared_secret);
+                assert!(ciphertexts.insert(encapsulated.ciphertext.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_pq_sessions_agree_locally_but_reject_cross_session_and_direction_records() {
+        use crate::{
+            config::TrafficConfig,
+            crypto::session::{
+                expand_epoch_keys, x25519_shared_secret, AeadCodec, CipherSuite, SessionKeys,
+                X25519KeyPair,
+            },
+            handshake::client::{data_codecs, ClientDataSession},
+            protocol::{
+                command::{
+                    FramedReassembler, PqRekeyRequest, ServerKeyExchange, MAX_PQ_HANDSHAKE_FRAME,
+                },
+                data::{DataRecordCodec, CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD},
+            },
+            traffic::PaddingProfile,
+        };
+        use rand::{rngs::StdRng, SeedableRng};
+
+        fn rekey(
+            initial: &SessionKeys,
+            suite: CipherSuite,
+            rng: &mut StdRng,
+        ) -> (ClientDataSession, SessionKeys) {
+            let traffic = TrafficConfig::default();
+            let mut client = ClientDataSession::new(initial.clone(), traffic).unwrap();
+            let (request_records, pending) = client.build_pq_rekey_record(rng).unwrap();
+            let (mut request_reader, mut response_writer) = data_codecs(initial, traffic).unwrap();
+            let mut frame = FramedReassembler::default();
+            let mut request_payload = None;
+            let mut offset = 0;
+            while offset < request_records.len() {
+                let len =
+                    u16::from_be_bytes([request_records[offset + 3], request_records[offset + 4]])
+                        as usize;
+                let end = offset + 5 + len;
+                let chunk = request_reader.open(&request_records[offset..end]).unwrap();
+                if let Some(payload) = frame.push(&chunk, MAX_PQ_HANDSHAKE_FRAME).unwrap() {
+                    assert_eq!(end, request_records.len());
+                    request_payload = Some(payload);
+                }
+                offset = end;
+            }
+            let request_payload = request_payload.unwrap();
+            let request = PqRekeyRequest::decode(&request_payload).unwrap();
+            let server_x25519 = X25519KeyPair::generate();
+            let dh = x25519_shared_secret(&server_x25519.private, &request.client_x25519_public);
+            let encapsulated = encapsulate(&request.client_mlkem_public_key).unwrap();
+            let response = ServerKeyExchange {
+                server_x25519_public: server_x25519.public,
+                mlkem_ciphertext: encapsulated.ciphertext,
+            }
+            .encode_with_suite(suite)
+            .unwrap();
+            let response_record = response_writer.seal(&response, rng).unwrap();
+            client
+                .apply_server_key_exchange_record(&response_record, &pending, b"same psk")
+                .unwrap();
+            let chain = hybrid_sandwich_rekey(
+                &initial.chain_secret,
+                &dh,
+                &encapsulated.shared_secret,
+                b"same psk",
+            )
+            .unwrap();
+            let server = expand_epoch_keys(chain, 1, initial.transcript_hash, dh).unwrap();
+            assert_eq!(client.session_keys(), &server);
+            assert_eq!(
+                client.pq_identity_binding().unwrap(),
+                crate::crypto::identity::pq_rekey_binding(&request_payload, &response)
+            );
+            (client, server)
+        }
+
+        let initial = expand_epoch_keys([0x61; 32], 0, [0x62; 32], [0x63; 32]).unwrap();
+        let mut rng = StdRng::seed_from_u64(0x1ade_6e11);
+        for suite in [CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm] {
+            // Deliberately hold PSK, epoch-0 keys, transcript and epoch constant:
+            // only the fresh production DH/KEM exchange separates the sessions.
+            let (mut first, first_keys) = rekey(&initial, suite, &mut rng);
+            let (mut second, second_keys) = rekey(&initial, suite, &mut rng);
+            assert_ne!(first_keys.client_key, second_keys.client_key);
+            assert_ne!(first_keys.server_key, second_keys.server_key);
+            assert_ne!(first_keys.client_key, first_keys.server_key);
+            let reader = |keys: &SessionKeys, reverse: bool| {
+                let (key, nonce, aad) = if reverse {
+                    (keys.server_key, keys.server_nonce, SERVER_TO_CLIENT_AAD)
+                } else {
+                    (keys.client_key, keys.client_nonce, CLIENT_TO_SERVER_AAD)
+                };
+                DataRecordCodec::new(
+                    AeadCodec::new_with_suite(suite, key, nonce),
+                    PaddingProfile::from_config(TrafficConfig::default()).unwrap(),
+                    aad,
+                )
+            };
+            let first_record = first.seal_payload(b"first session", &mut rng).unwrap();
+            let second_record = second.seal_payload(b"second session", &mut rng).unwrap();
+            assert_eq!(
+                reader(&first_keys, false).open(&first_record).unwrap(),
+                b"first session"
+            );
+            assert_eq!(
+                reader(&second_keys, false).open(&second_record).unwrap(),
+                b"second session"
+            );
+            assert!(reader(&second_keys, false).open(&first_record).is_err());
+            assert!(reader(&first_keys, false).open(&second_record).is_err());
+            assert!(reader(&first_keys, true).open(&first_record).is_err());
+            assert!(reader(&second_keys, true).open(&second_record).is_err());
+        }
     }
 
     #[test]

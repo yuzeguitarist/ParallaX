@@ -111,7 +111,14 @@ const WINDOW: usize = 6;
 /// and substream's `target_read.read(&mut target_buf)` now share activity across
 /// both directions instead of timing each read; their sibling/supervisor
 /// `relay_idle_watchdog` bounds are pinned below, and Cover does not renew them.
-const EXPECTED_UNTIMED_SERVER: usize = 13;
+///
+/// +1: streaming first-record inspection replaces the old timed collector read
+/// with client and origin reads in one `select!`. Both share the immutable
+/// `first_record_wait_timeout()` deadline, whose sibling `sleep_until(deadline)`
+/// is farther than WINDOW from the client read. The origin read classifies as
+/// TIMED because a nearby write helper contains the `timeout(` token; the
+/// structural guard below independently pins the actual deadline for BOTH reads.
+const EXPECTED_UNTIMED_SERVER: usize = 14;
 
 /// Untimed inbound-read sites in `src/client/runtime.rs` production code.
 ///
@@ -316,8 +323,8 @@ fn combined_inbound_read_census_is_pinned() {
         server.iter().filter(|s| s.timed).count() + runtime.iter().filter(|s| s.timed).count();
     let untimed = total - timed;
 
-    // Total inbound-read call sites across both production files today: 26
-    // (server) + 13 (runtime) = 39. This catches a *removed* read site too,
+    // Total inbound-read call sites across both production files today: 28
+    // (server) + 13 (runtime) = 41. This catches a *removed* read site too,
     // which would otherwise slip past the per-file untimed-only assertions.
     // (+2 server vs the mux-over-QUIC baseline of 28: the speed QUIC-run request
     // read and the speed QUIC-run TCP DONE read — both TIMED. +5 for the
@@ -335,11 +342,17 @@ fn combined_inbound_read_census_is_pinned() {
     // (+1 runtime vs 38: the TCP mux upload producer now reads under the oldest
     // tail's `timeout_at` deadline when a tail exists. Its empty-tail read retains
     // the existing shared watchdog. Untimed baselines remain unchanged.)
-    const EXPECTED_TOTAL_SITES: usize = 39;
-    // Timed sites: 13 (server) + 3 (runtime) = 16. The three existing TCP mux
+    // (+1 server vs 39: the old timed first-record collector read is replaced by
+    // client/origin select reads. Their shared absolute deadline is pinned by
+    // `first_record_inspection_deadline_is_pinned`, independent of WINDOW.)
+    // (+1 server vs 40: completing an already-started origin record before PQ
+    // cutover reads under the existing absolute pre-PQ deadline. The untimed
+    // baselines remain unchanged.)
+    const EXPECTED_TOTAL_SITES: usize = 41;
+    // Timed sites: 14 (server) + 3 (runtime) = 17. The three existing TCP mux
     // reads moved from per-read timeouts to shared idle watchdogs, not new reads;
     // `mux_structural_idle_bounds_are_pinned` guards their enclosing boundaries.
-    const EXPECTED_TIMED_SITES: usize = 16;
+    const EXPECTED_TIMED_SITES: usize = 17;
 
     assert_eq!(
         total, EXPECTED_TOTAL_SITES,
@@ -360,6 +373,48 @@ fn combined_inbound_read_census_is_pinned() {
         EXPECTED_UNTIMED_SERVER,
         EXPECTED_UNTIMED_RUNTIME
     );
+}
+
+/// Streaming a partial hello must not let either peer reset or remove the
+/// absolute assembly deadline, even though the local proximity scan cannot see
+/// that deadline from the client read.
+#[test]
+fn first_record_inspection_deadline_is_pinned() {
+    let lines = read_production_region("src/handshake/server.rs");
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("async fn read_first_client_record_predialing("))
+        .expect("missing first-record inspector");
+    let end = lines[start..]
+        .iter()
+        .position(|line| line == "}")
+        .expect("missing inspector closing brace");
+    let source = lines[start..=start + end].join("\n");
+    assert_eq!(
+        source.matches("tokio::select! {").count(),
+        1,
+        "both reads and the deadline must remain in one select"
+    );
+    assert_eq!(
+        source.matches("let deadline =").count(),
+        1,
+        "the immutable deadline must not be reset inside the loop"
+    );
+    let fingerprints = [
+        "let deadline = Instant::now() + first_record_wait_timeout();",
+        "loop {",
+        "tokio::select! {",
+        "read = client.read(&mut scratch[..read_len]) => {",
+        "origin.as_mut().expect(\"guarded origin\").read(&mut origin_reply).await",
+        "_ = sleep_until(deadline) => {}",
+    ];
+    let mut remaining = source.as_str();
+    for fingerprint in fingerprints {
+        let index = remaining.find(fingerprint).unwrap_or_else(|| {
+            panic!("missing or reordered first-record deadline fingerprint: {fingerprint}")
+        });
+        remaining = &remaining[index + fingerprint.len()..];
+    }
 }
 
 /// The three mux reads reclassified above must retain their shared idle bounds;

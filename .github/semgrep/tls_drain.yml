@@ -2,7 +2,7 @@ rules:
   - id: parallax-tls-ready-drain
     languages: [rust]
     severity: ERROR
-    message: Before the H2 opening, poll ready records and return at an empty boundary; only the same partially consumed reader may wait, and partial timeout/EOF must fail.
+    message: Poll ready records and return at an empty boundary; only the same partially consumed reader may wait under the normal record deadline, and partial timeout/EOF must fail.
     patterns:
       - pattern: 'async fn drain_post_handshake(...) { ... }'
       - pattern-not: |
@@ -11,7 +11,7 @@ rules:
               let read = match $READER.try_read_record_into(&mut $RECORD).await {
                 Some(result) => result,
                 None if $READER.at_record_boundary() => return Ok($OBSERVED),
-                None => match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, $READER.read_record_into(&mut $RECORD)).await {
+                None => match timeout(TLS_RECORD_COMPLETION_TIMEOUT, $READER.read_record_into(&mut $RECORD)).await {
                   Ok(result) => result,
                   Err(_) => {
                     return Err(Safari26TlsError::Handshake(...))
@@ -30,7 +30,7 @@ rules:
   - id: parallax-tls-post-handshake-processing
     languages: [rust]
     severity: ERROR
-    message: Both pre-opening drain and H2 receive paths must process framed handshake records with the shared state before accepting another inner record type.
+    message: Both the ready-only drain and H2 receive paths must process framed handshake records with the shared state before accepting another inner record type.
     patterns:
       - pattern-inside: 'async fn $PHASE(...) { ... }'
       - metavariable-regex:
@@ -69,7 +69,7 @@ rules:
       - pattern-not: |
           fn parse_post_handshake_message(...) {
             if bytes.len() < 4 { return Ok(None); }
-            let len = ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | bytes[3] as usize;
+            let len = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]) as usize;
             if len > MAX_POST_HANDSHAKE_MESSAGE { return Err(...); }
             let total = 4 + len;
             match bytes[0] {
@@ -191,8 +191,12 @@ rules:
       - pattern-not: |
           async fn complete(...) {
             ...
-            self.open_http2_connection(stream, &mut keys).await?;
-            self.ensure_post_handshake_boundary()?;
+            let $RESULT = async {
+              ...
+              let $OBSERVED = self.open_http2_connection($STREAM, $KEYS).await?;
+              self.ensure_post_handshake_boundary()?;
+              ...
+            }.await;
             ...
           }
       - pattern-not: |
@@ -217,7 +221,7 @@ rules:
   - id: parallax-tls-no-extra-blocking-drain
     languages: [rust]
     severity: ERROR
-    message: Blocking pre-opening reads are allowed only in the ready poll's guarded partial-record continuation.
+    message: Blocking drain reads are allowed only in the ready poll's guarded partial-record continuation under the normal record deadline.
     patterns:
       - pattern-inside: 'async fn drain_post_handshake(...) { ... }'
       - pattern-either:
@@ -228,8 +232,74 @@ rules:
           match $READER.try_read_record_into(...).await {
             Some(result) => result,
             None if $READER.at_record_boundary() => return Ok($OBSERVED),
-            None => match timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, $READER.read_record_into(...)).await {
+            None => match timeout(TLS_RECORD_COMPLETION_TIMEOUT, $READER.read_record_into(...)).await {
               Ok(result) => result,
               Err(_) => { return Err(Safari26TlsError::Handshake(...)) }
             },
           }
+
+  - id: parallax-tls-opening-before-drain
+    languages: [rust]
+    severity: ERROR
+    message: Write the complete H2 opening before draining server records; complete must delegate draining to that ordered opening path.
+    pattern-either:
+      - patterns:
+          - pattern: 'async fn open_http2_connection(...) { ... }'
+          - pattern-not: |
+              async fn open_http2_connection(...) {
+                if !keys.negotiated_h2() {
+                  return self.drain_post_handshake(stream, keys).await;
+                }
+                let fingerprint = Http2Fingerprint::safari26();
+                let mut flight = fingerprint.connection_preface()?;
+                flight.extend_from_slice(&fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?);
+                self.write_application_data(stream, keys, &flight).await?;
+                let observed = self.drain_post_handshake(stream, keys).await?;
+                self.await_http2_settings_ack(stream, keys).await?;
+                Ok(observed)
+              }
+      - patterns:
+          - pattern-inside: 'async fn complete(...) { ... }'
+          - pattern: 'self.drain_post_handshake(...)'
+
+  - id: parallax-tls-settings-record-completion
+    languages: [rust]
+    severity: ERROR
+    message: A short optional H2 boundary wait must resume the same partially consumed reader until the original normal record deadline; partial timeout/EOF must fail.
+    patterns:
+      - pattern: 'async fn await_http2_settings_ack(...) { ... }'
+      - pattern-not: |
+          async fn await_http2_settings_ack(...) {
+            ...
+            for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
+              let record_deadline = tokio::time::Instant::now() + TLS_RECORD_COMPLETION_TIMEOUT;
+              match timeout(H2_SETTINGS_ACK_TIMEOUT, reader.read_record_into(&mut record)).await {
+                Ok(Ok(())) => {},
+                Ok(Err(err)) if is_clean_close(&err) && reader.at_record_boundary() => {
+                  return self.ensure_post_handshake_boundary()
+                }
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) if reader.at_record_boundary() => {
+                  return self.ensure_post_handshake_boundary()
+                }
+                Err(_) => {
+                  match tokio::time::timeout_at(record_deadline, reader.read_record_into(&mut record)).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                      return Err(Safari26TlsError::Handshake(...))
+                    }
+                  }
+                }
+              }
+              ...
+            }
+            ...
+          }
+
+  - id: parallax-tls-record-completion-timeout
+    languages: [rust]
+    severity: ERROR
+    message: Partial TLS records must retain the reviewed twenty-second completion deadline rather than the optional sub-second boundary wait.
+    patterns:
+      - pattern: 'const TLS_RECORD_COMPLETION_TIMEOUT: Duration = $VALUE;'
+      - pattern-not: 'const TLS_RECORD_COMPLETION_TIMEOUT: Duration = Duration::from_secs(20);'

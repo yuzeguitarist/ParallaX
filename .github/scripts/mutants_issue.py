@@ -8,14 +8,14 @@ human-readable view, and then creates / updates / closes / reopens the single
 rolling issue (title below, label `mutation-testing`) accordingly:
 
   * survivors in any reported shard  -> issue open, body lists them per shard
-  * no survivors in any reported shard -> issue closed
+  * all eight complete shards at one commit have no survivors/timeouts -> closed
   * a later shard surfaces survivors -> issue reopened
 
 Only the per-shard JSON keeps state across runs, so each nightly run (which only
 knows its own 1/8 shard) updates just its section without clobbering the others.
 
 Env: GITHUB_REPOSITORY, ART_DIR (the artifact dir), RUN_HTML (triggering run URL),
-plus GH_TOKEN for the `gh` CLI.
+RUN_SHA (tested commit), RUN_ID, RUN_ATTEMPT, plus GH_TOKEN for the `gh` CLI.
 """
 import os
 import re
@@ -26,6 +26,9 @@ import datetime
 REPO = os.environ["GITHUB_REPOSITORY"]
 ART = os.environ["ART_DIR"]
 RUN = os.environ.get("RUN_HTML", "")
+SHA = os.environ.get("RUN_SHA", "")
+RUN_ID = int(os.environ.get("RUN_ID", "0"))
+RUN_ATTEMPT = int(os.environ.get("RUN_ATTEMPT", "1"))
 LABEL = "mutation-testing"
 TITLE = "Mutation testing: surviving mutants"
 NSHARDS = 8
@@ -41,19 +44,58 @@ STATE_RE = re.compile(r"<!-- mutants-state\s*(\{.*?\})\s*-->", re.S)
 def gh(*args):
     p = subprocess.run(["gh", *args], capture_output=True, text=True)
     if p.returncode != 0:
-        print(f"gh {' '.join(args)} -> {p.returncode}: {p.stderr.strip()}")
+        raise RuntimeError(f"gh {' '.join(args)} -> {p.returncode}: {p.stderr.strip()}")
     return p
 
 
-def read_lines(name):
-    try:
-        with open(os.path.join(ART, name)) as f:
-            return [ln.rstrip("\n") for ln in f if ln.strip()]
-    except FileNotFoundError:
-        return []
+def read_result():
+    """Accept only a finished test run covering every selected mutant.
+
+    Text lists exist before a run finishes, so an empty missed.txt cannot prove
+    a clean shard. Compare the final named outcomes with mutants.json instead.
+    """
+    with open(os.path.join(ART, "mutants.json")) as f:
+        selected = json.load(f)
+    with open(os.path.join(ART, "outcomes.json")) as f:
+        result = json.load(f)
+    expected = [m["name"] for m in selected]
+    outcomes = result["outcomes"]
+    baseline = [o for o in outcomes if o["scenario"] == "Baseline"]
+    if (len(baseline) != 1 or baseline[0]["summary"] != "Success" or
+            not any(p["phase"] == "Test" and p["process_status"] == "Success"
+                    for p in baseline[0]["phase_results"])):
+        raise ValueError("baseline tests did not pass")
+    mutants = [o for o in outcomes if isinstance(o["scenario"], dict)]
+    names = [o["scenario"]["Mutant"]["name"] for o in mutants]
+    if (not expected or len(set(expected)) != len(expected) or
+            len(names) != len(expected) or set(names) != set(expected) or
+            result["total_mutants"] != len(expected) or not result.get("end_time")):
+        raise ValueError("mutant outcomes are incomplete")
+    summaries = {"caught": "CaughtMutant", "missed": "MissedMutant",
+                 "unviable": "Unviable", "timeout": "Timeout"}
+    counts = {key: sum(o["summary"] == summary for o in mutants)
+              for key, summary in summaries.items()}
+    if sum(counts.values()) != len(expected) or any(result[k] != n for k, n in counts.items()):
+        raise ValueError("mutant outcome summaries are inconsistent")
+    missed = [o["scenario"]["Mutant"]["name"] for o in mutants if o["summary"] == "MissedMutant"]
+    timed_out = [o["scenario"]["Mutant"]["name"] for o in mutants if o["summary"] == "Timeout"]
+    return {
+        "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%MZ"),
+        "run": RUN,
+        "sha": SHA,
+        "run_id": RUN_ID,
+        "run_attempt": RUN_ATTEMPT,
+        "complete": True,
+        "missed": missed,
+        "missed_total": counts.pop("missed"),
+        "timed_out": timed_out,
+        **counts,
+    }
 
 
 def render(state, total):
+    complete = sum(e.get("complete") is True for e in state.values())
+    timeouts = sum(e["timeout"] for e in state.values())
     out = [
         "Auto-updated by `mutants-report` after each nightly `nightly-mutants` "
         "shard (1/8 of the surface per night; full coverage every 8 days). A "
@@ -61,6 +103,9 @@ def render(state, total):
         "spot where a new or strengthened test would help.",
         "",
         f"**Total known survivors: {total}** ({len(state)}/{NSHARDS} shards reported)",
+        f"**Verified complete shards: {complete}/{NSHARDS}; unresolved timeouts: {timeouts}.** "
+        "Closure requires eight complete shards at the same commit with no survivors or timeouts. "
+        "Each result below retains its tested commit and run provenance.",
         "",
     ]
     for k in sorted(state, key=lambda s: int(s) if s.isdigit() else 99):
@@ -70,6 +115,8 @@ def render(state, total):
         meta = f"_{e['date']} -- {e['caught']} caught, {e['unviable']} unviable, {e['timeout']} timeout_"
         if e.get("run"):
             meta += f" -- [run]({e['run']})"
+        if e.get("sha"):
+            meta += f" -- `{e['sha'][:12]}`"
         out.append(meta)
         shown = e.get("missed", [])
         if shown:
@@ -79,7 +126,10 @@ def render(state, total):
                 out.append(f"... and {n - len(shown)} more (see the run artifact)")
             out.append("```")
         else:
-            out.append("All mutants caught in this shard.")
+            out.append("No surviving mutants reported in this shard. "
+                       "Unviable mutants did not compile; timeouts remain unresolved.")
+        if not e.get("complete"):
+            out.append("Historical result: completion has not been verified; awaiting a fresh run.")
         out.append("")
     out.append("<!-- mutants-state")
     out.append(json.dumps(state, ensure_ascii=False))
@@ -94,16 +144,11 @@ def main():
         return
     shard = m.group(1)
 
-    missed = read_lines("missed.txt")
-    entry = {
-        "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%MZ"),
-        "run": RUN,
-        "missed": missed[:PER_SHARD_CAP],
-        "missed_total": len(missed),
-        "caught": len(read_lines("caught.txt")),
-        "unviable": len(read_lines("unviable.txt")),
-        "timeout": len(read_lines("timeout.txt")),
-    }
+    try:
+        entry = read_result()
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"unverified shard artifact ({error}); preserving the previous report") from error
+    missed = entry["missed"][:PER_SHARD_CAP]
 
     res = gh("issue", "list", "--repo", REPO, "--state", "all", "--label", LABEL,
              "--json", "number,title,state,body", "--limit", "30")
@@ -123,21 +168,37 @@ def main():
     # surfaces into the nightly totals (and showing 9/8 shards indefinitely).
     state = {k: v for k, v in state.items() if k in {str(i) for i in range(NSHARDS)}}
 
+    previous = state.get(shard, {})
+    if previous.get("run_id") and entry.get("run_id"):
+        previous_order = (previous["run_id"], previous.get("run_attempt", 1))
+        incoming_order = (entry["run_id"], entry["run_attempt"])
+        if incoming_order <= previous_order:
+            print("older or already reported run; preserving the previous report")
+            return
+
     # Diff this shard's survivors against what we last stored for it, so a
     # *reopen* means genuine new news (a survivor this shard didn't have before),
     # not merely that the standing backlog across all shards is nonzero. Compared
     # before we overwrite state[shard] with tonight's entry.
-    prev_missed = set(state.get(str(shard), {}).get("missed", []))
+    prev_missed = set(previous.get("missed", []))
     new_survivors = [x for x in missed if x not in prev_missed]
+    if "timed_out" in previous:
+        new_timeouts = len(set(entry.get("timed_out", [])) - set(previous["timed_out"]))
+    else:
+        new_timeouts = max(0, entry["timeout"] - previous.get("timeout", 0))
 
-    state[str(shard)] = entry
+    state[str(shard)] = {**entry, "missed": missed}
     total = sum(v.get("missed_total", len(v.get("missed", []))) for v in state.values())
+    timeouts = sum(v["timeout"] for v in state.values())
+    clean = (len(state) == NSHARDS and total == 0 and timeouts == 0 and
+             all(v.get("complete") is True and v.get("sha") == entry["sha"]
+                 for v in state.values()) and bool(entry["sha"]))
 
     with open("body.md", "w") as f:
         f.write(render(state, total))
 
     if issue is None:
-        if total == 0:
+        if total == 0 and timeouts == 0:
             print("clean shard and no existing issue; nothing to do")
             return
         gh("issue", "create", "--repo", REPO, "--title", TITLE,
@@ -147,16 +208,17 @@ def main():
 
     num = str(issue["number"])
     gh("issue", "edit", num, "--repo", REPO, "--body-file", "body.md")
-    if total == 0:
-        gh("issue", "close", num, "--repo", REPO,
-           "--comment", "All reported shards are clean -- closing. Reopens automatically if a later shard surfaces survivors.")
-        print("closed (no survivors)")
-    elif issue["state"].upper() == "CLOSED" and new_survivors:
+    if clean:
+        if issue["state"].upper() != "CLOSED":
+            gh("issue", "close", num, "--repo", REPO,
+               "--comment", "All eight shards completed at the same commit with no survivors or unresolved timeouts -- closing. Reopens automatically if a later shard surfaces new survivors or timeouts.")
+        print("closed (all eight shards verified clean at one commit)")
+    elif issue["state"].upper() == "CLOSED" and (new_survivors or new_timeouts):
         # Only reopen on genuine new news -- a survivor this shard didn't have
         # last run. A nonzero standing backlog alone keeps it closed once the
         # maintainer has closed it, so it won't nag every night.
         gh("issue", "reopen", num, "--repo", REPO,
-           "--comment", f"Reopening: shard {shard} surfaced {len(new_survivors)} new surviving mutant(s) since last run.")
+           "--comment", f"Reopening: shard {shard} surfaced {len(new_survivors)} new surviving mutant(s) and {new_timeouts} additional unresolved timeout(s) since last run.")
         print(f"reopened issue #{num} ({len(new_survivors)} new survivors this shard)")
     else:
         print(f"updated issue #{num} ({total} survivors, {len(new_survivors)} new this shard; "

@@ -216,6 +216,8 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gfw-lab-${{ matrix.transport }}
-          path: lab-artifacts/*.json
+          path: |
+            lab-artifacts/*.json
+            lab-artifacts/*.log
           if-no-files-found: warn
           retention-days: 14

@@ -701,6 +701,7 @@ mod tests {
                 listen: "127.0.0.1:8443".parse().unwrap(),
                 fallback_addr: "fallback.example:443".to_owned(),
                 data_target: None,
+                nat64_prefixes: vec![],
                 private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
                 identity_secret_key: STANDARD
                     .encode(vec![0_u8; mldsa::secret_key_bytes()])

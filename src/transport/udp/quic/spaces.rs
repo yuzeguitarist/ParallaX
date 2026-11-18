@@ -366,3 +366,103 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod generated_properties {
+    use super::super::property;
+    use super::*;
+    use std::collections::BTreeSet;
+
+    // Build connected components of the mathematical set, independently of the
+    // production interval insertion/merging code.
+    fn intervals(seen: &BTreeSet<u64>) -> Vec<(u64, u64)> {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for &pn in seen {
+            if let Some(last) = ranges.last_mut() {
+                if pn - last.1 == 1 {
+                    last.1 = pn;
+                    continue;
+                }
+            }
+            ranges.push((pn, pn));
+        }
+        ranges
+    }
+
+    #[test]
+    fn generated_receive_histories_match_set_model_and_preserve_replay_watermark() {
+        property::check("quic-receive-set-model", |case| {
+            let base = if case.a & 1 == 0 {
+                0
+            } else {
+                MAX_PACKET_NUMBER - 1024
+            };
+            let mut actual = ReceivedPackets::new();
+            let mut seen = BTreeSet::new();
+            let mut watermark = None;
+            // Every case crosses the range cap, then adds random duplicates,
+            // reordering and hole fills. The near-2^62 variant checks arithmetic.
+            let history = (0..70)
+                .map(|n| base + 2 * n)
+                .chain(case.payload(400).iter().map(|b| base + u64::from(*b)));
+            for pn in history {
+                let new = !watermark.is_some_and(|low| pn <= low) && seen.insert(pn);
+                prop_assert_eq!(actual.insert(pn), new);
+                let mut ranges = intervals(&seen);
+                if ranges.len() > 32 {
+                    let discarded_high = ranges.remove(0).1;
+                    watermark =
+                        Some(watermark.map_or(discarded_high, |n: u64| n.max(discarded_high)));
+                    seen.retain(|n| *n > discarded_high);
+                }
+                prop_assert_eq!(&actual.ranges, &ranges);
+                prop_assert_eq!(actual.low_water, watermark);
+                prop_assert_eq!(actual.largest(), seen.last().copied());
+                for probe in [base, pn, base + case.c % 256] {
+                    prop_assert_eq!(
+                        actual.contains(probe),
+                        watermark.is_some_and(|low| probe <= low) || seen.contains(&probe)
+                    );
+                }
+                let delay = case.b & ((1u64 << 62) - 1);
+                let ack = actual.to_ack(delay).unwrap();
+                prop_assert_eq!(ack.largest, *seen.last().unwrap());
+                prop_assert_eq!(ack.delay, delay);
+                ranges.reverse();
+                prop_assert_eq!(ack.ranges, ranges);
+                prop_assert_eq!(ack.ecn, None);
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn generated_protected_allocations_never_reuse_numbers_or_advance_on_rejection() {
+        property::check("quic-protected-allocation-model", |case| {
+            let mut next = MAX_PACKET_NUMBER - case.a % 32;
+            let mut actual = PacketNumberSpace { next };
+            for step in 0..64u64 {
+                let sealed = case.b.wrapping_add(step) % 16;
+                let limit = case.c.wrapping_add(step / 2) % 20;
+                let expected = if sealed < limit && next <= MAX_PACKET_NUMBER {
+                    let allocated = next;
+                    next += 1;
+                    Some(allocated)
+                } else {
+                    None
+                };
+                prop_assert_eq!(actual.allocate_protected(sealed, limit), expected);
+                prop_assert_eq!(actual.peek(), next);
+                prop_assert_eq!(actual.can_allocate(), next <= MAX_PACKET_NUMBER);
+            }
+            // A fresh key budget cannot revive an exhausted packet-number space.
+            while next <= MAX_PACKET_NUMBER {
+                prop_assert_eq!(actual.allocate_protected(0, 1), Some(next));
+                next += 1;
+            }
+            prop_assert_eq!(actual.allocate_protected(0, 1), None);
+            prop_assert_eq!(actual.peek(), MAX_PACKET_NUMBER + 1);
+            Ok(())
+        });
+    }
+}

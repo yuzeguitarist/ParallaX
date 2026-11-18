@@ -18,12 +18,11 @@
 //! [`write_handshake`]: ClientHandshake::write_handshake
 //! [`read_handshake`]: ClientHandshake::read_handshake
 
-use std::io::Read;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, ML_KEM_768};
-use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use rand::{rngs::OsRng, RngCore};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
@@ -35,13 +34,13 @@ use super::client_hello::{build_client_hello, ClientHelloParams, ResumptionParam
 use super::keys::{DirectionalKeys, KeyPair, Keys, PacketKey};
 use super::schedule::{
     binder_finished_key, client_early_traffic_secret, early_secret_from_psk, initial_keys,
-    resumption_psk, KeySchedule,
+    psk_binder, resumption_psk, KeySchedule,
 };
 use super::suite::CipherSuite;
 use super::ticket::{decode_new_session_ticket, ClientTicket};
 use super::{
     ClientConfig, QuicTlsError, Side, ALERT_BAD_CERTIFICATE, ALERT_DECODE_ERROR,
-    ALERT_DECRYPT_ERROR, ALERT_HANDSHAKE_FAILURE, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
+    ALERT_DECRYPT_ERROR, ALERT_ILLEGAL_PARAMETER, ALERT_MISSING_EXTENSION,
     ALERT_UNEXPECTED_MESSAGE, ALERT_UNSUPPORTED_EXTENSION, QUIC_VERSION_V1,
 };
 
@@ -61,6 +60,7 @@ const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
 const EXT_EARLY_DATA: u16 = 0x002a;
 const EXT_PRE_SHARED_KEY: u16 = 0x0029;
+const EXT_COOKIE: u16 = 0x002c;
 
 const TLS13_LEGACY_VERSION: u16 = 0x0303;
 const TLS13_SELECTED_VERSION: u16 = 0x0304;
@@ -82,6 +82,8 @@ const HRR_RANDOM: [u8; 32] = [
 
 /// A change of QUIC packet-protection keys, emitted by [`ClientHandshake::write_handshake`].
 pub enum KeyChange {
+    /// A HelloRetryRequest rejects previously queued 0-RTT data.
+    RejectZeroRtt,
     /// Install 0-RTT (early-data) write keys. Emitted right after the resumption
     /// ClientHello so the transport can send 0-RTT application data before the
     /// handshake completes. Only `keys.local` is meaningful on the client (0-RTT is
@@ -124,6 +126,7 @@ pub struct ClientHandshake {
     // Inbound.
     inbound: Vec<u8>,
     read_state: ReadState,
+    failed_alert: Option<u8>,
     notified_handshake_data: bool,
 
     // Negotiated state.
@@ -138,6 +141,10 @@ pub struct ClientHandshake {
     /// The resumption PSK offered in `pre_shared_key`; `Some` only when resuming.
     /// Fed into the key schedule iff the server accepts the PSK (`psk_accepted`).
     resumption_psk: Option<Zeroizing<Vec<u8>>>,
+    /// A retry binder uses the ticket's hash even if HRR chooses another hash.
+    resumption_suite: Option<CipherSuite>,
+    /// The original obfuscated age and monotonic epoch used to age a retry offer.
+    resumption_age: Option<(u32, std::time::Instant)>,
     /// 0-RTT write keys, queued to emit as [`KeyChange::ZeroRtt`] after the CH.
     pending_0rtt_keys: Option<Keys>,
     /// The server echoed `pre_shared_key` in ServerHello — the PSK was accepted, so
@@ -148,6 +155,9 @@ pub struct ClientHandshake {
     /// A resumption ticket parsed from a post-handshake NewSessionTicket, awaiting
     /// [`Self::take_session_ticket`]. `None` until one arrives.
     pending_session_ticket: Option<ClientTicket>,
+    retry_suite: Option<CipherSuite>,
+    retry_key: Option<(u16, aws_lc_rs::agreement::PrivateKey)>,
+    reject_0rtt: bool,
 }
 
 impl ClientHandshake {
@@ -267,6 +277,13 @@ impl ClientHandshake {
         }
 
         let mut resumption_psk = None;
+        let mut resumption_suite = None;
+        let resumption_age = ticket.map(|ticket| {
+            (
+                ticket.obfuscated_ticket_age(now_ms),
+                std::time::Instant::now(),
+            )
+        });
         let mut pending_0rtt_keys = None;
         let client_hello = if let Some(t) = ticket {
             // 0-RTT: derive the early secret + binder finished key, build the
@@ -297,6 +314,7 @@ impl ClientHandshake {
                 remote: DirectionalKeys::from_secret(suite, &cet)?,
             });
             resumption_psk = Some(Zeroizing::new(t.psk.to_vec()));
+            resumption_suite = Some(suite);
             ch
         } else {
             build_client_hello(&ClientHelloParams {
@@ -326,6 +344,7 @@ impl ClientHandshake {
             handshake_complete: false,
             inbound: Vec::new(),
             read_state: ReadState::ServerHello,
+            failed_alert: None,
             notified_handshake_data: false,
             suite: None,
             schedule: None,
@@ -334,10 +353,15 @@ impl ClientHandshake {
             alpn: None,
             peer_transport_params: None,
             resumption_psk,
+            resumption_suite,
+            resumption_age,
             pending_0rtt_keys,
             psk_accepted: false,
             early_data_accepted: false,
             pending_session_ticket: None,
+            retry_suite: None,
+            retry_key: None,
+            reject_0rtt: false,
         })
     }
 
@@ -380,6 +404,13 @@ impl ClientHandshake {
     /// Append outgoing CRYPTO bytes to `out`; return a [`KeyChange`] when crossing
     /// into the next packet-number space (Handshake, then 1-RTT), else `None`.
     pub fn write_handshake(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
+        if self.failed_alert.is_some() {
+            return None;
+        }
+        if self.reject_0rtt {
+            self.reject_0rtt = false;
+            return Some(KeyChange::RejectZeroRtt);
+        }
         if !self.client_hello_sent {
             out.extend_from_slice(&self.client_hello);
             self.client_hello_sent = true;
@@ -486,6 +517,26 @@ impl ClientHandshake {
     /// Feed reassembled CRYPTO-stream bytes. Returns `Ok(true)` the first time
     /// handshake data (ALPN / completion) becomes available, else `Ok(false)`.
     pub fn read_handshake(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
+        if let Some(description) = self.failed_alert {
+            return Err(QuicTlsError::alert(
+                description,
+                "TLS session already failed",
+            ));
+        }
+        let result = self.read_handshake_inner(data);
+        if let Err(error) = &result {
+            self.failed_alert = Some(error.alert_description().unwrap_or(80));
+            self.inbound.clear();
+            self.pending_0rtt_keys = None;
+            self.pending_handshake_keys = None;
+            self.pending_client_finished = None;
+            self.pending_1rtt_keys = None;
+            self.pending_session_ticket = None;
+        }
+        result
+    }
+
+    fn read_handshake_inner(&mut self, data: &[u8]) -> Result<bool, QuicTlsError> {
         self.inbound.extend_from_slice(data);
         let mut newly_ready = false;
         loop {
@@ -526,6 +577,9 @@ impl ClientHandshake {
         let body = &message[4..];
         match (self.read_state, msg_type) {
             (ReadState::ServerHello, HANDSHAKE_SERVER_HELLO) => {
+                if body.get(2..34) == Some(HRR_RANDOM.as_slice()) {
+                    return self.handle_hello_retry_request(message);
+                }
                 // Append BEFORE deriving: the handshake secrets hash over
                 // ClientHello..ServerHello (ServerHello included).
                 self.transcript.extend_from_slice(message);
@@ -585,8 +639,89 @@ impl ClientHandshake {
         }
     }
 
+    fn handle_hello_retry_request(&mut self, message: &[u8]) -> Result<(), QuicTlsError> {
+        use crate::tls::safari_shape::{GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1};
+        use aws_lc_rs::agreement;
+        if self.retry_suite.is_some() {
+            return Err(QuicTlsError::alert(
+                ALERT_UNEXPECTED_MESSAGE,
+                "second HelloRetryRequest",
+            ));
+        }
+        let hrr = parse_server_hello_body(&message[4..], self.resumption_psk.is_some())?;
+        let mut replacement = None;
+        if hrr.key_share_group != 0 {
+            let algorithm = match hrr.key_share_group {
+                GROUP_SECP256R1 => &agreement::ECDH_P256,
+                GROUP_SECP384R1 => &agreement::ECDH_P384,
+                GROUP_SECP521R1 => &agreement::ECDH_P521,
+                _ => {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "retry selected an unoffered or already shared group",
+                    ))
+                }
+            };
+            let private = agreement::PrivateKey::generate(algorithm)
+                .map_err(|_| QuicTlsError::Crypto("retry key generation".into()))?;
+            let public = private
+                .compute_public_key()
+                .map_err(|_| QuicTlsError::Crypto("retry public key".into()))?;
+            let mut entry = hrr.key_share_group.to_be_bytes().to_vec();
+            entry.extend_from_slice(&(public.as_ref().len() as u16).to_be_bytes());
+            entry.extend_from_slice(public.as_ref());
+            let mut share = (entry.len() as u16).to_be_bytes().to_vec();
+            share.extend_from_slice(&entry);
+            replacement = Some(share);
+            self.retry_key = Some((hrr.key_share_group, private));
+        }
+        let hash = hrr.suite.digest(&self.client_hello);
+        self.transcript = vec![0xfe, 0, 0, hash.len() as u8];
+        self.transcript.extend_from_slice(&hash);
+        self.transcript.extend_from_slice(message);
+        // Preserve all ClientHello1 bytes except the RFC-defined retry edits.
+        let mut second = rewrite_client_hello_retry(
+            &self.client_hello,
+            replacement.as_deref(),
+            hrr.cookie.as_deref(),
+            self.resumption_age
+                .map(|(age, started)| age.wrapping_add(started.elapsed().as_millis() as u32)),
+        )?;
+        if let Some(psk) = self.resumption_psk.as_ref() {
+            // Preserve the offer for peers requiring the extension in CH2.
+            // A peer choosing another hash cannot accept this PSK; its binder
+            // still uses the ticket's hash, independently of the main transcript.
+            let suite = self
+                .resumption_suite
+                .expect("offered PSK retains its suite");
+            let hash_len = suite.hash_len();
+            let mut binder_transcript = vec![0xfe, 0, 0, hash_len as u8];
+            binder_transcript.extend_from_slice(&suite.digest(&self.client_hello));
+            binder_transcript.extend_from_slice(message);
+            binder_transcript.extend_from_slice(&second[..second.len() - hash_len - 3]);
+            let early = early_secret_from_psk(suite, psk);
+            let key = binder_finished_key(suite, &early)?;
+            let binder = psk_binder(suite, &key, &suite.digest(&binder_transcript))?;
+            let start = second.len() - hash_len;
+            second[start..].copy_from_slice(&binder);
+        }
+        self.transcript.extend_from_slice(&second);
+        self.client_hello = second;
+        self.client_hello_sent = false;
+        self.pending_0rtt_keys = None;
+        self.reject_0rtt = true;
+        self.retry_suite = Some(hrr.suite);
+        Ok(())
+    }
+
     fn handle_server_hello(&mut self, body: &[u8]) -> Result<(), QuicTlsError> {
         let parsed = parse_server_hello_body(body, self.resumption_psk.is_some())?;
+        if self.retry_suite.is_some_and(|suite| suite != parsed.suite) {
+            return Err(QuicTlsError::alert(
+                ALERT_ILLEGAL_PARAMETER,
+                "ServerHello changed the retry cipher suite",
+            ));
+        }
         let suite = parsed.suite;
         let group = parsed.key_share_group;
         let share = parsed.key_share;
@@ -623,7 +758,10 @@ impl ClientHandshake {
             KeySchedule::after_server_hello(suite, psk, &shared_secret, &transcript_hash)?;
         self.x25519.private.zeroize();
         self.mlkem_secret.zeroize();
+        self.retry_key = None;
         self.resumption_psk = None;
+        self.resumption_suite = None;
+        self.resumption_age = None;
         self.schedule = Some(schedule);
         self.pending_handshake_keys = Some(keys);
         Ok(())
@@ -634,6 +772,21 @@ impl ClientHandshake {
         group: u16,
         share: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, QuicTlsError> {
+        if let Some((retry_group, private)) = &self.retry_key {
+            if group != *retry_group {
+                return Err(QuicTlsError::alert(
+                    ALERT_ILLEGAL_PARAMETER,
+                    "ServerHello changed the retry group",
+                ));
+            }
+            let peer = aws_lc_rs::agreement::UnparsedPublicKey::new(private.algorithm(), share);
+            return aws_lc_rs::agreement::agree(
+                private,
+                peer,
+                QuicTlsError::alert(ALERT_ILLEGAL_PARAMETER, "invalid retry key share"),
+                |secret| Ok(Zeroizing::new(secret.to_vec())),
+            );
+        }
         match group {
             GROUP_X25519 => {
                 // Accepted trade-off: a server selecting plain X25519 (dropping the
@@ -703,6 +856,12 @@ impl ClientHandshake {
         // which always runs first.
         let parsed =
             parse_encrypted_extensions_body(body, &self.config.alpn_protocols, self.psk_accepted)?;
+        if parsed.early_data && self.retry_suite.is_some() {
+            return Err(QuicTlsError::alert(
+                ALERT_ILLEGAL_PARAMETER,
+                "early_data after HelloRetryRequest",
+            ));
+        }
         self.alpn = parsed.alpn;
         self.peer_transport_params = parsed.transport_params;
         self.early_data_accepted = parsed.early_data;
@@ -825,6 +984,7 @@ struct ServerHelloParsed {
     key_share: Vec<u8>,
     /// The server echoed our (single) offered `pre_shared_key` — a resumption.
     psk_selected: bool,
+    cookie: Option<Vec<u8>>,
 }
 
 /// Parse a TLS 1.3 ServerHello body (the handshake-message payload, WITHOUT the
@@ -848,18 +1008,7 @@ fn parse_server_hello_body(
         ));
     }
     let random = c.bytes(32)?;
-    if random == HRR_RANDOM {
-        // Accepted limitation (tracked follow-up): HelloRetryRequest is not
-        // handled — the client aborts instead of sending a second ClientHello.
-        // The production QUIC peer is ParallaX's own server, which never sends
-        // HRR (it accepts the offered X25519MLKEM768), and the TCP camouflage
-        // path (safari26) takes the same posture. A future slice can add HRR
-        // for full browser parity under active Initial-space injection.
-        return Err(QuicTlsError::alert(
-            ALERT_HANDSHAKE_FAILURE,
-            "HelloRetryRequest is not supported",
-        ));
-    }
+    let retry = random == HRR_RANDOM;
     // legacy_session_id_echo: our QUIC ClientHello sends an EMPTY session id,
     // so RFC 8446 §4.1.3 requires the echo to be empty too. A non-empty echo
     // is a lenient behavioural tell vs rustls/Safari; reject it.
@@ -883,6 +1032,7 @@ fn parse_server_hello_body(
     let mut key_share_group = None;
     let mut key_share = None;
     let mut psk_selected = false;
+    let mut cookie = None;
     while e.remaining() > 0 {
         let ext_type = e.u16()?;
         let data = e.vec_u16()?;
@@ -914,7 +1064,11 @@ fn parse_server_hello_body(
                 }
                 let mut ks = Cursor::new(data);
                 key_share_group = Some(ks.u16()?);
-                key_share = Some(ks.vec_u16()?.to_vec());
+                key_share = Some(if retry {
+                    Vec::new()
+                } else {
+                    ks.vec_u16()?.to_vec()
+                });
                 if ks.remaining() != 0 {
                     return Err(QuicTlsError::alert(
                         ALERT_DECODE_ERROR,
@@ -928,6 +1082,12 @@ fn parse_server_hello_body(
             // than silently tolerating it — silent leniency is an active-probe
             // tell.
             EXT_PRE_SHARED_KEY => {
+                if retry {
+                    return Err(QuicTlsError::alert(
+                        ALERT_UNSUPPORTED_EXTENSION,
+                        "PSK selection in HelloRetryRequest",
+                    ));
+                }
                 if psk_selected {
                     return Err(QuicTlsError::alert(
                         ALERT_ILLEGAL_PARAMETER,
@@ -950,6 +1110,23 @@ fn parse_server_hello_body(
                     ));
                 }
                 psk_selected = true;
+            }
+            EXT_COOKIE if retry => {
+                if cookie.is_some() {
+                    return Err(QuicTlsError::alert(
+                        ALERT_ILLEGAL_PARAMETER,
+                        "duplicate retry cookie",
+                    ));
+                }
+                let mut value = Cursor::new(data);
+                let bytes = value.vec_u16()?;
+                if bytes.is_empty() || value.remaining() != 0 {
+                    return Err(QuicTlsError::alert(
+                        ALERT_DECODE_ERROR,
+                        "invalid retry cookie",
+                    ));
+                }
+                cookie = Some(bytes.to_vec());
             }
             other => {
                 return Err(QuicTlsError::alert(
@@ -974,6 +1151,16 @@ fn parse_server_hello_body(
             "trailing bytes after ServerHello extensions",
         ));
     }
+    if retry && key_share_group == Some(0) {
+        return Err(QuicTlsError::alert(
+            ALERT_ILLEGAL_PARAMETER,
+            "retry selected an unoffered group",
+        ));
+    }
+    if retry && key_share_group.is_none() && cookie.is_some() {
+        key_share_group = Some(0);
+        key_share = Some(Vec::new());
+    }
     let group = key_share_group.ok_or_else(|| {
         QuicTlsError::alert(ALERT_MISSING_EXTENSION, "ServerHello missing key_share")
     })?;
@@ -988,7 +1175,76 @@ fn parse_server_hello_body(
         key_share_group: group,
         key_share: share,
         psk_selected,
+        cookie,
     })
+}
+
+fn rewrite_client_hello_retry(
+    first: &[u8],
+    share: Option<&[u8]>,
+    cookie: Option<&[u8]>,
+    ticket_age: Option<u32>,
+) -> Result<Vec<u8>, QuicTlsError> {
+    let body = &first[4..];
+    let mut cursor = Cursor::new(body);
+    cursor.bytes(34)?;
+    cursor.vec_u8()?;
+    cursor.vec_u16()?;
+    cursor.vec_u8()?;
+    let prefix_len = body.len() - cursor.remaining();
+    let mut input = Cursor::new(cursor.vec_u16()?);
+    let mut extensions = Vec::new();
+    while input.remaining() != 0 {
+        let ty = input.u16()?;
+        let data = input.vec_u16()?;
+        if ty == EXT_EARLY_DATA {
+            continue;
+        }
+        let updated_psk = if ty == EXT_PRE_SHARED_KEY {
+            if let Some(age) = ticket_age {
+                let mut psk = Cursor::new(data);
+                let mut identities = Cursor::new(psk.vec_u16()?);
+                let identity = identities.vec_u16()?;
+                identities.bytes(4)?;
+                let age_offset = 4 + identity.len();
+                let mut updated = data.to_vec();
+                updated[age_offset..age_offset + 4].copy_from_slice(&age.to_be_bytes());
+                Some(updated)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let data = if ty == EXT_KEY_SHARE {
+            share.unwrap_or(data)
+        } else {
+            updated_psk.as_deref().unwrap_or(data)
+        };
+        extensions.extend_from_slice(&ty.to_be_bytes());
+        extensions.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(data);
+        if ty == EXT_KEY_SHARE {
+            if let Some(cookie) = cookie {
+                extensions.extend_from_slice(&EXT_COOKIE.to_be_bytes());
+                extensions.extend_from_slice(&((cookie.len() + 2) as u16).to_be_bytes());
+                extensions.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+                extensions.extend_from_slice(cookie);
+            }
+        }
+    }
+    let len = prefix_len + 2 + extensions.len();
+    if extensions.len() > u16::MAX as usize {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "retry ClientHello too large",
+        ));
+    }
+    let mut second = vec![1, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+    second.extend_from_slice(&body[..prefix_len]);
+    second.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    second.extend_from_slice(&extensions);
+    Ok(second)
 }
 
 /// The fields an EncryptedExtensions body parses down to.
@@ -1147,10 +1403,10 @@ fn parse_selected_alpn(data: &[u8]) -> Result<&[u8], QuicTlsError> {
     let mut l = Cursor::new(list);
     let proto = l.vec_u8()?;
     // RFC 7301 §3.2: the server selects exactly one protocol.
-    if l.remaining() != 0 {
+    if proto.is_empty() || l.remaining() != 0 {
         return Err(QuicTlsError::alert(
             ALERT_DECODE_ERROR,
-            "ALPN list carried more than one protocol",
+            "server ALPN must select exactly one non-empty protocol",
         ));
     }
     Ok(proto)
@@ -1159,7 +1415,12 @@ fn parse_selected_alpn(data: &[u8]) -> Result<&[u8], QuicTlsError> {
 /// Parse a TLS 1.3 Certificate message body into the DER chain.
 fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
     let mut c = Cursor::new(body);
-    let _request_context = c.vec_u8()?;
+    if !c.vec_u8()?.is_empty() {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "non-empty certificate_request_context in server Certificate",
+        ));
+    }
     let list = c.vec_u24()?;
     if c.remaining() != 0 {
         return Err(QuicTlsError::alert(
@@ -1171,12 +1432,18 @@ fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
     let mut certs = Vec::new();
     while l.remaining() > 0 {
         let cert = l.vec_u24()?;
+        if cert.is_empty() {
+            return Err(QuicTlsError::alert(
+                ALERT_DECODE_ERROR,
+                "empty certificate entry",
+            ));
+        }
         certs.push(cert.to_vec());
         let _extensions = l.vec_u16()?;
     }
     if certs.is_empty() {
         return Err(QuicTlsError::alert(
-            ALERT_BAD_CERTIFICATE,
+            ALERT_DECODE_ERROR,
             "empty certificate chain",
         ));
     }
@@ -1189,38 +1456,46 @@ fn parse_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
 fn parse_compressed_certificate_body(body: &[u8]) -> Result<Vec<Vec<u8>>, QuicTlsError> {
     let mut c = Cursor::new(body);
     let algorithm = c.u16()?;
+    let uncompressed_len = c.u24()? as usize;
+    let compressed = c.vec_u24()?;
+    if c.remaining() != 0 || compressed.is_empty() {
+        return Err(QuicTlsError::alert(
+            ALERT_DECODE_ERROR,
+            "malformed compressed certificate vector",
+        ));
+    }
     if algorithm != CERT_COMPRESSION_ZLIB {
         return Err(QuicTlsError::alert(
-            ALERT_BAD_CERTIFICATE,
+            ALERT_ILLEGAL_PARAMETER,
             "unsupported certificate compression algorithm",
         ));
     }
-    let uncompressed_len = c.u24()? as usize;
     if uncompressed_len > MAX_DECOMPRESSED_CERT_CHAIN {
         return Err(QuicTlsError::alert(
-            ALERT_BAD_CERTIFICATE,
+            ALERT_ILLEGAL_PARAMETER,
             "compressed_certificate uncompressed_length exceeds maximum",
         ));
     }
-    let compressed = c.vec_u24()?;
-    let decoder = ZlibDecoder::new(compressed);
-    let mut decompressed = Vec::with_capacity(uncompressed_len.min(MAX_DECOMPRESSED_CERT_CHAIN));
-    let mut limited = decoder.take((MAX_DECOMPRESSED_CERT_CHAIN as u64) + 1);
-    limited
-        .read_to_end(&mut decompressed)
+    // One spare output byte detects an understated length without inflating an
+    // unbounded stream. Require the zlib trailer and consume the entire vector.
+    let mut decompressed = vec![0; uncompressed_len + 1];
+    let mut decoder = Decompress::new(true);
+    let status = decoder
+        .decompress(compressed, &mut decompressed, FlushDecompress::Finish)
         .map_err(|_| QuicTlsError::alert(ALERT_BAD_CERTIFICATE, "zlib decompression failed"))?;
-    if decompressed.len() > MAX_DECOMPRESSED_CERT_CHAIN {
+    if status != Status::StreamEnd || decoder.total_in() != compressed.len() as u64 {
         return Err(QuicTlsError::alert(
             ALERT_BAD_CERTIFICATE,
-            "compressed_certificate inflates beyond maximum",
+            "compressed_certificate incomplete or trailing zlib stream",
         ));
     }
-    if decompressed.len() != uncompressed_len {
+    if decoder.total_out() != uncompressed_len as u64 {
         return Err(QuicTlsError::alert(
             ALERT_BAD_CERTIFICATE,
             "compressed_certificate length mismatch",
         ));
     }
+    decompressed.truncate(uncompressed_len);
     parse_certificate_body(&decompressed)
 }
 
@@ -1619,6 +1894,318 @@ mod tests {
         b
     }
 
+    fn retry_message(group: Option<u16>, cookie: Option<&[u8]>) -> Vec<u8> {
+        let mut extensions = vec![0, 0x2b, 0, 2, 3, 4];
+        if let Some(group) = group {
+            extensions.extend_from_slice(&[0, 0x33, 0, 2]);
+            extensions.extend_from_slice(&group.to_be_bytes());
+        }
+        if let Some(cookie) = cookie {
+            extensions.extend_from_slice(&EXT_COOKIE.to_be_bytes());
+            extensions.extend_from_slice(&((cookie.len() + 2) as u16).to_be_bytes());
+            extensions.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(cookie);
+        }
+        msg(
+            HANDSHAKE_SERVER_HELLO,
+            &server_hello_body(HRR_RANDOM, &extensions),
+        )
+    }
+
+    fn hello_extensions(hello: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut cursor = Cursor::new(&hello[4..]);
+        cursor.bytes(34).unwrap();
+        cursor.vec_u8().unwrap();
+        cursor.vec_u16().unwrap();
+        cursor.vec_u8().unwrap();
+        let mut extensions = Cursor::new(cursor.vec_u16().unwrap());
+        let mut result = Vec::new();
+        while extensions.remaining() != 0 {
+            result.push((
+                extensions.u16().unwrap(),
+                extensions.vec_u16().unwrap().to_vec(),
+            ));
+        }
+        result
+    }
+
+    #[test]
+    fn retry_preserves_client_hello_and_hashes_both_flights_and_cookie() {
+        for group in [None, Some(crate::tls::safari_shape::GROUP_SECP256R1)] {
+            let mut client = handshake();
+            let first = client.client_hello.clone();
+            let retry = retry_message(group, Some(b"opaque cookie"));
+            client.read_handshake(&retry).unwrap();
+            let second = client.client_hello.clone();
+            assert_eq!(&first[4..38], &second[4..38]);
+            let original: Vec<_> = hello_extensions(&first)
+                .into_iter()
+                .filter(|(kind, _)| *kind != EXT_KEY_SHARE)
+                .collect();
+            let rewritten: Vec<_> = hello_extensions(&second)
+                .into_iter()
+                .filter(|(kind, _)| !matches!(*kind, EXT_KEY_SHARE | EXT_COOKIE))
+                .collect();
+            assert_eq!(original, rewritten);
+            let mut expected = vec![0xfe, 0, 0, 32];
+            expected.extend_from_slice(&CipherSuite::Aes128GcmSha256.digest(&first));
+            expected.extend_from_slice(&retry);
+            expected.extend_from_slice(&second);
+            assert_eq!(client.transcript, expected);
+            let mut outbound = Vec::new();
+            assert!(matches!(
+                client.write_handshake(&mut outbound),
+                Some(KeyChange::RejectZeroRtt)
+            ));
+            assert!(outbound.is_empty());
+            assert!(client.write_handshake(&mut outbound).is_none());
+            assert_eq!(outbound, second);
+            if group.is_none() {
+                assert_eq!(
+                    hello_extensions(&first)
+                        .into_iter()
+                        .find(|(kind, _)| *kind == EXT_KEY_SHARE),
+                    hello_extensions(&second)
+                        .into_iter()
+                        .find(|(kind, _)| *kind == EXT_KEY_SHARE)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_rejects_repeated_retry_illegal_groups_and_changed_server_selection() {
+        for group in [0, GROUP_X25519, GROUP_X25519_MLKEM768, 0x1234] {
+            let error = handshake()
+                .read_handshake(&retry_message(Some(group), Some(b"cookie")))
+                .unwrap_err();
+            assert_eq!(error.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+        }
+        let retry = retry_message(Some(crate::tls::safari_shape::GROUP_SECP256R1), None);
+        let mut client = handshake();
+        client.read_handshake(&retry).unwrap();
+        assert_eq!(
+            client
+                .read_handshake(&retry)
+                .unwrap_err()
+                .alert_description(),
+            Some(ALERT_UNEXPECTED_MESSAGE)
+        );
+        for changed_suite in [false, true] {
+            let mut client = handshake();
+            client.read_handshake(&retry).unwrap();
+            let mut server = server_hello_with_extra_extensions(&[]);
+            if changed_suite {
+                server[35..37].copy_from_slice(&0x1302_u16.to_be_bytes());
+            }
+            assert_eq!(
+                client
+                    .read_handshake(&msg(HANDSHAKE_SERVER_HELLO, &server))
+                    .unwrap_err()
+                    .alert_description(),
+                Some(ALERT_ILLEGAL_PARAMETER)
+            );
+        }
+    }
+
+    fn rustls_retry_config(suite: rustls::CipherSuite) -> Arc<rustls::ServerConfig> {
+        let certified = rcgen::generate_simple_self_signed(vec!["example.com".to_owned()]).unwrap();
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::SECP256R1];
+        provider
+            .cipher_suites
+            .retain(|candidate| candidate.suite() == suite);
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(
+                    certified.key_pair.serialize_der(),
+                )),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"h3".to_vec()];
+        config.max_early_data_size = u32::MAX;
+        config.send_tls13_tickets = 1;
+        Arc::new(config)
+    }
+
+    fn complete_rustls_retry(
+        client: &mut ClientHandshake,
+        config: Arc<rustls::ServerConfig>,
+    ) -> ClientTicket {
+        let mut server: rustls::quic::Connection =
+            rustls::quic::ServerConnection::new(config, rustls::quic::Version::V1, vec![0x0f, 0])
+                .unwrap()
+                .into();
+        let mut first = Vec::new();
+        client.write_handshake(&mut first);
+        let mut empty = Vec::new();
+        client.write_handshake(&mut empty); // Install any initially offered 0-RTT keys.
+        server.read_hs(&first).unwrap();
+        let mut retry = Vec::new();
+        assert!(server.write_hs(&mut retry).is_none());
+        assert_eq!(retry.get(6..38), Some(HRR_RANDOM.as_slice()));
+        client.read_handshake(&retry).unwrap();
+        assert!(client.pending_0rtt_keys.is_none());
+        let mut second = Vec::new();
+        assert!(matches!(
+            client.write_handshake(&mut second),
+            Some(KeyChange::RejectZeroRtt)
+        ));
+        assert!(client.write_handshake(&mut second).is_none());
+        assert!(!hello_extensions(&second)
+            .iter()
+            .any(|(kind, _)| *kind == EXT_EARLY_DATA));
+        server.read_hs(&second).unwrap();
+        for _ in 0..4 {
+            let mut flight = Vec::new();
+            let change = server.write_hs(&mut flight);
+            if !flight.is_empty() {
+                client.read_handshake(&flight).unwrap();
+            }
+            if change.is_none() && flight.is_empty() {
+                break;
+            }
+        }
+        for _ in 0..4 {
+            let mut flight = Vec::new();
+            let change = client.write_handshake(&mut flight);
+            if !flight.is_empty() {
+                server.read_hs(&flight).unwrap();
+            }
+            if change.is_none() && flight.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+        assert!(client.retry_key.is_none());
+        let mut ours = [0; 32];
+        let mut peer = [0; 32];
+        client
+            .export_keying_material(&mut ours, b"retry interop", b"context")
+            .unwrap();
+        server
+            .export_keying_material(&mut peer, b"retry interop", Some(b"context"))
+            .unwrap();
+        assert_eq!(ours, peer);
+        let mut tickets = Vec::new();
+        server.write_hs(&mut tickets);
+        client.read_handshake(&tickets).unwrap();
+        client
+            .take_session_ticket(1_000_000)
+            .expect("rustls issued a QUIC resumption ticket")
+    }
+
+    #[test]
+    fn retry_completes_with_real_rustls_peer_for_all_suites_and_resumed_binders() {
+        for suite in [
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+        ] {
+            let config = rustls_retry_config(suite);
+            let mut client = handshake();
+            let ticket = complete_rustls_retry(&mut client, config.clone());
+            let mut resumed = ClientHandshake::new_resumption(
+                client.config.clone(),
+                QUIC_VERSION_V1,
+                "example.com",
+                vec![0x0f, 0],
+                &[],
+                &ticket,
+                1_000_001,
+            )
+            .unwrap();
+            complete_rustls_retry(&mut resumed, config);
+            assert!(
+                resumed.psk_accepted,
+                "rustls accepted the recomputed retry binder"
+            );
+            assert!(!resumed.is_early_data_accepted());
+        }
+    }
+
+    #[test]
+    fn retry_with_incompatible_psk_hash_completes_a_certificate_handshake() {
+        let mut client = handshake();
+        let config = rustls_retry_config(rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+        let ticket = complete_rustls_retry(&mut client, config.clone());
+        let mut other =
+            (*rustls_retry_config(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384)).clone();
+        other.session_storage = config.session_storage.clone();
+        let mut resumed = ClientHandshake::new_resumption(
+            client.config.clone(),
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x0f, 0],
+            &[],
+            &ticket,
+            1_000_001,
+        )
+        .unwrap();
+        complete_rustls_retry(&mut resumed, Arc::new(other));
+        assert!(!resumed.psk_accepted);
+        assert!(hello_extensions(&resumed.client_hello)
+            .iter()
+            .any(|(kind, _)| *kind == EXT_PRE_SHARED_KEY));
+    }
+
+    #[test]
+    fn delayed_retry_updates_wrapping_ticket_age_before_rebinding() {
+        let base = handshake();
+        let ticket = ClientTicket {
+            ticket: b"test-ticket".to_vec(),
+            psk: Zeroizing::new(vec![7; 32]),
+            suite: 0x1301,
+            alpn: b"h3".to_vec(),
+            peer_transport_params: vec![0x0f, 0],
+            age_add: u32::MAX - 1000,
+            lifetime_secs: 7200,
+            received_at_ms: 1000,
+        };
+        let mut client = ClientHandshake::new_resumption(
+            base.config.clone(),
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x0f, 0],
+            &[],
+            &ticket,
+            1001,
+        )
+        .unwrap();
+        let original_age = ticket.obfuscated_ticket_age(1001);
+        client.resumption_age.as_mut().unwrap().1 =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let first = client.client_hello.clone();
+        let retry = retry_message(Some(crate::tls::safari_shape::GROUP_SECP256R1), None);
+        client.read_handshake(&retry).unwrap();
+        let second = &client.client_hello;
+        let (_, psk) = hello_extensions(second)
+            .into_iter()
+            .find(|(kind, _)| *kind == EXT_PRE_SHARED_KEY)
+            .unwrap();
+        let age_offset = 4 + ticket.ticket.len();
+        let new_age = u32::from_be_bytes(psk[age_offset..age_offset + 4].try_into().unwrap());
+        assert!(new_age.wrapping_sub(original_age) >= 2000);
+        assert!(
+            new_age < original_age,
+            "obfuscated ticket age wraps as a u32"
+        );
+        let suite = CipherSuite::Aes128GcmSha256;
+        let mut binder_transcript = vec![0xfe, 0, 0, 32];
+        binder_transcript.extend_from_slice(&suite.digest(&first));
+        binder_transcript.extend_from_slice(&retry);
+        binder_transcript.extend_from_slice(&second[..second.len() - 35]);
+        let early = early_secret_from_psk(suite, &ticket.psk);
+        let key = binder_finished_key(suite, &early).unwrap();
+        let expected = psk_binder(suite, &key, &suite.digest(&binder_transcript)).unwrap();
+        assert_eq!(&second[second.len() - 32..], expected);
+    }
+
     #[test]
     fn unexpected_message_before_server_hello_is_rejected() {
         let mut hs = handshake();
@@ -1707,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_retry_request_is_cleanly_rejected() {
+    fn incomplete_hello_retry_request_is_rejected() {
         let mut hs = handshake();
         let err = hs
             .read_handshake(&msg(
@@ -1715,7 +2302,7 @@ mod tests {
                 &server_hello_body(HRR_RANDOM, &[]),
             ))
             .unwrap_err();
-        assert_eq!(err.alert_description(), Some(ALERT_HANDSHAKE_FAILURE));
+        assert_eq!(err.alert_description(), Some(ALERT_MISSING_EXTENSION));
     }
 
     #[test]
@@ -1941,6 +2528,27 @@ mod tests {
     }
 
     #[test]
+    fn hrr_forbids_early_data_even_when_the_psk_is_accepted() {
+        let alpn = alpn_ext_body(b"h3");
+        let ee = encrypted_extensions(&[
+            (EXT_ALPN, alpn.as_slice()),
+            (EXT_QUIC_TRANSPORT_PARAMETERS, &[0x0f, 0x00][..]),
+            (EXT_EARLY_DATA, &[][..]),
+        ]);
+        let mut hs = handshake();
+        hs.psk_accepted = true;
+        hs.handle_encrypted_extensions(&ee).unwrap();
+        assert!(hs.is_early_data_accepted());
+
+        let mut hs = handshake();
+        hs.psk_accepted = true;
+        hs.retry_suite = Some(CipherSuite::Aes128GcmSha256);
+        let error = hs.handle_encrypted_extensions(&ee).unwrap_err();
+        assert_eq!(error.alert_description(), Some(ALERT_ILLEGAL_PARAMETER));
+        assert!(!hs.is_early_data_accepted());
+    }
+
+    #[test]
     fn offered_extensions_answered_in_encrypted_extensions_are_accepted() {
         // The strict catch-all must not reject what a REAL server legitimately
         // answers: we offer server_name and supported_groups, and RFC 8446 §4.2
@@ -2057,5 +2665,474 @@ mod tests {
         let mut nonzero = [0_u8; X25519_KEY_LEN];
         nonzero[0] = 1;
         reject_degenerate_x25519(&nonzero).unwrap();
+    }
+
+    fn drain_authentication_flight(
+        mut write: impl FnMut(&mut Vec<u8>) -> Option<KeyChange>,
+    ) -> (Vec<u8>, Vec<&'static str>) {
+        let mut flight = Vec::new();
+        let mut changes = Vec::new();
+        for _ in 0..8 {
+            let mut bytes = Vec::new();
+            let change = write(&mut bytes);
+            let done = bytes.is_empty() && change.is_none();
+            if let Some(change) = change {
+                changes.push(match change {
+                    KeyChange::RejectZeroRtt => "reject_early",
+                    KeyChange::ZeroRtt { .. } => "early",
+                    KeyChange::Handshake { .. } => "handshake",
+                    KeyChange::OneRtt { .. } => "application",
+                });
+            }
+            flight.extend_from_slice(&bytes);
+            if done {
+                return (flight, changes);
+            }
+        }
+        panic!("handshake output did not quiesce");
+    }
+
+    fn authentication_test_server() -> super::super::ServerHandshake {
+        use aws_lc_rs::{
+            rand::SystemRandom,
+            signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
+        };
+        let signing =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
+                .unwrap();
+        super::super::ServerHandshake::new(
+            Arc::new(vec![vec![0x30, 3, 2, 1, 0]]),
+            signing.as_ref(),
+            vec![b"h3".to_vec()],
+            vec![0x0f, 0],
+            Some(Zeroizing::new([0x55; 32])),
+        )
+        .unwrap()
+    }
+
+    // Drive the actual cold handshake up to, but not including, a selected
+    // server message. Every MAC below is initially produced by the real peer.
+    fn client_before_server_message(
+        kind: u8,
+    ) -> (ClientHandshake, super::super::ServerHandshake, Vec<Vec<u8>>) {
+        let mut client = handshake();
+        let mut server = authentication_test_server();
+        let (hello, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        server.read_handshake(&hello).unwrap();
+        let (flight, changes) = drain_authentication_flight(|bytes| server.write_handshake(bytes));
+        assert_eq!(changes, ["handshake", "application"]);
+        let mut rest = Vec::new();
+        let mut cursor = 0;
+        while cursor < flight.len() {
+            let length = ((flight[cursor + 1] as usize) << 16)
+                | ((flight[cursor + 2] as usize) << 8)
+                | flight[cursor + 3] as usize;
+            let message = &flight[cursor..cursor + 4 + length];
+            if !rest.is_empty() || message[0] == kind {
+                rest.push(message.to_vec());
+            } else {
+                client.read_handshake(message).unwrap();
+            }
+            cursor += message.len();
+        }
+        assert_eq!(rest.first().map(|message| message[0]), Some(kind));
+        let (bytes, changes) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        assert!(bytes.is_empty());
+        assert_eq!(changes, ["handshake"]);
+        (client, server, rest)
+    }
+
+    fn assert_client_has_no_application_flight(client: &mut ClientHandshake) {
+        assert!(client.is_handshaking());
+        assert!(client.pending_client_finished.is_none());
+        assert!(client.pending_1rtt_keys.is_none());
+        assert!(client.pending_session_ticket.is_none());
+        assert!(client.resumption_master_secret().is_err());
+        assert!(client
+            .export_keying_material(&mut [0; 32], b"unfinished", b"")
+            .is_err());
+        let (bytes, changes) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        assert!(bytes.is_empty() && changes.is_empty());
+    }
+
+    #[test]
+    fn server_finished_mac_or_length_failure_does_not_commit_client_application_state() {
+        for variant in 0..4 {
+            let (mut client, server, flight) = client_before_server_message(HANDSHAKE_FINISHED);
+            assert_eq!(client.read_state, ReadState::Finished);
+            let transcript = client.transcript.clone();
+            let mut body = flight[0][4..].to_vec();
+            match variant {
+                0 => body[0] ^= 1,
+                1 => {
+                    body.pop();
+                }
+                2 => body.push(0),
+                _ => body.clear(),
+            }
+            let error = client
+                .read_handshake(&msg(HANDSHAKE_FINISHED, &body))
+                .unwrap_err();
+            assert_eq!(error.alert_description(), Some(ALERT_DECRYPT_ERROR));
+            assert_eq!(client.read_state, ReadState::Finished);
+            assert_eq!(client.transcript, transcript);
+            assert_client_has_no_application_flight(&mut client);
+            assert!(
+                server.is_handshaking(),
+                "no client Finished or ticket was produced"
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_server_finished_installs_application_keys_only_after_complete_verified_message() {
+        for cut in [0, 1, 3, 4, 35] {
+            let (mut client, mut server, flight) = client_before_server_message(HANDSHAKE_FINISHED);
+            let finished = &flight[0];
+            assert_eq!(finished.len(), 36);
+            client.read_handshake(&finished[..cut]).unwrap();
+            assert_eq!(client.read_state, ReadState::Finished);
+            assert_client_has_no_application_flight(&mut client);
+            client.read_handshake(&finished[cut..]).unwrap();
+            assert_eq!(client.read_state, ReadState::Complete);
+            let (client_finished, changes) =
+                drain_authentication_flight(|bytes| client.write_handshake(bytes));
+            assert_eq!(changes, ["application"]);
+            assert!(!client.is_handshaking());
+            server.read_handshake(&client_finished).unwrap();
+            assert!(!server.is_handshaking());
+            let (ticket, changes) =
+                drain_authentication_flight(|bytes| server.write_handshake(bytes));
+            assert!(changes.is_empty());
+            assert_eq!(ticket[0], HANDSHAKE_NEW_SESSION_TICKET);
+            client.read_handshake(&ticket).unwrap();
+            assert!(client.take_session_ticket(1_000_000).is_some());
+        }
+    }
+
+    fn zlib_bytes(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut compressor =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        compressor.write_all(plain).unwrap();
+        compressor.finish().unwrap()
+    }
+
+    fn compressed_certificate_body(algorithm: u16, declared: usize, compressed: &[u8]) -> Vec<u8> {
+        let mut body = algorithm.to_be_bytes().to_vec();
+        body.extend_from_slice(&(declared as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(&(compressed.len() as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(compressed);
+        body
+    }
+
+    #[test]
+    fn compressed_certificate_real_state_path_preserves_wire_transcript_and_exact_cap() {
+        for at_cap in [false, true] {
+            let (mut client, _, remaining) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+            let (certificate, expected) = if at_cap {
+                let der = vec![0; MAX_DECOMPRESSED_CERT_CHAIN - 9];
+                let mut body = vec![0]; // empty certificate_request_context
+                body.extend_from_slice(&((der.len() + 5) as u32).to_be_bytes()[1..]);
+                body.extend_from_slice(&(der.len() as u32).to_be_bytes()[1..]);
+                body.extend_from_slice(&der);
+                body.extend_from_slice(&[0, 0]); // empty per-certificate extensions
+                assert_eq!(body.len(), MAX_DECOMPRESSED_CERT_CHAIN);
+                (body, vec![der])
+            } else {
+                (remaining[0][4..].to_vec(), vec![vec![0x30, 3, 2, 1, 0]])
+            };
+            let body = compressed_certificate_body(1, certificate.len(), &zlib_bytes(&certificate));
+            let message = msg(HANDSHAKE_COMPRESSED_CERTIFICATE, &body);
+            let mut transcript = client.transcript.clone();
+            transcript.extend_from_slice(&message);
+            client.read_handshake(&message).unwrap();
+            assert_eq!(client.read_state, ReadState::CertificateVerify);
+            assert_eq!(client.server_certs, expected);
+            assert_eq!(
+                client.transcript, transcript,
+                "hash compressed wire bytes, not inflated bytes"
+            );
+            // This test stops at CertificateVerify: the modified server flight
+            // deliberately has no peer signature/Finished over its new transcript.
+            assert_client_has_no_application_flight(&mut client);
+        }
+    }
+
+    #[test]
+    fn malformed_compressed_certificates_cannot_advance_the_real_client_state() {
+        let (_, _, remaining) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+        let certificate = &remaining[0][4..];
+        let compressed = zlib_bytes(certificate);
+        let good = compressed_certificate_body(1, certificate.len(), &compressed);
+        let mut vector_truncated = good.clone();
+        vector_truncated.pop();
+        let mut outer_trailing = good.clone();
+        outer_trailing.push(0);
+        let mut stream_trailing = compressed.clone();
+        stream_trailing.push(0);
+        let cases = [
+            (
+                "algorithm",
+                compressed_certificate_body(2, certificate.len(), &compressed),
+                ALERT_ILLEGAL_PARAMETER,
+            ),
+            (
+                "declared cap",
+                compressed_certificate_body(1, MAX_DECOMPRESSED_CERT_CHAIN + 1, &compressed),
+                ALERT_ILLEGAL_PARAMETER,
+            ),
+            (
+                "inflation cap",
+                compressed_certificate_body(
+                    1,
+                    1,
+                    &zlib_bytes(&vec![0; MAX_DECOMPRESSED_CERT_CHAIN + 1]),
+                ),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                "length mismatch",
+                compressed_certificate_body(1, certificate.len() + 1, &compressed),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                "invalid zlib",
+                compressed_certificate_body(1, certificate.len(), &[0xff, 0xff]),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            ("truncated vector", vector_truncated, ALERT_DECODE_ERROR),
+            (
+                "truncated zlib checksum",
+                compressed_certificate_body(
+                    1,
+                    certificate.len(),
+                    &compressed[..compressed.len() - 1],
+                ),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            ("outer trailing", outer_trailing, ALERT_DECODE_ERROR),
+            (
+                "stream trailing",
+                compressed_certificate_body(1, certificate.len(), &stream_trailing),
+                ALERT_BAD_CERTIFICATE,
+            ),
+        ];
+        for (label, body, alert) in cases {
+            let (mut client, _, _) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+            let transcript = client.transcript.clone();
+            let error = client
+                .read_handshake(&msg(HANDSHAKE_COMPRESSED_CERTIFICATE, &body))
+                .expect_err(label);
+            assert_eq!(error.alert_description(), Some(alert), "{label}");
+            assert_eq!(client.read_state, ReadState::Certificate, "{label}");
+            assert!(client.server_certs.is_empty(), "{label}");
+            assert_eq!(client.transcript, transcript, "{label}");
+            assert_client_has_no_application_flight(&mut client);
+        }
+    }
+
+    #[test]
+    fn review_server_certificate_rejects_context_and_empty_chain_before_state_commit() {
+        let (_, _, remaining) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+        let valid = &remaining[0][4..];
+        let mut with_context = vec![1, 0x61];
+        with_context.extend_from_slice(&valid[1..]);
+        let mut long_context = vec![255];
+        long_context.extend_from_slice(&[0x62; 255]);
+        long_context.extend_from_slice(&valid[1..]);
+        for body in [
+            with_context,
+            long_context,
+            vec![0, 0, 0, 0],
+            vec![0, 0, 0, 5, 0, 0, 0, 0, 0],
+        ] {
+            for compressed in [false, true] {
+                let (mut client, _, remaining) =
+                    client_before_server_message(HANDSHAKE_CERTIFICATE);
+                let transcript = client.transcript.clone();
+                let message = if compressed {
+                    msg(
+                        HANDSHAKE_COMPRESSED_CERTIFICATE,
+                        &compressed_certificate_body(1, body.len(), &zlib_bytes(&body)),
+                    )
+                } else {
+                    msg(HANDSHAKE_CERTIFICATE, &body)
+                };
+                let error = client
+                    .read_handshake(&message)
+                    .expect_err("invalid Certificate cannot advance the real client");
+                assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+                assert_eq!(client.read_state, ReadState::Certificate);
+                assert!(client.server_certs.is_empty());
+                assert_eq!(client.transcript, transcript);
+                assert_client_has_no_application_flight(&mut client);
+                for valid_message in remaining {
+                    let error = client
+                        .read_handshake(&valid_message)
+                        .expect_err("a later valid flight cannot revive failed TLS");
+                    assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+                    assert_eq!(client.transcript, transcript);
+                    assert_client_has_no_application_flight(&mut client);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_server_alpn_name_must_not_be_empty() {
+        let error =
+            parse_selected_alpn(&[0, 1, 0]).expect_err("RFC 7301 protocol names are nonempty");
+        assert_eq!(error.alert_description(), Some(ALERT_DECODE_ERROR));
+        assert_eq!(parse_selected_alpn(&[0, 3, 2, b'h', b'3']).unwrap(), b"h3");
+    }
+
+    #[test]
+    fn compressed_certificate_alerts_match_tcp_rfc_boundaries() {
+        let (_, _, remaining) = client_before_server_message(HANDSHAKE_CERTIFICATE);
+        let plain = &remaining[0][4..];
+        let compressed = zlib_bytes(plain);
+        let body = compressed_certificate_body(1, plain.len(), &compressed);
+        assert!(parse_compressed_certificate_body(&body).is_ok());
+        assert_eq!(
+            crate::tls::safari26::compressed_certificate_alert_for_test(&body),
+            None
+        );
+        let mut stream_tail = compressed.clone();
+        stream_tail.push(0);
+        let mut outer_tail = body.clone();
+        outer_tail.push(0);
+        let mut truncated_vector = body;
+        truncated_vector.pop();
+        let cases = [
+            (
+                compressed_certificate_body(2, plain.len(), &compressed),
+                ALERT_ILLEGAL_PARAMETER,
+            ),
+            (
+                compressed_certificate_body(1, MAX_DECOMPRESSED_CERT_CHAIN + 1, &[0xff]),
+                ALERT_ILLEGAL_PARAMETER,
+            ),
+            (
+                compressed_certificate_body(1, plain.len(), &[0xff]),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                compressed_certificate_body(1, plain.len(), &compressed[..compressed.len() - 1]),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                compressed_certificate_body(1, plain.len(), &stream_tail),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                compressed_certificate_body(1, plain.len() + 1, &compressed),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (
+                compressed_certificate_body(1, plain.len() - 1, &compressed),
+                ALERT_BAD_CERTIFICATE,
+            ),
+            (outer_tail, ALERT_DECODE_ERROR),
+            (truncated_vector, ALERT_DECODE_ERROR),
+            (
+                compressed_certificate_body(1, plain.len(), &[]),
+                ALERT_DECODE_ERROR,
+            ),
+            (vec![0, 2], ALERT_DECODE_ERROR),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                parse_compressed_certificate_body(&body)
+                    .unwrap_err()
+                    .alert_description(),
+                Some(expected)
+            );
+            assert_eq!(
+                crate::tls::safari26::compressed_certificate_alert_for_test(&body),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn valid_psk_without_early_data_skips_guard_and_completes_certificate_fallback() {
+        use super::super::ticket::{seal_ticket, TicketState};
+        use super::super::ZeroRttGuard;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct SpyGuard(AtomicUsize);
+        impl ZeroRttGuard for SpyGuard {
+            fn accept_ticket(&self, _: &[u8], _: u64) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = TicketState {
+            suite: 0x1301,
+            alpn: b"h3".to_vec(),
+            psk: Zeroizing::new(vec![0x34; 32]),
+            issued_at: now - 1,
+            lifetime_secs: 3600,
+        };
+        let ticket = ClientTicket {
+            ticket: seal_ticket(&[0x55; 32], &state).unwrap(),
+            psk: state.psk.clone(),
+            suite: state.suite,
+            alpn: state.alpn.clone(),
+            peer_transport_params: vec![0x0f, 0],
+            age_add: 0,
+            lifetime_secs: 3600,
+            received_at_ms: now * 1000,
+        };
+        let mut client = ClientHandshake::new_resumption(
+            handshake().config.clone(),
+            QUIC_VERSION_V1,
+            "example.com",
+            vec![0x0f, 0],
+            &[],
+            &ticket,
+            now * 1000,
+        )
+        .unwrap();
+        // Only this test fixture's pre-emission offer/transcript changes. The
+        // shared test helper uses the production server parser to assert that
+        // the actual wire retains PSK identity/binder while omitting early_data.
+        let hello = super::super::server::tests::psk_offer_without_early_data(
+            &client.client_hello,
+            &ticket.psk,
+        );
+        client.client_hello = hello.clone();
+        client.transcript = hello;
+        client.pending_0rtt_keys = None;
+        let guard = Arc::new(SpyGuard(AtomicUsize::new(0)));
+        let mut server = authentication_test_server();
+        server.set_zero_rtt_guard(guard.clone());
+        let (hello, changes) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        assert!(changes.is_empty());
+        server.read_handshake(&hello).unwrap();
+        assert_eq!(guard.0.load(Ordering::SeqCst), 0);
+        let (flight, changes) = drain_authentication_flight(|bytes| server.write_handshake(bytes));
+        assert_eq!(changes, ["handshake", "application"]);
+        assert!(!server.is_early_data_accepted());
+        client.read_handshake(&flight).unwrap();
+        assert!(!client.psk_accepted);
+        assert!(!client.is_early_data_accepted());
+        assert!(client.peer_certificates().is_some());
+        let (finished, _) = drain_authentication_flight(|bytes| client.write_handshake(bytes));
+        server.read_handshake(&finished).unwrap();
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(guard.0.load(Ordering::SeqCst), 0);
+        let (mut client_exporter, mut server_exporter) = ([0; 32], [0; 32]);
+        client
+            .export_keying_material(&mut client_exporter, b"no early", b"context")
+            .unwrap();
+        server
+            .export_keying_material(&mut server_exporter, b"no early", b"context")
+            .unwrap();
+        assert_eq!(client_exporter, server_exporter);
     }
 }

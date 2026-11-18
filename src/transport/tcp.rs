@@ -3,16 +3,17 @@ use std::time::Duration;
 use std::{
     future::{poll_fn, Future},
     io,
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        OnceLock,
+        Arc, OnceLock,
     },
     task::Poll,
 };
 
 use tokio::{
-    net::{lookup_host, tcp::OwnedReadHalf, TcpSocket, TcpStream},
+    net::{tcp::OwnedReadHalf, TcpSocket, TcpStream},
+    sync::Semaphore,
     time::{timeout_at, Instant},
 };
 
@@ -162,11 +163,35 @@ const TCP_NOTSENT_LOWAT_BYTES: libc::c_uint = 256 * 1024;
 const SOCKET_BUSY_POLL_MICROS: libc::c_int = 50;
 
 pub async fn connect_tuned_tcp_host(addr: &str, deadline: Instant) -> io::Result<TcpStream> {
-    let addrs: Vec<SocketAddr> = timeout_at(deadline, lookup_host(addr))
+    let addrs = timeout_at(deadline, resolve_tcp_host(addr))
         .await
-        .map_err(|_| connect_timeout_error())??
-        .collect();
+        .map_err(|_| connect_timeout_error())??;
     connect_tuned_tcp_any(&addrs, deadline).await
+}
+
+/// Keep uncancellable getaddrinfo calls bounded even after their async callers
+/// time out. The blocking job owns the permit until the resolver actually exits.
+pub(crate) async fn resolve_tcp_host(addr: &str) -> io::Result<Vec<SocketAddr>> {
+    if let Ok(addr) = addr.parse::<SocketAddr>() {
+        return Ok(vec![addr]);
+    }
+    static DNS_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    let slots = Arc::clone(DNS_SLOTS.get_or_init(|| Arc::new(Semaphore::new(32))));
+    let addr = addr.to_owned();
+    bounded_dns_lookup(slots, move || addr.to_socket_addrs().map(Iterator::collect)).await
+}
+
+async fn bounded_dns_lookup<F>(slots: Arc<Semaphore>, lookup: F) -> io::Result<Vec<SocketAddr>>
+where
+    F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    let permit = slots.acquire_owned().await.map_err(io::Error::other)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        lookup()
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 pub async fn connect_tuned_tcp_any(
@@ -458,7 +483,7 @@ pub(crate) fn server_relay_connection_limit(
     udp_enabled: bool,
     max_streams: usize,
 ) -> io::Result<usize> {
-    configure_relay_fd_budget(
+    let fd_limit = configure_relay_fd_budget(
         nofile_soft_limit()?,
         server_fds_per_relay(udp_enabled, max_streams),
         RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS,
@@ -468,7 +493,124 @@ pub(crate) fn server_relay_connection_limit(
             "RLIMIT_NOFILE soft limit is too low; need more than {} file descriptors",
             RESERVED_PROCESS_FDS + RESERVED_CAP_SHED_FDS,
         ))
-    })
+    })?;
+    let heap_limit = server_relay_heap_limit(udp_enabled, max_streams, relay_heap_budget())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "server stream limit exceeds the relay heap budget; lower max_concurrent_streams",
+            )
+        })?;
+    Ok(fd_limit.min(heap_limit))
+}
+
+/// Bound the aggregate worst-case relay queues as well as socket descriptors.
+/// 32 MiB covers the 1024-record downlink, TLS readers and crypto batches; each
+/// stream reserves another MiB for its 32-record upload queue and live buffers.
+/// QUIC additionally retains at most 16 MiB receive and 16 MiB send data per
+/// connection, under the transport's aggregate limits.
+fn server_relay_heap_limit(udp_enabled: bool, max_streams: usize, budget: usize) -> Option<usize> {
+    const MIB: usize = 1024 * 1024;
+    let streams = max_streams.clamp(1, 256);
+    let per_session = 32 * MIB + streams * MIB + if udp_enabled { 32 * MIB } else { 0 };
+    let limit = budget / per_session;
+    (limit > 0).then_some(limit)
+}
+
+fn relay_heap_budget() -> usize {
+    const MIB: usize = 1024 * 1024;
+    let memory = physical_memory_bytes().unwrap_or(256 * MIB);
+    #[cfg(target_os = "linux")]
+    let memory = {
+        let mut memory = memory;
+        let mut paths = vec![
+            std::path::PathBuf::from("/sys/fs/cgroup/memory.max"),
+            std::path::PathBuf::from("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+        ];
+        if let Ok(groups) = std::fs::read_to_string("/proc/self/cgroup") {
+            for line in groups.lines() {
+                let fields: Vec<_> = line.splitn(3, ':').collect();
+                if fields.len() == 3 {
+                    let (root, file) = if fields[0] == "0" && fields[1].is_empty() {
+                        ("/sys/fs/cgroup", "memory.max")
+                    } else if fields[1]
+                        .split(',')
+                        .any(|controller| controller == "memory")
+                    {
+                        ("/sys/fs/cgroup/memory", "memory.limit_in_bytes")
+                    } else {
+                        continue;
+                    };
+                    let relative = fields[2].trim_start_matches('/');
+                    if std::path::Path::new(relative)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                    {
+                        // A child may say "max" while an ancestor imposes the
+                        // actual container allowance; honor every ancestor cap.
+                        let mut group = std::path::PathBuf::from(relative);
+                        loop {
+                            paths.push(std::path::Path::new(root).join(&group).join(file));
+                            if !group.pop() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for path in paths {
+            if let Some(limit) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|limit| *limit > 0)
+            {
+                memory = memory.min(limit);
+            }
+        }
+        memory
+    };
+    // Leave half the host/container allowance for the runtime, replay journal,
+    // fallback pool and operating system. Bound even effectively unlimited hosts.
+    (memory / 2).min(1024 * MIB)
+}
+
+#[cfg(target_os = "linux")]
+fn physical_memory_bytes() -> Option<usize> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("MemTotal:")?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })?
+        .checked_mul(1024)
+}
+
+#[cfg(target_os = "macos")]
+fn physical_memory_bytes() -> Option<usize> {
+    let mut bytes = 0u64;
+    let mut size = std::mem::size_of_val(&bytes);
+    // SAFETY: hw.memsize writes one u64 to the valid output pointer; the NUL-
+    // terminated selector and output length match the sysctl contract.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0).then(|| usize::try_from(bytes).ok()).flatten()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn physical_memory_bytes() -> Option<usize> {
+    None
 }
 
 #[cfg(test)]
@@ -517,6 +659,12 @@ fn connect_fd_budget() -> io::Result<&'static ExtraFdBudget> {
         relay_fd_budget_from_nofile(nofile, FDS_PER_RELAY_CONNECTION, RESERVED_PROCESS_FDS)
             .map_or(0, |budget| budget.extra_fds);
     Ok(EXTRA_FD_BUDGET.get_or_init(|| ExtraFdBudget::new(extra_fds)))
+}
+
+pub(crate) fn try_reserve_extra_fds(
+    count: usize,
+) -> io::Result<Option<ExtraFdReservation<'static>>> {
+    Ok(connect_fd_budget()?.try_reserve(count))
 }
 
 struct RelayFdBudget {
@@ -1156,8 +1304,61 @@ mod kernel_splice {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heap_admission_rejects_an_oversized_session_and_accounts_mux_queues() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(server_relay_heap_limit(false, 1, 32 * MIB), None);
+        assert_eq!(server_relay_heap_limit(false, 1, 66 * MIB), Some(2));
+        assert_eq!(server_relay_heap_limit(false, 4, 66 * MIB), Some(1));
+        assert_eq!(server_relay_heap_limit(true, 1, 66 * MIB), Some(1));
+        assert!(relay_heap_budget() <= 1024 * MIB);
+    }
     use super::*;
     use std::{cell::Cell, rc::Rc, time::Duration};
+
+    #[tokio::test]
+    async fn cancelled_dns_lookup_keeps_capacity_until_blocking_resolver_finishes() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_slots = Arc::clone(&slots);
+        let first = tokio::spawn(bounded_dns_lookup(first_slots, move || {
+            let _ = started_tx.send(());
+            release_rx.recv().unwrap();
+            Ok(Vec::new())
+        }));
+        started_rx.await.unwrap();
+        first.abort();
+        let _ = first.await;
+        assert_eq!(slots.available_permits(), 0);
+        let (second_started_tx, mut second_started_rx) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(bounded_dns_lookup(Arc::clone(&slots), move || {
+            let _ = second_started_tx.send(());
+            Ok(Vec::new())
+        }));
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            second_started_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_dns_preserves_literal_socket_addresses() {
+        for addr in ["127.0.0.1:443", "[::1]:8443"] {
+            assert_eq!(
+                resolve_tcp_host(addr).await.unwrap(),
+                [addr.parse::<SocketAddr>().unwrap()]
+            );
+        }
+    }
 
     #[test]
     fn splice_path_stats_counts_each_path() {

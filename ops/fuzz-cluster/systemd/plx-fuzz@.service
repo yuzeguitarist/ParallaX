@@ -26,7 +26,7 @@ Environment=PATH=/var/lib/plxfuzz/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr
 # node-id and execs exactly ONE in-process `cargo fuzz run` (no -jobs/-workers:
 # that hides crashes and drops post-`--` flags). The libFuzzer exit code is
 # therefore this unit's exit code.
-ExecStart=/var/lib/plxfuzz/bin/run-one.sh %i
+ExecStart=/usr/local/lib/plxfuzz/run-one.sh %i
 
 # A crash/OOM makes libFuzzer exit non-zero -> OnFailure fires the crash
 # reporter the instant it happens (no polling).

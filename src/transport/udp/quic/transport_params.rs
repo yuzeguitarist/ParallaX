@@ -859,6 +859,51 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod generated_properties {
+    use super::super::property;
+    use super::*;
+
+    #[test]
+    fn generated_parameters_preserve_values_and_reject_duplicate_or_truncated_fields() {
+        property::check("quic-transport-parameters", |case| {
+            let cid = case.payload(20);
+            let mut expected = TransportParameters::server(cid);
+            expected.initial_max_data = case.a & varint::MAX;
+            expected.initial_max_stream_data_bidi_local = case.b & varint::MAX;
+            expected.initial_max_stream_data_bidi_remote = case.c & varint::MAX;
+            expected.initial_max_stream_data_uni = case.a & varint::MAX;
+            expected.initial_max_streams_bidi = case.b % (MAX_STREAMS_LIMIT + 1);
+            expected.initial_max_streams_uni = case.c % (MAX_STREAMS_LIMIT + 1);
+            expected.active_connection_id_limit = 2 + case.a % (varint::MAX - 1);
+            let wire = expected.encode_server();
+            prop_assert_eq!(TransportParameters::read(&wire).unwrap(), expected.clone());
+            let unknown = 0x40 + case.b % 4096;
+            let mut extended = wire.clone();
+            put_param_bytes(&mut extended, unknown, case.payload(256));
+            prop_assert_eq!(TransportParameters::read(&extended).unwrap(), expected);
+            put_param_bytes(&mut extended, unknown, &[]);
+            prop_assert_eq!(TransportParameters::read(&extended), Err(Error::Duplicate));
+            let mut duplicate = wire;
+            put_param(&mut duplicate, TP_INITIAL_MAX_DATA, 0);
+            prop_assert_eq!(TransportParameters::read(&duplicate), Err(Error::Duplicate));
+            let mut truncated = Vec::new();
+            varint::encode(unknown, &mut truncated);
+            varint::encode(case.bytes.len() as u64 + 1, &mut truncated);
+            truncated.extend_from_slice(&case.bytes);
+            prop_assert_eq!(TransportParameters::read(&truncated), Err(Error::Truncated));
+            let mut invalid = Vec::new();
+            put_param(
+                &mut invalid,
+                TP_ACK_DELAY_EXPONENT,
+                21 + case.c % (varint::MAX - 20),
+            );
+            prop_assert_eq!(TransportParameters::read(&invalid), Err(Error::Invalid));
+            Ok(())
+        });
+    }
+}
+
 /// Fuzz-only re-export of the transport-parameters decoder. `TransportParameters`
 /// is `pub(crate)`, so `read` is not reachable from the fuzz crate; this thin
 /// wrapper exposes it ONLY under `--cfg fuzzing` (which cargo-fuzz sets), so it

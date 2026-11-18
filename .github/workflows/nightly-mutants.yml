@@ -38,9 +38,9 @@ on:
           - protocol
           - transport
       shard_index:
-        description: 'Shard index for this run (0-based; ignored when module=nightly)'
+        description: 'Shard index (0-based); auto rotates nightly or selects 0 for module sweeps'
         type: string
-        default: '0'
+        default: 'auto'
       shard_total:
         # Default 8 keeps each shard well under the 75-min job cap. The nightly is
         # tuned to ~60 mutants/shard; a large module (crypto ~440, protocol ~890,
@@ -63,7 +63,7 @@ permissions:
 # For the scheduled nightly the inputs are empty, so the group collapses back to
 # the per-ref behaviour (re-dispatch supersedes an in-flight nightly).
 concurrency:
-  group: nightly-mutants-${{ github.ref }}-${{ github.event.inputs.module || 'nightly' }}-${{ github.event.inputs.shard_index || '0' }}-${{ github.event.inputs.shard_total || '8' }}
+  group: nightly-mutants-${{ github.ref }}-${{ github.event.inputs.module || 'nightly' }}-${{ github.event.inputs.shard_index || 'auto' }}-${{ github.event.inputs.shard_total || '8' }}
   cancel-in-progress: true
 
 env:
@@ -84,13 +84,10 @@ jobs:
   mutants:
     name: cargo-mutants (indistinguishability/crypto surface)
     runs-on: ubuntu-latest
-    # One rolling shard per night (see the run step): ~60 mutants at ~50s each on
-    # the 4-vCPU runner -- the per-mutant cost is the lib REBUILD (~40s), not the
-    # scoped test (~8s). One-at-a-time (in-place) a shard finishes in ~25-50 min,
-    # so this cap is a backstop. We shard because the full 479-mutant suite needs
-    # ~6h here -- over GitHub's 6h job limit, and what made this job SIGKILL at
-    # timeout-minutes every night before sharding.
-    timeout-minutes: 75
+    # A shard now contains up to 76 mutants. Serialized test processes preserve
+    # the memory bound, but a full TLS shard can exceed the former 75-minute cap.
+    # Leave room for every selected mutation to finish and report its outcome.
+    timeout-minutes: 120
     # NON-GATING: this report must never fail a PR or the nightly schedule.
     continue-on-error: true
     steps:
@@ -110,10 +107,10 @@ jobs:
           # Nightly mutation builds are unusual; never write back to the shared cache.
           save-if: false
 
-      - name: Install cargo-mutants
-        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - name: Install mutation test tools
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
-          tool: cargo-mutants@27.1.0
+          tool: cargo-mutants@27.1.0,cargo-nextest@0.9.151
 
       - name: Run cargo-mutants (scoped, one rolling shard)
         # WHY sharded: on the 4-vCPU runner each mutant costs ~50s (a ~40s lib
@@ -147,12 +144,19 @@ jobs:
         # below overrides the config's examine_globs (CLI wins).
         env:
           MUT_MODULE: ${{ github.event.inputs.module || 'nightly' }}
-          MUT_SHARD_INDEX: ${{ github.event.inputs.shard_index || '0' }}
+          MUT_SHARD_INDEX: ${{ github.event.inputs.shard_index || 'auto' }}
           MUT_SHARD_TOTAL: ${{ github.event.inputs.shard_total || '8' }}
         run: |
           ulimit -v 12582912   # 12 GiB address-space cap per process
           if [ "$MUT_MODULE" = "nightly" ]; then
-            shard=$(( 10#$(date -u +%j) % 8 ))
+            if [ "$MUT_SHARD_INDEX" = "auto" ]; then
+              shard=$(( 10#$(date -u +%j) % 8 ))
+            elif [[ "$MUT_SHARD_INDEX" =~ ^[0-7]$ ]]; then
+              shard=$MUT_SHARD_INDEX
+            else
+              echo "nightly shard_index must be auto or 0..7" >&2
+              exit 1
+            fi
             echo "MUT_SHARD=$shard" >> "$GITHUB_ENV"
             echo "Testing mutation shard $shard/8 (rotates daily; full surface every 8 days)"
             cargo mutants \
@@ -163,6 +167,9 @@ jobs:
               -f src/tls/safari26.rs \
               -f src/crypto/auth.rs
           else
+            if [ "$MUT_SHARD_INDEX" = "auto" ]; then
+              MUT_SHARD_INDEX=0
+            fi
             echo "MUT_SHARD=${MUT_MODULE}-${MUT_SHARD_INDEX}of${MUT_SHARD_TOTAL}" >> "$GITHUB_ENV"
             echo "Sweeping module src/${MUT_MODULE}/** shard ${MUT_SHARD_INDEX}/${MUT_SHARD_TOTAL}"
             cargo mutants \

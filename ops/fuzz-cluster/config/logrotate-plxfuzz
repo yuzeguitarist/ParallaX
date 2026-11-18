@@ -13,6 +13,7 @@
 # missingok   -> a unit that never wrote a log is not an error.
 # notifempty  -> do not rotate an empty file.
 /var/lib/plxfuzz/logs/*.log {
+    su plxfuzz plxfuzz
     size 200M
     rotate 3
     compress

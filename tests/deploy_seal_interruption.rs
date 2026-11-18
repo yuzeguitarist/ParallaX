@@ -35,7 +35,7 @@ if command == 'install':
             directory = True
             i += 1
         else:
-            paths.append(checked(arg))
+            paths.append(pathlib.Path(arg) if arg == '/dev/stdin' else checked(arg))
             i += 1
     if directory:
         for path in paths:
@@ -43,7 +43,8 @@ if command == 'install':
             path.chmod(mode)
     else:
         source, destination = paths
-        shutil.copyfile(source, destination)
+        if str(source) == '/dev/stdin': destination.write_bytes(sys.stdin.buffer.read())
+        else: shutil.copyfile(source, destination)
         destination.chmod(mode)
         if (os.environ.get('FAIL_AFTER_BUNDLE') == '1'
                 and destination == root / 'etc/parallax/parallax.toml.secrets.enc'):
@@ -55,7 +56,19 @@ elif command == 'rm':
         if path.is_dir(): shutil.rmtree(path)
         else: path.unlink(missing_ok=True)
 elif command == 'runuser':
-    raise SystemExit(subprocess.run(args[args.index('--') + 1:]).returncode)
+    child = args[args.index('--') + 1:]
+    if child[0] == 'cat' and os.environ.get('SWAP_SEAL_OUTPUT') == '1':
+        victim = root / 'root-only'
+        if pathlib.Path(child[1]).resolve() == victim.resolve():
+            raise SystemExit(13)  # model the service UID's permission boundary
+    result = subprocess.run(child)
+    if (result.returncode == 0 and 'seal' in child
+            and os.environ.get('SWAP_SEAL_OUTPUT') == '1'):
+        config = pathlib.Path(child[child.index('-c') + 1])
+        bundle = pathlib.Path(str(config) + '.secrets.enc')
+        bundle.unlink()
+        bundle.symlink_to(root / 'root-only')
+    raise SystemExit(result.returncode)
 elif command == 'id':
     print(os.getuid())
 elif command == 'uname':
@@ -160,6 +173,7 @@ fn interrupted_bundle_install_keeps_new_inline_config_consistent() {
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     fs::create_dir(root.join("commands")).unwrap();
     fs::create_dir_all(root.join("etc/systemd/system")).unwrap();
+    fs::create_dir(root.join("run")).unwrap();
     for command in [
         "install",
         "rm",
@@ -197,6 +211,7 @@ fn interrupted_bundle_install_keeps_new_inline_config_consistent() {
         "/etc/",
         "/var/lib/",
         "/usr/local/bin",
+        "/run/",
         "/tmp/parallax-deploy.",
     ] {
         payload = payload.replace(prefix, &format!("{}{prefix}", root.display()));
@@ -245,6 +260,16 @@ fn interrupted_bundle_install_keeps_new_inline_config_consistent() {
     let current = Config::load(&active).unwrap();
     assert!(current.inline_secret_fields().is_empty());
     assert_same_config(&current, &expected);
+    let bundle: toml::Value =
+        fs::read_to_string(active.with_file_name("parallax.toml.secrets.enc"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(
+        bundle["entries"].as_table().unwrap().len(),
+        3,
+        "redeploys must retain a stable config namespace"
+    );
 
     // Operators can reuse a downloaded legacy config and ciphertext without
     // copying the VPS host key locally. Migrate its relative bare fragments
@@ -332,6 +357,7 @@ fn interrupted_bundle_install_keeps_new_inline_config_consistent() {
         "/etc/",
         "/var/lib/",
         "/usr/local/bin",
+        "/run/",
         "/tmp/parallax-deploy.",
     ] {
         reuse_payload = reuse_payload.replace(prefix, &format!("{}{prefix}", root.display()));
@@ -352,5 +378,24 @@ fn interrupted_bundle_install_keeps_new_inline_config_consistent() {
     assert_same_config(&Config::load(&active).unwrap(), &old);
     assert_same_config(&Config::load(&other).unwrap(), &expected);
     assert_eq!(fs::read_to_string(&legacy_bundle).unwrap(), legacy_bytes);
+    let installed_bundle = active.with_file_name("parallax.toml.secrets.enc");
+    let before_attack = fs::read(&installed_bundle).unwrap();
+    fs::write(root.join("root-only"), "privileged sentinel").unwrap();
+    stage_upload(&new_path);
+    std::env::set_var("SWAP_SEAL_OUTPUT", "1");
+    let attack = bash(&payload, root, false);
+    std::env::remove_var("SWAP_SEAL_OUTPUT");
+    assert!(attack.status.success(), "{:?}", attack);
+    assert!(
+        String::from_utf8_lossy(&attack.stderr).contains("could not read sealed staging outputs"),
+        "{:?}",
+        attack
+    );
+    assert_eq!(fs::read(&installed_bundle).unwrap(), before_attack);
+    assert_eq!(
+        fs::read_to_string(root.join("root-only")).unwrap(),
+        "privileged sentinel"
+    );
+    assert_same_config(&Config::load(&active).unwrap(), &expected);
     std::env::remove_var(parallax::secret_store::HOST_KEY_ENV);
 }

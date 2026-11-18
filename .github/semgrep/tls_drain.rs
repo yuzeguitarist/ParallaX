@@ -10,7 +10,7 @@ async fn drain_post_handshake(stream: &mut TcpStream) -> Result<usize, Error> {
             Some(result) => result,
             None if reader.at_record_boundary() => return Ok(observed),
             None => match timeout(
-                POST_HANDSHAKE_DRAIN_TIMEOUT,
+                TLS_RECORD_COMPLETION_TIMEOUT,
                 // ok: parallax-tls-no-extra-blocking-drain
                 reader.read_record_into(&mut record),
             ).await {
@@ -37,6 +37,7 @@ async fn drain_post_handshake(stream: &mut TcpStream) -> Result<usize, Error> {
     Ok(observed)
 }
 
+// ruleid: parallax-tls-settings-record-completion
 async fn await_http2_settings_ack() {
     // ruleid: parallax-tls-post-handshake-processing
     let chunk = keys.server_application.decrypt_record(&record)?;
@@ -46,7 +47,7 @@ async fn await_http2_settings_ack() {
 // ok: parallax-tls-key-update-framing
 fn parse_post_handshake_message(bytes: &[u8]) -> Result<Option<PostHandshakeMessage>, &'static str> {
     if bytes.len() < 4 { return Ok(None); }
-    let len = ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | bytes[3] as usize;
+    let len = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]) as usize;
     if len > MAX_POST_HANDSHAKE_MESSAGE { return Err("oversized"); }
     let total = 4 + len;
     match bytes[0] {
@@ -140,13 +141,109 @@ fn update_application_traffic_keys() -> Result<(), Error> { Ok(()) }
 
 // ok: parallax-tls-post-handshake-handoff
 async fn complete() -> Result<(), Error> {
-    self.open_http2_connection(stream, &mut keys).await?;
-    self.ensure_post_handshake_boundary()?;
-    Ok(())
+    let result = async {
+        let observed = self.open_http2_connection(stream, keys).await?;
+        self.ensure_post_handshake_boundary()?;
+        Ok(observed)
+    }.await;
+    result
 }
 
 // ruleid: parallax-tls-post-handshake-handoff
-async fn complete() -> Result<(), Error> { Ok(()) }
+async fn complete() -> Result<(), Error> {
+    let result = async {
+        let observed = self.open_http2_connection(stream, keys).await?;
+        Ok(observed)
+    }.await;
+    result
+}
+
+// ok: parallax-tls-post-handshake-handoff
+async fn complete() -> Result<(), Error> {
+    let result = async {
+        // ruleid: parallax-tls-opening-before-drain
+        self.drain_post_handshake(stream, keys).await?;
+        let observed = self.open_http2_connection(stream, keys).await?;
+        self.ensure_post_handshake_boundary()?;
+        Ok(observed)
+    }.await;
+    result
+}
+
+// ok: parallax-tls-opening-before-drain
+async fn open_http2_connection() -> Result<usize, Error> {
+    if !keys.negotiated_h2() {
+        return self.drain_post_handshake(stream, keys).await;
+    }
+    let fingerprint = Http2Fingerprint::safari26();
+    let mut flight = fingerprint.connection_preface()?;
+    flight.extend_from_slice(&fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?);
+    self.write_application_data(stream, keys, &flight).await?;
+    let observed = self.drain_post_handshake(stream, keys).await?;
+    self.await_http2_settings_ack(stream, keys).await?;
+    Ok(observed)
+}
+
+// ruleid: parallax-tls-opening-before-drain
+async fn open_http2_connection() -> Result<usize, Error> {
+    if !keys.negotiated_h2() {
+        return self.drain_post_handshake(stream, keys).await;
+    }
+    let fingerprint = Http2Fingerprint::safari26();
+    let mut flight = fingerprint.connection_preface()?;
+    flight.extend_from_slice(&fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?);
+    let observed = self.drain_post_handshake(stream, keys).await?;
+    self.write_application_data(stream, keys, &flight).await?;
+    self.await_http2_settings_ack(stream, keys).await?;
+    Ok(observed)
+}
+
+// ok: parallax-tls-settings-record-completion
+async fn await_http2_settings_ack() -> Result<(), Error> {
+    let mut reader = TlsRecordReader::new(&mut *stream);
+    let mut record = Vec::new();
+    for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
+        let record_deadline = tokio::time::Instant::now() + TLS_RECORD_COMPLETION_TIMEOUT;
+        match timeout(H2_SETTINGS_ACK_TIMEOUT, reader.read_record_into(&mut record)).await {
+            Ok(Ok(())) => {},
+            Ok(Err(err)) if is_clean_close(&err) && reader.at_record_boundary() => {
+                return self.ensure_post_handshake_boundary()
+            }
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) if reader.at_record_boundary() => {
+                return self.ensure_post_handshake_boundary()
+            }
+            Err(_) => {
+                match tokio::time::timeout_at(record_deadline, reader.read_record_into(&mut record)).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(Safari26TlsError::Handshake("partial".to_owned()))
+                    }
+                }
+            }
+        }
+    }
+    self.ensure_post_handshake_boundary()
+}
+
+// ruleid: parallax-tls-settings-record-completion
+async fn await_http2_settings_ack() -> Result<(), Error> {
+    let mut reader = TlsRecordReader::new(&mut *stream);
+    let mut record = Vec::new();
+    for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
+        match timeout(H2_SETTINGS_ACK_TIMEOUT, reader.read_record_into(&mut record)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(Error),
+        }
+    }
+    Ok(())
+}
+
+// ok: parallax-tls-record-completion-timeout
+const TLS_RECORD_COMPLETION_TIMEOUT: Duration = Duration::from_secs(20);
+
+// ruleid: parallax-tls-record-completion-timeout
+const TLS_RECORD_COMPLETION_TIMEOUT: Duration = Duration::from_millis(180);
 
 // ok: parallax-tls-post-handshake-handoff
 fn ensure_post_handshake_boundary() -> Result<(), Error> {
@@ -176,7 +273,7 @@ async fn drain_post_handshake(stream: &mut TcpStream) -> Result<usize, Error> {
     let mut record = Vec::new();
     for _ in 0..POST_HANDSHAKE_DRAIN_LIMIT {
         // ruleid: parallax-tls-no-extra-blocking-drain
-        timeout(POST_HANDSHAKE_DRAIN_TIMEOUT, reader.read_record_into(&mut record)).await?;
+        timeout(TLS_RECORD_COMPLETION_TIMEOUT, reader.read_record_into(&mut record)).await?;
         observed += 1;
     }
     Ok(observed)

@@ -13,18 +13,17 @@ use zeroize::Zeroizing;
 
 use rand::{
     rngs::{OsRng, StdRng},
-    SeedableRng,
+    Rng, SeedableRng,
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{
-        lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
     sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
-    time::{sleep, timeout, timeout_at, Instant},
+    time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
 
 use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;
@@ -58,7 +57,7 @@ use crate::{
         },
         tcp::{
             connect_tuned_tcp_any, drain_ready_tcp_read, is_fd_exhaustion_error,
-            is_transient_accept_error, relay_connection_limit, tune_tcp_stream,
+            is_transient_accept_error, relay_connection_limit, resolve_tcp_host, tune_tcp_stream,
         },
     },
 };
@@ -312,7 +311,7 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
     tracing::info!(
         connection_limit,
         "ParallaX client SOCKS5 listening on {}",
-        client.listen
+        listener.local_addr()?
     );
 
     loop {
@@ -537,9 +536,23 @@ struct MuxPoolState {
     /// Fired whenever a build finishes (success or failure) so parked waiters
     /// re-check the pool. Lazily created; shared by all current waiters.
     build_notify: Option<Arc<Notify>>,
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
 }
 
 impl MuxPoolState {
+    fn record_build_result(&mut self, succeeded: bool) {
+        if succeeded {
+            self.consecutive_failures = 0;
+            self.retry_at = None;
+        } else {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            let base_ms = 250u64 << self.consecutive_failures.saturating_sub(1).min(5);
+            let wait_ms = rand::thread_rng().gen_range(base_ms * 3 / 4..=base_ms * 5 / 4);
+            self.retry_at = Some(Instant::now() + Duration::from_millis(wait_ms));
+        }
+    }
+
     /// Returns the shared build-completion `Notify`, creating it on first use.
     fn build_wakeup(&mut self) -> Arc<Notify> {
         Arc::clone(
@@ -897,6 +910,26 @@ fn reserve_slot(sessions: &[ClientMuxHandle]) -> Option<(ClientMuxHandle, OwnedS
     None
 }
 
+fn retryable_mux_build_error(err: &ClientRuntimeError) -> bool {
+    let io = match err {
+        ClientRuntimeError::Io(io) | ClientRuntimeError::Safari26Tls(Safari26TlsError::Io(io)) => {
+            io
+        }
+        _ => return false,
+    };
+    matches!(
+        io.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+    )
+}
+
 impl ClientMuxPool {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -953,6 +986,11 @@ impl ClientMuxPool {
             if let Some(reserved) = reserve_slot(&state.sessions) {
                 return Ok(reserved);
             }
+            if let Some(retry_at) = state.retry_at.filter(|until| *until > Instant::now()) {
+                drop(state);
+                sleep_until(retry_at).await;
+                continue;
+            }
             // No free slot. While the pool is EMPTY, single-flight the first
             // session so a cold-start burst COALESCES onto it (mux's whole point:
             // many substreams share one session) instead of every connection
@@ -982,7 +1020,9 @@ impl ClientMuxPool {
                         // re-checks existing sessions first, so a slot another build
                         // just freed is still preferred over another handshake.
                         build_attempts += 1;
-                        if build_attempts >= MUX_ACQUIRE_MAX_BUILD_ATTEMPTS {
+                        if build_attempts >= MUX_ACQUIRE_MAX_BUILD_ATTEMPTS
+                            || !retryable_mux_build_error(&err)
+                        {
                             return Err(err);
                         }
                         tracing::debug!(
@@ -1019,6 +1059,7 @@ impl ClientMuxPool {
         let result = self.spawn_build().await;
         let mut state = self.inner.lock().await;
         state.builds_in_flight -= 1;
+        state.record_build_result(result.is_ok());
         let outcome = match result {
             Ok(handle) => {
                 // A fresh session always has free slots, so this cannot fail.
@@ -1058,12 +1099,18 @@ impl ClientMuxPool {
             if !state.sessions.is_empty() {
                 return Ok(());
             }
+            if let Some(retry_at) = state.retry_at.filter(|until| *until > Instant::now()) {
+                drop(state);
+                sleep_until(retry_at).await;
+                continue;
+            }
             if state.builds_in_flight == 0 {
                 state.builds_in_flight += 1;
                 drop(state);
                 let result = self.spawn_build().await;
                 let mut state = self.inner.lock().await;
                 state.builds_in_flight -= 1;
+                state.record_build_result(result.is_ok());
                 let outcome = match result {
                     Ok(handle) => {
                         state.sessions.push(handle);
@@ -2167,6 +2214,8 @@ async fn run_client_udp_probe(
         let nonce = match crate::transport::udp::probe::probe_client_send_request_early(
             &mut relay_send,
             sni,
+            psk,
+            &offer.offer_id,
         )
         .await
         {
@@ -2605,7 +2654,7 @@ async fn resolve_client_server_addr(
     }
 
     let mut addrs = Vec::new();
-    for addr in lookup_host(server_addr).await? {
+    for addr in resolve_tcp_host(server_addr).await? {
         if !addrs.contains(&addr) {
             addrs.push(addr);
         }
@@ -3128,8 +3177,16 @@ async fn client_exchange_quic_done(
 ) -> Result<(), ClientRuntimeError> {
     // Seal our DONE on the client->server (send) codec -- its next sequence
     // number -- and write it over the reliable TCP control stream.
-    let done = seal_to_server
-        .seal(QUIC_RELAY_DONE_MARKER, &mut OsRng)
+    let mut done = Vec::new();
+    let pad = crate::protocol::command::control_frame_shaping_pad(
+        QUIC_RELAY_DONE_MARKER.len(),
+        seal_to_server
+            .max_plaintext_len()
+            .saturating_sub(QUIC_RELAY_DONE_MARKER.len()),
+        &mut OsRng,
+    );
+    seal_to_server
+        .seal_into_exact_padded(QUIC_RELAY_DONE_MARKER, pad, &mut OsRng, &mut done)
         .map_err(ClientHandshakeError::from)?;
     // Bound the DONE write+flush with the same backstop as the DONE read below: a
     // peer that stops reading the reliable TCP control stream during teardown must
@@ -3460,14 +3517,20 @@ where
                 let _ = local_write.shutdown().await;
                 return Ok(open_from_server);
             }
-            Some(err) => return Err(ClientRuntimeError::Io(err)),
+            Some(err) => {
+                abort_client_download(local_write);
+                return Err(ClientRuntimeError::Io(err));
+            }
             None => match server_records.read_record_into(&mut server_record).await {
                 Ok(()) => {}
                 Err(err) if server_records.is_clean_close(&err) => {
                     let _ = local_write.shutdown().await;
                     return Ok(open_from_server);
                 }
-                Err(err) => return Err(ClientRuntimeError::Io(err)),
+                Err(err) => {
+                    abort_client_download(local_write);
+                    return Err(ClientRuntimeError::Io(err));
+                }
             },
         }
         log_record_read(cid, "server->client", "client-outer-reader", &server_record);
@@ -3780,13 +3843,24 @@ async fn client_mux_download_loop(
             break;
         }
     }
-    let _ = local_write.shutdown().await;
     let outcome = if local_write_failed {
         DownloadOutcome::Reset
     } else {
         terminal.outcome()
     };
+    if matches!(outcome, DownloadOutcome::Fin) {
+        let _ = local_write.shutdown().await;
+    } else {
+        abort_client_download(local_write);
+    }
     let _ = outcome_tx.send(outcome);
+}
+
+fn abort_client_download(local_write: OwnedWriteHalf) {
+    let _ = socket2::SockRef::from(local_write.as_ref()).set_linger(Some(Duration::ZERO));
+    // OwnedWriteHalf's ordinary drop shuts down the write direction, emitting
+    // FIN before the upload half closes. Leave it open for the abortive close.
+    local_write.forget();
 }
 
 /// Keeps the reader's unanswered-Open set (stream id -> `relay_now_millis()` when
@@ -4618,6 +4692,30 @@ fn is_peer_idle_close(conn: &crate::transport::udp::quic::endpoint::Connection) 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn mux_build_failures_share_a_jittered_cooldown_and_reset_on_success() {
+        let mut state = MuxPoolState::default();
+        state.record_build_result(false);
+        let first = state.retry_at.unwrap().duration_since(Instant::now());
+        assert!((Duration::from_millis(187)..=Duration::from_millis(312)).contains(&first));
+        state.record_build_result(false);
+        let second = state.retry_at.unwrap().duration_since(Instant::now());
+        assert!((Duration::from_millis(375)..=Duration::from_millis(625)).contains(&second));
+        state.record_build_result(true);
+        assert!(state.retry_at.is_none());
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(retryable_mux_build_error(&ClientRuntimeError::Io(
+            io::Error::from(io::ErrorKind::TimedOut)
+        )));
+        assert!(!retryable_mux_build_error(
+            &ClientRuntimeError::MissingClient
+        ));
+        assert!(!retryable_mux_build_error(
+            &ClientRuntimeError::Safari26Tls(Safari26TlsError::Certificate(
+                "bad certificate".into()
+            ))
+        ));
+    }
     use std::{io::Cursor, sync::Arc};
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -5426,6 +5524,236 @@ mod tests {
         (session, pending, kx_record)
     }
 
+    async fn identity_reader_test_session() -> (ClientDataSession, DataRecordCodec, [u8; 32]) {
+        let (mut session, pending, exchange) = session_with_server_key_exchange();
+        let (_, mut before_rekey) =
+            data_codecs(session.session_keys(), TrafficConfig::default()).unwrap();
+        let exchange_payload = open_framed_payload(&mut before_rekey, &exchange);
+        let binding = pending.identity_binding(&exchange_payload);
+        let mut wire = exchange.as_slice();
+        apply_server_key_exchange_after_residuals(&mut wire, &mut session, &pending, PSK)
+            .await
+            .unwrap();
+        let (_, server_seal) =
+            data_codecs(session.session_keys(), TrafficConfig::default()).unwrap();
+        (session, server_seal, binding)
+    }
+
+    fn identity_reader_test_seal(seal: &mut DataRecordCodec, chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for chunk in chunks {
+            seal.seal_into(chunk, &mut OsRng, &mut wire).unwrap();
+        }
+        wire
+    }
+
+    async fn identity_reader_test_receive(
+        session: &mut ClientDataSession,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, ClientRuntimeError> {
+        timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (connected, accepted) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let mut client = connected.unwrap();
+            let (mut server, _) = accepted.unwrap();
+            let send = async {
+                // Split TLS headers and ciphertext across socket writes. The
+                // production reader owns record framing as well as reassembly.
+                for part in wire.chunks(3) {
+                    server.write_all(part).await.unwrap();
+                }
+                server.shutdown().await.unwrap();
+            };
+            let (_, result) =
+                tokio::join!(send, read_server_identity_payload(&mut client, session));
+            result
+        })
+        .await
+        .expect("identity reader must finish or reject after peer EOF")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_reassembles_and_verifies_a_pq_bound_signature() {
+        let (mut session, mut seal, binding) = identity_reader_test_session().await;
+        let identity_keys = identity::keypair();
+        let server_pin = [91; 32];
+        let keys = session.session_keys();
+        let signature = identity::sign_server_identity(
+            &identity_keys.secret,
+            &keys.transcript_hash,
+            &server_pin,
+            &binding,
+            keys.epoch,
+        )
+        .unwrap();
+        let proof = ServerIdentityProof { signature }.encode().unwrap();
+        let chunks = ServerIdentityChunk::encode_all(&proof, 317).unwrap();
+        assert!(chunks.len() > 1);
+        let wire = identity_reader_test_seal(&mut seal, &chunks);
+        let received = identity_reader_test_receive(&mut session, &wire)
+            .await
+            .unwrap();
+        assert_eq!(received, proof);
+        session
+            .verify_server_identity_payload(&received, &identity_keys.public, &server_pin)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_accepts_exactly_the_payload_limit() {
+        let (mut session, mut seal, _) = identity_reader_test_session().await;
+        let payload: Vec<_> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+        let chunks = ServerIdentityChunk::encode_all(&payload, 701).unwrap();
+        let wire = identity_reader_test_seal(&mut seal, &chunks);
+        assert_eq!(
+            identity_reader_test_receive(&mut session, &wire)
+                .await
+                .unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_rejects_changed_total_and_noncontiguous_offsets() {
+        for (total, offset) in [(9, 2), (8, 1), (8, 3), (8, 0)] {
+            let (mut session, mut seal, _) = identity_reader_test_session().await;
+            let chunks = [
+                ServerIdentityChunk {
+                    total_len: 8,
+                    offset: 0,
+                    bytes: b"ab".to_vec(),
+                }
+                .encode()
+                .unwrap(),
+                ServerIdentityChunk {
+                    total_len: total,
+                    offset,
+                    bytes: b"cd".to_vec(),
+                }
+                .encode()
+                .unwrap(),
+            ];
+            let wire = identity_reader_test_seal(&mut seal, &chunks);
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::InvalidServerIdentityChunks)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_rejects_oversized_totals_before_reassembly() {
+        for total_len in [16 * 1024 + 1, u32::MAX] {
+            let (mut session, mut seal, _) = identity_reader_test_session().await;
+            let chunk = ServerIdentityChunk {
+                total_len,
+                offset: 0,
+                bytes: vec![1],
+            }
+            .encode()
+            .unwrap();
+            let wire = identity_reader_test_seal(&mut seal, &[chunk]);
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::ServerIdentityTooLarge)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_rejects_eof_between_chunks_and_inside_records() {
+        for truncate in [0, 1, 8] {
+            let (mut session, mut seal, _) = identity_reader_test_session().await;
+            let chunk = ServerIdentityChunk {
+                total_len: 4,
+                offset: 0,
+                bytes: b"ab".to_vec(),
+            }
+            .encode()
+            .unwrap();
+            let mut wire = identity_reader_test_seal(&mut seal, &[chunk]);
+            if truncate > 0 {
+                wire.truncate(truncate);
+            }
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_rejects_bad_aead_and_prior_epoch_records() {
+        for old_epoch in [false, true] {
+            let (mut session, pending, exchange) = session_with_server_key_exchange();
+            let (_, mut seal) =
+                data_codecs(session.session_keys(), TrafficConfig::default()).unwrap();
+            let mut exchange_wire = exchange.as_slice();
+            apply_server_key_exchange_after_residuals(
+                &mut exchange_wire,
+                &mut session,
+                &pending,
+                PSK,
+            )
+            .await
+            .unwrap();
+            if !old_epoch {
+                (_, seal) = data_codecs(session.session_keys(), TrafficConfig::default()).unwrap();
+            }
+            let chunks = ServerIdentityChunk::encode_all(b"identity", 20).unwrap();
+            let mut wire = identity_reader_test_seal(&mut seal, &chunks);
+            if !old_epoch {
+                *wire.last_mut().unwrap() ^= 1;
+            }
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::Handshake(
+                    ClientHandshakeError::DataRecord(DataRecordError::Aead(_))
+                ))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn identity_reader_requires_px1i_framing_and_valid_chunk_bounds() {
+        use crate::protocol::command::ServerIdentityChunkError;
+        let bare_proof = ServerIdentityProof {
+            signature: vec![1; crate::crypto::mldsa::SIG_BYTES],
+        }
+        .encode()
+        .unwrap();
+        let mut zero_total = ServerIdentityChunk {
+            total_len: 1,
+            offset: 0,
+            bytes: vec![1],
+        }
+        .encode()
+        .unwrap();
+        zero_total[4..8].copy_from_slice(&0_u32.to_be_bytes());
+        for (chunk, expected) in [
+            (bare_proof, ServerIdentityChunkError::BadMagic),
+            (b"PX1Ishort".to_vec(), ServerIdentityChunkError::Truncated),
+            (zero_total, ServerIdentityChunkError::InvalidOffset),
+        ] {
+            let (mut session, mut seal, _) = identity_reader_test_session().await;
+            let wire = identity_reader_test_seal(&mut seal, &[chunk]);
+            assert!(matches!(
+                identity_reader_test_receive(&mut session, &wire).await,
+                Err(ClientRuntimeError::Handshake(ClientHandshakeError::ServerIdentityChunk(error))) if error == expected
+            ));
+        }
+    }
+
     /// Regression for the original high-RTT handshake-failure bug (client budget
     /// 16 records vs server forward limit 64): the client must skip
     /// `MAX_PRE_KEY_EXCHANGE_CAMOUFLAGE_RECORDS` camouflage records (well under
@@ -5527,6 +5855,212 @@ mod tests {
                  fallback forward byte limit"
             );
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ClientDonePeer {
+        WrongMarker,
+        BadAead,
+        Eof,
+        PartialEof,
+        GraceDone,
+        GraceMissing,
+        LiveMissing,
+    }
+
+    async fn client_done_exchange_case(case: ClientDonePeer) -> Result<(), ClientRuntimeError> {
+        use crate::crypto::session::AeadCodec;
+        use crate::protocol::data::{CLIENT_TO_SERVER_AAD, SERVER_TO_CLIENT_AAD};
+        use crate::traffic::PaddingProfile;
+        use crate::transport::udp::test_support::loopback_pair;
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        fn codec(aad: &'static [u8]) -> DataRecordCodec {
+            DataRecordCodec::new(
+                AeadCodec::new([0x31; 32], [0x52; 12]),
+                PaddingProfile::new(0, 0).unwrap(),
+                aad,
+            )
+        }
+        let (_server_ep, _client_ep, client_conn, server_conn) =
+            timeout(Duration::from_secs(5), loopback_pair())
+                .await
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connected, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let (client_read, mut client_write) = connected.unwrap().into_split();
+        let (peer_read, mut peer_write) = accepted.unwrap().0.into_split();
+        let mut seal = codec(CLIENT_TO_SERVER_AAD);
+        let mut open = codec(SERVER_TO_CLIENT_AAD);
+        let mut peer_open = codec(CLIENT_TO_SERVER_AAD);
+        let mut peer_seal = codec(SERVER_TO_CLIENT_AAD);
+        // DONE must continue the relay's nonce counters in both directions.
+        assert_eq!(
+            peer_open
+                .open(&seal.seal(b"upload tail", &mut OsRng).unwrap())
+                .unwrap(),
+            b"upload tail"
+        );
+        assert_eq!(
+            open.open(&peer_seal.seal(b"download tail", &mut OsRng).unwrap())
+                .unwrap(),
+            b"download tail"
+        );
+        let mut exchange = Box::pin(client_exchange_quic_done(
+            &client_conn,
+            &mut client_write,
+            client_read,
+            &mut seal,
+            &mut open,
+            1,
+        ));
+        let mut peer_reader = TlsRecordReader::new(peer_read);
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut exchange => panic!("client concluded before the peer DONE: {result:?}"),
+                record = peer_reader.read_record() => {
+                    assert_eq!(peer_open.open(&record.unwrap()).unwrap(), QUIC_RELAY_DONE_MARKER);
+                }
+            }
+        }).await.expect("client must first send its correctly sequenced DONE");
+        let payload = if matches!(case, ClientDonePeer::WrongMarker) {
+            b"wrong marker".as_slice()
+        } else {
+            QUIC_RELAY_DONE_MARKER
+        };
+        let mut reply = peer_seal.seal(payload, &mut OsRng).unwrap();
+        match case {
+            ClientDonePeer::WrongMarker => peer_write.write_all(&reply).await.unwrap(),
+            ClientDonePeer::BadAead => {
+                *reply.last_mut().unwrap() ^= 1;
+                peer_write.write_all(&reply).await.unwrap();
+            }
+            ClientDonePeer::Eof => peer_write.shutdown().await.unwrap(),
+            ClientDonePeer::PartialEof => {
+                peer_write.write_all(&reply[..3]).await.unwrap();
+                peer_write.shutdown().await.unwrap();
+            }
+            ClientDonePeer::GraceDone | ClientDonePeer::GraceMissing => {
+                peer_write.write_all(&reply[..3]).await.unwrap();
+                tokio::select! {
+                    result = &mut exchange => panic!("partial DONE was accepted: {result:?}"),
+                    _ = sleep(Duration::from_millis(10)) => {}
+                }
+                server_conn.close(0u32.into(), b"done-test-peer-close");
+                timeout(
+                    Duration::from_secs(2),
+                    crate::transport::udp::endpoint::conn_closed(&client_conn),
+                )
+                .await
+                .unwrap();
+                // No complete record exists yet: this poll must take the closed
+                // arm and leave the production grace read pending.
+                std::future::poll_fn(|cx| {
+                    assert!(exchange.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                if matches!(case, ClientDonePeer::GraceDone) {
+                    peer_write.write_all(&reply[3..]).await.unwrap();
+                }
+            }
+            ClientDonePeer::LiveMissing => {
+                let (mut alive_send, _unused) = client_conn.open_bi();
+                alive_send.write_all(b"a").await.unwrap();
+                let (_unused, mut alive_recv) =
+                    timeout(Duration::from_secs(5), server_conn.accept_bi())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut byte = [0];
+                alive_recv.read_exact(&mut byte).await.unwrap();
+                tokio::time::pause();
+                let wall = std::time::Instant::now();
+                for _ in 0..=QUIC_RELAY_DONE_BACKSTOP.as_secs() {
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                    let state =
+                        std::future::poll_fn(|cx| Poll::Ready(exchange.as_mut().poll(cx))).await;
+                    assert!(
+                        !client_conn.is_closed() && !server_conn.is_closed(),
+                        "live QUIC must not substitute an idle/grace failure for the DONE backstop"
+                    );
+                    if let Poll::Ready(result) = state {
+                        return result;
+                    }
+                    alive_send.write_all(b"a").await.unwrap();
+                    let mut read = Box::pin(alive_recv.read_exact(&mut byte));
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut read => { result.unwrap(); break; }
+                            _ = tokio::task::yield_now() => {
+                                assert!(wall.elapsed() < Duration::from_secs(10), "QUIC liveness fixture stalled");
+                            }
+                        }
+                    }
+                }
+                panic!("missing DONE exceeded its absolute backstop");
+            }
+        }
+        timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("DONE result must be bounded")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn client_quic_done_rejects_wrong_marker_bad_aead_and_tcp_eof() {
+        for case in [
+            ClientDonePeer::WrongMarker,
+            ClientDonePeer::BadAead,
+            ClientDonePeer::Eof,
+            ClientDonePeer::PartialEof,
+        ] {
+            let error = client_done_exchange_case(case).await.unwrap_err();
+            match case {
+                ClientDonePeer::WrongMarker => assert!(
+                    matches!(error, ClientRuntimeError::Io(e) if e.kind() == io::ErrorKind::InvalidData)
+                ),
+                ClientDonePeer::BadAead => assert!(matches!(
+                    error,
+                    ClientRuntimeError::Handshake(ClientHandshakeError::DataRecord(
+                        DataRecordError::Aead(_)
+                    ))
+                )),
+                _ => assert!(
+                    matches!(error, ClientRuntimeError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets"]
+    async fn client_quic_done_grace_completes_only_a_valid_inflight_record() {
+        client_done_exchange_case(ClientDonePeer::GraceDone)
+            .await
+            .unwrap();
+        let error = client_done_exchange_case(ClientDonePeer::GraceMissing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientRuntimeError::Io(e) if e.kind() == io::ErrorKind::ConnectionAborted)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP/UDP sockets and paused-clock liveness pumping"]
+    async fn client_quic_done_missing_record_hits_backstop_while_quic_is_alive() {
+        let error = client_done_exchange_case(ClientDonePeer::LiveMissing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientRuntimeError::Io(e) if e.kind() == io::ErrorKind::TimedOut && e.to_string() == "QUIC fast-plane teardown DONE backstop elapsed")
+        );
     }
 
     /// The UDP circuit breaker: starts closed, trips on an unusable outcome and
@@ -6418,6 +6952,55 @@ mod tests {
         feeder.abort();
         drop(app_side);
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn client_mux_download_preserves_reset_versus_fin_on_local_socket() {
+        for outcome in [DownloadOutcome::Reset, DownloadOutcome::Fin] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (app, proxy) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let mut app = app.unwrap();
+            let (proxy_read, proxy_write) = proxy.unwrap().0.into_split();
+            let (events_tx, events_rx) = mpsc::channel(1);
+            let terminal = StreamTerminal::new();
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            let task = tokio::spawn(client_mux_download_loop(
+                proxy_write,
+                events_rx,
+                terminal.clone(),
+                outcome_tx,
+                Duration::from_secs(5),
+            ));
+            events_tx
+                .send(DownloadEvent(b"tail".to_vec()))
+                .await
+                .unwrap();
+            let mut tail = [0; 4];
+            app.read_exact(&mut tail).await.unwrap();
+            assert_eq!(&tail, b"tail");
+            terminal.set(outcome);
+            drop(events_tx);
+            task.await.unwrap();
+            assert!(matches!(
+                (outcome_rx.await.unwrap(), outcome),
+                (DownloadOutcome::Fin, DownloadOutcome::Fin)
+                    | (DownloadOutcome::Reset, DownloadOutcome::Reset)
+            ));
+            drop(proxy_read);
+            let close = timeout(Duration::from_secs(5), app.read(&mut [0; 1]))
+                .await
+                .unwrap();
+            match outcome {
+                DownloadOutcome::Fin => assert_eq!(close.unwrap(), 0),
+                DownloadOutcome::Reset => {
+                    assert_eq!(close.unwrap_err().kind(), io::ErrorKind::ConnectionReset)
+                }
+            }
+        }
     }
 
     const CAMOUFLAGE_CERT_DER_B64: &str = concat!(
@@ -8501,6 +9084,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             fallback_addr: fallback_addr.to_string(),
             data_target: Some(target_addr.to_string()),
+            nat64_prefixes: vec![],
             private_key: STANDARD.encode(server_keys.private).into(),
             identity_secret_key: STANDARD.encode(&server_identity_keys.secret).into(),
             replay_cache_path,

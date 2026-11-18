@@ -7,13 +7,13 @@
 # or write via the GitHub API. exit 0 = allow.
 #
 # Pushes are DEFAULT-DENY: a `git push` is allowed only when it explicitly
-# targets a claude/* ref, or when HEAD is already a claude/* branch. Anything
-# else (bare push on main, an explicit main target, or a quote/command-
+# targets a claude/* ref. Anything
+# else (a bare push, an explicit main target, or a quote/command-
 # substitution-obfuscated target) is refused. It errs safe.
 set -uo pipefail
 
 input="$(cat)"
-command -v jq >/dev/null 2>&1 || exit 0   # no jq: don't break the run (deny-list still applies)
+command -v jq >/dev/null 2>&1 || { echo 'BLOCKED: push guard requires jq' >&2; exit 2; }
 
 tool="$(printf '%s' "$input" | jq -r '.tool_name // empty')"
 [ "$tool" = "Bash" ] || exit 0
@@ -38,15 +38,46 @@ if printf '%s' "$norm" | grep -Eiq '\bgit\b' && printf '%s' "$norm" | grep -Eiq 
   case "$norm" in
     *"'"*|*'"'*|*'`'*|*'$('*) block "git push contains quotes/command-substitution (possible target obfuscation)" ;;
   esac
-  if printf '%s' "$norm" | grep -Eq 'claude/'; then
-    : # explicit claude/* target — allow
-  else
-    cur="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-    case "$cur" in
-      claude/*) : ;;  # already on a claude branch — a bare push is fine
-      *) block "git push without an explicit claude/* target (current branch: ${cur:-detached/unknown})" ;;
+  case "$norm" in
+    *'$'*|*'\\'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*|*'{'*|*'}'*|*'#'*) block "git push contains shell syntax or target obfuscation" ;;
+  esac
+  read -r -a words <<< "$norm"
+  [ "${words[0]:-}" = git ] && [ "${words[1]:-}" = push ] \
+    || block "git push must be a standalone explicit command"
+  remote=0
+  refs=0
+  for word in "${words[@]:2}"; do
+    if [ "$remote" -eq 0 ]; then
+      case "$word" in
+        -u|--set-upstream|--force-with-lease|--force|--dry-run|-n|--porcelain|-v|--verbose|-q|--quiet) continue ;;
+        origin) remote=1; continue ;;
+        *) block "git push option or remote is not allowlisted" ;;
+      esac
+    fi
+    case "$word" in -*) block "git push options after the remote are refused" ;; esac
+    ref="${word#+}"
+    dest="${ref##*:}"
+    case "$dest" in
+      refs/heads/claude/*) ;;
+      claude/*) dest="refs/heads/$dest" ;;
+      *) block "git push destination must be an explicit claude/* branch" ;;
     esac
-  fi
+    git check-ref-format "$dest" >/dev/null 2>&1 \
+      || block "git push destination is not a literal branch ref"
+    case "${ref%:*}" in
+      ''|*:*|*'*'*|*'?'*|*'['*|*']'*) block "git push source must be a single explicit ref" ;;
+    esac
+    refs=$((refs + 1))
+  done
+  [ "$remote" -eq 1 ] && [ "$refs" -gt 0 ] \
+    || block "git push requires origin and an explicit claude/* destination"
+  for setting in push.followTags remote.origin.mirror; do
+    value="$(git config --bool --get "$setting" 2>/dev/null)"
+    case "$value" in
+      ''|false) ;;
+      *) block "git push configuration enables aggregate refs ($setting)" ;;
+    esac
+  done
 fi
 
 # ---- PR merge in any form ----
