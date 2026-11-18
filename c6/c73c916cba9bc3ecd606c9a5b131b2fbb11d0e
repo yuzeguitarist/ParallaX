@@ -1,0 +1,19 @@
+src/protocol/data.rs
+  s_c22ffc928fdaee::t_25f918c0613b01 1426-1430
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c6c73c916cba9bc3ecd606c9a5b131b2fbb11d0e",
+  "prompts": {},
+  "sessions": {
+    "s_c22ffc928fdaee": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ee28-2ea7-7d82-8806-1022509d7a42",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
