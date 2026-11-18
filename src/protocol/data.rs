@@ -87,6 +87,11 @@ pub struct DataRecordCodec {
     aad: &'static [u8],
 }
 
+#[cfg(test)]
+thread_local! {
+    static PARALLEL_SEAL_PANIC_GROUP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedRecord {
     pub range: Range<usize>,
@@ -985,6 +990,7 @@ impl DataRecordCodec {
     /// writers use this to keep each record frame-aligned — identical record
     /// boundaries to the serial path — while still spreading the AEAD work
     /// across `pool`. Records map to sequence numbers `base..base+n` in order.
+    /// Worker errors and unwinding poison the codec; panics still propagate.
     pub fn seal_records_into_parallel<R>(
         &mut self,
         pool: &CryptoPool,
@@ -1009,12 +1015,23 @@ impl DataRecordCodec {
         // Reserve before dispatch: a failed sibling must never make a nonce
         // already used by another worker available for a later seal.
         let base_sequence = self.aead.reserve_sequence(record_count as u64)?;
+        struct PoisonOnUnwind<'a>(&'a mut AeadCodec);
+        impl Drop for PoisonOnUnwind<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.poison();
+                }
+            }
+        }
+        let unwind_guard = PoisonOnUnwind(&mut self.aead);
         let group_count = pool.width().max(1).min(record_count);
 
-        let cipher = self.aead.cipher();
-        let nonce_base = self.aead.nonce_base();
+        let cipher = unwind_guard.0.cipher();
+        let nonce_base = unwind_guard.0.nonce_base();
         let aad = self.aad;
         let padding = self.padding;
+        #[cfg(test)]
+        let panic_group = PARALLEL_SEAL_PANIC_GROUP.with(|group| group.take());
 
         let mut jobs = Vec::with_capacity(group_count);
         let mut next_record = 0;
@@ -1034,6 +1051,10 @@ impl DataRecordCodec {
             let seed = rng.gen::<u64>();
             let cipher = SharedCipher::clone(&cipher);
             jobs.push(move || {
+                #[cfg(test)]
+                if panic_group == Some(group) {
+                    panic!("parallel seal worker panic");
+                }
                 seal_records_segment(
                     &cipher,
                     &nonce_base,
@@ -1056,6 +1077,7 @@ impl DataRecordCodec {
             match segment {
                 Ok(segment) => sealed.push(segment),
                 Err(err) => {
+                    drop(unwind_guard);
                     self.aead.poison();
                     return Err(err);
                 }
@@ -1065,6 +1087,7 @@ impl DataRecordCodec {
         for segment in &sealed {
             out.extend_from_slice(segment);
         }
+        drop(unwind_guard);
         Ok(())
     }
 
@@ -3312,6 +3335,73 @@ mod tests {
             enc.seal(b"retry after rekey", &mut rng),
             Err(DataRecordError::Aead(SessionError::Aead))
         ));
+    }
+
+    #[test]
+    fn parallel_seal_worker_panic_reserves_nonces_and_poisons_even_after_rekey() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        for width in [1, 2] {
+            let pool = CryptoPool::new(width);
+            let mut enc = DataRecordCodec::new(
+                AeadCodec::new([13; KEY_LEN], [14; NONCE_LEN]),
+                PaddingProfile::new(0, 0).unwrap(),
+                CLIENT_TO_SERVER_AAD,
+            );
+            let mut rng = StdRng::seed_from_u64(96);
+            let mut out = b"prefix".to_vec();
+            // Width one panics inline; width two panics on the sibling worker.
+            PARALLEL_SEAL_PANIC_GROUP.with(|group| group.set(Some(width - 1)));
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                enc.seal_records_into_parallel(&pool, b"ab", &[1, 1], &mut rng, &mut out)
+            }))
+            .expect_err("the original worker panic must propagate");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"parallel seal worker panic")
+            );
+            assert_eq!(out, b"prefix");
+            assert_eq!(enc.aead.sequence(), 2);
+            assert!(matches!(
+                enc.seal(b"retry", &mut rng),
+                Err(DataRecordError::Aead(SessionError::Aead))
+            ));
+            enc.rekey([15; KEY_LEN], [16; NONCE_LEN]);
+            assert!(matches!(
+                enc.seal(b"retry after rekey", &mut rng),
+                Err(DataRecordError::Aead(SessionError::Aead))
+            ));
+        }
+    }
+
+    #[test]
+    fn successful_parallel_seal_keeps_codec_usable() {
+        for width in [1, 2] {
+            let pool = CryptoPool::new(width);
+            let padding = PaddingProfile::new(0, 0).unwrap();
+            let mut enc = DataRecordCodec::new(
+                AeadCodec::new([17; KEY_LEN], [18; NONCE_LEN]),
+                padding,
+                CLIENT_TO_SERVER_AAD,
+            );
+            let mut dec = DataRecordCodec::new(
+                AeadCodec::new([17; KEY_LEN], [18; NONCE_LEN]),
+                padding,
+                CLIENT_TO_SERVER_AAD,
+            );
+            let mut rng = StdRng::seed_from_u64(97);
+            let mut out = b"prefix".to_vec();
+            enc.seal_records_into_parallel(&pool, b"ab", &[1, 1], &mut rng, &mut out)
+                .unwrap();
+            assert_eq!(&out[..6], b"prefix");
+            let mut opened = Vec::new();
+            dec.open_concat_records_parallel(&pool, &out[6..], &mut opened)
+                .unwrap();
+            assert_eq!(opened, b"ab");
+            assert_eq!(enc.aead.sequence(), 2);
+            let tail = enc.seal(b"tail", &mut rng).unwrap();
+            assert_eq!(dec.open(&tail).unwrap(), b"tail");
+        }
     }
 
     #[test]

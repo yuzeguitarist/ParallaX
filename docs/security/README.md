@@ -7,6 +7,12 @@ review findings, audit debt and remaining external acceptance conditions.
 These controls supplement existing fuzz, Kani, Miri, constant-time, browser
 parity, GFW simulation and static-analysis jobs.
 
+The [47-category validation catalog](../../verification/SECURITY-VALIDATION.md)
+maps cryptographic, protocol and traffic/privacy requests to concrete tests,
+symbolic analyses, statistical experiments and explicit unfulfilled boundaries.
+Its evidence checker keeps CAVP/CMVP certification, unsupported capabilities and
+missing field corpora separate from passing functional checks.
+
 ## Commands
 
 Use recent stable Rust, Python 3.11+ and committed lockfiles from the repository
@@ -15,8 +21,10 @@ metadata. Model/canary crates are isolated non-shipping workspaces.
 
 | Command | Purpose |
 | --- | --- |
-| `python3 scripts/security/assurance.py protocol` | Independent parser/AEAD oracles, faulty I/O and existing ML-DSA oracle/vectors |
+| `python3 scripts/security/assurance.py protocol` | All library tests including serial network cases, generated/differential carrier oracles, binary E2E, real listener and ML-DSA vectors |
 | `python3 scripts/security/assurance.py listener` | Real child server/TLS, replay persistence/capacity/corruption and source quota recovery; localhost only |
+| `python3 scripts/security/timing.py` | Bounded reject-path timing experiment, controls, six ordered shape pairs and retained provenance; not a whole-module constant-time proof |
+| `python3 scripts/verification/security_catalog.py --check` | All 47 categories and concrete references, without claiming execution |
 | `python3 scripts/security/assurance.py std` | Production limiter, FD budget and pool scenarios with standard-library synchronization |
 | `python3 scripts/security/assurance.py loom` | Actual production limiter, FD budget and pool under bounded Loom exploration |
 | `python3 scripts/security/assurance.py shuttle` | Same source under seeded scheduling and schedule replay |

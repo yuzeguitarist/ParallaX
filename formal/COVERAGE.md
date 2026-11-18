@@ -29,7 +29,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/cli.rs` | not-exhaustive | argv parsing and filesystem paths |
 | `src/client/initial_payload.rs` | not-exhaustive | first-record bytes and socket deadlines |
 | `src/client/mod.rs` | not-exhaustive | module wiring |
-| `src/client/runtime.rs` | bounded-elsewhere | Kani checks mux activation and bounded tail append arithmetic. ParallaXSession and ParallaXZeroRtt cover control order only; TCP and QUIC I/O are not proved |
+| `src/client/runtime.rs` | bounded-elsewhere | Kani checks mux activation and bounded tail append arithmetic. ParallaXSession and ParallaXZeroRtt cover control order; ParallaXIdentityChunks covers bounded PX1I caller metadata, completion/verification/CONNECT gates, and establishment failure outcomes. TCP and QUIC I/O are not proved |
 | `src/client/socks.rs` | not-exhaustive | SOCKS byte parser and sockets |
 | `src/concurrency.rs` | not-exhaustive | std synchronization facade; isolated Loom/Shuttle builds substitute instrumented primitives, not a whole-program OS model |
 | `src/config.rs` | not-exhaustive | config files, secrets, and OS paths |
@@ -50,14 +50,14 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/crypto/pq.rs` | not-exhaustive | ML-KEM-1024 encapsulation bytes. ParallaXSession anchors the all-zero X25519 reject in hybrid_sandwich_rekey |
 | `src/crypto/quic_marker.rs` | not-exhaustive | HMAC over ClientHello.random |
 | `src/crypto/pool.rs` | not-exhaustive | production worker queue and lifecycle are exercised under bounded Loom/Shuttle schedules; arbitrary closures, OS threads and all schedules are not proved |
-| `src/crypto/replay.rs` | bounded-elsewhere | Kani checks post-HMAC digest copying and wiping. ParallaXReplay is the in-memory stage_insert order for one slot; the journal MAC and disk are not proved |
-| `src/crypto/session.rs` | bounded-elsewhere | Kani proves nonce injectivity in the sequence and substream HKDF-info injectivity in the stream id. AEAD and HKDF bytes are not enumerated. ParallaXSession only anchors the degenerate-secret check |
+| `src/crypto/replay.rs` | bounded-elsewhere | Kani checks post-HMAC digest copying and wiping. ParallaXReplay is the in-memory stage_insert order for one slot; ParallaXSession separates early pending admission refusal/splice from the late data-proof commit refusal/close. The journal MAC and disk are not proved |
+| `src/crypto/session.rs` | bounded-elsewhere | Kani proves nonce injectivity in the sequence and substream HKDF-info injectivity in the stream id. AEAD and HKDF bytes are not enumerated. ParallaXSession anchors the degenerate-secret check; ParallaXRecords covers a three-sequence reservation window and permanent poison across fresh-key rekey |
 | `src/fingerprint/http2.rs` | not-exhaustive | HTTP/2 frame bytes |
 | `src/fingerprint/http3.rs` | not-exhaustive | HTTP/3 and QPACK bytes |
 | `src/fingerprint/mod.rs` | not-exhaustive | module wiring |
 | `src/handshake/client.rs` | not-exhaustive | ParallaXSession rekey order only; records and crypto calls do the rest |
 | `src/handshake/mod.rs` | not-exhaustive | module wiring |
-| `src/handshake/server.rs` | bounded-elsewhere | Kani checks mux receipt claims, bounded tail append and record-planning arithmetic. ParallaXSession, ParallaXInbound, and the ParallaXProbe retention gate cover control slices; sockets and records are not proved |
+| `src/handshake/server.rs` | bounded-elsewhere | Kani checks mux receipt claims, bounded tail append and record-planning arithmetic. ParallaXSession, ParallaXInbound, and the ParallaXProbe retention gate cover control slices. ParallaXMux covers two TCP streams under capacity one/two, half-close, asynchronous cancellation, local setup failure, and sibling isolation; sockets, scheduler liveness, and arbitrary stream counts are not proved |
 | `src/handshake/source_limit.rs` | not-exhaustive | admission map keyed by IP addresses, not a finite control vector |
 | `src/handshake/transcript.rs` | not-exhaustive | transcript hash bytes |
 | `src/lib.rs` | not-exhaustive | crate root |
@@ -65,8 +65,8 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/netmatrix.rs` | not-exhaustive | live network measurements |
 | `src/probe.rs` | not-exhaustive | external reachability probe over sockets and clocks; not the UDP probe machine |
 | `src/process_hardening.rs` | not-exhaustive | OS sandbox, rlimits, and procfs |
-| `src/protocol/command.rs` | not-exhaustive | command codecs over unbounded records. The PX1P status byte is exhausted by check_probe_status_bytes for ParallaXProbe; other commands are not |
-| `src/protocol/data.rs` | bounded-elsewhere | Kani checks record capacity, nonce-budget reservation, and poisoned-state rejection; AEAD record bodies are not proved |
+| `src/protocol/command.rs` | not-exhaustive | command codecs over unbounded records. The PX1P status byte is exhausted by check_probe_status_bytes for ParallaXProbe. ParallaXFragments covers all partitions of 1..3-byte PX1F payloads, two frames, and abstract reject classes; arbitrary bytes and PX1I caller reassembly are not proved |
+| `src/protocol/data.rs` | bounded-elsewhere | Kani checks record capacity, nonce-budget reservation, and poisoned-state rejection. ParallaXRecords covers parallel seal reservation, failure poison, and publication control; AEAD bodies and arbitrary record batches are not proved |
 | `src/protocol/mod.rs` | not-exhaustive | module wiring |
 | `src/runtime_guard.rs` | not-exhaustive | OS user, group, and process role |
 | `src/secret_store.rs` | not-exhaustive | sealed secret files and the OS keystore |

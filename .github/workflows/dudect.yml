@@ -1,14 +1,12 @@
 name: dudect
 
-# Load-bearing constant-time gate for the inbound-reject path
+# Bounded timing-regression experiment for the inbound-reject path
 # (src/handshake/server.rs `rejection_path_timing_is_constant_dudect`).
 #
-# The REJECT_DH_OPS counter tests prove the X25519 op COUNT is input-independent;
-# this job proves the actual WALL-CLOCK latency of the rejection decision is
-# constant-time across the three attacker-reachable reject shapes, by sampling
-# each shape thousands of times and gating on the self-calibrated mean-latency
-# effect size. A data-dependent latency the op-count guard cannot see (the kind
-# that re-introduces an active-probing distinguisher) turns this RED.
+# Count checks and wall-clock measurements cover three reject shapes with one
+# fixed server key, compiler and host. Statistical gates detect measured gross
+# regressions; they do not prove constant time for every primitive, input or
+# cache/power/EM channel. Retain sample budgets, controls and all six shape pairs.
 #
 # It is gated behind `--features dudect` (NOT #[ignore]) so it is a hard,
 # non-ignored gate here while staying out of the default `cargo test` (it is far
@@ -70,7 +68,7 @@ env:
 
 jobs:
   dudect:
-    name: dudect (reject-path constant-time)
+    name: dudect (bounded reject-path timing)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -93,8 +91,15 @@ jobs:
 
       # The hard gate. Single-threaded so the timing loop is not perturbed by
       # other test threads sharing the runner's cores.
-      - name: cargo test --features dudect (reject-path constant-time)
-        run: |
-          cargo test --locked --features dudect --lib \
-            rejection_path_timing_is_constant_dudect \
-            -- --nocapture --test-threads=1
+      - name: Check timing runner controls
+        run: python3 scripts/security/test_timing.py
+      - name: Measure reject-path timing with retained evidence
+        run: python3 scripts/security/timing.py
+      - name: Retain timing measurements and controls
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: timing-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/security/timing/
+          if-no-files-found: error
+          retention-days: 10

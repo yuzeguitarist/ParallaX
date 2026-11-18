@@ -513,3 +513,303 @@ mod tests {
         assert!(sp.discard(0).is_none(), "discarding twice is a no-op");
     }
 }
+
+#[cfg(test)]
+mod generated_properties {
+    use super::super::property;
+    use super::*;
+    use std::collections::BTreeSet;
+
+    // The reference model stores a flat list and integer microsecond times.
+    // ACKs filter by set membership; loss filters by mathematical distance/age.
+    // It does not call production packet/range or recovery helpers.
+    #[derive(Clone, Debug)]
+    struct ReferencePacket {
+        pn: u64,
+        sent_us: u64,
+        size: u64,
+        eliciting: bool,
+        delivered: u64,
+    }
+
+    impl ReferencePacket {
+        fn fields(&self) -> (u64, u64, u64, bool, u64) {
+            (
+                self.pn,
+                self.sent_us,
+                self.size,
+                self.eliciting,
+                self.delivered,
+            )
+        }
+
+        fn sent(&self, origin: Instant) -> SentPacket {
+            SentPacket {
+                time_sent: origin + Duration::from_micros(self.sent_us),
+                size: self.size,
+                ack_eliciting: self.eliciting,
+                delivered: self.delivered,
+            }
+        }
+    }
+
+    fn observed(packets: &[(u64, SentPacket)], origin: Instant) -> Vec<(u64, u64, u64, bool, u64)> {
+        let mut fields: Vec<_> = packets
+            .iter()
+            .map(|(pn, packet)| {
+                (
+                    *pn,
+                    packet.time_sent.duration_since(origin).as_micros() as u64,
+                    packet.size,
+                    packet.ack_eliciting,
+                    packet.delivered,
+                )
+            })
+            .collect();
+        fields.sort_unstable();
+        fields
+    }
+
+    #[test]
+    fn generated_ack_discard_and_loss_histories_match_independent_packet_list() {
+        property::check("quic-recovery-history-model", |case| {
+            let origin = Instant::now();
+            let base = if case.a & 1 == 0 {
+                0
+            } else {
+                (1u64 << 62) - 128
+            };
+            let bytes = case.array::<96>(0);
+            let mut actual = SentPackets::new();
+            let mut remaining: Vec<_> = (0..64usize)
+                .map(|i| ReferencePacket {
+                    pn: base + i as u64,
+                    sent_us: i as u64 * 250,
+                    size: 1 + u64::from(bytes[i]) + case.b % 1200,
+                    eliciting: (i % 3 != 0) ^ (bytes[i] & 1 != 0),
+                    delivered: case.c.wrapping_add(i as u64 * 64),
+                })
+                .collect();
+            for packet in &remaining {
+                actual.on_sent(packet.pn, packet.sent(origin));
+            }
+            let mut largest = None;
+            for step in 0..48usize {
+                let operation = if step == 0 {
+                    0
+                } else if step == 1 {
+                    2
+                } else {
+                    step % 3
+                };
+                let index = u64::from(bytes[step * 2]) % 64;
+                match operation {
+                    0 => {
+                        let other = u64::from(bytes[step * 2 + 1]) % 64;
+                        let low = if step == 0 { 32 } else { index.min(other) };
+                        let high = if step == 0 { 32 } else { index.max(other) };
+                        let ranges = [(base + low, base + high), (base + low, base + high)];
+                        let mut expected = Vec::new();
+                        remaining.retain(|packet| {
+                            if (base + low..=base + high).contains(&packet.pn) {
+                                expected.push(packet.fields());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        largest = Some(largest.map_or(base + high, |n: u64| n.max(base + high)));
+                        prop_assert_eq!(
+                            observed(&actual.on_ack(base + high, &ranges), origin),
+                            expected
+                        );
+                        prop_assert!(actual.on_ack(base + high, &ranges).is_empty());
+                    }
+                    1 => {
+                        let pn = base + index;
+                        let expected = remaining
+                            .iter()
+                            .position(|packet| packet.pn == pn)
+                            .map(|index| remaining.remove(index).fields());
+                        let discarded = actual
+                            .discard(pn)
+                            .map(|packet| observed(&[(pn, packet)], origin).remove(0));
+                        prop_assert_eq!(discarded, expected);
+                        prop_assert!(actual.discard(pn).is_none());
+                    }
+                    _ => {
+                        let now_us = 16_000 + step as u64 * 250;
+                        let delay_us = if step == 1 {
+                            100_000
+                        } else {
+                            1 + case.b % 50_000
+                        };
+                        let mut expected = Vec::new();
+                        let mut deadline = None;
+                        remaining.retain(|packet| {
+                            if largest.is_some_and(|pn| packet.pn < pn) {
+                                let by_number = largest.unwrap() - packet.pn >= 3;
+                                let by_age = now_us - packet.sent_us >= delay_us;
+                                if by_number || by_age {
+                                    expected.push(packet.fields());
+                                    return false;
+                                }
+                                let packet_deadline = packet.sent_us + delay_us;
+                                deadline = Some(
+                                    deadline
+                                        .map_or(packet_deadline, |n: u64| n.min(packet_deadline)),
+                                );
+                            }
+                            true
+                        });
+                        let (lost, next) = actual.detect_lost(
+                            Duration::from_micros(delay_us),
+                            origin + Duration::from_micros(now_us),
+                        );
+                        prop_assert_eq!(observed(&lost, origin), expected);
+                        prop_assert_eq!(
+                            next,
+                            deadline.map(|us| origin + Duration::from_micros(us))
+                        );
+                    }
+                }
+                let in_flight: u64 = remaining
+                    .iter()
+                    .filter(|packet| packet.eliciting)
+                    .map(|packet| packet.size)
+                    .sum();
+                prop_assert_eq!(actual.in_flight(), in_flight);
+                prop_assert_eq!(actual.largest_acked(), largest);
+                let tracked: Vec<_> = actual
+                    .packets
+                    .iter()
+                    .map(|(pn, packet)| (*pn, packet.clone()))
+                    .collect();
+                prop_assert_eq!(
+                    observed(&tracked, origin),
+                    remaining
+                        .iter()
+                        .map(ReferencePacket::fields)
+                        .collect::<Vec<_>>()
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn generated_pure_ack_flood_retains_only_recent_issued_entries_without_losing_in_flight() {
+        property::check("quic-pure-ack-cap-model", |case| {
+            let origin = Instant::now();
+            let mut actual = SentPackets::new();
+            let mut all = Vec::new();
+            let mut pure = Vec::new();
+            let mut acknowledged = BTreeSet::new();
+            let mut largest = None;
+            for pn in 0..360 + case.a % 64 {
+                let packet = ReferencePacket {
+                    pn,
+                    sent_us: pn,
+                    size: 1 + case.b % 1500,
+                    eliciting: pn % 7 == 0,
+                    delivered: case.c,
+                };
+                if !packet.eliciting {
+                    pure.push(pn);
+                }
+                actual.on_sent(pn, packet.sent(origin));
+                all.push(packet);
+                if pn % 37 == 0 {
+                    let acked = pn.saturating_sub(case.c % 32);
+                    acknowledged.insert(acked);
+                    actual.on_ack(acked, &[(acked, acked)]);
+                    largest = Some(largest.map_or(acked, |n: u64| n.max(acked)));
+                }
+            }
+            let recent: BTreeSet<_> = pure.iter().rev().take(256).copied().collect();
+            let retained: Vec<_> = all
+                .iter()
+                .filter(|packet| {
+                    !acknowledged.contains(&packet.pn)
+                        && (packet.eliciting || recent.contains(&packet.pn))
+                })
+                .collect();
+            let tracked: Vec<_> = actual
+                .packets
+                .iter()
+                .map(|(pn, packet)| (*pn, packet.clone()))
+                .collect();
+            prop_assert_eq!(
+                observed(&tracked, origin),
+                retained
+                    .iter()
+                    .map(|packet| packet.fields())
+                    .collect::<Vec<_>>()
+            );
+            prop_assert_eq!(
+                actual.in_flight(),
+                retained
+                    .iter()
+                    .filter(|packet| packet.eliciting)
+                    .map(|packet| packet.size)
+                    .sum::<u64>()
+            );
+            prop_assert_eq!(actual.largest_acked(), largest);
+            prop_assert!(actual.non_ack_eliciting.len() <= 256);
+            let last = all.last().unwrap().pn;
+            actual.on_ack(last, &[(0, last)]);
+            prop_assert_eq!(actual.in_flight(), 0);
+            prop_assert!(actual.on_ack(last, &[(0, last)]).is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn generated_rtt_history_matches_integer_nanosecond_rfc_ewma() {
+        property::check("quic-rtt-ewma-oracle", |case| {
+            let mut actual = RttEstimator::new();
+            prop_assert_eq!(actual.pto_base().as_nanos(), 999_000_000);
+            let bytes = case.array::<64>(0);
+            let (mut smoothed, mut variance, mut minimum) = (0u128, 0u128, u128::MAX);
+            for step in 0..32usize {
+                let sample = u128::from(
+                    1 + case.a.wrapping_add(u64::from(bytes[step]) * 65_537) % 1_000_000_000,
+                );
+                let delay = u128::from(
+                    case.b.wrapping_add(u64::from(bytes[step + 32]) * 4099) % 100_000_000,
+                );
+                if step == 0 {
+                    smoothed = sample;
+                    variance = sample / 2;
+                    minimum = sample;
+                } else {
+                    minimum = minimum.min(sample);
+                    let adjusted = if sample >= minimum + delay {
+                        sample - delay
+                    } else {
+                        sample
+                    };
+                    variance = (3 * variance + smoothed.abs_diff(adjusted)) / 4;
+                    smoothed = (7 * smoothed + adjusted) / 8;
+                }
+                actual.update(
+                    Duration::from_nanos(delay as u64),
+                    Duration::from_nanos(sample as u64),
+                );
+                prop_assert_eq!(actual.latest().as_nanos(), sample);
+                prop_assert_eq!(actual.min().as_nanos(), minimum);
+                prop_assert_eq!(actual.smoothed().as_nanos(), smoothed);
+                prop_assert_eq!(actual.rttvar().as_nanos(), variance);
+                prop_assert_eq!(
+                    actual.pto_base().as_nanos(),
+                    smoothed + (4 * variance).max(1_000_000)
+                );
+                prop_assert_eq!(
+                    actual.loss_delay().as_nanos(),
+                    (9 * smoothed.max(sample) / 8).max(1_000_000)
+                );
+            }
+            Ok(())
+        });
+    }
+}

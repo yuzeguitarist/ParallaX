@@ -24,7 +24,9 @@ POLICY = "parallax-client-mux-tail-single-tcp-callsite"
 def findings(semgrep, target, rules=RULES):
     # Complete-runtime mutation files are deliberately large. Keep the scan
     # serial instead of multiplying parser memory and per-rule CPU contention.
-    result = run(semgrep, "--strict", "--jobs", "1", "--no-git-ignore", "--config", str(rules),
+    # Full-runtime fixtures need more than Semgrep's default five-second limit.
+    # Retain a finite timeout and reject incomplete scans below.
+    result = run(semgrep, "--strict", "--jobs", "1", "--timeout", "30", "--no-git-ignore", "--config", str(rules),
                  "--json", "--quiet", str(target))
     data = json.loads(result.stdout)
     if result.returncode not in (0, 1) or data.get("errors") or data.get("skipped_rules"):

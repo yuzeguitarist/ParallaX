@@ -224,6 +224,9 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         // Parse frame headers (one DATA frame at a time) until we are positioned
         // inside a payload, then copy payload bytes into `buf`.
         while this.remaining == 0 {
@@ -269,12 +272,16 @@ where
             match Pin::new(&mut this.inner).poll_read(cx, &mut one) {
                 Poll::Ready(Ok(())) => {
                     if one.filled().is_empty() {
-                        // Clean EOF. At a frame boundary (no partial header) this is
-                        // a clean finish; mid-header it is a truncated header. Either
-                        // way surface EOF as the inner reader would (UnexpectedEof
-                        // via read_exact upstack) — return Ok with 0 filled so the
-                        // record reader sees EOF.
-                        return Poll::Ready(Ok(()));
+                        return Poll::Ready(if this.header.is_empty() {
+                            Ok(())
+                        } else {
+                            // InvalidData keeps truncated H3 framing distinct from
+                            // the record reader's clean frame-boundary EOF.
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "truncated H3 DATA frame header",
+                            ))
+                        });
                     }
                     this.header.push(byte[0]);
                 }
@@ -294,6 +301,12 @@ where
         match Pin::new(&mut this.inner).poll_read(cx, &mut limited) {
             Poll::Ready(Ok(())) => {
                 let n = limited.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated H3 DATA frame payload",
+                    )));
+                }
                 // SAFETY: the inner reader initialized and filled `n` bytes in
                 // `limited`, which aliases `buf`'s spare capacity (tokio Take pattern).
                 unsafe {
@@ -337,8 +350,8 @@ impl LegReader for H3DataFrameLegReader {
 
     /// QUIC clean-close override: a clean finish is `UnexpectedEof`;
     /// `ConnectionReset` (`RESET_STREAM`) is a truncated relay and is NOT a clean
-    /// close. The de-framer propagates the inner error kind, so this classification
-    /// is unchanged by the DATA framing.
+    /// close. Truncated DATA framing is `InvalidData`, distinct from a clean
+    /// frame-boundary EOF.
     fn is_clean_close(&self, err: &io::Error) -> bool {
         matches!(
             err.kind(),
@@ -405,6 +418,108 @@ mod tests {
         let reader = TcpLegReader::buffered(tokio::io::duplex(64).0);
         assert!(!reader.is_clean_close(&io::Error::from(io::ErrorKind::ConnectionReset)));
         assert!(reader.is_clean_close(&io::Error::from(io::ErrorKind::UnexpectedEof)));
+    }
+
+    #[tokio::test]
+    async fn h3_stream_reader_rejects_invalid_frames_and_partial_fin() {
+        for wire in [
+            vec![1, 0],                // HEADERS after the business HEADERS boundary
+            vec![0, 0x80, 0x10, 0, 1], // DATA length 1 MiB + 1
+            vec![0x40],                // incomplete type varint
+            vec![0, 0x40],             // incomplete length varint
+            vec![0, 3, b'a'],          // incomplete payload
+        ] {
+            let mut reader = H3DataFrameReader::new(wire.as_slice());
+            let mut received = Vec::new();
+            let error = reader
+                .read_to_end(&mut received)
+                .await
+                .expect_err("malformed H3 framing must not become a normal FIN");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "wire={wire:?}");
+        }
+        // Each byte cut through two nonminimal 8-byte varints and a DATA body
+        // must fail; the empty stream and complete frame remain valid finishes.
+        let wire = [
+            0xc0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 3, b'a', b'b', b'c',
+        ];
+        for end in 1..wire.len() {
+            let mut reader = H3DataFrameReader::new(&wire[..end]);
+            assert_eq!(
+                reader
+                    .read_to_end(&mut Vec::new())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for (input, expected) in [
+            (&wire[..0], b"".as_slice()),
+            (&wire[..], b"abc"),
+            (&[0, 0][..], b""),
+        ] {
+            let mut reader = H3DataFrameReader::new(input);
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn h3_stream_truncated_tail_preserves_prior_records_but_is_not_clean_close() {
+        for tail in [vec![0x40], vec![0, 0x40], vec![0, 3, b'x']] {
+            let record = b"\x17\x03\x03\0\x03abc";
+            let mut wire = vec![0, record.len() as u8];
+            wire.extend_from_slice(record);
+            wire.extend_from_slice(&tail);
+            let mut reader = TcpLegReader::buffered(H3DataFrameReader::new(wire.as_slice()));
+            let mut received = Vec::new();
+            reader.read_record_into(&mut received).await.unwrap();
+            assert_eq!(received, record);
+            let error = reader.read_record_into(&mut received).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(!reader.is_clean_close(&error));
+        }
+    }
+
+    #[tokio::test]
+    async fn h3_stream_real_quic_fin_rejects_truncated_framing_after_a_valid_record() {
+        use tokio::io::AsyncWriteExt;
+
+        let (_server_endpoint, _client_endpoint, client, server) = loopback_pair().await;
+        for tail in [
+            vec![],
+            vec![0, 0],
+            vec![0x40],
+            vec![0, 0x40],
+            vec![0, 3, b'x'],
+        ] {
+            let record = b"\x17\x03\x03\0\x03abc";
+            let mut wire = vec![0, record.len() as u8];
+            wire.extend_from_slice(record);
+            wire.extend_from_slice(&tail);
+            let (mut send, _recv) = client.open_bi();
+            send.write_all(&wire).await.unwrap();
+            send.finish();
+            let (_send, recv) = server.accept_bi().await.unwrap();
+            let mut reader = H3DataFrameLegReader::buffered(recv);
+            let mut received = Vec::new();
+            reader.read_record_into(&mut received).await.unwrap();
+            assert_eq!(received, record);
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                reader.read_record_into(&mut received),
+            )
+            .await
+            .expect("QUIC FIN must resolve the pending frame")
+            .unwrap_err();
+            if tail.is_empty() || tail == [0, 0] {
+                assert!(reader.is_clean_close(&error));
+            } else {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "tail={tail:?}");
+                assert!(!reader.is_clean_close(&error));
+            }
+        }
     }
 
     // These functional cases transfer several MiB through the real QUIC stack.

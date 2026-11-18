@@ -1119,6 +1119,142 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod generated_properties {
+    use super::super::property;
+    use super::*;
+
+    #[test]
+    fn generated_frame_families_preserve_fields_and_concatenation() {
+        property::check("quic-frames", |case| {
+            let id = case.a & varint::MAX;
+            let value = case.b & varint::MAX;
+            let data = case.payload(256);
+            let cid = case.array::<20>(0);
+            let token = case.array::<16>(20);
+            let ack = Ack {
+                largest: 100 + case.a % 1000,
+                delay: value,
+                ranges: vec![(100 + case.a % 1000 - 7, 100 + case.a % 1000), (1, 5)],
+                ecn: Some(EcnCounts {
+                    ect0: id,
+                    ect1: value,
+                    ce: case.c & varint::MAX,
+                }),
+            };
+            let frames = vec![
+                Frame::Padding(1 + case.c as usize % 32),
+                Frame::Ping,
+                Frame::Ack(ack.clone()),
+                Frame::Ack(Ack { ecn: None, ..ack }),
+                Frame::ResetStream {
+                    id,
+                    error_code: value,
+                    final_size: id,
+                },
+                Frame::StopSending {
+                    id,
+                    error_code: value,
+                },
+                Frame::Crypto { offset: id, data },
+                Frame::NewToken { token: data },
+                Frame::Stream {
+                    id,
+                    offset: value,
+                    fin: case.c & 1 != 0,
+                    data,
+                },
+                Frame::MaxData(value),
+                Frame::MaxStreamData { id, max: value },
+                Frame::MaxStreams {
+                    dir: Dir::Bidi,
+                    max: value,
+                },
+                Frame::MaxStreams {
+                    dir: Dir::Uni,
+                    max: value,
+                },
+                Frame::DataBlocked(value),
+                Frame::StreamDataBlocked { id, limit: value },
+                Frame::StreamsBlocked {
+                    dir: Dir::Bidi,
+                    limit: value,
+                },
+                Frame::StreamsBlocked {
+                    dir: Dir::Uni,
+                    limit: value,
+                },
+                Frame::NewConnectionId {
+                    seq: id,
+                    retire_prior_to: id,
+                    cid: &cid[..1 + case.c as usize % 20],
+                    reset_token: &token,
+                },
+                Frame::RetireConnectionId(id),
+                Frame::PathChallenge(case.a),
+                Frame::PathResponse(case.b),
+                Frame::Close(Close {
+                    application: false,
+                    error_code: id,
+                    frame_type: value,
+                    reason: data,
+                }),
+                Frame::Close(Close {
+                    application: true,
+                    error_code: id,
+                    frame_type: 0,
+                    reason: data,
+                }),
+                Frame::HandshakeDone,
+            ];
+            let mut wire = Vec::new();
+            for frame in &frames {
+                frame.encode(&mut wire);
+            }
+            prop_assert_eq!(
+                Iter::new(&wire).collect::<Result<Vec<_>, _>>().unwrap(),
+                frames
+            );
+            // Unknown frame types stop the iterator instead of resynchronizing
+            // into arbitrary attacker-controlled bytes as another frame.
+            let mut bad = Vec::new();
+            varint::encode(0x20 + case.a % 1000, &mut bad);
+            bad.extend_from_slice(data);
+            let mut iter = Iter::new(&bad);
+            prop_assert!(matches!(
+                iter.next(),
+                Some(Err(FrameError::UnknownFrame(_)))
+            ));
+            prop_assert!(iter.next().is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn generated_length_frames_reject_truncation_and_ack_underflow() {
+        property::check("quic-frame-negative", |case| {
+            for ty in [FT_CRYPTO, FT_NEW_TOKEN, FT_STREAM_BASE | STREAM_LEN] {
+                let mut wire = Vec::new();
+                varint::encode(ty, &mut wire);
+                if ty != FT_NEW_TOKEN {
+                    varint::encode(case.a & varint::MAX, &mut wire);
+                }
+                let data = case.payload(256);
+                varint::encode(data.len() as u64 + 1, &mut wire);
+                wire.extend_from_slice(data);
+                prop_assert_eq!(Iter::new(&wire).next(), Some(Err(FrameError::Truncated)));
+            }
+            let largest = case.a % (varint::MAX - 1);
+            let mut wire = Vec::new();
+            for value in [FT_ACK, largest, 0, 0, largest + 1] {
+                varint::encode(value, &mut wire);
+            }
+            prop_assert_eq!(Iter::new(&wire).next(), Some(Err(FrameError::Malformed)));
+            Ok(())
+        });
+    }
+}
+
 /// Fuzz-only driver for the QUIC frame decoder ([`Iter`]). Compiled ONLY under
 /// `--cfg fuzzing` (which cargo-fuzz sets); absent from normal `cargo build` /
 /// `cargo test` and CI, so it adds no production API surface. This is what lets

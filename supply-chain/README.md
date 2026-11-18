@@ -39,6 +39,20 @@ Root imports Google only, with no `imports.exclude` setting. Mozilla is delibera
 
 The local [untrusted 0.9.0 analysis](reviews/untrusted-0.9.0.md) is a bounded, explicitly AI-attributed compiled-source inspection. Its initial safe-to-run audit record was withdrawn pending independent human source review. The note grants no cargo-vet criteria and does not close either safe-to-run or safe-to-deploy gaps, review untrusted 0.7.1, or validate native crypto.
 
+Root and fuzz additionally inherit three individually selected rustix statements:
+[Vaultline's full 1.1.4 audit](https://github.com/bloopdex/vaultline/blob/bb98cf1eefa3ac33a5a045e5242746b24225ef07/supply-chain/audits.toml),
+[Himmelblau's 1.1.4 to 1.1.5 delta](https://github.com/himmelblau-idm/himmelblau/blob/200969d274af233c2accc3ac7ef06d658ce7f9d3/supply-chain/audits.toml), and
+[Merkur's 1.1.5 to 1.1.6 delta](https://github.com/merkur-sh/merkur/blob/009df98f029561b200d7808ce26c239495065a73/supply-chain/audits.toml).
+The local records retain the named authors, immutable provenance, introduction
+commits and summaries of the original notes. All three use the built-in
+`safe-to-deploy` criterion without feature/platform exclusions or remapping;
+the resulting chain also supplies `safe-to-run`. These are inherited public
+statements, not audits performed by ParallaX. Vaultline's baseline notes are
+generic, and account attribution does not establish review depth or a purely
+human process. Acceptance of these exact statements is a source-trust judgment,
+not evidence of a defect-free crate. No publisher trust, exemption, other crate,
+future version or replacement import snapshot is accepted with them.
+
 ## Completing the audit backlog
 
 Use cargo-vet's inspect/diff/suggest commands in a review branch. Read the full new crate or the complete delta from an accepted prior version, including build scripts, procedural macros, native code, generated artifacts, dependencies and enabled features. Record the exact version/delta, reviewer identity, criteria, and substantive evidence in `audits.toml`; link a review note where needed. Run the frozen checker after every change. A successful test or vulnerability scan is not a source audit.
