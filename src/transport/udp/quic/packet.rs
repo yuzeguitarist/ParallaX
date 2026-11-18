@@ -237,6 +237,29 @@ impl Header {
         }
     }
 
+    /// Packet-number offset within a freshly encoded header, without allocating
+    /// a temporary encoding for the packet planners.
+    pub(crate) fn pn_offset(&self) -> usize {
+        match self {
+            Header::Short { dcid, .. } => 1 + dcid.len(),
+            Header::Long {
+                ty,
+                dcid,
+                scid,
+                token,
+                length,
+                ..
+            } => {
+                let token_len = if *ty == LongType::Initial {
+                    varint::size(token.len() as u64) + token.len()
+                } else {
+                    0
+                };
+                7 + dcid.len() + scid.len() + token_len + varint::size(*length)
+            }
+        }
+    }
+
     /// Serialize the header (through the plaintext packet number) into `out`, and
     /// return the byte offset of the packet-number field (the HP `pn_offset`). The
     /// written bytes are the AEAD AAD.
@@ -633,6 +656,55 @@ mod tests {
         assert_eq!(cid.len(), 8);
         assert_eq!(cid.as_slice(), &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(ConnectionId::new(&[]).is_empty());
+    }
+
+    #[test]
+    fn calculated_pn_offset_matches_header_encoding() {
+        let assert_offset = |header: Header| {
+            for prefix in [0, 7] {
+                let mut bytes = vec![0x55; prefix];
+                let actual = header.encode(&mut bytes);
+                assert_eq!(actual, prefix + header.pn_offset());
+            }
+        };
+        for dcid_len in [0, MAX_CID_LEN] {
+            let dcid = ConnectionId::new(&[0x33; MAX_CID_LEN][..dcid_len]);
+            for pn_len in 1..=8 {
+                assert_offset(Header::Short {
+                    spin: true,
+                    key_phase: true,
+                    dcid,
+                    packet_number: 7,
+                    pn_len,
+                });
+                for scid_len in [0, MAX_CID_LEN] {
+                    let scid = ConnectionId::new(&[0x44; MAX_CID_LEN][..scid_len]);
+                    for ty in [
+                        LongType::Initial,
+                        LongType::ZeroRtt,
+                        LongType::Handshake,
+                        LongType::Retry,
+                    ] {
+                        for token_len in [0, 63, 64, 16383, 16384] {
+                            for length in
+                                [0, 63, 64, 16383, 16384, (1 << 30) - 1, 1 << 30, varint::MAX]
+                            {
+                                assert_offset(Header::Long {
+                                    ty,
+                                    version: 1,
+                                    dcid,
+                                    scid,
+                                    token: vec![0x77; token_len],
+                                    length,
+                                    packet_number: 7,
+                                    pn_len,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
