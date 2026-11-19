@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use aws_lc_rs::aead::LessSafeKey;
+use bytes::{Bytes, BytesMut};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
@@ -1244,6 +1245,125 @@ impl DataRecordCodec {
         self.aead.advance_sequence(record_count as u64);
         Ok(())
     }
+
+    /// In-place counterpart of [`Self::open_concat_records_parallel`] for
+    /// callers that own the staged ciphertext: each worker decrypts its record
+    /// group directly inside `records` (handed over as disjoint owned views of
+    /// the same allocation and rejoined afterwards), so no per-group ciphertext
+    /// copy, plaintext staging buffer or scrub of that staging buffer is
+    /// needed. Same validation, sequence handling and fail-close behaviour;
+    /// plaintext residue matches the serial [`Self::open_concat_records`]: on
+    /// success `records` holds decrypted bytes the caller must not reuse, on
+    /// error `out` keeps only its pre-call contents and `records` is zeroized.
+    pub fn open_concat_records_parallel_in_place(
+        &mut self,
+        pool: &CryptoPool,
+        records: &mut Vec<u8>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError> {
+        self.aead.ensure_usable()?;
+        let output_start = out.len();
+        let result = self.open_concat_records_parallel_in_place_inner(pool, records, out);
+        if result.is_err() {
+            out[output_start..].zeroize();
+            out.truncate(output_start);
+            records.zeroize();
+            self.aead.poison();
+        }
+        result
+    }
+
+    fn open_concat_records_parallel_in_place_inner(
+        &mut self,
+        pool: &CryptoPool,
+        records: &mut Vec<u8>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataRecordError> {
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
+        let mut offset = 0;
+        while offset < records.len() {
+            let header = validate_record_header(records, offset)?;
+            bounds.push((offset, header.total_len));
+            offset += header.total_len;
+        }
+
+        let record_count = bounds.len();
+        if record_count == 0 {
+            return Ok(());
+        }
+        let group_count = pool.width().max(1).min(record_count);
+
+        let cipher = self.aead.cipher();
+        let nonce_base = self.aead.nonce_base();
+        let base_sequence = self.aead.sequence();
+        if base_sequence.checked_add(record_count as u64).is_none() {
+            return Err(SessionError::NonceExhausted.into());
+        }
+        let aad = self.aad;
+        // Reserve before decrypting so appending plaintext never reallocates
+        // (and frees) a buffer that rollback could no longer wipe.
+        out.reserve(records.len());
+        crate::process_hardening::exclude_transient_from_core_dump(
+            "data_record.open_concat_plaintext",
+            records.as_slice(),
+        );
+
+        // A uniquely owned `Bytes` converts to `BytesMut` without copying.
+        let mut remaining = BytesMut::from(Bytes::from(std::mem::take(records)));
+        let mut jobs = Vec::with_capacity(group_count);
+        let mut next_record = 0;
+        for group in 0..group_count {
+            let records_here = (record_count - next_record).div_ceil(group_count - group);
+            let record_end = next_record + records_here;
+            let byte_start = bounds[next_record].0;
+            let (last_start, last_len) = bounds[record_end - 1];
+            let mut group_bytes =
+                ScrubOnDrop(remaining.split_to(last_start + last_len - byte_start));
+            let group_bounds: Vec<(usize, usize)> = bounds[next_record..record_end]
+                .iter()
+                .map(|(record_offset, total_len)| (record_offset - byte_start, *total_len))
+                .collect();
+            let group_base_sequence = base_sequence + next_record as u64;
+            let cipher = SharedCipher::clone(&cipher);
+            jobs.push(move || {
+                let opened = open_record_group_in_place(
+                    &cipher,
+                    &nonce_base,
+                    aad,
+                    group_base_sequence,
+                    &mut group_bytes.0,
+                    &group_bounds,
+                );
+                (group_bytes, opened)
+            });
+            next_record = record_end;
+        }
+
+        // A panicking job is re-raised here: every view, run or not, is then
+        // dropped while still wrapped and wipes its part of the buffer.
+        let segments = parallel::dispatch_blocking(|| pool.run_ordered(jobs));
+        let mut first_error = None;
+        for (mut group_bytes, opened) in segments {
+            // Nothing below can unwind, so the view no longer needs its guard.
+            let group_bytes = std::mem::take(&mut group_bytes.0);
+            match opened {
+                Ok(len) if first_error.is_none() => out.extend_from_slice(&group_bytes[..len]),
+                Ok(_) => {}
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+            // Adjacent views of one allocation rejoin without copying.
+            remaining.unsplit(group_bytes);
+        }
+        // All views are rejoined, so this hands the original allocation back.
+        *records = Vec::from(remaining);
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        self.aead.advance_sequence(record_count as u64);
+        Ok(())
+    }
 }
 
 /// One record's plaintext source, either borrowed or already staged in `out`.
@@ -1428,6 +1548,37 @@ fn open_record_group(
         "data_record.open_concat_plaintext",
         bytes.as_slice(),
     );
+    let output_len =
+        open_record_group_in_place(cipher, nonce_base, aad, base_sequence, &mut bytes, bounds)?;
+    // Compaction leaves duplicate plaintext in the suffix. Wipe it while it is
+    // still live so truncation cannot hide it from Zeroizing's drop scrub.
+    bytes[output_len..].zeroize();
+    bytes.truncate(output_len);
+    Ok(bytes)
+}
+
+/// A view of a staging buffer that is wiped when dropped, so a view lost to an
+/// unwinding crypto-pool job cannot leave decrypted bytes in freed memory.
+struct ScrubOnDrop(BytesMut);
+
+impl Drop for ScrubOnDrop {
+    fn drop(&mut self) {
+        let bytes: &mut [u8] = &mut self.0;
+        bytes.zeroize();
+    }
+}
+
+/// Opens the records at `bounds` inside `bytes` in place and compacts their
+/// unpadded plaintext to the front, returning its length. Bytes past that
+/// length may still hold decrypted data.
+fn open_record_group_in_place(
+    cipher: &LessSafeKey,
+    nonce_base: &[u8; NONCE_LEN],
+    aad: &'static [u8],
+    base_sequence: u64,
+    bytes: &mut [u8],
+    bounds: &[(usize, usize)],
+) -> Result<usize, DataRecordError> {
     let mut output_len = 0;
     for (index, &(record_offset, total_len)) in bounds.iter().enumerate() {
         let sequence = base_sequence + index as u64;
@@ -1462,11 +1613,7 @@ fn open_record_group(
         );
         output_len += unpadded_len;
     }
-    // Compaction leaves duplicate plaintext in the suffix. Wipe it while it is
-    // still live so truncation cannot hide it from Zeroizing's drop scrub.
-    bytes[output_len..].zeroize();
-    bytes.truncate(output_len);
-    Ok(bytes)
+    Ok(output_len)
 }
 
 fn record_overhead(padding: &PaddingProfile) -> usize {
@@ -2555,6 +2702,86 @@ mod tests {
                 .unwrap();
             assert_eq!(opened, payload);
         }
+    }
+
+    #[test]
+    fn parallel_in_place_open_matches_copying_open_and_keeps_the_allocation() {
+        let pool = test_pool();
+        let (key, nonce) = ([1_u8; KEY_LEN], [2_u8; NONCE_LEN]);
+        let padding = PaddingProfile::new(0, 128).unwrap();
+        let payload = (0..(1024 * 1024 + 7))
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        let codec =
+            || DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let (mut enc, mut dec) = (codec(), codec());
+        let mut rng = StdRng::seed_from_u64(55);
+        let mut opened = Vec::new();
+        // Two batches prove the sequence advances and the staging buffer is
+        // handed back for reuse, with and without spare capacity.
+        for spare in [0, 4096] {
+            let mut sealed = Vec::new();
+            enc.seal_chunks_into_parallel(&pool, &payload, &mut rng, &mut sealed)
+                .unwrap();
+            sealed.reserve_exact(spare);
+            let (ptr, len, capacity) = (sealed.as_ptr(), sealed.len(), sealed.capacity());
+            opened.clear();
+            dec.open_concat_records_parallel_in_place(&pool, &mut sealed, &mut opened)
+                .unwrap();
+            assert_eq!(opened, payload);
+            assert_eq!(
+                (sealed.as_ptr(), sealed.len(), sealed.capacity()),
+                (ptr, len, capacity)
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_on_drop_wipes_a_view_lost_to_an_unwinding_job() {
+        let mut whole = BytesMut::from(&[0xA5_u8; 64][..]);
+        let view = ScrubOnDrop(whole.split_to(48));
+        let view_start = view.0.as_ptr();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _view = view;
+            std::panic::resume_unwind(Box::new("job panicked"));
+        }));
+        assert!(unwound.is_err());
+        // SAFETY: `whole` still owns the allocation both views were split
+        // from, so the dropped view's 48 bytes stay allocated and initialized,
+        // and nothing else references them any more.
+        let wiped = unsafe { std::slice::from_raw_parts(view_start, 48) };
+        assert!(wiped.iter().all(|byte| *byte == 0));
+        // The neighbouring view is untouched.
+        assert!(whole.iter().all(|byte| *byte == 0xA5));
+    }
+
+    #[test]
+    fn parallel_in_place_open_fails_closed_and_wipes_on_tamper() {
+        let pool = test_pool();
+        let (key, nonce) = ([1_u8; KEY_LEN], [2_u8; NONCE_LEN]);
+        let padding = PaddingProfile::new(0, 0).unwrap();
+        let payload = vec![0x5A_u8; 256 * 1024];
+        let codec =
+            || DataRecordCodec::new(AeadCodec::new(key, nonce), padding, SERVER_TO_CLIENT_AAD);
+        let (mut enc, mut dec) = (codec(), codec());
+        let mut rng = StdRng::seed_from_u64(55);
+        let mut sealed = Vec::new();
+        enc.seal_chunks_into_parallel(&pool, &payload, &mut rng, &mut sealed)
+            .unwrap();
+        // Corrupt the last record so earlier groups decrypt successfully first.
+        let last = sealed.len() - 1;
+        sealed[last] ^= 1;
+        let len = sealed.len();
+        let mut opened = b"kept".to_vec();
+        assert!(dec
+            .open_concat_records_parallel_in_place(&pool, &mut sealed, &mut opened)
+            .is_err());
+        assert_eq!(opened, b"kept");
+        // `Vec::zeroize` wipes the whole allocation and then clears it.
+        assert!(sealed.is_empty() && sealed.capacity() >= len);
+        assert!(dec
+            .open_concat_records_parallel_in_place(&pool, &mut sealed, &mut opened)
+            .is_err());
     }
 
     #[test]

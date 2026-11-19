@@ -6013,9 +6013,9 @@ where
             let payload_bytes =
                 batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
             if should_parallelize_aead(record_count, payload_bytes) {
-                client_open.open_concat_records_parallel(
+                client_open.open_concat_records_parallel_in_place(
                     parallel::global(),
-                    &batch_records,
+                    &mut batch_records,
                     &mut batch_plaintext,
                 )?;
             } else {
