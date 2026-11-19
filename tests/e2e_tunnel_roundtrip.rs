@@ -497,10 +497,7 @@ fn position_encoded_payload(len: usize) -> Vec<u8> {
 #[test]
 #[ignore = "requires loopback TCP sockets"]
 fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
-    // Install one shared CA before starting workers. native_roots() is cached,
-    // so the direct and delayed scenarios must use this same PKI.
-    let pki = generate_camouflage_pki();
-    let _ca_guard = install_trust_root(&pki.ca_cert_pem);
+    let pki = shared_pki();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -510,9 +507,9 @@ fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
     let result = catch_unwind(AssertUnwindSafe(|| {
         runtime.block_on(async {
             timeout(Duration::from_secs(180), async {
-                origin_rejects_mid_handshake_eof(&pki).await;
-                run_roundtrip(&pki, false, &mut tasks).await;
-                run_roundtrip(&pki, true, &mut tasks).await;
+                origin_rejects_mid_handshake_eof(pki).await;
+                run_roundtrip(pki, false, &mut tasks).await;
+                run_roundtrip(pki, true, &mut tasks).await;
             })
             .await
             .expect("end-to-end fixtures exceeded their overall deadline");
@@ -524,6 +521,145 @@ fn tunnel_roundtrips_large_payload_and_closes_cleanly() {
     if let Err(panic) = result {
         resume_unwind(panic);
     }
+}
+
+/// One CA for the whole test binary, installed before any worker starts:
+/// native_roots() is cached per process, so every scenario and test here must
+/// present a leaf from this same PKI.
+fn shared_pki() -> &'static CamouflagePki {
+    static PKI: std::sync::OnceLock<(CamouflagePki, tempfile::NamedTempFile)> =
+        std::sync::OnceLock::new();
+    &PKI.get_or_init(|| {
+        let pki = generate_camouflage_pki();
+        let ca_guard = install_trust_root(&pki.ca_cert_pem);
+        (pki, ca_guard)
+    })
+    .0
+}
+
+/// Latency probe, not an assertion: time from the app's SOCKS connect to the
+/// first byte echoed back through a NEW authenticated tunnel (camouflage TLS ->
+/// PQ rekey -> identity proof -> CONNECT -> echo), against one long-lived server
+/// so the replay journal is on its steady-state append path. Loopback only: it
+/// measures server/client CPU and disk work, not network round trips.
+///
+///   cargo test --release --locked --test e2e_tunnel_roundtrip \
+///     handshake_first_byte_latency -- --ignored --nocapture
+///
+/// `PARALLAX_HANDSHAKE_LATENCY_ITERS` sets the sample count (default 300);
+/// `PARALLAX_HANDSHAKE_LATENCY_DIR` sets where the replay journal lives
+/// (default: the system temp dir), since its fsync cost depends on the disk.
+#[test]
+#[ignore = "requires loopback TCP sockets; latency measurement"]
+fn handshake_first_byte_latency() {
+    let pki = shared_pki();
+    let iterations: usize = std::env::var("PARALLAX_HANDSHAKE_LATENCY_ITERS")
+        .ok()
+        .map(|v| v.parse().expect("PARALLAX_HANDSHAKE_LATENCY_ITERS"))
+        .unwrap_or(300);
+    let replay_dir = match std::env::var_os("PARALLAX_HANDSHAKE_LATENCY_DIR") {
+        Some(dir) => tempfile::tempdir_in(dir),
+        None => tempfile::tempdir(),
+    }
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut samples = runtime.block_on(async {
+        let origin_tls = rustls_server_config(pki);
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = origin.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = origin.accept().await.unwrap();
+                let config = Arc::clone(&origin_tls);
+                tokio::spawn(async move {
+                    let _ = serve_origin_connection(stream, config).await;
+                });
+            }
+        });
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = target.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut byte = [0_u8; 1];
+                    if stream.read_exact(&mut byte).await.is_ok() {
+                        let _ = stream.write_all(&byte).await;
+                    }
+                });
+            }
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let config = Arc::new(server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_dir.path().join("parallax-replay.cache"),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    let _ = server::handle_connection(
+                        stream,
+                        &config,
+                        TrafficConfig::default(),
+                        &UdpConfig::default(),
+                        PSK,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let mut samples = Vec::with_capacity(iterations);
+        // The first handshakes pay one-off costs (trust-root load, journal
+        // creation), so they are run but not sampled.
+        for i in 0..iterations + 5 {
+            let mut tasks = FixtureTasks::new();
+            let local_addr = spawn_local_client(
+                parallax_addr,
+                &server_keys,
+                &server_identity_keys,
+                &mut tasks,
+            )
+            .await;
+            let start = std::time::Instant::now();
+            let mut app = connect_socks_target(local_addr, target_addr).await;
+            app.write_all(&[0x5a]).await.unwrap();
+            let mut echoed = [0_u8; 1];
+            timeout(Duration::from_secs(30), app.read_exact(&mut echoed))
+                .await
+                .expect("first relayed byte timed out")
+                .expect("first relayed byte");
+            if i >= 5 {
+                samples.push(start.elapsed());
+            }
+            assert_eq!(echoed, [0x5a]);
+            tasks.shutdown().await;
+        }
+        samples
+    });
+    samples.sort_unstable();
+    let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize].as_micros();
+    let mean = samples.iter().sum::<Duration>().as_micros() / samples.len() as u128;
+    eprintln!(
+        "[handshake-first-byte-latency] n={} mean_us={mean} p50_us={} p95_us={} p99_us={}",
+        samples.len(),
+        at(0.50),
+        at(0.95),
+        at(0.99),
+    );
 }
 
 async fn run_roundtrip(pki: &CamouflagePki, force_predial: bool, tasks: &mut FixtureTasks) {

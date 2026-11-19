@@ -2823,7 +2823,27 @@ async fn run_authenticated_data_mode(
                         };
                         let client_x25519_public = pq_rekey.client_x25519_public;
                         let client_mlkem_public_key = pq_rekey.client_mlkem_public_key.to_vec();
-                        if !commit_pending_replay_entry(&mut pending_replay).await? {
+                        // The replay-journal commit (a blocking fsync) and the PQ
+                        // response crypto (X25519, ML-KEM, ML-DSA identity signature)
+                        // do not depend on each other, so they run concurrently
+                        // instead of back to back. Nothing prepared here is written
+                        // until the commit below has confirmed the ClientHello is
+                        // fresh; on a replay it is dropped (and wiped) unsent.
+                        let signed_transcript_hash = handshake.session_keys.transcript_hash;
+                        let signed_epoch = handshake.session_keys.epoch.saturating_add(1);
+                        let (replay_committed, pq_response) = tokio::join!(
+                            commit_pending_replay_entry(&mut pending_replay),
+                            prepare_server_pq_response(
+                                client_x25519_public,
+                                client_mlkem_public_key,
+                                first_payload.as_slice(),
+                                identity_secret_key,
+                                signed_transcript_hash,
+                                handshake.server_public_key,
+                                signed_epoch,
+                            ),
+                        );
+                        if !replay_committed? {
                             tracing::warn!(cid, "closing on replayed ClientHello after data proof");
                             // Blur the replay close-time tell (M-5): hold the inert
                             // connection for a WIDE jittered delay before tearing it
@@ -2888,33 +2908,15 @@ async fn run_authenticated_data_mode(
                             graceful_close_pre_pq(client_records, client_write, fallback_records, fallback_write).await;
                             return Ok(());
                         }
-                        let server_ephemeral = X25519KeyPair::generate();
-                        crate::process_hardening::protect_secret_bytes(
-                            "pq_rekey.server_x25519_private",
-                            &server_ephemeral.private,
-                        );
-                        let x25519_ephemeral_shared = zeroize::Zeroizing::new(x25519_shared_secret(
-                            &server_ephemeral.private,
-                            &client_x25519_public,
-                        ));
-                        let pq_encapsulation =
-                            encapsulate_mlkem_blocking(client_mlkem_public_key).await?;
-                        // The ML-KEM shared secret is a `Zeroizing<[u8; 32]>` field, so
-                        // moving it out here into a wipe-on-drop local scrubs it on ANY
-                        // return (every `?` between here and the rekey — encode / seal /
-                        // write / rekey). `.ciphertext` is moved into the key-exchange
-                        // payload below (partially moving the struct), which is why the
-                        // secret is a self-wiping FIELD rather than relying on struct
-                        // Drop glue that a partial move would forbid.
-                        let pq_shared_secret = pq_encapsulation.shared_secret;
-                        let cipher_suite = server_data_cipher_suite();
-                        let key_exchange_payload = ServerKeyExchange {
-                            server_x25519_public: server_ephemeral.public,
-                            mlkem_ciphertext: pq_encapsulation.ciphertext,
-                        }
-                        .encode_with_suite(cipher_suite)?;
-                        let pq_identity_binding =
-                            identity::pq_rekey_binding(first_payload.as_slice(), &key_exchange_payload);
+                        let PreparedPqResponse {
+                            x25519_ephemeral_shared,
+                            pq_shared_secret,
+                            cipher_suite,
+                            key_exchange_payload,
+                            identity_signature,
+                        } = pq_response?;
+                        // Re-pin at the secret's final address: it was pinned where
+                        // it was created and has since moved out of the helper.
                         crate::process_hardening::protect_secret_bytes(
                             "pq_rekey.mlkem_shared_secret",
                             &*pq_shared_secret,
@@ -2983,14 +2985,13 @@ async fn run_authenticated_data_mode(
                         // derivation root (mux-over-QUIC substreams key off it), so
                         // pin its secret pages too — not just the local `rekeyed_keys`.
                         handshake.session_keys.protect_secret_memory();
-                        let identity_signature = sign_server_identity_blocking(
-                            identity_secret_key,
-                            rekeyed_keys.transcript_hash,
-                            handshake.server_public_key,
-                            pq_identity_binding,
-                            rekeyed_keys.epoch,
-                        )
-                        .await?;
+                        // The identity proof was signed ahead of the rekey over the
+                        // values the rekey was going to produce; a divergence would
+                        // only make the client reject the proof (fail closed).
+                        debug_assert_eq!(
+                            (rekeyed_keys.transcript_hash, rekeyed_keys.epoch),
+                            (signed_transcript_hash, signed_epoch),
+                        );
                         let identity_payload = ServerIdentityProof {
                             signature: identity_signature,
                         }
@@ -4042,6 +4043,74 @@ async fn encapsulate_mlkem_blocking(
     client_mlkem_public_key: Vec<u8>,
 ) -> Result<pq::MlKemEncapsulation, HandshakeServerError> {
     Ok(tokio::task::spawn_blocking(move || pq::encapsulate(&client_mlkem_public_key)).await??)
+}
+
+/// The server's half of the PQ rekey, computed before anything is written.
+struct PreparedPqResponse {
+    x25519_ephemeral_shared: zeroize::Zeroizing<[u8; 32]>,
+    pq_shared_secret: zeroize::Zeroizing<[u8; 32]>,
+    cipher_suite: CipherSuite,
+    key_exchange_payload: Vec<u8>,
+    identity_signature: Vec<u8>,
+}
+
+/// Everything the PX1K key exchange and the identity proof need that depends
+/// only on the client's PX1Q: the ephemeral X25519 share, the ML-KEM
+/// encapsulation, the encoded key-exchange payload and the ML-DSA signature
+/// over the post-rekey (`transcript_hash`, `epoch`). It performs no I/O, so the
+/// caller can run it alongside the replay-journal commit.
+async fn prepare_server_pq_response(
+    client_x25519_public: [u8; 32],
+    client_mlkem_public_key: Vec<u8>,
+    pq_rekey_request: &[u8],
+    identity_secret_key: Arc<crate::process_hardening::MaskedSecret>,
+    transcript_hash: [u8; 32],
+    server_public_key: [u8; 32],
+    epoch: u64,
+) -> Result<PreparedPqResponse, HandshakeServerError> {
+    let server_ephemeral = X25519KeyPair::generate();
+    crate::process_hardening::protect_secret_bytes(
+        "pq_rekey.server_x25519_private",
+        &server_ephemeral.private,
+    );
+    let x25519_ephemeral_shared = zeroize::Zeroizing::new(x25519_shared_secret(
+        &server_ephemeral.private,
+        &client_x25519_public,
+    ));
+    let pq_encapsulation = encapsulate_mlkem_blocking(client_mlkem_public_key).await?;
+    // The ML-KEM shared secret is a `Zeroizing<[u8; 32]>` field, so moving it out
+    // here into a wipe-on-drop local scrubs it on ANY return (every `?` between
+    // here and the rekey). `.ciphertext` is moved into the key-exchange payload
+    // below (partially moving the struct), which is why the secret is a
+    // self-wiping FIELD rather than relying on struct Drop glue that a partial
+    // move would forbid.
+    let pq_shared_secret = pq_encapsulation.shared_secret;
+    crate::process_hardening::protect_secret_bytes(
+        "pq_rekey.mlkem_shared_secret",
+        &*pq_shared_secret,
+    );
+    let cipher_suite = server_data_cipher_suite();
+    let key_exchange_payload = ServerKeyExchange {
+        server_x25519_public: server_ephemeral.public,
+        mlkem_ciphertext: pq_encapsulation.ciphertext,
+    }
+    .encode_with_suite(cipher_suite)?;
+    let pq_identity_binding = identity::pq_rekey_binding(pq_rekey_request, &key_exchange_payload);
+    let identity_signature = sign_server_identity_blocking(
+        identity_secret_key,
+        transcript_hash,
+        server_public_key,
+        pq_identity_binding,
+        epoch,
+    )
+    .await?;
+    Ok(PreparedPqResponse {
+        x25519_ephemeral_shared,
+        pq_shared_secret,
+        cipher_suite,
+        key_exchange_payload,
+        identity_signature,
+    })
 }
 
 async fn sign_server_identity_blocking(
@@ -9729,6 +9798,48 @@ mod tests {
         assert_eq!(
             boundary.advance(&[3, 0xff, 0xff]).unwrap_err().kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_pq_response_signs_the_binding_of_request_and_key_exchange() {
+        let identity_keys = identity::keypair();
+        let client_x25519 = X25519KeyPair::generate();
+        let client_mlkem = pq::keypair();
+        let server_static = X25519KeyPair::generate();
+        let request = b"client px1q payload";
+        let transcript_hash = [0x11; 32];
+        let epoch = 1;
+
+        let prepared = prepare_server_pq_response(
+            client_x25519.public,
+            client_mlkem.public.clone(),
+            request,
+            Arc::new(crate::process_hardening::MaskedSecret::new(
+                &identity_keys.secret,
+            )),
+            transcript_hash,
+            server_static.public,
+            epoch,
+        )
+        .await
+        .unwrap();
+
+        // The proof prepared ahead of the rekey must be exactly the one the
+        // client checks: bound to the PX1Q it sent and the PX1K it will receive.
+        identity::verify_server_identity(
+            &identity_keys.public,
+            &prepared.identity_signature,
+            &transcript_hash,
+            &server_static.public,
+            &identity::pq_rekey_binding(request, &prepared.key_exchange_payload),
+            epoch,
+        )
+        .unwrap();
+        let key_exchange = ServerKeyExchange::decode(&prepared.key_exchange_payload).unwrap();
+        assert_eq!(
+            *prepared.x25519_ephemeral_shared,
+            x25519_shared_secret(&client_x25519.private, &key_exchange.server_x25519_public),
         );
     }
 
