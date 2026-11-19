@@ -16,6 +16,7 @@ on:
     branches:
       - main
       - master
+      - 'perf/latency-peak'
     paths:
       # Code that can affect TCP relay teardown (FIN-vs-RST): the splice fast path
       # (src/transport/tcp.rs) and the userspace fallback teardown + graceful-close

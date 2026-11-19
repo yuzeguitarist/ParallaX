@@ -12,7 +12,7 @@ name: formal
 
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     paths:
       - 'formal/**'
       - 'src/handshake/**'

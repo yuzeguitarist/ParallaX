@@ -23,7 +23,7 @@ on:
         description: 'Per-direction rate cap (Mbit/s)'
         default: '100'
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     paths:
       - 'src/transport/**'
       - 'src/client/**'
