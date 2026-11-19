@@ -283,6 +283,12 @@ pub async fn run(config: Config) -> Result<(), ClientRuntimeError> {
         )?
         .into_boxed_slice(),
     );
+    // Off the accept path: the first SOCKS connection otherwise pays these
+    // one-time initializations inline (~30 ms measured on loopback).
+    // Detached on purpose; both initializers are safe to race with a handshake.
+    drop(tokio::task::spawn_blocking(
+        crate::tls::safari26::prewarm_client_handshake,
+    ));
     let listener = TcpListener::bind(client.listen).await?;
     let server_addr = ServerAddrResolver::new(&client.server_addr).await?;
     let client = Arc::new(client);
