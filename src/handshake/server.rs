@@ -577,8 +577,29 @@ struct AuthenticatedInbound {
     x25519_shared_secret: zeroize::Zeroizing<[u8; 32]>,
 }
 
+/// The authenticated-handshake replay cache, split so the accept path never
+/// waits on (or sheds behind) a journal fsync. `journal` is the durable,
+/// authoritative cache and is locked only on blocking threads. `gate` mirrors
+/// its live entries in memory and holds the in-flight reservations; its lock is
+/// never held across I/O. A hello is mirrored into `gate` while its reservation
+/// is still held, so a replay is refused there at every instant.
+#[derive(Debug)]
+struct ServerReplayCache {
+    gate: Mutex<ReplayCache>,
+    journal: Mutex<ReplayCache>,
+}
+
+impl ServerReplayCache {
+    fn new(journal: ReplayCache) -> Self {
+        Self {
+            gate: Mutex::new(journal.memory_mirror()),
+            journal: Mutex::new(journal),
+        }
+    }
+}
+
 struct PendingReplayEntry {
-    cache: Arc<Mutex<ReplayCache>>,
+    cache: Arc<ServerReplayCache>,
     entry: ReplayEntry,
     source: Option<IpAddr>,
     reserved: bool,
@@ -588,7 +609,7 @@ struct PendingReplayEntry {
 impl Drop for PendingReplayEntry {
     fn drop(&mut self) {
         if self.reserved {
-            match self.cache.try_lock() {
+            match self.cache.gate.try_lock() {
                 Ok(mut cache) => cache.release_pending(&self.entry.transcript_fingerprint),
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
                     .into_inner()
@@ -597,11 +618,10 @@ impl Drop for PendingReplayEntry {
                     let cache = Arc::clone(&self.cache);
                     let transcript = self.entry.transcript_fingerprint;
                     let admission = self.admission.clone();
-                    // A journal fsync may own the cache lock. Cleanup must not
-                    // block the async executor behind that filesystem operation.
                     tokio::task::spawn_blocking(move || {
                         let _admission = admission;
                         cache
+                            .gate
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .release_pending(&transcript)
@@ -925,7 +945,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
     let psk = decode_psk(config.crypto.psk.as_b64())?;
     crate::process_hardening::protect_secret_bytes("runtime.crypto.psk", psk.as_slice());
     let psk = Arc::new(psk);
-    let replay_cache = Arc::new(Mutex::new(
+    let replay_cache = Arc::new(ServerReplayCache::new(
         ReplayCache::load_or_create_authenticated_with_window(
             &server.replay_cache_path,
             server.replay_cache_capacity,
@@ -1158,7 +1178,7 @@ pub async fn handle_connection(
 }
 
 type ReplayCacheKey = (std::path::PathBuf, usize, [u8; 32]);
-type SharedReplayCacheSlot = Arc<Mutex<Option<Arc<Mutex<ReplayCache>>>>>;
+type SharedReplayCacheSlot = Arc<Mutex<Option<Arc<ServerReplayCache>>>>;
 
 fn shared_replay_cache_table() -> &'static Mutex<HashMap<ReplayCacheKey, SharedReplayCacheSlot>> {
     static TABLE: OnceLock<Mutex<HashMap<ReplayCacheKey, SharedReplayCacheSlot>>> = OnceLock::new();
@@ -1168,7 +1188,7 @@ fn shared_replay_cache_table() -> &'static Mutex<HashMap<ReplayCacheKey, SharedR
 async fn initialize_shared_replay_cache(
     slot: SharedReplayCacheSlot,
     load: impl FnOnce() -> Result<ReplayCache, ReplayCacheError> + Send + 'static,
-) -> Result<Arc<Mutex<ReplayCache>>, HandshakeServerError> {
+) -> Result<Arc<ServerReplayCache>, HandshakeServerError> {
     tokio::task::spawn_blocking(move || {
         // Loading can compact/upgrade the journal. Keep the single-flight lock
         // inside the blocking task so cancelling its async waiter cannot let a
@@ -1177,7 +1197,7 @@ async fn initialize_shared_replay_cache(
         if let Some(cache) = initialized.as_ref() {
             return Ok(Arc::clone(cache));
         }
-        let cache = Arc::new(Mutex::new(load()?));
+        let cache = Arc::new(ServerReplayCache::new(load()?));
         *initialized = Some(Arc::clone(&cache));
         Ok::<_, ReplayCacheError>(cache)
     })
@@ -1192,7 +1212,7 @@ async fn initialize_shared_replay_cache(
 async fn shared_replay_cache(
     config: &ServerConfig,
     psk: &[u8],
-) -> Result<Arc<Mutex<ReplayCache>>, HandshakeServerError> {
+) -> Result<Arc<ServerReplayCache>, HandshakeServerError> {
     let mut mac = Sha256::new();
     mac.update(psk);
     let key: ReplayCacheKey = (
@@ -1227,7 +1247,7 @@ async fn handle_connection_with_replay(
     traffic: TrafficConfig,
     udp: &UdpConfig,
     psk: &[u8],
-    replay_cache: Arc<Mutex<ReplayCache>>,
+    replay_cache: Arc<ServerReplayCache>,
     secrets: &ServerRuntimeSecrets,
     cid: u64,
     admission: Arc<OwnedSemaphorePermit>,
@@ -1253,7 +1273,7 @@ async fn handle_connection_inner(
     traffic: TrafficConfig,
     udp: &UdpConfig,
     psk: &[u8],
-    replay_cache: Option<Arc<Mutex<ReplayCache>>>,
+    replay_cache: Option<Arc<ServerReplayCache>>,
     secrets: &ServerRuntimeSecrets,
     cid: u64,
     mut admission: Option<Arc<OwnedSemaphorePermit>>,
@@ -1315,7 +1335,7 @@ async fn handle_connection_inner(
             let source = client.peer_addr().ok().map(|peer| replay_source(peer.ip()));
             let pending_replay = if let Some(cache) = replay_cache {
                 let now = current_unix_timestamp()?;
-                let fresh = match cache.try_lock() {
+                let fresh = match cache.gate.try_lock() {
                     Ok(mut cache) => cache.reserve_pending(&entry, now),
                     Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                         poisoned.into_inner().reserve_pending(&entry, now)
@@ -4068,7 +4088,7 @@ async fn sign_server_identity_blocking(
 }
 
 async fn insert_replay_entry_blocking(
-    replay_cache: Arc<Mutex<ReplayCache>>,
+    replay_cache: Arc<ServerReplayCache>,
     entry: ReplayEntry,
     source: Option<IpAddr>,
 ) -> Result<bool, HandshakeServerError> {
@@ -4078,13 +4098,27 @@ async fn insert_replay_entry_blocking(
         // panic while holding the cache lock must not take down every subsequent
         // authenticated handshake. The cache invariants are restored on each
         // insert, so proceeding on the recovered guard is safe.
-        let mut cache = replay_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match source {
-            Some(source) => cache.insert_new_outcome_for_source(entry, now, source),
-            None => cache.insert_new_outcome(entry, now),
+        let outcome = {
+            let mut journal = replay_cache
+                .journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match source {
+                Some(source) => journal.insert_new_outcome_for_source(entry.clone(), now, source),
+                None => journal.insert_new_outcome(entry.clone(), now),
+            }?
+        };
+        if outcome != ReplayInsertOutcome::Inserted {
+            return Ok(outcome);
         }
+        // The entry is durable. Mirror it into the gate while the caller still
+        // holds this hello's reservation there; anything but a clean mirror
+        // fails this handshake closed.
+        replay_cache
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert_new_outcome(entry, now)
     })
     .await??;
     Ok(match outcome {
@@ -9410,14 +9444,14 @@ mod tests {
         let (mut origin, _) = origin_listener.accept().await.unwrap();
         let admissions = Arc::new(Semaphore::new(1));
         let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
-        let cache = Arc::new(Mutex::new(ReplayCache::new(8)));
+        let cache = Arc::new(ServerReplayCache::new(ReplayCache::new(8)));
         let now = current_unix_timestamp().unwrap();
         let entry = ReplayEntry {
             timestamp: now,
             nonce: [7; 8],
             transcript_fingerprint: [8; 32],
         };
-        assert!(cache.lock().unwrap().reserve_pending(&entry, now));
+        assert!(cache.gate.lock().unwrap().reserve_pending(&entry, now));
         let pending = PendingReplayEntry {
             cache: Arc::clone(&cache),
             entry: entry.clone(),
@@ -9475,10 +9509,11 @@ mod tests {
         );
         assert!(!relay.is_finished());
         assert!(
-            cache.lock().unwrap().reserve_pending(&entry, now),
+            cache.gate.lock().unwrap().reserve_pending(&entry, now),
             "the provisional replay reservation must also release"
         );
         cache
+            .gate
             .lock()
             .unwrap()
             .release_pending(&entry.transcript_fingerprint);
@@ -9521,7 +9556,7 @@ mod tests {
                 .await
                 .unwrap();
             let (mut origin, _) = origin_listener.accept().await.unwrap();
-            let cache = Arc::new(Mutex::new(ReplayCache::new(8)));
+            let cache = Arc::new(ServerReplayCache::new(ReplayCache::new(8)));
             let admissions = Arc::new(Semaphore::new(1));
             let admission = Arc::new(admissions.clone().try_acquire_owned().unwrap());
             let entry = ReplayEntry {
@@ -9617,7 +9652,7 @@ mod tests {
             timeout(Duration::from_secs(5), async {
                 loop {
                     let committed = {
-                        let mut cache = cache.lock().unwrap();
+                        let mut cache = cache.gate.lock().unwrap();
                         let unseen = cache.reserve_pending(&entry, entry.timestamp);
                         if unseen {
                             cache.release_pending(&entry.transcript_fingerprint);
@@ -9734,7 +9769,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_replay_entry_commits_once_after_data_proof() {
-        let cache = Arc::new(Mutex::new(ReplayCache::new(8)));
+        let cache = Arc::new(ServerReplayCache::new(ReplayCache::new(8)));
         let entry = ReplayEntry {
             timestamp: current_unix_timestamp().unwrap(),
             nonce: [7; 8],
@@ -9768,6 +9803,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_reservation_does_not_wait_on_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.cache");
+        let load = || {
+            ReplayCache::load_or_create_authenticated_with_window(
+                &path,
+                8,
+                PSK,
+                replay_freshness_window_secs(),
+            )
+            .unwrap()
+        };
+        let cache = Arc::new(ServerReplayCache::new(load()));
+        let now = current_unix_timestamp().unwrap();
+        let entry = |id: u8| ReplayEntry {
+            timestamp: now,
+            nonce: [id; 8],
+            transcript_fingerprint: [id; 32],
+        };
+        let pending = |id: u8| {
+            Some(PendingReplayEntry {
+                cache: Arc::clone(&cache),
+                entry: entry(id),
+                source: None,
+                reserved: true,
+                admission: None,
+            })
+        };
+
+        // A commit that owns the journal (fsync in progress) must not make a
+        // concurrent handshake's reservation fall back to the origin.
+        let journal = cache.journal.lock().unwrap();
+        assert!(cache
+            .gate
+            .try_lock()
+            .unwrap()
+            .reserve_pending(&entry(1), now));
+        drop(journal);
+        let mut first = pending(1);
+        assert!(commit_pending_replay_entry(&mut first).await.unwrap());
+
+        // The committed hello is refused at the reservation gate, also while a
+        // later commit owns the journal, and is refused again at commit.
+        let journal = cache.journal.lock().unwrap();
+        assert!(!cache
+            .gate
+            .try_lock()
+            .unwrap()
+            .reserve_pending(&entry(1), now));
+        drop(journal);
+        let mut replayed = pending(1);
+        replayed.as_mut().unwrap().reserved = false;
+        assert!(!commit_pending_replay_entry(&mut replayed).await.unwrap());
+
+        // After a restart the gate is rebuilt from the durable journal.
+        drop(cache);
+        let restarted = ServerReplayCache::new(load());
+        assert!(!restarted
+            .gate
+            .lock()
+            .unwrap()
+            .reserve_pending(&entry(1), now));
+        assert!(restarted
+            .gate
+            .lock()
+            .unwrap()
+            .reserve_pending(&entry(2), now));
+    }
+
+    /// Measures the authenticated-handshake replay gate under concurrent load:
+    /// each simulated handshake reserves its hello exactly like the accept path
+    /// (non-blocking; a busy cache sheds to the fallback origin) and then commits
+    /// it durably after the data proof.
+    ///
+    /// `PARALLAX_REPLAY_BENCH_DIR=<dir on the disk to measure> cargo test --release
+    /// --locked replay_commit_contention_benchmark -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark; run explicitly with --nocapture"]
+    async fn replay_commit_contention_benchmark() {
+        const HANDSHAKES_PER_LEVEL: usize = 2048;
+        let dir = match std::env::var_os("PARALLAX_REPLAY_BENCH_DIR") {
+            Some(base) => tempfile::tempdir_in(base).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        for concurrency in [1_usize, 8, 64, 256] {
+            let path = dir.path().join(format!("replay-{concurrency}.cache"));
+            let cache = Arc::new(ServerReplayCache::new(
+                ReplayCache::load_or_create_authenticated_with_window(
+                    &path,
+                    1 << 20,
+                    PSK,
+                    replay_freshness_window_secs(),
+                )
+                .unwrap(),
+            ));
+            let per_task = HANDSHAKES_PER_LEVEL / concurrency;
+            let started = Instant::now();
+            let mut tasks = Vec::with_capacity(concurrency);
+            for task in 0..concurrency {
+                let cache = Arc::clone(&cache);
+                tasks.push(tokio::spawn(async move {
+                    let mut shed = 0_usize;
+                    let mut latencies = Vec::with_capacity(per_task);
+                    for index in 0..per_task {
+                        let id = ((task as u64) << 32) | index as u64;
+                        let mut transcript_fingerprint = [0_u8; 32];
+                        transcript_fingerprint[..8].copy_from_slice(&id.to_be_bytes());
+                        let now = current_unix_timestamp().unwrap();
+                        let entry = ReplayEntry {
+                            timestamp: now,
+                            nonce: id.to_be_bytes(),
+                            transcript_fingerprint,
+                        };
+                        let fresh = match cache.gate.try_lock() {
+                            Ok(mut cache) => cache.reserve_pending(&entry, now),
+                            Err(_) => false,
+                        };
+                        if !fresh {
+                            shed += 1;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        let mut pending = Some(PendingReplayEntry {
+                            cache: Arc::clone(&cache),
+                            entry,
+                            source: None,
+                            reserved: true,
+                            admission: None,
+                        });
+                        let commit_started = Instant::now();
+                        assert!(commit_pending_replay_entry(&mut pending).await.unwrap());
+                        latencies.push(commit_started.elapsed());
+                    }
+                    (shed, latencies)
+                }));
+            }
+            let mut shed = 0;
+            let mut latencies = Vec::new();
+            for task in tasks {
+                let (task_shed, task_latencies) = task.await.unwrap();
+                shed += task_shed;
+                latencies.extend(task_latencies);
+            }
+            let elapsed = started.elapsed();
+            latencies.sort_unstable();
+            let percentile = |p: usize| {
+                latencies
+                    .get((latencies.len() * p / 100).min(latencies.len().saturating_sub(1)))
+                    .copied()
+                    .unwrap_or_default()
+            };
+            println!(
+                "concurrency={concurrency} committed={} shed_to_fallback={shed} \
+                 commits_per_sec={:.0} p50={:?} p95={:?} p99={:?}",
+                latencies.len(),
+                latencies.len() as f64 / elapsed.as_secs_f64(),
+                percentile(50),
+                percentile(95),
+                percentile(99),
+            );
+            let reloaded = ReplayCache::load_or_create_authenticated_with_window(
+                &path,
+                1 << 20,
+                PSK,
+                replay_freshness_window_secs(),
+            )
+            .unwrap();
+            drop(cache);
+            drop(reloaded);
+        }
+    }
+
+    #[tokio::test]
     async fn direct_connections_share_one_replay_cache() {
         let dir = tempfile::tempdir().unwrap();
         let server_keys = X25519KeyPair::generate();
@@ -9795,6 +10003,7 @@ mod tests {
         };
         assert_eq!(
             first
+                .journal
                 .lock()
                 .unwrap()
                 .insert_new_outcome(entry.clone(), now)
@@ -9803,6 +10012,7 @@ mod tests {
         );
         assert_eq!(
             second
+                .journal
                 .lock()
                 .unwrap()
                 .insert_new_outcome(entry, now)
@@ -9865,6 +10075,7 @@ mod tests {
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         assert_eq!(
             cache
+                .journal
                 .lock()
                 .unwrap()
                 .insert_new_outcome(entry.clone(), now)

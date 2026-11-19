@@ -322,6 +322,18 @@ impl ReplayCache {
         Ok(cache)
     }
 
+    /// A journal-less copy of the live entries. Checks against it never wait on
+    /// this cache's journal I/O; the owner must mirror every durable insert
+    /// into it.
+    pub(crate) fn memory_mirror(&self) -> Self {
+        let mut mirror = Self::new(self.capacity).with_window_secs(self.window_secs);
+        mirror.encoded_entries = VecDeque::new();
+        for entry in &self.order {
+            mirror.insert_loaded(entry.clone());
+        }
+        mirror
+    }
+
     pub fn insert_new(&mut self, entry: ReplayEntry, now: u64) -> Result<bool, ReplayCacheError> {
         Ok(self.insert_new_outcome(entry, now)? == ReplayInsertOutcome::Inserted)
     }
