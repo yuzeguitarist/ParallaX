@@ -4,25 +4,22 @@
 //!
 //! These are ParallaX-owned types with inherent methods used directly by the
 //! hand-written transport's packet/header protection; the engine names no quinn
-//! type. AEAD uses the RustCrypto `aes-gcm` /
-//! `chacha20poly1305` crates (the same backend the TCP path's record cipher uses);
+//! type. AEAD uses AWS-LC (`aws-lc-rs`, already the TLS provider's backend);
 //! header-protection masks use a raw single-block AES-ECB (`aes`) or a ChaCha20
 //! keystream (`chacha20`).
 
 use aes::{Aes128Enc, Aes256Enc};
+use aws_lc_rs::aead::{
+    Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305,
+};
 use chacha20::ChaCha20;
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::ChaCha20Poly1305;
+use chacha20poly1305::aead::KeyInit;
 use cipher::generic_array::GenericArray;
 use cipher::{BlockEncrypt, KeyIvInit, StreamCipher, StreamCipherSeek};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::suite::CipherSuite;
 use super::QuicTlsError;
-
-// GCM seal/open and header protection use only forward AES, without inverse round keys.
-type Aes128Gcm = aes_gcm::AesGcm<Aes128Enc, cipher::consts::U12>;
-type Aes256Gcm = aes_gcm::AesGcm<Aes256Enc, cipher::consts::U12>;
 
 /// AEAD tag length for every supported suite (RFC 9001 §5.3).
 pub const AEAD_TAG_LEN: usize = 16;
@@ -67,14 +64,17 @@ pub struct Keys {
 
 /// Packet-protection AEAD key for one direction of one packet-number space.
 ///
-/// Holds the raw `quic key` + `quic iv`; the AEAD cipher is constructed per
-/// operation (matching the TCP record cipher) so the key bytes stay in
-/// `Zeroizing` and are scrubbed on drop. The QUIC packet number is supplied
-/// per call and folded into the nonce as `iv XOR pad(pn)`.
+/// Holds the `quic iv` and an AWS-LC AEAD context keyed with `quic key`, built
+/// once per key so the key schedule is not re-expanded per packet; AWS-LC
+/// cleanses the context on drop. The QUIC packet number is supplied per call
+/// and folded into the nonce as `iv XOR pad(pn)`.
 pub struct PacketKey {
     suite: CipherSuite,
-    key: Zeroizing<Vec<u8>>,
+    aead: LessSafeKey,
     iv: [u8; IV_LEN],
+    /// Raw key for the RustCrypto differential reference in tests.
+    #[cfg(test)]
+    key: Zeroizing<Vec<u8>>,
 }
 
 impl PacketKey {
@@ -84,7 +84,21 @@ impl PacketKey {
         let iv_vec = Zeroizing::new(suite.hkdf_expand_label(secret, "quic iv", &[], IV_LEN)?);
         let mut iv = [0_u8; IV_LEN];
         iv.copy_from_slice(&iv_vec);
-        Ok(Self { suite, key, iv })
+        let algorithm = match suite {
+            CipherSuite::Aes128GcmSha256 => &AES_128_GCM,
+            CipherSuite::Aes256GcmSha384 => &AES_256_GCM,
+            CipherSuite::ChaCha20Poly1305Sha256 => &CHACHA20_POLY1305,
+        };
+        let aead = UnboundKey::new(algorithm, &key)
+            .map(LessSafeKey::new)
+            .map_err(|_| QuicTlsError::Crypto("invalid packet key".into()))?;
+        Ok(Self {
+            suite,
+            aead,
+            iv,
+            #[cfg(test)]
+            key,
+        })
     }
 
     /// AEAD tag length (always 16).
@@ -137,23 +151,12 @@ impl PacketKey {
         }
         let split = buf.len() - AEAD_TAG_LEN;
         let (plaintext, tag_out) = buf.split_at_mut(split);
-        let nonce = GenericArray::from_slice(&self.nonce(packet_number)[..]).to_owned();
-        let aead_err = || QuicTlsError::Crypto("AEAD seal failed".into());
-        let tag = match self.suite {
-            CipherSuite::Aes128GcmSha256 => Aes128Gcm::new_from_slice(&self.key)
-                .map_err(|_| aead_err())?
-                .encrypt_in_place_detached(&nonce, header, plaintext)
-                .map_err(|_| aead_err())?,
-            CipherSuite::Aes256GcmSha384 => Aes256Gcm::new_from_slice(&self.key)
-                .map_err(|_| aead_err())?
-                .encrypt_in_place_detached(&nonce, header, plaintext)
-                .map_err(|_| aead_err())?,
-            CipherSuite::ChaCha20Poly1305Sha256 => ChaCha20Poly1305::new_from_slice(&self.key)
-                .map_err(|_| aead_err())?
-                .encrypt_in_place_detached(&nonce, header, plaintext)
-                .map_err(|_| aead_err())?,
-        };
-        tag_out.copy_from_slice(&tag);
+        let nonce = Nonce::assume_unique_for_key(self.nonce(packet_number));
+        let tag = self
+            .aead
+            .seal_in_place_separate_tag(nonce, Aad::from(header), plaintext)
+            .map_err(|_| QuicTlsError::Crypto("AEAD seal failed".into()))?;
+        tag_out.copy_from_slice(tag.as_ref());
         Ok(())
     }
 
@@ -171,28 +174,11 @@ impl PacketKey {
                 "packet shorter than AEAD tag",
             ));
         }
-        let pt_len = buf.len() - AEAD_TAG_LEN;
-        let nonce = GenericArray::from_slice(&self.nonce(packet_number)[..]).to_owned();
-        let aead_err = || QuicTlsError::alert(super::ALERT_BAD_RECORD_MAC, "AEAD open failed");
-        {
-            let (ciphertext, tag) = buf.split_at_mut(pt_len);
-            let tag = GenericArray::from_slice(tag);
-            match self.suite {
-                CipherSuite::Aes128GcmSha256 => Aes128Gcm::new_from_slice(&self.key)
-                    .map_err(|_| aead_err())?
-                    .decrypt_in_place_detached(&nonce, header, ciphertext, tag)
-                    .map_err(|_| aead_err())?,
-                CipherSuite::Aes256GcmSha384 => Aes256Gcm::new_from_slice(&self.key)
-                    .map_err(|_| aead_err())?
-                    .decrypt_in_place_detached(&nonce, header, ciphertext, tag)
-                    .map_err(|_| aead_err())?,
-                CipherSuite::ChaCha20Poly1305Sha256 => ChaCha20Poly1305::new_from_slice(&self.key)
-                    .map_err(|_| aead_err())?
-                    .decrypt_in_place_detached(&nonce, header, ciphertext, tag)
-                    .map_err(|_| aead_err())?,
-            }
-        }
-        Ok(&buf[..pt_len])
+        let nonce = Nonce::assume_unique_for_key(self.nonce(packet_number));
+        self.aead
+            .open_in_place(nonce, Aad::from(header), buf)
+            .map(|plaintext| &*plaintext)
+            .map_err(|_| QuicTlsError::alert(super::ALERT_BAD_RECORD_MAC, "AEAD open failed"))
     }
 }
 
@@ -308,6 +294,8 @@ impl HeaderProtectionKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chacha20poly1305::aead::AeadInPlace;
+    use chacha20poly1305::ChaCha20Poly1305;
 
     // Keep the original full AES types independent of the production aliases.
     fn legacy_encrypt(
@@ -469,7 +457,9 @@ mod tests {
                             let reference = legacy_decrypt(&key, pn, bad_aad, &mut expected);
                             assert!(result.is_err());
                             assert_eq!(format!("{result:?}"), format!("{reference:?}"));
-                            assert_eq!(actual, expected);
+                            // AWS-LC clears the rejected plaintext region; the tag
+                            // and everything outside the packet stay untouched.
+                            assert_eq!(actual[len..], expected[len..]);
                         }
                     }
                 }
