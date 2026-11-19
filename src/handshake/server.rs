@@ -4088,11 +4088,14 @@ async fn sign_server_identity_blocking(
 }
 
 async fn insert_replay_entry_blocking(
-    replay_cache: Arc<ServerReplayCache>,
-    entry: ReplayEntry,
-    source: Option<IpAddr>,
+    pending: PendingReplayEntry,
 ) -> Result<bool, HandshakeServerError> {
     let outcome = tokio::task::spawn_blocking(move || {
+        // The reservation is owned here, not by the handshake task: if that task
+        // is cancelled mid-commit, the hello stays reserved in the gate until it
+        // is mirrored there (or the commit failed), never in neither.
+        let pending = pending;
+        let (replay_cache, entry, source) = (&pending.cache, pending.entry.clone(), pending.source);
         let now = current_unix_timestamp()?;
         // Recover from a poisoned lock rather than panicking the task: a prior
         // panic while holding the cache lock must not take down every subsequent
@@ -4111,14 +4114,15 @@ async fn insert_replay_entry_blocking(
         if outcome != ReplayInsertOutcome::Inserted {
             return Ok(outcome);
         }
-        // The entry is durable. Mirror it into the gate while the caller still
+        // The entry is durable. Mirror it into the gate while `pending` still
         // holds this hello's reservation there; anything but a clean mirror
         // fails this handshake closed.
-        replay_cache
+        let mirrored = replay_cache
             .gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert_new_outcome(entry, now)
+            .insert_new_outcome(entry, now);
+        mirrored
     })
     .await??;
     Ok(match outcome {
@@ -4148,12 +4152,7 @@ async fn commit_pending_replay_entry(
     let Some(pending) = pending_replay.take() else {
         return Ok(false);
     };
-    insert_replay_entry_blocking(
-        Arc::clone(&pending.cache),
-        pending.entry.clone(),
-        pending.source,
-    )
-    .await
+    insert_replay_entry_blocking(pending).await
 }
 
 fn apply_server_pq_rekey(
@@ -9857,6 +9856,34 @@ mod tests {
         replayed.as_mut().unwrap().reserved = false;
         assert!(!commit_pending_replay_entry(&mut replayed).await.unwrap());
 
+        // A handshake cancelled mid-commit keeps its hello refused at the gate
+        // the whole time: reserved until the blocking commit has mirrored it.
+        assert!(cache.gate.lock().unwrap().reserve_pending(&entry(3), now));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                let _journal = cache.journal.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+        };
+        locked_rx.recv().unwrap();
+        let mut cancelled = pending(3);
+        let commit = tokio::spawn(async move { commit_pending_replay_entry(&mut cancelled).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        commit.abort();
+        assert!(commit.await.unwrap_err().is_cancelled());
+        assert!(!cache.gate.lock().unwrap().reserve_pending(&entry(3), now));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        while Arc::strong_count(&cache) > 1 {
+            assert!(!cache.gate.lock().unwrap().reserve_pending(&entry(3), now));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(!cache.gate.lock().unwrap().reserve_pending(&entry(3), now));
+
         // After a restart the gate is rebuilt from the durable journal.
         drop(cache);
         let restarted = ServerReplayCache::new(load());
@@ -9877,15 +9904,17 @@ mod tests {
     /// (non-blocking; a busy cache sheds to the fallback origin) and then commits
     /// it durably after the data proof.
     ///
-    /// `PARALLAX_REPLAY_BENCH_DIR=<dir on the disk to measure> cargo test --release
-    /// --locked replay_commit_contention_benchmark -- --ignored --nocapture`
+    /// Runs only when `PARALLAX_REPLAY_BENCH_DIR` is set, so CI's `--ignored`
+    /// step skips it: `PARALLAX_REPLAY_BENCH_DIR=<dir on the disk to measure>
+    /// cargo test --release --locked replay_commit_contention_benchmark --
+    /// --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "benchmark; run explicitly with --nocapture"]
     async fn replay_commit_contention_benchmark() {
         const HANDSHAKES_PER_LEVEL: usize = 2048;
         let dir = match std::env::var_os("PARALLAX_REPLAY_BENCH_DIR") {
             Some(base) => tempfile::tempdir_in(base).unwrap(),
-            None => tempfile::tempdir().unwrap(),
+            None => return,
         };
         for concurrency in [1_usize, 8, 64, 256] {
             let path = dir.path().join(format!("replay-{concurrency}.cache"));
