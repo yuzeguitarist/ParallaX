@@ -1317,7 +1317,8 @@ impl DataRecordCodec {
             let record_end = next_record + records_here;
             let byte_start = bounds[next_record].0;
             let (last_start, last_len) = bounds[record_end - 1];
-            let mut group_bytes = remaining.split_to(last_start + last_len - byte_start);
+            let mut group_bytes =
+                ScrubOnDrop(remaining.split_to(last_start + last_len - byte_start));
             let group_bounds: Vec<(usize, usize)> = bounds[next_record..record_end]
                 .iter()
                 .map(|(record_offset, total_len)| (record_offset - byte_start, *total_len))
@@ -1330,7 +1331,7 @@ impl DataRecordCodec {
                     &nonce_base,
                     aad,
                     group_base_sequence,
-                    &mut group_bytes,
+                    &mut group_bytes.0,
                     &group_bounds,
                 );
                 (group_bytes, opened)
@@ -1338,9 +1339,13 @@ impl DataRecordCodec {
             next_record = record_end;
         }
 
+        // A panicking job is re-raised here: every view, run or not, is then
+        // dropped while still wrapped and wipes its part of the buffer.
         let segments = parallel::dispatch_blocking(|| pool.run_ordered(jobs));
         let mut first_error = None;
-        for (group_bytes, opened) in segments {
+        for (mut group_bytes, opened) in segments {
+            // Nothing below can unwind, so the view no longer needs its guard.
+            let group_bytes = std::mem::take(&mut group_bytes.0);
             match opened {
                 Ok(len) if first_error.is_none() => out.extend_from_slice(&group_bytes[..len]),
                 Ok(_) => {}
@@ -1550,6 +1555,17 @@ fn open_record_group(
     bytes[output_len..].zeroize();
     bytes.truncate(output_len);
     Ok(bytes)
+}
+
+/// A view of a staging buffer that is wiped when dropped, so a view lost to an
+/// unwinding crypto-pool job cannot leave decrypted bytes in freed memory.
+struct ScrubOnDrop(BytesMut);
+
+impl Drop for ScrubOnDrop {
+    fn drop(&mut self) {
+        let bytes: &mut [u8] = &mut self.0;
+        bytes.zeroize();
+    }
 }
 
 /// Opens the records at `bounds` inside `bytes` in place and compacts their
@@ -2718,6 +2734,25 @@ mod tests {
                 (ptr, len, capacity)
             );
         }
+    }
+
+    #[test]
+    fn scrub_on_drop_wipes_a_view_lost_to_an_unwinding_job() {
+        let mut whole = BytesMut::from(&[0xA5_u8; 64][..]);
+        let view = ScrubOnDrop(whole.split_to(48));
+        let view_start = view.0.as_ptr();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _view = view;
+            std::panic::resume_unwind(Box::new("job panicked"));
+        }));
+        assert!(unwound.is_err());
+        // SAFETY: `whole` still owns the allocation both views were split
+        // from, so the dropped view's 48 bytes stay allocated and initialized,
+        // and nothing else references them any more.
+        let wiped = unsafe { std::slice::from_raw_parts(view_start, 48) };
+        assert!(wiped.iter().all(|byte| *byte == 0));
+        // The neighbouring view is untouched.
+        assert!(whole.iter().all(|byte| *byte == 0xA5));
     }
 
     #[test]
