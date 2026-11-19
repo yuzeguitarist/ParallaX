@@ -4260,7 +4260,7 @@ mod tests {
         let total: usize = std::env::var("PLX_PERF_MIB")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(256)
+            .unwrap_or(if cfg!(debug_assertions) { 4 } else { 256 })
             * 1024
             * 1024;
         let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -4307,7 +4307,7 @@ mod tests {
     #[ignore = "perf harness: loopback request/response latency"]
     async fn perf_loopback_ping_pong_latency() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let rounds: usize = 20000;
+        let rounds: usize = if cfg!(debug_assertions) { 200 } else { 20_000 };
         let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
         let server_addr = server.local_addr().unwrap();
