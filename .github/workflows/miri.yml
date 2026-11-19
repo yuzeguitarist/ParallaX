@@ -14,7 +14,7 @@ on:
   # Path-filtered gate: run only when one of the FFI-free pure-logic modules Miri
   # actually exercises changes (see the run filter at the bottom of this file).
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     paths:
       - 'src/transport/udp/quic/varint.rs'
       - 'src/transport/udp/quic/frame.rs'

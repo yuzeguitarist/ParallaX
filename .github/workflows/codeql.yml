@@ -16,7 +16,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, 'perf/latency-peak']
   schedule:
     # Weekly baseline scan (Mon 12:43 UTC) so new CodeQL queries catch latent
     # issues even when no code changes land.
