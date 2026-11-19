@@ -4252,4 +4252,96 @@ mod tests {
         );
         assert!(applied.send.is_none(), "send was not requested");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "perf harness: loopback bulk throughput"]
+    async fn perf_loopback_bulk_throughput() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let total: usize = std::env::var("PLX_PERF_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+            * 1024
+            * 1024;
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap();
+            let mut recv = conn.accept_uni().await.unwrap();
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut got = 0usize;
+            loop {
+                let n = recv.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            got
+        });
+        let conn = client.connect(server_addr, "example.com").await.unwrap();
+        let mut send = conn.open_uni();
+        let chunk = vec![0xA5u8; 64 * 1024];
+        let start = Instant::now();
+        let mut sent = 0;
+        while sent < total {
+            send.write_all(&chunk).await.unwrap();
+            sent += chunk.len();
+        }
+        send.finish();
+        let got = srv.await.unwrap();
+        let secs = start.elapsed().as_secs_f64();
+        assert_eq!(got, sent);
+        eprintln!(
+            "PERF bulk: {:.1} MiB in {:.3}s = {:.1} MiB/s",
+            got as f64 / 1048576.0,
+            secs,
+            got as f64 / 1048576.0 / secs
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "perf harness: loopback request/response latency"]
+    async fn perf_loopback_ping_pong_latency() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rounds: usize = 20000;
+        let loop_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::server(loop_addr, server_config()).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = Endpoint::client(loop_addr).await.unwrap();
+        client.set_default_client_config(client_config());
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut buf = [0u8; 512];
+            while recv.read_exact(&mut buf).await.is_ok() {
+                send.write_all(&buf).await.unwrap();
+            }
+        });
+        let conn = client.connect(server_addr, "example.com").await.unwrap();
+        let (mut send, mut recv) = conn.open_bi();
+        let msg = [7u8; 512];
+        let mut buf = [0u8; 512];
+        let mut lat = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let t = Instant::now();
+            send.write_all(&msg).await.unwrap();
+            recv.read_exact(&mut buf).await.unwrap();
+            lat.push(t.elapsed().as_nanos() as u64);
+        }
+        send.finish();
+        let _ = srv.await;
+        lat.sort_unstable();
+        let p = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize] as f64 / 1000.0;
+        eprintln!(
+            "PERF pingpong: p50 {:.1}us p95 {:.1}us p99 {:.1}us max {:.1}us",
+            p(0.5),
+            p(0.95),
+            p(0.99),
+            p(1.0)
+        );
+    }
 }
