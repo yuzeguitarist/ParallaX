@@ -20,6 +20,31 @@ pub fn transcript_hash(client_hello_record: &[u8], server_hello_record: &[u8]) -
     hasher.finalize().into()
 }
 
+/// Domain-separated carrier transcript hash for a TLS 1.3 handshake that went
+/// through a single `HelloRetryRequest`: binds all four carrier handshake
+/// records (`ClientHello1`, `HelloRetryRequest`, `ClientHello2`, and the final
+/// `ServerHello`) with 32-bit big-endian length prefixes so tampering with any
+/// leg or record boundary causes epoch-0 AEAD and ML-DSA identity failure.
+pub fn hrr_transcript_hash(
+    client_hello_1: &[u8],
+    hello_retry_request: &[u8],
+    client_hello_2: &[u8],
+    server_hello: &[u8],
+) -> TranscriptHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ParallaX v1 HRR handshake transcript");
+    for record in [
+        client_hello_1,
+        hello_retry_request,
+        client_hello_2,
+        server_hello,
+    ] {
+        hasher.update((record.len() as u32).to_be_bytes());
+        hasher.update(record);
+    }
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +136,24 @@ mod tests {
             open.open(&ciphertext, CLIENT_TO_SERVER_AAD),
             Err(SessionError::Aead)
         ));
+    }
+
+    #[test]
+    fn hrr_transcript_hash_binds_all_four_records_and_record_boundaries() {
+        let base = hrr_transcript_hash(b"ch1", b"hrr", b"ch2", b"sh2");
+        assert_ne!(base, transcript_hash(b"ch1", b"hrr"));
+        assert_ne!(base, transcript_hash(b"ch1", b"sh2"));
+
+        // Any mutation in any of the four records changes the digest.
+        assert_ne!(base, hrr_transcript_hash(b"chX", b"hrr", b"ch2", b"sh2"));
+        assert_ne!(base, hrr_transcript_hash(b"ch1", b"hrX", b"ch2", b"sh2"));
+        assert_ne!(base, hrr_transcript_hash(b"ch1", b"hrr", b"chX", b"sh2"));
+        assert_ne!(base, hrr_transcript_hash(b"ch1", b"hrr", b"ch2", b"shX"));
+
+        // Every adjacent boundary is canonicalized by its 32-bit length prefix.
+        assert_ne!(base, hrr_transcript_hash(b"ch", b"1hrr", b"ch2", b"sh2"));
+        assert_ne!(base, hrr_transcript_hash(b"ch1h", b"rr", b"ch2", b"sh2"));
+        assert_ne!(base, hrr_transcript_hash(b"ch1", b"hr", b"rch2", b"sh2"));
+        assert_ne!(base, hrr_transcript_hash(b"ch1", b"hrr", b"ch", b"2sh2"));
     }
 }

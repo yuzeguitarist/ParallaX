@@ -54,8 +54,10 @@ the Finished (exactly one per connection); and the second ClientHello is produce
 rewriting the first one's bytes — only the `key_share` is replaced by a single entry
 and an optional `cookie` inserted after it — so it cannot drift from the validated
 fingerprint. A second HRR, a changed cipher suite, or a mismatched `key_share` group
-is a hard error. The second ClientHello does not carry the ParallaX auth binding, so
-a retried connection degrades to ordinary origin traffic rather than authenticating.
+is a hard error. Because `ClientHello.random` and `session_id` are copied unchanged
+into `ClientHello2`, the ParallaX server relays the single HRR exchange and binds
+all four handshake records (`ClientHello1`, `HRR`, `ClientHello2`, `ServerHello`)
+into the authenticated ParallaX session transcript.
 
 ## HTTP/2 post-handshake behavior
 

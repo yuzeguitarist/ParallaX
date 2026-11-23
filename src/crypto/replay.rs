@@ -143,6 +143,11 @@ pub struct ReplayCache {
     fail_directory_sync: Option<DirectorySyncFailure>,
     #[cfg(test)]
     prune_scanned_entries: usize,
+    #[cfg(test)]
+    pause_persist_once: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 /// Test-only fault injection for the header-commit phase of
@@ -189,7 +194,23 @@ impl ReplayCache {
             fail_directory_sync: None,
             #[cfg(test)]
             prune_scanned_entries: 0,
+            #[cfg(test)]
+            pause_persist_once: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pause_persist_once(
+        &mut self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.pause_persist_once = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_header_commit_before_write_for_test(&mut self) {
+        self.fail_header_commit = Some(HeaderCommitFailure::BeforeWrite);
     }
 
     /// Overrides the PAST/retention window (default [`DEFAULT_REPLAY_WINDOW_SECS`]).
@@ -445,6 +466,52 @@ impl ReplayCache {
         outcome
     }
 
+    /// Construct a pure in-memory mirror of this cache's live retention state
+    /// (`path = None`). Used by non-blocking QUIC admission guards so the fast
+    /// in-memory gate stays resident while the disk-backed [`ReplayCache`] runs
+    /// its journal `fsync` on a blocking worker without holding the gate lock.
+    pub(crate) fn in_memory_mirror(&self) -> Self {
+        Self {
+            capacity: self.capacity,
+            window_secs: self.window_secs,
+            path: None,
+            mac_key: None,
+            auth_journal: None,
+            order: self.order.clone(),
+            oldest_timestamp: self.oldest_timestamp,
+            encoded_entries: VecDeque::new(),
+            nonces: self.nonces.clone(),
+            transcripts: self.transcripts.clone(),
+            pending_persist: VecDeque::new(),
+            pending_transcripts: HashSet::new(),
+            source_commits: HashMap::new(),
+            nonce_sources: HashMap::new(),
+            #[cfg(test)]
+            fail_header_commit: None,
+            #[cfg(all(test, unix))]
+            fail_directory_sync: None,
+            #[cfg(test)]
+            prune_scanned_entries: 0,
+            #[cfg(test)]
+            pause_persist_once: None,
+        }
+    }
+
+    /// Stage an entry into an in-memory mirror without queuing a deferred disk
+    /// write (`pending_persist` stays empty on mirrors that never touch disk).
+    pub(crate) fn insert_in_memory(&mut self, entry: ReplayEntry, now: u64) -> ReplayInsertOutcome {
+        if self.capacity == 0 {
+            return ReplayInsertOutcome::Inserted;
+        }
+        self.stage_insert(entry, now)
+    }
+
+    /// Advance expiration on the disk-backed cache to match the highest `now`
+    /// observed by its paired in-memory gate before replaying queued inserts.
+    pub(crate) fn prune_expired_at(&mut self, now: u64) {
+        self.prune_expired(now);
+    }
+
     /// Durably persists every entry queued by [`Self::insert_new_outcome_deferred`],
     /// oldest first. This is the blocking half of the deferred insert (journal
     /// append + fsync, or a full compaction); run it off the async executor (e.g.
@@ -453,6 +520,11 @@ impl ReplayCache {
     /// keeps gating replays for this process's lifetime, only its restart
     /// durability is pending.
     pub fn persist_pending(&mut self) -> Result<(), ReplayCacheError> {
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.pause_persist_once.take() {
+            let _ = entered.send(());
+            let _ = resume.recv();
+        }
         while let Some(entry) = self.pending_persist.front().cloned() {
             // An entry pruned from memory while queued has already expired: a
             // fresh load would prune its journal line immediately, and skipping

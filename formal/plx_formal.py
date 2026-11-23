@@ -1214,20 +1214,23 @@ def quic_machine() -> Machine:
 def zero_rtt_machine() -> Machine:
     """One 0-RTT ticket identity, including a replay of that same ticket.
 
-    ``guard = busy`` is a contended or poisoned lock. ``guard = out`` is the
-    cache already checked out when this attempt starts. Both fail closed: the
-    ticket is not burned and early data is not accepted. After a fresh accept,
-    ``Checkout`` is the background persist taking the cache, and a second offer
-    in that window is ``CheckoutReject`` (fail closed, not a replay lookup).
-    ``Persist`` returns the cache and makes the accept durable. CacheFull and an
-    8-byte nonce prefix collision are decisions under a free lock: the ticket is not
-    accepted and not burned, which is not the lock-busy path. The insert is
-    ``insert_new_outcome_deferred``; the fsync is later. A restart before that
-    fsync drops the in-memory accept so the same ticket can be accepted again.
-    ``AcceptsAtMostOnce`` is per boot while the journal is not yet durable, not
-    once-ever across that crash. A bad binder returns before the guard. Retain
-    and the next ticket wait until the probe is verified AND the Safari
-    SETTINGS check passes. ``dead`` is a handshake timeout.
+    ``guard = busy`` is a contended or poisoned gate lock: it fails closed so
+    the ticket is not burned and early data is not accepted. The in-memory
+    mirror stays resident while the background worker persists to disk, so
+    concurrent distinct tickets are not rejected by an in-flight ``fsync``.
+    After a fresh accept, ``Checkout`` starts the background journal write
+    (``journal = out``), and a replay of that ticket in that window is still
+    rejected immediately by the resident in-memory gate (``ReplayReject``).
+    ``Persist`` finishes the ``fsync`` (``journal = back``) and makes the accept
+    durable. CacheFull and an 8-byte nonce prefix collision are decisions under
+    a free lock: the ticket is not accepted and not burned, which is not the
+    lock-busy path. The insert is ``insert_in_memory`` + queued background
+    persist; the fsync is later. A restart before that fsync drops the in-memory
+    accept so the same ticket can be accepted again. ``AcceptsAtMostOnce`` is
+    per boot while the journal is not yet durable, not once-ever across that
+    crash. A bad binder returns before the guard. Retain and the next ticket
+    wait until the probe is verified AND the Safari SETTINGS check passes.
+    ``dead`` is a handshake timeout.
     """
 
     fields = (
@@ -1278,7 +1281,7 @@ def zero_rtt_machine() -> Machine:
     }
     initials = tuple(
         {"guard": guard, "binder": binder}
-        for guard in ("free", "busy", "out")
+        for guard in ("free", "busy")
         for binder in ("ok", "bad")
     )
     return Machine(
@@ -1403,13 +1406,7 @@ def zero_rtt_machine() -> Machine:
             ),
             act(
                 "ReplayReject",
-                'replay_offered /\\ ~replay_decided /\\ journal # "out"',
-                replay_decided="TRUE",
-                replay_rejected="TRUE",
-            ),
-            act(
-                "CheckoutReject",
-                'replay_offered /\\ ~replay_decided /\\ journal = "out"',
+                "replay_offered /\\ ~replay_decided",
                 replay_decided="TRUE",
                 replay_rejected="TRUE",
             ),
@@ -1516,11 +1513,6 @@ def zero_rtt_machine() -> Machine:
                 "BusyGuardFailsClosed",
                 "a contended guard fails closed without burning the ticket",
                 'decided /\\ ~early /\\ ~burned /\\ guard = "busy"',
-            ),
-            claim(
-                "CheckedOutGuardFailsClosed",
-                "a checked-out cache fails closed without burning the ticket",
-                'decided /\\ ~early /\\ ~burned /\\ guard = "out"',
             ),
             claim(
                 "ConcurrentOfferWhileCheckedOut",
@@ -3742,16 +3734,15 @@ def correspond(root: Path = ROOT) -> None:
     )
 
     ticket = _extract_fn(zero_rtt, "accept_ticket")
-    some_at = ticket.find("Some(cache) =>")
-    none_at = ticket.find("None =>", some_at if some_at >= 0 else 0)
-    some_arm = ticket[some_at:none_at] if 0 <= some_at < none_at else ""
-    if "== ReplayInsertOutcome::Inserted" not in some_arm:
+    ok_at = ticket.find("Ok(mut gate) =>")
+    err_at = ticket.find("Err(_) =>", ok_at if ok_at >= 0 else 0)
+    ok_arm = ticket[ok_at:err_at] if 0 <= ok_at < err_at else ""
+    if "== ReplayInsertOutcome::Inserted" not in ok_arm:
         problems.append(
-            "0-RTT Some(cache) arm must accept only `== ReplayInsertOutcome::Inserted`"
+            "0-RTT Ok(mut gate) arm must accept only `== ReplayInsertOutcome::Inserted`"
         )
-    for snippet in ("Err(_) => false", "None => false"):
-        if snippet not in ticket:
-            problems.append(f"0-RTT accept_ticket no longer fail-closed: missing {snippet}")
+    if "Err(_) => false" not in ticket:
+        problems.append("0-RTT accept_ticket no longer fail-closed: missing Err(_) => false")
 
     probe = _extract_fn(runtime, "run_client_udp_probe")
     _order(

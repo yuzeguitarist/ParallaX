@@ -91,8 +91,7 @@ availability. The experimental UDP path stays disabled by default.
 Fingerprint equality for selected captures is different from equality of
 connection-level timing, packetization, errors, retry paths and population
 statistics. Production-origin changes and new browser releases can invalidate
-old evidence. The authenticated TCP HRR limitation described in `SPEC.md`
-remains relevant. Local fallback equivalence tests are bounded comparisons,
+old evidence. Local fallback equivalence tests are bounded comparisons,
 not a verdict about every deployed censor or a guarantee of user anonymity.
 
 ### Host controls

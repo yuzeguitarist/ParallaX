@@ -26,7 +26,7 @@ use crate::{
     traffic::{PaddingProfile, TrafficError},
 };
 
-use super::transcript::transcript_hash;
+use super::transcript::{hrr_transcript_hash, transcript_hash};
 
 #[derive(Debug, Error)]
 pub enum ClientHandshakeError {
@@ -79,6 +79,27 @@ pub fn derive_session_keys_from_shared(
     server_hello_record: &[u8],
 ) -> Result<SessionKeys, ClientHandshakeError> {
     let transcript_hash = transcript_hash(client_hello_record, server_hello_record);
+    Ok(derive_client_keys_from_shared(
+        psk,
+        x25519_shared_secret,
+        &transcript_hash,
+    )?)
+}
+
+pub fn derive_hrr_session_keys_from_shared(
+    psk: &[u8],
+    x25519_shared_secret: &[u8; 32],
+    client_hello_1: &[u8],
+    hello_retry_request: &[u8],
+    client_hello_2: &[u8],
+    server_hello: &[u8],
+) -> Result<SessionKeys, ClientHandshakeError> {
+    let transcript_hash = hrr_transcript_hash(
+        client_hello_1,
+        hello_retry_request,
+        client_hello_2,
+        server_hello,
+    );
     Ok(derive_client_keys_from_shared(
         psk,
         x25519_shared_secret,

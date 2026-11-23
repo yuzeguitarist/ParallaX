@@ -9,12 +9,25 @@ const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const TLS13_VERSION: u16 = 0x0304;
 const RANDOM_LEN: usize = 32;
 
+/// RFC 8446 §4.1.3 SHA-256("HelloRetryRequest") sentinel placed in
+/// `ServerHello.random` to encode a TLS 1.3 `HelloRetryRequest`.
+pub const HELLO_RETRY_REQUEST_RANDOM: [u8; RANDOM_LEN] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerHello {
     pub record_len: usize,
     pub random: [u8; RANDOM_LEN],
     pub session_id_range: Range<usize>,
     pub tls13_selected: bool,
+}
+
+impl ServerHello {
+    pub fn is_hello_retry_request(&self) -> bool {
+        self.random == HELLO_RETRY_REQUEST_RANDOM
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -29,6 +42,10 @@ pub enum ServerHelloError {
     Truncated,
     #[error("ServerHello length is invalid")]
     InvalidLength,
+    #[error("origin sent a second HelloRetryRequest")]
+    UnexpectedHelloRetryRequest,
+    #[error("client retry flight after HelloRetryRequest is invalid")]
+    RetryClientHelloInvalid,
 }
 
 pub fn parse_server_hello(record: &[u8]) -> Result<ServerHello, ServerHelloError> {

@@ -10,7 +10,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use zeroize::Zeroizing;
 
 use crate::tls::quic::{AcceptAnyServerCert, ServerCertVerifier, ZeroRttGuard};

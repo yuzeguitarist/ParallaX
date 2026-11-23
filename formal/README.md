@@ -104,13 +104,13 @@ The server sets `handshake_complete` and only then issues the session ticket.
 ### 0-RTT and reconnect (`ParallaXZeroRtt`)
 
 One ticket identity. The client consumes it on offer. The server consults the
-guard only after the binder matches. `busy` is a contended lock; `out` is the
-cache checked out for a persist. Both fail closed: early data is not accepted
-and the ticket is not burned. CacheFull and an 8-byte nonce prefix collision
-are decided under a free lock and do not burn the ticket. After a fresh
-accept the background persist checks the cache out. A second offer in that
-window fails closed and does not look like a replay. The journal fsync is
-deferred; a restart before it can accept the ticket again.
+guard only after the binder matches. `busy` is a contended gate lock and fails
+closed: early data is not accepted and the ticket is not burned. The in-memory
+mirror stays resident while the background worker writes to disk, so concurrent
+distinct tickets stay accepted during `fsync` while replays of an accepted
+ticket are still gated immediately in memory. CacheFull and an 8-byte nonce
+prefix collision are decided under a free lock and do not burn the ticket. The
+journal fsync is deferred; a restart before it can accept the ticket again.
 `AcceptsAtMostOnce` counts one boot, not a crash before that fsync. A second
 offer of an accepted ticket is a replay. Relay bytes wait for the handshake,
 a verified probe, and Safari SETTINGS.

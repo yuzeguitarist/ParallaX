@@ -27,7 +27,7 @@ class FormalModelTests(unittest.TestCase):
             {
                 "ParallaXSession": 63,
                 "ParallaXQuic": 260,
-                "ParallaXZeroRtt": 456,
+                "ParallaXZeroRtt": 418,
                 "ParallaXReplay": 26,
                 "ParallaXProbe": 224,
                 "ParallaXInbound": 32,
