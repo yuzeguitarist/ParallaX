@@ -3513,7 +3513,7 @@ MACHINE_ANCHORS: dict[str, dict[str, tuple[str, ...]]] = {
         "src/handshake/server.rs": (
             "cache.reserve_pending(&entry, now)",
             "if !fresh",
-            "if !commit_pending_replay_entry",
+            "if !replay_committed?",
             "apply_server_pq_rekey(",
         ),
         "src/client/runtime.rs": (
@@ -4069,7 +4069,8 @@ def correspond(root: Path = ROOT) -> None:
         data_mode,
         (
             "let pq_rekey = match PqRekeyRequest::decode_ref(",
-            "if !commit_pending_replay_entry",
+            "commit_pending_replay_entry(&mut pending_replay)",
+            "if !replay_committed?",
             "return Ok(())",
             "apply_server_pq_rekey(",
         ),
