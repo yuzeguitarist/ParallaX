@@ -60,7 +60,9 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use crate::crypto::replay::{ReplayCache, ReplayEntry, ReplayInsertOutcome};
+use crate::crypto::replay::{
+    ReplayCache, ReplayEntry, ReplayInsertOutcome, BACKGROUND_PERSIST_RETRY_BACKOFF,
+};
 use crate::tls::quic::ZeroRttGuard;
 
 /// Upper bound on accepted tickets waiting for the durable journal. When disk
@@ -119,8 +121,7 @@ impl ReplayCacheGuard {
 
     /// Runs the single-flight durable persist worker off the async executor via
     /// `spawn_blocking`. Outside a tokio runtime (sync tests) it persists inline.
-    /// A persist failure is logged and the queued entry retried on the next
-    /// accepted ticket; the resident `gate` mirror keeps gating replays either way.
+    /// A persist failure is logged and retried with bounded backoff; the resident `gate` mirror keeps gating replays either way.
     fn persist_in_background(&self) {
         let gate = Arc::clone(&self.gate);
         let persister = Arc::clone(&self.persister);
@@ -169,16 +170,64 @@ impl ReplayCacheGuard {
                 tracing::warn!(
                     error = %err,
                     "0-RTT replay cache persist failed; ticket accept recorded \
-                     in memory only (retried on the next accepted ticket)"
+                     in memory only (retrying)"
                 );
-                let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if state.pending.is_empty() {
-                    state.worker_running = false;
+                if Self::retry_failed_persist(gate, persister) {
                     reset.armed = false;
                     return;
                 }
             }
         }
+    }
+
+    /// Retries a failed persist with bounded backoff while nothing new is queued.
+    /// Replays never enqueue work, so without this an entry whose persist failed
+    /// would reach disk only on the next admission, and a restart before then
+    /// would admit its replay. Returns `true` once the worker has stopped (queue
+    /// empty and the worker marked idle); `false` hands control back to the main
+    /// loop, which journals the next batch together with any still-pending entry.
+    fn retry_failed_persist(
+        gate: &Mutex<ZeroRttGateState>,
+        persister: &Mutex<ReplayCache>,
+    ) -> bool {
+        for delay in BACKGROUND_PERSIST_RETRY_BACKOFF {
+            if !gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pending
+                .is_empty()
+            {
+                return false;
+            }
+            std::thread::sleep(delay);
+            let result = persister
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .persist_pending();
+            match result {
+                Ok(()) => return false,
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "0-RTT replay cache persist retry failed"
+                ),
+            }
+        }
+        let still_pending = persister
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .has_pending_persist();
+        let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.pending.is_empty() {
+            return false;
+        }
+        if still_pending {
+            tracing::error!(
+                "0-RTT replay cache persist kept failing; the entry stays in memory \
+                 only and is retried on the next admission"
+            );
+        }
+        state.worker_running = false;
+        true
     }
 
     /// Test-only: synchronously drain any queued durable persist so a test can
@@ -415,6 +464,48 @@ mod tests {
     }
 
     #[test]
+    fn failed_persist_is_retried_without_a_later_ticket() {
+        // A persist failure with nothing queued behind it must still reach disk:
+        // replays never enqueue work, so waiting for the next accepted ticket
+        // would leave a restart free to admit the replay.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero-rtt-replay-retry.cache");
+        let key = b"server-host-key-derived-mac-material";
+        let now = crate::crypto::replay::current_unix_timestamp().unwrap();
+        let ticket = b"retried-ticket-identity";
+
+        let mut cache = ReplayCache::load_or_create_authenticated_with_window(
+            &path,
+            64,
+            key,
+            TICKET_LIFETIME_SECS,
+        )
+        .unwrap();
+        cache.fail_next_persists_for_test(1);
+        let g = ReplayCacheGuard::new(cache);
+        // Outside a runtime the worker runs inline, retry included.
+        assert!(g.accept_ticket(ticket, now), "first use accepted");
+        assert!(
+            !g.accept_ticket(ticket, now),
+            "replay stays gated in memory"
+        );
+        drop(g);
+
+        let reloaded = ReplayCache::load_or_create_authenticated_with_window(
+            &path,
+            64,
+            key,
+            TICKET_LIFETIME_SECS,
+        )
+        .unwrap();
+        let g2 = ReplayCacheGuard::new(reloaded);
+        assert!(
+            !g2.accept_ticket(ticket, now),
+            "the retried persist made the first use durable"
+        );
+    }
+
+    #[test]
     fn accept_never_blocks_on_a_contended_lock() {
         // Raw mutex contention on the fast gate (another thread holding `gate`)
         // must not block the driver — `try_lock` fails closed to 1-RTT
@@ -590,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_failure_keeps_in_memory_replay_gate_and_retries_on_next_accept() {
+    fn persist_failure_keeps_in_memory_replay_gate_and_retries_without_a_later_ticket() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("zero-rtt-persist-retry.cache");
         let key = b"server-host-key-derived-mac-material";
@@ -619,26 +710,26 @@ mod tests {
         // Even though the disk commit failed, the in-memory gate STILL blocks replays.
         assert!(!g.accept_ticket(t1, now));
 
-        // Non-vacuity: before retry, an isolated snapshot of the on-disk journal
-        // has `t0` but NOT `t1` yet (proving the injected commit failure actually
-        // prevented `t1` from landing durably on disk).
+        // The worker retries the failed commit with backoff instead of waiting
+        // for the next accepted ticket (outside a runtime it runs inline), so
+        // `t1` is already durable without any further admission.
         let snapshot_path = dir.path().join("zero-rtt-persist-retry.snapshot.cache");
         std::fs::copy(&path, &snapshot_path).unwrap();
-        let before_retry = ReplayCache::load_or_create_authenticated_with_window(
+        let after_retry = ReplayCache::load_or_create_authenticated_with_window(
             &snapshot_path,
             64,
             key,
             TICKET_LIFETIME_SECS,
         )
         .unwrap();
-        let g_mid = ReplayCacheGuard::new(before_retry);
+        let g_mid = ReplayCacheGuard::new(after_retry);
         assert!(!g_mid.accept_ticket(t0, now));
         assert!(
-            g_mid.accept_ticket(t1, now),
-            "t1 must not yet be durable on disk before the compaction retry"
+            !g_mid.accept_ticket(t1, now),
+            "t1 must be durable after the background retry, before any later ticket"
         );
 
-        // Next fresh accept triggers compaction retry and makes `t0`, `t1`, and `t2` durable.
+        // A later fresh accept still journals normally alongside the retried entries.
         assert!(g.accept_ticket(t2, now));
         let reloaded = ReplayCache::load_or_create_authenticated_with_window(
             &path,

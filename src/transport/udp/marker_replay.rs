@@ -25,7 +25,9 @@ use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 
 use crate::crypto::quic_marker::Marker;
-use crate::crypto::replay::{ReplayCache, ReplayEntry, ReplayInsertOutcome};
+use crate::crypto::replay::{
+    ReplayCache, ReplayEntry, ReplayInsertOutcome, BACKGROUND_PERSIST_RETRY_BACKOFF,
+};
 
 struct MarkerGateState {
     mirror: ReplayCache,
@@ -143,8 +145,7 @@ impl MarkerReplayGuard {
 
     /// Runs the single-flight durable persist worker off the async executor via
     /// `spawn_blocking`. Outside a tokio runtime (sync tests) it persists inline.
-    /// A persist failure is logged and the queued entry retried on the next
-    /// sighting; the resident `gate` mirror keeps gating replays either way.
+    /// A persist failure is logged and retried with bounded backoff; the resident `gate` mirror keeps gating replays either way.
     fn persist_in_background(&self) {
         let gate = Arc::clone(&self.gate);
         let persister = Arc::clone(&self.persister);
@@ -179,11 +180,12 @@ impl MarkerReplayGuard {
                 if let Some(now) = max_now {
                     cache.prune_expired_at(now);
                 }
+                // Do not prune again at the batch maximum after inserting: after a
+                // clock rollback an entry admitted at a lower `now` would be pruned
+                // before it is journaled, and a restart would then admit its replay
+                // even though the live gate rejected it.
                 for (entry, now) in batch {
                     let _ = cache.insert_new_outcome_deferred(entry, now);
-                }
-                if let Some(now) = max_now {
-                    cache.prune_expired_at(now);
                 }
                 cache.persist_pending()
             };
@@ -192,16 +194,61 @@ impl MarkerReplayGuard {
                 tracing::warn!(
                     error = %err,
                     "marker replay cache persist failed; first sighting recorded \
-                     in memory only (retried on the next sighting)"
+                     in memory only (retrying)"
                 );
-                let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if state.pending.is_empty() {
-                    state.worker_running = false;
+                if Self::retry_failed_persist(gate, persister) {
                     reset.armed = false;
                     return;
                 }
             }
         }
+    }
+
+    /// Retries a failed persist with bounded backoff while nothing new is queued.
+    /// Replays never enqueue work, so without this an entry whose persist failed
+    /// would reach disk only on the next admission, and a restart before then
+    /// would admit its replay. Returns `true` once the worker has stopped (queue
+    /// empty and the worker marked idle); `false` hands control back to the main
+    /// loop, which journals the next batch together with any still-pending entry.
+    fn retry_failed_persist(gate: &Mutex<MarkerGateState>, persister: &Mutex<ReplayCache>) -> bool {
+        for delay in BACKGROUND_PERSIST_RETRY_BACKOFF {
+            if !gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pending
+                .is_empty()
+            {
+                return false;
+            }
+            std::thread::sleep(delay);
+            let result = persister
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .persist_pending();
+            match result {
+                Ok(()) => return false,
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "marker replay cache persist retry failed"
+                ),
+            }
+        }
+        let still_pending = persister
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .has_pending_persist();
+        let mut state = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.pending.is_empty() {
+            return false;
+        }
+        if still_pending {
+            tracing::error!(
+                "marker replay cache persist kept failing; the entry stays in memory \
+                 only and is retried on the next admission"
+            );
+        }
+        state.worker_running = false;
+        true
     }
 }
 
@@ -308,6 +355,45 @@ mod tests {
         assert!(
             !g2.first_sighting(&m, now),
             "replay spliced across a restart (persistent single-use)"
+        );
+    }
+
+    #[test]
+    fn failed_persist_is_retried_without_a_later_sighting() {
+        // A persist failure with nothing queued behind it must still reach disk:
+        // replays never enqueue work, so waiting for the next first sighting
+        // would leave a restart free to admit the replay.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker-replay-retry.cache");
+        let key = b"server-static-key-derived-mac-material";
+        let now = crate::crypto::replay::current_unix_timestamp().unwrap();
+        let m = marker(0x6b, now);
+
+        let mut cache = ReplayCache::load_or_create_authenticated_with_window(
+            &path,
+            64,
+            key,
+            MARKER_WINDOW_SECS,
+        )
+        .unwrap();
+        cache.fail_next_persists_for_test(1);
+        let g = MarkerReplayGuard::new(cache);
+        // Outside a runtime the worker runs inline, retry included.
+        assert!(g.first_sighting(&m, now), "first sighting terminates");
+        assert!(!g.first_sighting(&m, now), "replay stays gated in memory");
+        drop(g);
+
+        let reloaded = ReplayCache::load_or_create_authenticated_with_window(
+            &path,
+            64,
+            key,
+            MARKER_WINDOW_SECS,
+        )
+        .unwrap();
+        let g2 = MarkerReplayGuard::new(reloaded);
+        assert!(
+            !g2.first_sighting(&m, now),
+            "the retried persist made the first sighting durable"
         );
     }
 

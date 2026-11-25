@@ -148,7 +148,23 @@ pub struct ReplayCache {
         std::sync::mpsc::SyncSender<()>,
         std::sync::mpsc::Receiver<()>,
     )>,
+    /// Number of upcoming [`Self::persist_pending`] calls that fail before
+    /// touching disk (tests only).
+    #[cfg(test)]
+    fail_persist_pending: usize,
 }
+
+/// Backoff between retries of a background journal persist that failed while
+/// no new admission was queued behind it. Without a retry, an entry whose
+/// persist failed would stay in memory only until the next admission, and a
+/// restart before then would admit its replay. The retries are bounded so a
+/// persistently failing disk does not pin a blocking thread forever.
+pub(crate) const BACKGROUND_PERSIST_RETRY_BACKOFF: [std::time::Duration; 4] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(5),
+];
 
 /// Test-only fault injection for the header-commit phase of
 /// [`ReplayCache::persist_authenticated_entry`]: deterministically reproduces
@@ -196,6 +212,8 @@ impl ReplayCache {
             prune_scanned_entries: 0,
             #[cfg(test)]
             pause_persist_once: None,
+            #[cfg(test)]
+            fail_persist_pending: 0,
         }
     }
 
@@ -206,6 +224,16 @@ impl ReplayCache {
         resume: std::sync::mpsc::Receiver<()>,
     ) {
         self.pause_persist_once = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_persists_for_test(&mut self, count: usize) {
+        self.fail_persist_pending = count;
+    }
+
+    /// Whether entries admitted with a deferred persist still wait for the journal.
+    pub(crate) fn has_pending_persist(&self) -> bool {
+        !self.pending_persist.is_empty()
     }
 
     #[cfg(test)]
@@ -494,6 +522,8 @@ impl ReplayCache {
             prune_scanned_entries: 0,
             #[cfg(test)]
             pause_persist_once: None,
+            #[cfg(test)]
+            fail_persist_pending: 0,
         }
     }
 
@@ -524,6 +554,13 @@ impl ReplayCache {
         if let Some((entered, resume)) = self.pause_persist_once.take() {
             let _ = entered.send(());
             let _ = resume.recv();
+        }
+        #[cfg(test)]
+        if self.fail_persist_pending > 0 {
+            self.fail_persist_pending -= 1;
+            return Err(ReplayCacheError::Io(io::Error::other(
+                "injected persist failure",
+            )));
         }
         while let Some(entry) = self.pending_persist.front().cloned() {
             // An entry pruned from memory while queued has already expired: a
