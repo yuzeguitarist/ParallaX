@@ -8,7 +8,8 @@ branch measured by main's security/camouflage yardstick:
    into perf/latency-peak;
 2. relative to the merge base with main, no captured-traffic fixture or
    censor-model data file is modified or removed;
-3. relative to that merge base, no Rust test is removed or newly #[ignore]d.
+3. relative to that merge base, no Rust test is removed, newly #[ignore]d, or
+   newly placed under a #[cfg(...)] / #[cfg_attr(...)] that can disable it.
 
 Modified existing test files are reported as warnings for reviewers.
 """
@@ -47,7 +48,8 @@ def pr_branches(text):
 
 def ungated_workflows(workflows):
     missing = []
-    for path in sorted(workflows.glob("*.yml")):
+    paths = [*workflows.glob("*.yml"), *workflows.glob("*.yaml")]
+    for path in sorted(paths, key=lambda p: p.name):
         branches = pr_branches(path.read_text())
         if branches and "main" in branches and BRANCH not in branches:
             missing.append(path.name)
@@ -62,7 +64,9 @@ def rust_tests(text):
         stripped = line.strip()
         if stripped.startswith("#["):
             is_test = is_test or bool(TEST_ATTR.match(stripped))
-            ignored = ignored or stripped.startswith("#[ignore")
+            # A cfg or cfg_attr on a test can compile it out or ignore it, so a
+            # test under one does not count as active.
+            ignored = ignored or stripped.startswith(("#[ignore", "#[cfg(", "#[cfg_attr("))
             continue
         if not stripped or stripped.startswith("//"):
             continue

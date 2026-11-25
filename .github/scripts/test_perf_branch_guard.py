@@ -35,7 +35,8 @@ class PerfBranchGuardTests(unittest.TestCase):
             (root / "a.yml").write_text("on:\n  pull_request:\n    branches: [main, master]\n")
             (root / "b.yml").write_text("on:\n  pull_request:\n    branches: [main, 'perf/latency-peak']\n")
             (root / "c.yml").write_text("on:\n  pull_request:\n")
-            self.assertEqual(guard.ungated_workflows(root), ["a.yml"])
+            (root / "d.yaml").write_text("on:\n  pull_request:\n    branches: [main]\n")
+            self.assertEqual(guard.ungated_workflows(root), ["a.yml", "d.yaml"])
 
     def test_rust_tests_are_counted_with_ignore_state(self):
         total, active = guard.rust_tests(
@@ -47,6 +48,15 @@ class PerfBranchGuardTests(unittest.TestCase):
         )
         self.assertEqual(dict(total), {"plain": 1, "looped": 1, "skipped": 1, "commented": 1})
         self.assertEqual(dict(active), {"plain": 1, "commented": 1})
+
+    def test_cfg_gated_tests_are_not_counted_as_active(self):
+        total, active = guard.rust_tests(
+            "#[test]\n#[cfg(any())]\nfn compiled_out() {}\n"
+            "#[cfg_attr(not(feature = \"x\"), ignore)]\n#[test]\nfn maybe_ignored() {}\n"
+            "#[test]\nfn plain() {}\n"
+        )
+        self.assertEqual(dict(total), {"compiled_out": 1, "maybe_ignored": 1, "plain": 1})
+        self.assertEqual(dict(active), {"plain": 1})
 
 
 if __name__ == "__main__":
