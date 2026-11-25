@@ -108,11 +108,13 @@ them defeats the protocol's purpose:
 - **I1 — Indistinguishable bytes.** Every byte a passive observer sees on the
   carrier MUST be a value a real Safari 26 client/server could emit, in the same
   order and with the same record/packet sizing distribution (§11, §12).
-- **I2 — No tells on failure.** Authentication failure, replay, malformed input,
-  and policy rejection MUST all funnel into the same observable behavior as a
-  real origin serving a non-ParallaX client. There MUST be no
-  ParallaX-specific error response, RST timing, or close code observable on the
-  wire.
+- **I2 — No tells on carrier rejection.** Carrier authentication failure,
+  malformed carrier input and pending-admission refusal (including a known
+  replay) MUST funnel into the real origin serving a non-ParallaX client.
+  After valid inner data proof on an admitted session, malformed inner messages,
+  policy refusal or failed persistent replay commit instead use graceful close
+  (§7.4/§8). These paths MUST NOT emit a ParallaX-specific plaintext error,
+  RST timing pattern or externally visible close code.
 - **I3 — Fail-closed crypto.** Any AEAD open failure, nonce exhaustion, or
   transcript mismatch MUST terminate the session; partial or ambiguous state MUST
   NOT be exposed.
@@ -267,12 +269,13 @@ Carried as the trailing byte of `SERVER_KEY_EXCHANGE` (§5.6).
 | `POST_HANDSHAKE_DRAIN_LIMIT` | 4 | max origin post-handshake records the client drains before Phase B (§7.3) |
 | `POST_HANDSHAKE_DRAIN_TIMEOUT` | 180 ms | per-record timeout while draining; tolerated only at a record boundary (§7.3) |
 
-### 3.7 Record-size shaping bands (plaintext byte targets)
+### 3.7 Record-size shaping centers
 
 | Name | Values |
 |------|--------|
-| `CONNECT_RECORD_SIZE_BANDS` | `[286, 469, 569, 735, 911, 1180, 1353, 1600]` |
-| `PQ_FLIGHT_RECORD_TARGETS` | `[144, 191, 286, 339, 469, 519, 569, 713, 735, 911, 1180, 1353]` |
+| `CONNECT_RECORD_SIZE_BANDS` | `[286, 339, 469, 519, 569, 713, 735, 1353]` |
+| `PQ_FLIGHT_RECORD_TARGETS` | `[144, 191, 286, 339, 469, 519, 569, 713, 735, 1353, 1440, 1459]` |
+| `SHAPED_RECORD_SIZE_JITTER` | `96` |
 | `PQ_FLIGHT_RECORD_MIN` | `144` |
 | `PQ_FLIGHT_AGGREGATE_PAD_MIN` / `_MAX` | `64` / `512` |
 
@@ -718,11 +721,16 @@ The 16-byte header is `PQ_CHUNK_FRAME_HEADER_LEN = 16` (= `4+4+4+4`). The
 receiver reassembles strictly in increasing-offset order (out-of-order →
 `OutOfOrder`); a differing `total_len` across chunks → `InconsistentTotal`;
 `offset + chunk_len > total_len` → `InvalidOffset`. The reassembled artifact MUST
-NOT exceed `MAX_PQ_HANDSHAKE_FRAME = 4096` bytes for `PX1F`. Per-chunk plaintext
-is drawn from `[PQ_HANDSHAKE_CHUNK_MIN_PLAINTEXT, PQ_HANDSHAKE_CHUNK_MAX_PLAINTEXT]
-= [256, 1024]` bytes (the sender picks a per-session chunk size in that range, so
-record sizes vary across connections). `PX1I` (§6.4) is the identical layout for
-the server identity proof.
+NOT exceed `MAX_PQ_HANDSHAKE_FRAME = 4096` bytes for `PX1F`. Production handshake
+senders use `encode_all_browser_shaped`: chunk body sizes are selected around
+`PQ_FLIGHT_RECORD_TARGETS` with a bias toward smaller centers and downward jitter
+of up to `SHAPED_RECORD_SIZE_JITTER = 96` bytes (§11.2). A final remainder is
+kept whole; nonfinal chunks and the remaining tail are at least
+`PQ_FLIGHT_RECORD_MIN = 144` bytes. The codec's safe record budget caps the
+chunk size. The older `encode_all_shaped` helper's `[256, 1024]` range is not
+the production handshake distribution. `PX1I` (§6.4) has the identical wire
+layout for the server identity proof; its client caller caps the complete
+identity payload at 16384 bytes.
 
 ---
 
@@ -1117,9 +1125,12 @@ session (no `CONNECT`, connection closed like a normal origin would).
 
 ### 7.4 Replay / freshness check
 
-Once the auth tag verifies (§7.2), the server runs this freshness/replay check
-before treating the client as authenticated (a failure here is treated exactly
-like an auth failure → indefinite origin relay). The server extracts
+The replay gate has two stages. Once the carrier auth tag verifies (§7.2), the
+server first tries a **pending admission reservation**: freshness, an already
+committed nonce or transcript, a duplicate pending transcript, pending capacity,
+or a busy cache lock can refuse admission. Refused connections immediately use
+the ordinary origin splice and do not install epoch-0 keys or enter the
+authenticated pre-PQ bridge. The server extracts
 `(timestamp, nonce)` from the recovered `tail` plus a transcript fingerprint of
 the ClientHello, and consults the replay cache (capacity/semantics §13.1,
 on-disk journal §18):
@@ -1127,15 +1138,35 @@ on-disk journal §18):
 - `timestamp` MUST satisfy `now − window ≤ timestamp ≤ now + 5s` (`window`
   default ≈720 s in the reference: `fallback_idle_floor_secs` default 600 s plus
   the base 120 s replay window; `+5 s` future skew clamp). Outside → `Stale`,
-  splice.
+  refuse admission through the origin splice. A provisionally admitted entry
+  that becomes stale before commit instead closes after data proof.
 - The `(nonce, transcript_fingerprint)` MUST be unseen within the window.
-  Seen → `Replayed`, splice.
-- On acceptance the entry is inserted (single-use).
+  A previously committed nonce **or** transcript fingerprint refuses admission
+  through the origin splice. Pending transcripts also prevent duplicate
+  simultaneous reservations.
+- A pending reservation is not a durable journal insertion. Only an admitted
+  connection that decrypts and reassembles a valid first `PX1Q` reaches
+  **persistent commit**, before the PQ ratchet. Commit rechecks freshness and
+  uniqueness: a competing nonce commit, expiry, a full persistent cache/source
+  quota or missing cache refuses this session by graceful close. Fresh committed
+  entries are not evicted to admit a new one. Cancellation releases pending
+  admission without burning a journal entry.
+
+A known replayed ClientHello uses the origin splice, including any subsequent
+bytes on that refused connection. A connection admitted provisionally can fail
+the later commit; this post-proof refusal uses the existing jittered graceful
+close path and does not install epoch-1 keys or dial a target.
 
 ### 7.5 Handshake timeout
 
-The whole authenticated handshake (Phases A–C) is bounded by a server-side
-timeout (default 8 s). Exceeding it closes the connection like an idle origin.
+The reference uses stage-specific deadlines. Origin connection and individual
+handshake record operations use `HANDSHAKE_TIMEOUT = 8 s`. The origin-bridged
+pre-PQ phase has an absolute deadline derived from `fallback_idle_timeout()`;
+the post-rekey wait for the first mode-selection record is also bounded by that
+idle budget. The client wraps complete establishment, including identity
+reassembly, in `CLIENT_ESTABLISH_TIMEOUT = 15 s`. These are not one common
+8-second end-to-end deadline. A record arriving during a phase does not extend
+that phase's absolute deadline.
 
 ---
 
@@ -1174,13 +1205,14 @@ connection over.
                                     │ relay origin ServerHello+flight to client
                                     │ (transcript = CH || origin SH; derive keys)
               ┌─────────────────────┴────────────────────────┐
-        authenticated & fresh                       not-auth / replay / malformed
+       carrier + pending admitted                   not-auth / malformed / admission refused
               │                                              │
               ▼                                              ▼
         BRIDGE_UNTIL_PX1Q                             ORIGIN_SPLICE  (§13)
          (keep relaying client↔origin;               (relay client↔origin forever;
           await client's first PX1Q)                  indistinguishable from a real origin)
-              │ recv valid PX1Q → drop origin
+              │ valid PX1Q → persistent commit; refusal → CLOSED
+              │ fresh commit → drop origin
               ▼
         SEND_KEX+IDENTITY (PX1K, PX1I carrying PX1S) ──► REKEYED
               │
@@ -1406,21 +1438,26 @@ target sizes drawn from fixed bands:
 
 - **CONNECT record.** The sender computes `raw_wire = encoded_len +
   DATA_RECORD_WIRE_OVERHEAD(18)`, collects every band in
-  `CONNECT_RECORD_SIZE_BANDS = [286, 469, 569, 735, 911, 1180, 1353, 1600]` with
+  `CONNECT_RECORD_SIZE_BANDS = [286, 339, 469, 519, 569, 713, 735, 1353]` with
   `band ≥ raw_wire` and `band − raw_wire ≤ max_extra_pad` (where `max_extra_pad`
   is how much pad this record can still take without pushing the sealed record
-  past `OUTER_TLS_RECORD_LIMIT`), then **picks one of the fitting bands uniformly
-  at random** (NOT the smallest — random choice decorrelates the on-wire length
-  from the host length and 0-RTT payload size).
+  past `OUTER_TLS_RECORD_LIMIT`), then chooses a fitting center with a bias toward
+  smaller centers: take the smaller of two independently uniform candidate
+  indices. It adds upward jitter in `[0, min(96, remaining_pad_budget)]`.
+  The jitter chooses an inclusive span of up to 32, 64 or 96 bytes with
+  probabilities 70%, 22% and 8%, then samples uniformly in that span. Thus
+  records spread around centers instead of exposing a comb of exact lengths.
   The pad rides the self-describing 2-byte trailer (§11.1), so decoding is
   unchanged. If no band fits (large 0-RTT payload) shaping is skipped for that
   record and its size is dominated by the payload.
 - **PQ handshake flight (`PX1Q`, `PX1K`, identity).** Chunked and shaped to
-  `PQ_FLIGHT_RECORD_TARGETS = [144, 191, 286, 339, 469, 519, 569, 713, 735, 911,
-  1180, 1353]`, with a minimum record size of `PQ_FLIGHT_RECORD_MIN = 144`
+  `PQ_FLIGHT_RECORD_TARGETS = [144, 191, 286, 339, 469, 519, 569, 713, 735, 1353,
+  1440, 1459]`, with a minimum chunk body size of `PQ_FLIGHT_RECORD_MIN = 144`
   (no tiny records), and a per-session aggregate pad in
   `[PQ_FLIGHT_AGGREGATE_PAD_MIN, PQ_FLIGHT_AGGREGATE_PAD_MAX] = [64, 512]`
-  applied to the last record of the flight to decorrelate the total flight size.
+  applied by the seal layer to decorrelate the total flight size. Centers use
+  the same smaller-of-two-index weighting; jitter is subtracted downward and
+  clamped to preserve the minimum body and remaining tail (§5.8).
 - **Control frames.** The fixed-length in-band control frames — UDP negotiation
   (`PX1G`/`PX1O`/`PX1P`/`PX1N`) and the `SPEED_*` diagnostics — are **also** padded
   up to a `CONNECT_RECORD_SIZE_BANDS` target, so a tiny fixed-size control record
@@ -1430,8 +1467,10 @@ target sizes drawn from fixed bands:
   write → one record → one TCP segment in steady state; no `1/n−1` split, no
   coalescing across records).
 
-These targets are *plaintext* byte counts; the on-wire record adds the 18-byte
-data-record overhead and the 5-byte TLS header.
+CONNECT/control centers describe the TLS record payload length, already
+including the 18-byte data-record overhead; the outer TLS header adds 5 bytes.
+PQ-flight centers describe chunk body sizes: their records additionally carry
+the 16-byte chunk header, record padding/trailer, AEAD tag and TLS header.
 
 ### 11.3 Optional traffic-shaping profiles
 
@@ -1614,9 +1653,13 @@ After the TLS handshake, the connection looks like Safari's HTTP/2:
 - **Request pseudo-header order:** `:method`, `:scheme`, `:authority`, `:path`
   (m, s, a, p).
 
-ParallaX inner records ride as HTTP/2 `DATA` frame payloads on a long-lived
-stream; a DATA frame body is sized at 16374 to sit just under the 16384 record
-boundary, matching Safari's bulk-transfer behavior.
+When the origin negotiates `h2`, the camouflage handshake sends this opening
+under the origin's TLS application keys and consumes its SETTINGS/ACK before
+handoff. This is still origin-bridged traffic. The first **ParallaX inner**
+record is then `PX1Q` (§7.3), and after takeover subsequent ParallaX records use
+`DataRecordCodec` directly; they are not wrapped in an ongoing HTTP/2 DATA
+stream. HTTP/3 DATA framing on the QUIC plane is a separate, live carrier
+(§9.2/§12.6).
 
 ### 12.5 QUIC ClientHello (QUIC plane)
 
@@ -1805,8 +1848,10 @@ MAY omit it (always do a full 1-RTT handshake).
   is an AEAD-sealed server-side state (a Server Ticket Encryption Key, derived
   per-server, seals: negotiated suite, ALPN, the resumption PSK, issue time, and
   lifetime). The client simply stores and replays it as the
-  `pre_shared_key` identity. The sealed ticket is padded to a **fixed 160 bytes**
-  on the wire (inside Safari 26.4's observed 157–160 B resumption-ticket range)
+  `pre_shared_key` identity. The sealed ticket is padded to a per-ticket random
+  length from `MIN_SEALED_TICKET_LEN = 157` through
+  `MAX_SEALED_TICKET_LEN = 160` bytes, inclusive, on the wire
+  (Safari 26.4's observed resumption-ticket range)
   so the `pre_shared_key` identity length is not a ParallaX tell. Ticket
   `lifetime_secs` is capped at 604800 (7 days) per RFC 8446.
 - **Anti-replay.** 0-RTT early data is **single-use**: the server keeps a
@@ -1904,8 +1949,10 @@ not":
 
 - The auth path and the splice path MUST be indistinguishable to the peer in
   bytes and timing to the extent achievable; the reference implementation funnels
-  every failure mode (auth, replay, malformed, policy) into the same splice
-  behavior (I2).
+  unauthenticated carrier and pending-admission failures into the origin-splice
+  behavior (I2). Malformed inner data and persistent replay-commit refusal on an
+  already admitted connection use graceful close (§7.4/§8); they do not resume
+  origin forwarding or install epoch-1 traffic keys.
 - The fallback origin's certificate MUST validly chain for `sni`, which is why a
   live deployment requires the fallback host to be reachable.
 - A residual, bounded (~50 ms) timing characteristic on the QUIC decide path is
@@ -2105,7 +2152,7 @@ fail-closed / splice behavior. None of these names appear on the wire.
 `InvalidHost` (non-UTF-8), `ZeroPort`, `InvalidPayloadLength`.
 
 `MuxFrameError`: `Truncated`, `BadMagic`, `InvalidKind` (kind ∉ 1..=5),
-`InvalidStreamId` (parity rule violated), `PayloadTooLong`,
+`InvalidStreamId` (COVER uses a nonzero id, or another kind uses zero), `PayloadTooLong`,
 `InvalidPayloadLength`.
 
 `PqRekeyError` / `ServerKeyExchangeError`: `Truncated`, `BadMagic`,
@@ -2225,9 +2272,11 @@ identity"`; the signed message is per §5.6. Verification is FIPS 204
 - **Nonce reuse.** Per-direction sequence counters make AEAD nonces unique;
   exhaustion aborts. Substreams derive independent keys (distinct HKDF info
   containing the stream id), so two streams never share a nonce base.
-- **Active probing.** Origin-splice (§13) makes an unauthenticated/replayed probe
-  indistinguishable from a real connection to the fallback origin. The auth and
-  failure paths MUST converge (I2).
+- **Active probing.** Origin-splice (§13) forwards unauthenticated carriers and
+  ClientHellos refused by pending admission to the fallback origin, including
+  already committed replays. For an admitted session, a later persistent commit
+  refusal after valid inner proof closes before rekey (§7.4). The
+  unauthenticated auth-failure paths MUST converge on origin forwarding (I2).
 - **Traffic analysis.** Record-size shaping (§11.2), the Safari fingerprint
   (§12), and cover frames (§9.1) defend against passive size/timing
   classification. An implementer MUST NOT introduce records, settings, or timing
@@ -2314,8 +2363,8 @@ this document; an implementer should reproduce these checks:
 - `OUTER_TLS_RECORD_LIMIT = 16384 + 17 = 16401`.
 - One CONNECT for `host="example.com"` (11 bytes), no 0-RTT:
   `encoded_len = 12 + 11 + 0 = 23`, so `raw_wire = 23 + 18 = 41`; every band
-  ≥ 41 fits (all of them here), and the sender picks one uniformly at random
-  (e.g. 286, 469, …, 1600) and pads to it (§11.2).
+  ≥ 41 fits (all of them here), and the sender uses the weighted center plus
+  upward jitter (e.g. a length within 286–382 or 1353–1449) (§11.2).
 - `PqRekeyRequest` with ML-KEM-1024 public key: `40 + 1568 = 1608` bytes
   (then chunked/shaped across `PQ_FLIGHT_RECORD_TARGETS`).
 - `ServerKeyExchange` (with suite): `40 + 1568 + 1 = 1609` bytes.
@@ -2342,8 +2391,10 @@ A second implementation claiming interoperability with the reference SHOULD pass
 6. **Origin-splice.** A connection with a wrong PSK is transparently relayed to
    the fallback origin and completes a valid TLS session to it; the prober
    observes nothing ParallaX-specific.
-7. **Replay rejection.** Re-sending a captured authenticated ClientHello within
-   the window is spliced (rejected), not authenticated.
+7. **Replay rejection.** Re-sending a previously committed ClientHello is
+   refused by pending admission and its complete response is the real origin's.
+   Separately, an admitted session whose persistent commit is refused after a
+   valid `PX1Q` closes before rekey and creates no target connection (§7.4).
 8. **Post-handshake drain.** Against a fallback origin that emits a
    `NewSessionTicket` after the TLS handshake, the new client drains it to a
    record boundary and still sends a well-formed first `PX1Q` (§7.3) — it does

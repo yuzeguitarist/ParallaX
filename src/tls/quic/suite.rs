@@ -195,6 +195,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sha256_hmac_matches_rfc4231_short_and_long_keys() {
+        // RFC 4231 sections 4.2/4.7, published independent known answers:
+        // https://www.rfc-editor.org/rfc/rfc4231.html
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            assert_eq!(
+                suite.hmac(&[0x0b; 20], b"Hi There").unwrap(),
+                hex::decode("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+                    .unwrap()
+            );
+            assert_eq!(
+                suite
+                    .hmac(
+                        &[0xaa; 131],
+                        b"Test Using Larger Than Block-Size Key - Hash Key First"
+                    )
+                    .unwrap(),
+                hex::decode("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn sha256_hkdf_extract_matches_rfc5869() {
+        // RFC 5869 Appendix A.1/A.2/A.3. These call the production extract
+        // helper; arbitrary-info Expand is not a public TLS-Expand-Label API.
+        // https://www.rfc-editor.org/rfc/rfc5869.html#appendix-A
+        let cases = [
+            (
+                (0..13).collect::<Vec<u8>>(),
+                vec![0x0b; 22],
+                "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
+            ),
+            (
+                (0x60..=0xaf).collect(),
+                (0..=0x4f).collect(),
+                "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244",
+            ),
+            (
+                vec![],
+                vec![0x0b; 22],
+                "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04",
+            ),
+        ];
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            for (salt, ikm, expected) in &cases {
+                assert_eq!(
+                    suite.hkdf_extract(salt, ikm),
+                    hex::decode(expected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn suite_params_match_rfc8446() {
         assert_eq!(CipherSuite::Aes128GcmSha256.hash_len(), 32);
         assert_eq!(CipherSuite::Aes128GcmSha256.key_len(), 16);

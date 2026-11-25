@@ -190,6 +190,7 @@ impl TransportParameters {
 
     /// Serialize the server's transport parameters (RFC 9000 §18) in ascending id
     /// order. Includes `initial_max_streams_bidi` (the client's encoder omits it).
+    /// ACK delay parameters are omitted only when they match the RFC defaults.
     pub fn encode_server(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(56);
         put_param(&mut out, TP_INITIAL_MAX_DATA, self.initial_max_data);
@@ -218,6 +219,16 @@ impl TransportParameters {
             TP_INITIAL_MAX_STREAMS_UNI,
             self.initial_max_streams_uni,
         );
+        if self.ack_delay_exponent != DEFAULT_ACK_DELAY_EXPONENT {
+            put_param(
+                &mut out,
+                TP_ACK_DELAY_EXPONENT,
+                self.ack_delay_exponent as u64,
+            );
+        }
+        if self.max_ack_delay_ms != DEFAULT_MAX_ACK_DELAY_MS {
+            put_param(&mut out, TP_MAX_ACK_DELAY, self.max_ack_delay_ms);
+        }
         put_param(
             &mut out,
             TP_ACTIVE_CONNECTION_ID_LIMIT,
@@ -623,6 +634,40 @@ mod tests {
     }
 
     #[test]
+    fn server_encoding_roundtrips_fuzz_issue_231() {
+        // Minimized input from #231 (base64: CwJ0Ww==): max_ack_delay = 13403 ms.
+        let tp = TransportParameters::read(&[0x0b, 0x02, 0x74, 0x5b]).unwrap();
+        assert_eq!(tp.max_ack_delay_ms, 13_403);
+        assert_eq!(TransportParameters::read(&tp.encode_server()).unwrap(), tp);
+    }
+
+    #[test]
+    fn server_encoding_preserves_ack_parameters() {
+        for exponent in [0, DEFAULT_ACK_DELAY_EXPONENT, 20] {
+            for max_delay in [0, DEFAULT_MAX_ACK_DELAY_MS, 63, 64, (1 << 14) - 1] {
+                let mut tp = TransportParameters::server(&[0xab, 0xcd]);
+                tp.ack_delay_exponent = exponent;
+                tp.max_ack_delay_ms = max_delay;
+                let encoded = tp.encode_server();
+                assert_eq!(TransportParameters::read(&encoded).unwrap(), tp);
+                let ids: Vec<u64> = decode_pairs(&encoded)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                assert_eq!(
+                    ids.contains(&TP_ACK_DELAY_EXPONENT),
+                    exponent != DEFAULT_ACK_DELAY_EXPONENT
+                );
+                assert_eq!(
+                    ids.contains(&TP_MAX_ACK_DELAY),
+                    max_delay != DEFAULT_MAX_ACK_DELAY_MS
+                );
+                assert!(ids.windows(2).all(|ids| ids[0] < ids[1]));
+            }
+        }
+    }
+
+    #[test]
     fn read_populates_known_ids_and_ignores_unknown() {
         // A server-style blob: initial_max_data, a bidi grant of 1, the CID limit,
         // and an unknown id that must be ignored without error.
@@ -811,6 +856,51 @@ mod tests {
         varint::encode(TP_INITIAL_MAX_DATA, &mut blob);
         varint::encode((1u64 << 62) - 1, &mut blob); // claims ~4.6 exabytes of body
         assert_eq!(TransportParameters::read(&blob), Err(Error::Truncated));
+    }
+}
+
+#[cfg(test)]
+mod generated_properties {
+    use super::super::property;
+    use super::*;
+
+    #[test]
+    fn generated_parameters_preserve_values_and_reject_duplicate_or_truncated_fields() {
+        property::check("quic-transport-parameters", |case| {
+            let cid = case.payload(20);
+            let mut expected = TransportParameters::server(cid);
+            expected.initial_max_data = case.a & varint::MAX;
+            expected.initial_max_stream_data_bidi_local = case.b & varint::MAX;
+            expected.initial_max_stream_data_bidi_remote = case.c & varint::MAX;
+            expected.initial_max_stream_data_uni = case.a & varint::MAX;
+            expected.initial_max_streams_bidi = case.b % (MAX_STREAMS_LIMIT + 1);
+            expected.initial_max_streams_uni = case.c % (MAX_STREAMS_LIMIT + 1);
+            expected.active_connection_id_limit = 2 + case.a % (varint::MAX - 1);
+            let wire = expected.encode_server();
+            prop_assert_eq!(TransportParameters::read(&wire).unwrap(), expected.clone());
+            let unknown = 0x40 + case.b % 4096;
+            let mut extended = wire.clone();
+            put_param_bytes(&mut extended, unknown, case.payload(256));
+            prop_assert_eq!(TransportParameters::read(&extended).unwrap(), expected);
+            put_param_bytes(&mut extended, unknown, &[]);
+            prop_assert_eq!(TransportParameters::read(&extended), Err(Error::Duplicate));
+            let mut duplicate = wire;
+            put_param(&mut duplicate, TP_INITIAL_MAX_DATA, 0);
+            prop_assert_eq!(TransportParameters::read(&duplicate), Err(Error::Duplicate));
+            let mut truncated = Vec::new();
+            varint::encode(unknown, &mut truncated);
+            varint::encode(case.bytes.len() as u64 + 1, &mut truncated);
+            truncated.extend_from_slice(&case.bytes);
+            prop_assert_eq!(TransportParameters::read(&truncated), Err(Error::Truncated));
+            let mut invalid = Vec::new();
+            put_param(
+                &mut invalid,
+                TP_ACK_DELAY_EXPONENT,
+                21 + case.c % (varint::MAX - 20),
+            );
+            prop_assert_eq!(TransportParameters::read(&invalid), Err(Error::Invalid));
+            Ok(())
+        });
     }
 }
 

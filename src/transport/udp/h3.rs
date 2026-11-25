@@ -536,4 +536,146 @@ mod tests {
             "an unbounded read against a silent peer must hit the wrapping timeout"
         );
     }
+
+    async fn assert_business_frame(
+        response: bool,
+        wire: &[u8],
+        expected_error: Option<io::ErrorKind>,
+    ) {
+        let (_server_endpoint, _client_endpoint, client, server) = loopback_pair().await;
+        let (mut client_send, client_recv) = client.open_bi();
+        // A server cannot open a response on a client bidi before its first byte.
+        // In the request direction that byte belongs to the tested frame.
+        client_send
+            .write_all(if response { b"\0" } else { &wire[..1] })
+            .await
+            .unwrap();
+        let (server_send, server_recv) = server.accept_bi().await.unwrap();
+        let (mut send, mut recv) = if response {
+            (server_send, client_recv)
+        } else {
+            (client_send, server_recv)
+        };
+        let writer = async {
+            let remaining = if response { wire } else { &wire[1..] };
+            for chunk in remaining.chunks(17) {
+                send.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            if expected_error.is_none() {
+                // HEADERS must consume exactly one frame, leaving DATA untouched.
+                send.write_all(b"\0\x03end").await.unwrap();
+            }
+            send.finish();
+        };
+        let reader = async {
+            let result = if response {
+                read_business_response_headers(&mut recv).await
+            } else {
+                read_business_request_headers(&mut recv).await
+            };
+            if let Some(kind) = expected_error {
+                assert_eq!(result.unwrap_err().kind(), kind, "response={response}");
+            } else {
+                result.unwrap();
+                let mut data = [0; 5];
+                recv.read_exact(&mut data).await.unwrap();
+                assert_eq!(&data, b"\0\x03end");
+                assert_eq!(recv.read(&mut data).await.unwrap(), 0);
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(writer, reader);
+        })
+        .await
+        .expect("framing decision must complete, including truncated FIN");
+    }
+
+    #[tokio::test]
+    async fn business_headers_bound_and_fragmented_varints_preserve_following_data() {
+        for response in [false, true] {
+            for size in [0u64, 1, 4096] {
+                // Independent, deliberately nonminimal 8-byte QUIC varints.
+                let mut wire = vec![0xc0, 0, 0, 0, 0, 0, 0, 1];
+                let mut length = size.to_be_bytes();
+                length[0] |= 0xc0;
+                wire.extend_from_slice(&length);
+                wire.resize(wire.len() + size as usize, 0xa5);
+                assert_business_frame(response, &wire, None).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn business_headers_reject_over_cap_and_each_incomplete_framing_stage() {
+        for response in [false, true] {
+            for (wire, kind) in [
+                (vec![1, 0x50, 1], io::ErrorKind::InvalidData), // 4097, no body
+                (vec![0, 0], io::ErrorKind::InvalidData),       // DATA, not HEADERS
+                (vec![0xc0, 0], io::ErrorKind::UnexpectedEof),  // type varint
+                (vec![1, 0x80, 0], io::ErrorKind::UnexpectedEof), // length varint
+                (vec![1, 0x50, 0, 7], io::ErrorKind::UnexpectedEof), // body
+            ] {
+                assert_business_frame(response, &wire, Some(kind)).await;
+            }
+        }
+    }
+
+    async fn assert_control_prefix(streams: &[Vec<u8>], expected: Result<usize, io::ErrorKind>) {
+        let (_server_endpoint, _client_endpoint, client, server) = loopback_pair().await;
+        let writer = async {
+            let mut held = Vec::new();
+            for wire in streams {
+                let mut send = client.open_uni();
+                for byte in wire {
+                    send.write_all(&[*byte]).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+                if expected == Err(io::ErrorKind::UnexpectedEof) {
+                    send.finish();
+                }
+                held.push(send);
+            }
+            held
+        };
+        let reader = async {
+            match (read_peer_h3_settings(&server).await, expected) {
+                (Ok(settings), Ok(count)) => assert_eq!(settings.len(), count),
+                (Err(error), Err(kind)) => assert_eq!(error.kind(), kind),
+                (actual, expected) => panic!("SETTINGS result {actual:?}, expected {expected:?}"),
+            }
+        };
+        let (_held, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(writer, reader)
+        })
+        .await
+        .expect("control-prefix classification must complete");
+    }
+
+    #[tokio::test]
+    async fn control_stream_allows_both_qpack_orders_and_exact_settings_limit() {
+        for order in [[2, 3], [3, 2]] {
+            let mut control = vec![0, 4, 0x41, 0]; // 256-byte SETTINGS payload
+            for id in 64..128 {
+                control.extend_from_slice(&[0x40, id, 0x40, 0]);
+            }
+            assert_control_prefix(&[vec![order[0]], vec![order[1]], control], Ok(64)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn control_stream_rejects_duplicate_decoder_and_incomplete_or_oversized_settings() {
+        for (streams, kind) in [
+            (vec![vec![3], vec![3]], io::ErrorKind::InvalidData),
+            (vec![vec![2], vec![3], vec![2]], io::ErrorKind::InvalidData),
+            (vec![vec![0, 0, 0]], io::ErrorKind::InvalidData),
+            (vec![vec![0, 4, 0x41, 1]], io::ErrorKind::InvalidData),
+            (vec![vec![0xc0, 0]], io::ErrorKind::UnexpectedEof),
+            (vec![vec![0, 0x40]], io::ErrorKind::UnexpectedEof),
+            (vec![vec![0, 4, 0x80, 0]], io::ErrorKind::UnexpectedEof),
+            (vec![vec![0, 4, 2, 1]], io::ErrorKind::UnexpectedEof),
+        ] {
+            assert_control_prefix(&streams, Err(kind)).await;
+        }
+    }
 }

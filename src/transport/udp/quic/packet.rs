@@ -237,6 +237,29 @@ impl Header {
         }
     }
 
+    /// Packet-number offset within a freshly encoded header, without allocating
+    /// a temporary encoding for the packet planners.
+    pub(crate) fn pn_offset(&self) -> usize {
+        match self {
+            Header::Short { dcid, .. } => 1 + dcid.len(),
+            Header::Long {
+                ty,
+                dcid,
+                scid,
+                token,
+                length,
+                ..
+            } => {
+                let token_len = if *ty == LongType::Initial {
+                    varint::size(token.len() as u64) + token.len()
+                } else {
+                    0
+                };
+                7 + dcid.len() + scid.len() + token_len + varint::size(*length)
+            }
+        }
+    }
+
     /// Serialize the header (through the plaintext packet number) into `out`, and
     /// return the byte offset of the packet-number field (the HP `pn_offset`). The
     /// written bytes are the AEAD AAD.
@@ -633,6 +656,55 @@ mod tests {
         assert_eq!(cid.len(), 8);
         assert_eq!(cid.as_slice(), &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(ConnectionId::new(&[]).is_empty());
+    }
+
+    #[test]
+    fn calculated_pn_offset_matches_header_encoding() {
+        let assert_offset = |header: Header| {
+            for prefix in [0, 7] {
+                let mut bytes = vec![0x55; prefix];
+                let actual = header.encode(&mut bytes);
+                assert_eq!(actual, prefix + header.pn_offset());
+            }
+        };
+        for dcid_len in [0, MAX_CID_LEN] {
+            let dcid = ConnectionId::new(&[0x33; MAX_CID_LEN][..dcid_len]);
+            for pn_len in 1..=8 {
+                assert_offset(Header::Short {
+                    spin: true,
+                    key_phase: true,
+                    dcid,
+                    packet_number: 7,
+                    pn_len,
+                });
+                for scid_len in [0, MAX_CID_LEN] {
+                    let scid = ConnectionId::new(&[0x44; MAX_CID_LEN][..scid_len]);
+                    for ty in [
+                        LongType::Initial,
+                        LongType::ZeroRtt,
+                        LongType::Handshake,
+                        LongType::Retry,
+                    ] {
+                        for token_len in [0, 63, 64, 16383, 16384] {
+                            for length in
+                                [0, 63, 64, 16383, 16384, (1 << 30) - 1, 1 << 30, varint::MAX]
+                            {
+                                assert_offset(Header::Long {
+                                    ty,
+                                    version: 1,
+                                    dcid,
+                                    scid,
+                                    token: vec![0x77; token_len],
+                                    length,
+                                    packet_number: 7,
+                                    pn_len,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1043,5 +1115,195 @@ mod tests {
         let (decoded, aad_len) = Header::decode(&pkt, 0, 0).unwrap();
         assert_eq!(decoded, hdr);
         assert_eq!(aad_len, pn_offset + 1);
+    }
+}
+
+#[cfg(test)]
+mod generated_properties {
+    use super::super::property;
+    use super::*;
+
+    // RFC 9000 A.3 chooses the valid congruent packet number nearest the next
+    // expected number, preferring the larger value at the half-window tie. This
+    // enumerates neighboring candidates rather than copying the decoder branches.
+    fn nearest_packet_number(largest: u64, truncated: u64, width: usize) -> u64 {
+        let expected = u128::from(largest) + 1;
+        let window = 1u128 << (width * 8);
+        let quotient = expected / window;
+        (quotient.saturating_sub(1)..=quotient + 1)
+            .map(|n| n * window + u128::from(truncated))
+            .filter(|n| *n < (1u128 << 62))
+            .min_by_key(|n| (n.abs_diff(expected), u128::MAX - n))
+            .unwrap() as u64
+    }
+
+    fn wire_varint(value: u64, wire: &mut Vec<u8>) {
+        let width = [1, 2, 4, 8]
+            .into_iter()
+            .find(|width| u128::from(value) < (1u128 << (width * 8 - 2)))
+            .unwrap();
+        let begin = wire.len();
+        wire.extend_from_slice(&value.to_be_bytes()[8 - width..]);
+        wire[begin] |= match width {
+            1 => 0,
+            2 => 0x40,
+            4 => 0x80,
+            _ => 0xc0,
+        };
+    }
+
+    #[test]
+    fn generated_packet_numbers_match_nearest_candidate_and_minimal_width_oracles() {
+        property::check("quic-packet-number-model", |case| {
+            let largest = (case.a & ((1u64 << 62) - 1)).min((1u64 << 62) - 2);
+            for width in 1..=4 {
+                let mask = (1u64 << (width * 8)) - 1;
+                for truncated in [0, mask / 2, mask / 2 + 1, mask, case.b & mask] {
+                    prop_assert_eq!(
+                        decode_packet_number(largest, truncated, width),
+                        nearest_packet_number(largest, truncated, width)
+                    );
+                }
+            }
+            let full = case.a & ((1u64 << 62) - 1);
+            for acked in [None, Some(full.saturating_sub(case.b % (1u64 << 33)))] {
+                let distance = acked.map_or(u128::from(full) + 1, |n| u128::from(full - n));
+                let expected_width = (1..=4)
+                    .find(|width| 2 * distance < (1u128 << (width * 8)))
+                    .unwrap_or(4);
+                let (bytes, width) = encode_packet_number(full, acked);
+                prop_assert_eq!(width, expected_width);
+                prop_assert_eq!(&bytes[..width], &full.to_be_bytes()[8 - width..]);
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn generated_wire_headers_preserve_fields_boundaries_and_reserved_bit_rejection() {
+        property::check("quic-wire-header-oracle", |case| {
+            let dcid_bytes = case.array::<20>(0);
+            let scid_bytes = case.array::<20>(20);
+            let dcid = &dcid_bytes[..case.a as usize % 21];
+            let scid = &scid_bytes[..case.b as usize % 21];
+            let token = case.payload(32);
+            let payload = case.payload(64);
+            let largest = (case.a & ((1u64 << 62) - 1)).min((1u64 << 62) - 2);
+            for width in 1..=4 {
+                let truncated = case.c & ((1u64 << (width * 8)) - 1);
+                let number = nearest_packet_number(largest, truncated, width);
+                for (bits, ty) in [
+                    (0, LongType::Initial),
+                    (0x10, LongType::ZeroRtt),
+                    (0x20, LongType::Handshake),
+                ] {
+                    let mut wire = vec![0xc0 | bits | (width as u8 - 1)];
+                    wire.extend_from_slice(&(case.b as u32).to_be_bytes());
+                    wire.push(dcid.len() as u8);
+                    wire.extend_from_slice(dcid);
+                    wire.push(scid.len() as u8);
+                    wire.extend_from_slice(scid);
+                    if bits == 0 {
+                        wire_varint(token.len() as u64, &mut wire);
+                        wire.extend_from_slice(token);
+                    }
+                    let length = (width + payload.len()) as u64;
+                    wire_varint(length, &mut wire);
+                    let offset = wire.len();
+                    wire.extend_from_slice(&truncated.to_be_bytes()[8 - width..]);
+                    let header_end = wire.len();
+                    wire.extend_from_slice(payload);
+                    let total = wire.len();
+                    let expected = Header::Long {
+                        ty,
+                        version: case.b as u32,
+                        dcid: ConnectionId::new(dcid),
+                        scid: ConnectionId::new(scid),
+                        token: if bits == 0 {
+                            token.to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                        length,
+                        packet_number: number,
+                        pn_len: width,
+                    };
+                    prop_assert_eq!(locate_pn_offset(&wire, dcid.len()), Ok(offset));
+                    prop_assert_eq!(
+                        Header::decode(&wire, dcid.len(), largest),
+                        Ok((expected.clone(), header_end))
+                    );
+                    let mut encoded = Vec::new();
+                    prop_assert_eq!(expected.encode(&mut encoded), offset);
+                    prop_assert_eq!(encoded, &wire[..header_end]);
+                    for cut in 0..header_end {
+                        prop_assert!(Header::decode(&wire[..cut], dcid.len(), largest).is_err());
+                    }
+                    for cut in 0..total {
+                        prop_assert_eq!(long_packet_len(&wire[..cut]), None);
+                    }
+                    wire.extend_from_slice(&[0x40, 0]);
+                    prop_assert_eq!(long_packet_len(&wire), Some(total));
+                    for reserved in [0x04, 0x08] {
+                        let mut bad = wire.clone();
+                        bad[0] |= reserved;
+                        prop_assert_eq!(
+                            Header::decode(&bad, dcid.len(), largest),
+                            Err(DecodeError::ReservedBitsSet)
+                        );
+                        // The pre-HP locator must ignore still-protected bits.
+                        prop_assert_eq!(locate_pn_offset(&bad, dcid.len()), Ok(offset));
+                    }
+                }
+                let spin = case.a & 1 != 0;
+                let phase = case.b & 1 != 0;
+                let mut wire =
+                    vec![0x40 | (u8::from(spin) << 5) | (u8::from(phase) << 2) | (width as u8 - 1)];
+                wire.extend_from_slice(dcid);
+                wire.extend_from_slice(&truncated.to_be_bytes()[8 - width..]);
+                let expected = Header::Short {
+                    spin,
+                    key_phase: phase,
+                    dcid: ConnectionId::new(dcid),
+                    packet_number: number,
+                    pn_len: width,
+                };
+                prop_assert_eq!(
+                    Header::decode(&wire, dcid.len(), largest),
+                    Ok((expected.clone(), wire.len()))
+                );
+                let mut encoded = Vec::new();
+                prop_assert_eq!(expected.encode(&mut encoded), 1 + dcid.len());
+                prop_assert_eq!(encoded, wire);
+                prop_assert_eq!(long_packet_len(&wire), None);
+                for cut in 0..wire.len() {
+                    prop_assert!(Header::decode(&wire[..cut], dcid.len(), largest).is_err());
+                }
+                for reserved in [0x08, 0x10] {
+                    let mut bad = wire.clone();
+                    bad[0] |= reserved;
+                    prop_assert_eq!(
+                        Header::decode(&bad, dcid.len(), largest),
+                        Err(DecodeError::ReservedBitsSet)
+                    );
+                }
+            }
+            for invalid_len in [21, 255, usize::MAX] {
+                prop_assert_eq!(
+                    Header::decode(&[0x40], invalid_len, 0),
+                    Err(DecodeError::CidTooLong)
+                );
+                prop_assert_eq!(
+                    locate_pn_offset(&[0x40], invalid_len),
+                    Err(DecodeError::CidTooLong)
+                );
+            }
+            // A length-prefixed DCID over the v1 bound is rejected before use.
+            prop_assert_eq!(
+                Header::decode(&[0xc0, 0, 0, 0, 1, 21], 0, 0),
+                Err(DecodeError::CidTooLong)
+            );
+            Ok(())
+        });
     }
 }

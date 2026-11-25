@@ -312,26 +312,54 @@ impl From<packet::DecodeError> for OpenError {
 /// must already be set (the caller picks `pn_len` via
 /// [`packet::encode_packet_number`]). Returns the protected datagram.
 pub fn seal_packet(keys: &DirectionalKeys, mut header: Header, frames: &[Frame]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    for f in frames {
-        f.encode(&mut payload);
-    }
     let tag_len = keys.packet.tag_len();
     let pn = header.packet_number();
     let pn_len = header.pn_len();
-    if let Header::Long { length, .. } = &mut header {
-        *length = (pn_len + payload.len() + tag_len) as u64;
-    }
-
-    let mut pkt = Vec::with_capacity(pn_len + payload.len() + tag_len + 32);
-    let pn_offset = header.encode(&mut pkt);
-    // AEAD AAD = the header bytes through the (plaintext) packet number.
-    let aad = pkt[..pn_offset + pn_len].to_vec();
-    let body = pkt.len();
-    pkt.extend_from_slice(&payload);
+    let stream_len = match (&header, frames) {
+        (
+            Header::Short { pn_len: 1..=4, .. },
+            [Frame::Stream {
+                id, offset, data, ..
+            }],
+        ) => Some(
+            1 + super::varint::size(*id)
+                + if *offset == 0 {
+                    0
+                } else {
+                    super::varint::size(*offset)
+                }
+                + super::varint::size(data.len() as u64)
+                + data.len(),
+        ),
+        _ => None,
+    };
+    let (mut pkt, pn_offset, body) = if let Some(payload_len) = stream_len {
+        // The bulk path can encode directly into the final allocation. Keep the
+        // same capacity as the staged encoder, including room for the tag.
+        let mut pkt = Vec::with_capacity(pn_len + payload_len + tag_len + 32);
+        let pn_offset = header.encode(&mut pkt);
+        let body = pkt.len();
+        frames[0].encode(&mut pkt);
+        (pkt, pn_offset, body)
+    } else {
+        let mut payload = Vec::new();
+        for frame in frames {
+            frame.encode(&mut payload);
+        }
+        if let Header::Long { length, .. } = &mut header {
+            *length = (pn_len + payload.len() + tag_len) as u64;
+        }
+        let mut pkt = Vec::with_capacity(pn_len + payload.len() + tag_len + 32);
+        let pn_offset = header.encode(&mut pkt);
+        let body = pkt.len();
+        pkt.extend_from_slice(&payload);
+        (pkt, pn_offset, body)
+    };
     pkt.resize(pkt.len() + tag_len, 0);
+    // AAD and ciphertext occupy disjoint parts of the final packet.
+    let (aad, ciphertext) = pkt.split_at_mut(body);
     keys.packet
-        .encrypt_in_place(pn, &aad, &mut pkt[body..])
+        .encrypt_in_place(pn, aad, ciphertext)
         .expect("packet buffer reserves the AEAD tag");
     keys.header
         .encrypt_header(pn_offset, &mut pkt)
@@ -2783,8 +2811,7 @@ impl Connection {
             // RFC 9000 §14.1: a client pads EVERY datagram carrying an Initial, an
             // ACK-only one included (Safari: ACK + PADDING to 1200).
             if space == SPACE_INITIAL && self.side == Side::Client {
-                let mut probe = Vec::new();
-                let pn_offset = header.encode(&mut probe);
+                let pn_offset = header.pn_offset();
                 let mut payload = Vec::new();
                 ack.encode(&mut payload);
                 let pad = MIN_INITIAL_DATAGRAM.saturating_sub(
@@ -3024,6 +3051,24 @@ impl Connection {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_handshake_crypto(&self) -> &[u8] {
+        &self.spaces[SPACE_HANDSHAKE].crypto_send
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_handshake_packet(&mut self, offset: u64, data: &[u8]) -> Vec<u8> {
+        let pn = self.allocate_packet_number(SPACE_HANDSHAKE);
+        let (_, pn_len) = packet::encode_packet_number(pn, None);
+        let header = self.make_header(SPACE_HANDSHAKE, pn, pn_len);
+        let keys = self.spaces[SPACE_HANDSHAKE].keys.as_ref().unwrap();
+        seal_packet(
+            &keys.local,
+            header,
+            &[Frame::Crypto { offset, data }, Frame::Padding(3)],
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_cancelled_stream_waits_for_accept(&self, id: u64) -> bool {
         self.streams.get(&id).is_some_and(|s| {
             s.reset_acked && s.recv_reset.is_some() && s.recv_high == 0 && !s.recv_released
@@ -3081,8 +3126,7 @@ impl Connection {
         let pn = self.allocate_packet_number(SPACE_DATA);
         let (_, pn_len) = packet::encode_packet_number(pn, None);
         let header = self.make_header(SPACE_DATA, pn, pn_len);
-        let mut hdr_buf = Vec::new();
-        let pn_offset = header.encode(&mut hdr_buf);
+        let pn_offset = header.pn_offset();
         let tag_len = self.spaces[SPACE_DATA]
             .keys
             .as_ref()
@@ -3206,8 +3250,7 @@ impl Connection {
             .packet
             .tag_len();
         let header = self.make_header(space, pn, pn_len);
-        let mut probe = Vec::new();
-        let pn_offset = header.encode(&mut probe);
+        let pn_offset = header.pn_offset();
 
         // A lost CRYPTO range is resent verbatim (it was already sized to fit a
         // packet); otherwise carve the next fresh chunk under the datagram budget.
@@ -3375,8 +3418,7 @@ impl Connection {
             .packet
             .tag_len();
         let header = self.make_header(SPACE_DATA, pn, pn_len);
-        let mut probe = Vec::new();
-        let pn_offset = header.encode(&mut probe);
+        let pn_offset = header.pn_offset();
 
         let s = &self.streams[&id];
         let offset = s.retransmit.first().map_or(s.send_off, |range| range.0);
@@ -3473,8 +3515,7 @@ impl Connection {
             .packet
             .tag_len();
         let header = self.make_zero_rtt_header(pn, pn_len);
-        let mut probe = Vec::new();
-        let pn_offset = header.encode(&mut probe);
+        let pn_offset = header.pn_offset();
 
         let s = &self.streams[&id];
         let (offset, end, fin, is_retransmit) = if let Some(&(off, len, fin)) = s.retransmit.first()
@@ -3613,6 +3654,12 @@ impl Connection {
         }
         let space = space_index(pspace);
         if self.spaces[space].discarded {
+            return Ok(());
+        }
+        // A known four-tuple still cannot change the connection's QUIC version.
+        // The version is plaintext AAD, so reject unsupported long headers before
+        // deriving keys, decrypting or committing authenticated receive state.
+        if pkt[0] & 0x80 != 0 && pkt.get(1..5) != Some(self.version.to_be_bytes().as_slice()) {
             return Ok(());
         }
 
@@ -3768,9 +3815,9 @@ impl Connection {
             self.peer_addr_validated = true;
         }
 
-        // Copy the decrypted frames out so the TLS engine can be mutated while we
-        // iterate.
-        let payload = pkt[range].to_vec();
+        // The packet buffer is independent of the connection, so frames can
+        // borrow it while the TLS and stream state are updated.
+        let payload = &pkt[range];
         // A packet is ack-eliciting (RFC 9002 §2) if it carries any frame other
         // than ACK / PADDING / CONNECTION_CLOSE — such a packet schedules an ACK.
         let mut ack_eliciting = false;
@@ -3782,7 +3829,7 @@ impl Connection {
         // fingerprints/interop breaks against a real
         // origin, but a ParallaX peer never sends them. See frame.rs's invariant note
         // before pointing this path at any non-ParallaX peer.
-        let mut frames = Iter::new(&payload);
+        let mut frames = Iter::new(payload);
         while let Some(frame) = frames.next() {
             let frame_type = frames.last_frame_type();
             let frame = frame.map_err(|e| {
@@ -4990,6 +5037,195 @@ mod tests {
         );
     }
 
+    /// Original allocating encoder, retained as a byte/capacity/panic oracle.
+    fn legacy_seal_packet(keys: &DirectionalKeys, mut header: Header, frames: &[Frame]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for frame in frames {
+            frame.encode(&mut payload);
+        }
+        let tag_len = keys.packet.tag_len();
+        let pn = header.packet_number();
+        let pn_len = header.pn_len();
+        if let Header::Long { length, .. } = &mut header {
+            *length = (pn_len + payload.len() + tag_len) as u64;
+        }
+        let mut pkt = Vec::with_capacity(pn_len + payload.len() + tag_len + 32);
+        let pn_offset = header.encode(&mut pkt);
+        let aad = pkt[..pn_offset + pn_len].to_vec();
+        let body = pkt.len();
+        pkt.extend_from_slice(&payload);
+        pkt.resize(pkt.len() + tag_len, 0);
+        keys.packet
+            .encrypt_in_place(pn, &aad, &mut pkt[body..])
+            .expect("packet buffer reserves the AEAD tag");
+        keys.header
+            .encrypt_header(pn_offset, &mut pkt)
+            .expect("sealed packet is longer than the HP sample");
+        pkt
+    }
+
+    fn assert_packet_seal_matches_legacy(keys: &DirectionalKeys, header: Header, frames: &[Frame]) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let expected = catch_unwind(AssertUnwindSafe(|| {
+            legacy_seal_packet(keys, header.clone(), frames)
+        }));
+        let actual = catch_unwind(AssertUnwindSafe(|| seal_packet(keys, header, frames)));
+        match (actual, expected) {
+            (Ok(actual), Ok(expected)) => {
+                assert_eq!(actual, expected);
+                assert_eq!(actual.capacity(), expected.capacity());
+            }
+            (Err(actual), Err(expected)) => {
+                let message = |panic: Box<dyn std::any::Any + Send>| {
+                    panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                };
+                assert_eq!(message(actual), message(expected));
+            }
+            _ => panic!("packet encoder changed whether it panics"),
+        }
+    }
+
+    #[test]
+    fn packet_seal_matches_legacy_bytes_capacity_and_panics() {
+        let max = super::super::varint::MAX;
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let keys = DirectionalKeys::from_secret(suite, &vec![0x42; suite.hash_len()]).unwrap();
+            for cid_len in [0, packet::MAX_CID_LEN] {
+                let dcid = ConnectionId::new(&[0x33; packet::MAX_CID_LEN][..cid_len]);
+                let short_header = |pn_len, spin, key_phase| Header::Short {
+                    spin,
+                    key_phase,
+                    dcid,
+                    packet_number: 0x1234_5678,
+                    pn_len,
+                };
+                for pn_len in 1..=8 {
+                    for (spin, key_phase) in
+                        [(false, false), (false, true), (true, false), (true, true)]
+                    {
+                        for (id, offset, len, fin) in [
+                            (0, 0, 0, false),
+                            (0, 0, 1, true),
+                            (63, 63, 63, false),
+                            (64, 64, 64, true),
+                            (16383, 16383, 1200, false),
+                            (16384, 16384, 16383, true),
+                            ((1 << 30) - 1, (1 << 30) - 1, 16384, false),
+                            (1 << 30, 1 << 30, 2, true),
+                            (max, max, 64, false),
+                        ] {
+                            let data: Vec<_> = (0..len).map(|index| index as u8).collect();
+                            assert_packet_seal_matches_legacy(
+                                &keys,
+                                short_header(pn_len, spin, key_phase),
+                                &[Frame::Stream {
+                                    id,
+                                    offset,
+                                    fin,
+                                    data: &data,
+                                }],
+                            );
+                        }
+                    }
+                }
+                for pn_len in [0, 1, 2, 3, 4, 5, 8, 9, usize::MAX] {
+                    let header = short_header(pn_len, false, false);
+                    assert_packet_seal_matches_legacy(&keys, header.clone(), &[]);
+                    assert_packet_seal_matches_legacy(&keys, header.clone(), &[Frame::Ping]);
+                    assert_packet_seal_matches_legacy(
+                        &keys,
+                        header,
+                        &[Frame::Stream {
+                            id: 0,
+                            offset: 0,
+                            fin: false,
+                            data: &[0x5a; 64],
+                        }],
+                    );
+                }
+                let header = short_header(4, false, false);
+                for value in [max + 1, u64::MAX] {
+                    assert_packet_seal_matches_legacy(
+                        &keys,
+                        header.clone(),
+                        &[Frame::Stream {
+                            id: value,
+                            offset: 0,
+                            fin: false,
+                            data: &[0x5a; 64],
+                        }],
+                    );
+                    assert_packet_seal_matches_legacy(
+                        &keys,
+                        header.clone(),
+                        &[Frame::Stream {
+                            id: 0,
+                            offset: value,
+                            fin: false,
+                            data: &[0x5a; 64],
+                        }],
+                    );
+                }
+                let ack = [
+                    Frame::Ack(Ack {
+                        largest: 5,
+                        delay: 3,
+                        ranges: vec![(0, 5)],
+                        ecn: None,
+                    }),
+                    Frame::Padding(8),
+                ];
+                assert_packet_seal_matches_legacy(&keys, header.clone(), &ack);
+                let mixed = [
+                    Frame::Stream {
+                        id: 0,
+                        offset: 64,
+                        fin: true,
+                        data: &[0x5a; 64],
+                    },
+                    Frame::Ping,
+                ];
+                assert_packet_seal_matches_legacy(&keys, header, &mixed);
+                for ty in [
+                    LongType::Initial,
+                    LongType::ZeroRtt,
+                    LongType::Handshake,
+                    LongType::Retry,
+                ] {
+                    for pn_len in [0, 1, 4, 5, 8, 9] {
+                        let header = Header::Long {
+                            ty,
+                            version: 1,
+                            dcid,
+                            scid: dcid,
+                            token: vec![0x77; 64],
+                            length: 1200,
+                            packet_number: 7,
+                            pn_len,
+                        };
+                        assert_packet_seal_matches_legacy(
+                            &keys,
+                            header.clone(),
+                            &[Frame::Crypto {
+                                offset: 64,
+                                data: &[0x5a; 1200],
+                            }],
+                        );
+                        assert_packet_seal_matches_legacy(&keys, header, &ack);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn initial_packet_seal_open_round_trips() {
         let keys = test_keys();
@@ -5896,6 +6132,177 @@ mod tests {
             client.handshake_confirmed,
             "client confirms on receiving HANDSHAKE_DONE"
         );
+    }
+
+    #[test]
+    fn authenticated_wrong_version_packets_do_not_commit_and_v1_recovers() {
+        for receiving_client in [false, true] {
+            let mut client = Connection::new_client(
+                client_config(),
+                "example.com",
+                ConnectionId::new(&[0xb1; 8]),
+                ConnectionId::new(&[]),
+            )
+            .unwrap();
+            let mut server = Connection::new_server(
+                Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+                &server_key(),
+                vec![b"h3".to_vec()],
+                server_tp(),
+                ConnectionId::new(&[0xb2; 4]),
+            )
+            .unwrap();
+            let now = Instant::now();
+            while let Some(datagram) = client.poll_transmit(now) {
+                server.handle_datagram(&datagram, now).unwrap();
+            }
+            let (sender, receiver) = if receiving_client {
+                (&mut server, &mut client)
+            } else {
+                (&mut client, &mut server)
+            };
+            let pn = sender.allocate_packet_number(SPACE_INITIAL);
+            let header = sender.make_header(SPACE_INITIAL, pn, 1);
+            let mut wrong_header = header.clone();
+            let Header::Long { version, .. } = &mut wrong_header else {
+                panic!("Initial requires a long header");
+            };
+            *version = 0x0a0a_0a0a;
+            let keys = sender.spaces[SPACE_INITIAL].keys.as_ref().unwrap();
+            let frames = [Frame::Ping, Frame::Padding(1200)];
+            let wrong = seal_packet(&keys.local, wrong_header, &frames);
+            let good = seal_packet(&keys.local, header, &frames);
+            // The unsupported version is authenticated as part of AAD. A mere
+            // flipped version byte would fail AEAD and miss this admission gate.
+            let mut opened = wrong.clone();
+            let (decoded, _) = open_packet(
+                &keys.local,
+                &mut opened,
+                receiver.scid.len(),
+                receiver.spaces[SPACE_INITIAL].recv.largest(),
+            )
+            .unwrap();
+            assert!(matches!(
+                decoded,
+                Header::Long {
+                    version: 0x0a0a_0a0a,
+                    ..
+                }
+            ));
+            let before_pn = receiver.spaces[SPACE_INITIAL].recv.to_ack(0);
+            let before_idle = receiver.last_recv_time;
+            let before_cid = receiver.dcid;
+            let before_ecn = receiver.spaces[SPACE_INITIAL].recv_ecn;
+            receiver
+                .handle_datagram_ecn(&wrong, EcnCodepoint::Ce, now + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(receiver.spaces[SPACE_INITIAL].recv.to_ack(0), before_pn);
+            assert_eq!(receiver.last_recv_time, before_idle);
+            assert_eq!(receiver.dcid, before_cid);
+            let after_ecn = receiver.spaces[SPACE_INITIAL].recv_ecn;
+            assert_eq!(
+                (after_ecn.ect0, after_ecn.ect1, after_ecn.ce),
+                (before_ecn.ect0, before_ecn.ect1, before_ecn.ce)
+            );
+            assert!(!receiver.is_closed());
+            sender.record_sent(
+                SPACE_INITIAL,
+                pn,
+                good.len(),
+                true,
+                SentContent::default(),
+                now,
+            );
+            receiver
+                .handle_datagram(&good, now + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(receiver.spaces[SPACE_INITIAL].recv.largest(), Some(pn));
+            drive_at(&mut client, &mut server, now + Duration::from_secs(2));
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+        }
+    }
+
+    #[test]
+    fn valid_zero_rtt_does_not_validate_address_or_lift_amplification_limit() {
+        let (ticket, stek) = ack_parameter_resumption_ticket();
+        let mut client = Connection::new_client_resumption(
+            client_config(),
+            "example.com",
+            ConnectionId::new(&[0xb3; 8]),
+            ConnectionId::new(&[]),
+            &ticket,
+            1_001_000,
+        )
+        .unwrap();
+        let mut server = Connection::new_server_with_stek(
+            Arc::new(vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]),
+            &server_key(),
+            vec![b"h3".to_vec()],
+            server_tp(),
+            ConnectionId::new(&[0xb4; 4]),
+            Some(stek),
+        )
+        .unwrap();
+        let early = b"authenticated early stream is not address validation";
+        client.send_stream(RELAY_STREAM_ID, early);
+        let now = Instant::now();
+        let mut received = 0;
+        let mut saw_early = false;
+        while let Some(datagram) = client.poll_transmit(now) {
+            saw_early |= packet::first_packet_space(&datagram) == Some(PacketSpace::ZeroRtt);
+            received += datagram.len() as u64;
+            server.handle_datagram(&datagram, now).unwrap();
+            assert!(!server.peer_addr_validated);
+        }
+        assert!(saw_early && server.zero_rtt_keys_installed());
+        assert_eq!(server.read_stream(RELAY_STREAM_ID), early);
+        assert!(server.is_handshaking());
+        assert_eq!(server.anti_amp_recv, received);
+
+        // A valid PSK lets the server encrypt application output, but its holder
+        // can replay an old early-data flight from a spoofed source. Force enough
+        // genuine output to hit the address budget before any Handshake reply.
+        let response = vec![0x6d; 24 * 1024];
+        server.send_stream(RELAY_STREAM_ID, &response);
+        let mut sent = 0;
+        while let Some(datagram) = server.poll_transmit(now) {
+            sent += datagram.len() as u64;
+            client.handle_datagram(&datagram, now).unwrap();
+        }
+        assert!(!server.peer_addr_validated);
+        assert!(sent <= 3 * received);
+        assert_eq!(server.anti_amp_sent, sent);
+        assert!(server.streams[&RELAY_STREAM_ID].send_off < response.len() as u64);
+        assert!(
+            server.anti_amp_sent + MAX_DATAGRAM as u64 > 3 * server.anti_amp_recv,
+            "the anti-amplification budget, not just pacing, must stop output"
+        );
+
+        // Deliver the real client's pending Handshake flight, then permit ACKs
+        // and data in both directions. The former address budget must no longer
+        // cap the rest of the response.
+        for _ in 0..32 {
+            let mut moved = false;
+            while let Some(datagram) = client.poll_transmit(now) {
+                server.handle_datagram(&datagram, now).unwrap();
+                moved = true;
+            }
+            while let Some(datagram) = server.poll_transmit(now) {
+                sent += datagram.len() as u64;
+                client.handle_datagram(&datagram, now).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        assert!(server.peer_addr_validated);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert!(
+            sent > 3 * received,
+            "Handshake validation lifts the earlier bound"
+        );
+        assert_eq!(client.read_stream(RELAY_STREAM_ID), response);
     }
 
     /// RFC 9000 §8.1 anti-amplification (findings #203/#216): before the client's
@@ -8475,6 +8882,242 @@ mod tests {
             response,
             "client received the response"
         );
+    }
+
+    /// Isolates authenticated near-MTU packet processing from packet generation
+    /// and socket I/O. Run in release mode with --ignored --nocapture.
+    #[test]
+    #[ignore = "packet processing timing benchmark; run manually in release mode"]
+    fn packet_processing_benchmark() {
+        // The ignored CI lane is a smoke check; release measurements stay fixed.
+        const PACKETS: u64 = if cfg!(debug_assertions) { 256 } else { 20_000 };
+        const SAMPLES: usize = 7;
+        for suite in [
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..=SAMPLES {
+                let (mut client, mut server) = handshake_start(suite);
+                drive(&mut client, &mut server);
+                assert!(client.handshake_confirmed && server.handshake_confirmed);
+                let first = client.spaces[SPACE_DATA].send.peek();
+                let keys = &client.spaces[SPACE_DATA].keys.as_ref().unwrap().local;
+                let mut packets: Vec<_> = (first..first + PACKETS)
+                    .map(|pn| {
+                        let (_, pn_len) = packet::encode_packet_number(pn, None);
+                        seal_packet(
+                            keys,
+                            client.make_header(SPACE_DATA, pn, pn_len),
+                            &[Frame::Ping, Frame::Padding(1199)],
+                        )
+                    })
+                    .collect();
+                let now = Instant::now();
+                let failures = server.data_packets_open_failed;
+                let start = Instant::now();
+                for packet in &mut packets {
+                    server
+                        .process_packet(packet, EcnCodepoint::NotEct, now)
+                        .unwrap();
+                }
+                let ns_per_packet = start.elapsed().as_secs_f64() * 1e9 / PACKETS as f64;
+                assert_eq!(
+                    server.spaces[SPACE_DATA].recv.largest(),
+                    Some(first + PACKETS - 1)
+                );
+                assert_eq!(server.data_packets_open_failed, failures);
+                assert!(!server.is_closed());
+                if sample != 0 {
+                    samples.push(ns_per_packet);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "packet processing {suite:?}: 1200-byte payload, ns/packet samples={samples:?}, median={:.0}",
+                samples[SAMPLES / 2],
+            );
+        }
+    }
+
+    /// Times the real STREAM packet builder and isolated sealing controls.
+    /// Run in release mode with --ignored --nocapture.
+    #[test]
+    #[ignore = "packet transmit timing benchmark; run manually in release mode"]
+    fn packet_transmit_benchmark() {
+        use std::hint::black_box;
+
+        const BYTES: usize = if cfg!(debug_assertions) {
+            64 * 1024
+        } else {
+            STREAM_SEND_BUFFER
+        };
+        const ITERATIONS: u64 = if cfg!(debug_assertions) { 32 } else { 5_000 };
+        const SAMPLES: usize = 7;
+        let payload = vec![0x5a; BYTES];
+        let report = |suite: CipherSuite, name: &str, mut samples: Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "packet transmit {suite:?}, {name}: ns/packet samples={samples:?}, median={:.0}",
+                samples[SAMPLES / 2],
+            );
+        };
+
+        for suite in [
+            CipherSuite::Aes128GcmSha256,
+            CipherSuite::Aes256GcmSha384,
+            CipherSuite::ChaCha20Poly1305Sha256,
+        ] {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..=SAMPLES {
+                let (mut client, mut server) = handshake_start(suite);
+                drive(&mut client, &mut server);
+                let id = client.open_bi();
+                client.send_stream(id, &payload);
+                client.finish_stream(id);
+                assert!(client.streams[&id].send_max >= BYTES as u64);
+                assert!(client.send_max_data - client.send_data_total >= BYTES as u64);
+                let first_pn = client.spaces[SPACE_DATA].send.peek();
+                let sent_before = client.spaces[SPACE_DATA].sent_content.len();
+                let sealed_before = client.data_packets_sealed;
+                let now = Instant::now();
+                let mut first_packet = None;
+                let mut last_packet = None;
+                let mut packets = 0u64;
+                let start = Instant::now();
+                while client.streams[&id].send_off < BYTES as u64 {
+                    let packet = client.build_stream_packet(id, now);
+                    black_box(&packet);
+                    if first_packet.is_none() {
+                        first_packet = Some(packet);
+                    } else {
+                        last_packet = Some(packet);
+                    }
+                    packets += 1;
+                }
+                let ns_per_packet = start.elapsed().as_secs_f64() * 1e9 / packets as f64;
+                assert_eq!(client.streams[&id].send, payload);
+                assert!(client.streams[&id].fin_sent);
+                assert_eq!(client.spaces[SPACE_DATA].send.peek() - first_pn, packets);
+                assert_eq!(client.data_packets_sealed - sealed_before, packets);
+                assert_eq!(
+                    client.spaces[SPACE_DATA].sent_content.len() - sent_before,
+                    packets as usize
+                );
+                for (pn, mut packet) in [
+                    (first_pn, first_packet.unwrap()),
+                    (first_pn + packets - 1, last_packet.unwrap()),
+                ] {
+                    let (_, range) = open_packet(
+                        &server.spaces[SPACE_DATA].keys.as_ref().unwrap().remote,
+                        &mut packet,
+                        server.scid.len(),
+                        Some(pn.saturating_sub(1)),
+                    )
+                    .unwrap();
+                    let Frame::Stream {
+                        id: stream,
+                        offset,
+                        fin,
+                        data,
+                    } = Iter::new(&packet[range]).next().unwrap().unwrap()
+                    else {
+                        panic!("builder must emit a STREAM frame");
+                    };
+                    assert_eq!(stream, id);
+                    assert_eq!(
+                        data,
+                        &payload[offset as usize..offset as usize + data.len()]
+                    );
+                    assert_eq!(fin, offset as usize + data.len() == BYTES);
+                }
+                if sample != 0 {
+                    samples.push(ns_per_packet);
+                }
+            }
+            report(suite, "stream-builder", samples);
+
+            for (case, name) in ["stream-64", "stream-1200", "ack", "long-crypto"]
+                .into_iter()
+                .enumerate()
+            {
+                let secret = vec![0x42 + case as u8; suite.hash_len()];
+                let keys = DirectionalKeys::from_secret(suite, &secret).unwrap();
+                let data = vec![0x5a; if case == 0 { 64 } else { 1200 }];
+                let frames = match case {
+                    0 | 1 => vec![Frame::Stream {
+                        id: 0,
+                        offset: 64,
+                        fin: false,
+                        data: &data,
+                    }],
+                    2 => vec![
+                        Frame::Ack(Ack {
+                            largest: 0,
+                            delay: 0,
+                            ranges: vec![(0, 0)],
+                            ecn: None,
+                        }),
+                        Frame::Padding(8),
+                    ],
+                    _ => vec![Frame::Crypto {
+                        offset: 0,
+                        data: &data,
+                    }],
+                };
+                let header = if case == 3 {
+                    Header::Long {
+                        ty: LongType::Handshake,
+                        version: 1,
+                        dcid: ConnectionId::new(&[1; 8]),
+                        scid: ConnectionId::new(&[2; 4]),
+                        token: Vec::new(),
+                        length: 0,
+                        packet_number: 0,
+                        pn_len: 4,
+                    }
+                } else {
+                    Header::Short {
+                        spin: false,
+                        key_phase: false,
+                        dcid: ConnectionId::new(&[1; 8]),
+                        packet_number: 0,
+                        pn_len: 4,
+                    }
+                };
+                type Encoder = for<'a> fn(&DirectionalKeys, Header, &[Frame<'a>]) -> Vec<u8>;
+                let encoders: [Encoder; 2] = [seal_packet, legacy_seal_packet];
+                let mut samples = [Vec::with_capacity(SAMPLES), Vec::with_capacity(SAMPLES)];
+                for sample in 0..=SAMPLES {
+                    for variant in if sample % 2 == 0 { [0, 1] } else { [1, 0] } {
+                        let mut headers: Vec<_> = (1..=ITERATIONS)
+                            .map(|pn| {
+                                let mut header = header.clone();
+                                match &mut header {
+                                    Header::Long { packet_number, .. }
+                                    | Header::Short { packet_number, .. } => {
+                                        *packet_number = sample as u64 * ITERATIONS + pn;
+                                    }
+                                }
+                                header
+                            })
+                            .collect();
+                        let encoder = encoders[variant];
+                        let start = Instant::now();
+                        for header in headers.drain(..) {
+                            black_box(black_box(encoder)(&keys, header, &frames));
+                        }
+                        let elapsed = start.elapsed();
+                        if sample != 0 {
+                            samples[variant].push(elapsed.as_secs_f64() * 1e9 / ITERATIONS as f64);
+                        }
+                    }
+                }
+                let [current, legacy] = samples;
+                report(suite, name, current);
+                report(suite, &format!("{name}-legacy"), legacy);
+            }
+        }
     }
 
     #[test]

@@ -123,6 +123,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identity_secret_container_live_wipe_has_automatic_drop_contract() {
+        fn drops_zeroized<T: ZeroizeOnDrop>() {}
+        drops_zeroized::<MlDsaKeyPair>();
+        let mut keys = keypair();
+        assert!(!keys.public.is_empty());
+        assert!(!keys.secret.is_empty());
+        // Safely observe live Vec::zeroize behavior; this does not read freed
+        // storage or claim that every compiler/OS copy has been erased.
+        keys.zeroize();
+        assert!(keys.public.is_empty());
+        assert!(keys.secret.is_empty());
+    }
+
+    #[test]
+    fn os_rng_identity_key_generation_and_hedged_signing_smoke_is_consistent() {
+        let mut public_keys = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let keys = keypair();
+            assert!(public_keys.insert(keys.public.clone()));
+            let first =
+                sign_server_identity(&keys.secret, &[1; 32], &[2; 32], &[3; 32], 1).unwrap();
+            let second =
+                sign_server_identity(&keys.secret, &[1; 32], &[2; 32], &[3; 32], 1).unwrap();
+            assert_ne!(first, second, "hedged signing draws fresh OS randomness");
+            for signature in [first, second] {
+                verify_server_identity(&keys.public, &signature, &[1; 32], &[2; 32], &[3; 32], 1)
+                    .unwrap();
+            }
+        }
+        // Three key pairs/six signatures are regression smoke, not an OS
+        // entropy assessment or a signature-security proof.
+    }
+
+    #[test]
     fn mldsa87_identity_signature_round_trip() {
         let keys = keypair();
         let transcript_hash = [7_u8; 32];

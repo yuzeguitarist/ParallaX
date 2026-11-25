@@ -17,6 +17,11 @@
 //! no active CID rotation. The relay rides one reliable bidi stream (HTTP/3 DATA
 //! frames) plus the H3 control/encoder uni streams.
 
+#[cfg(test)]
+#[macro_use]
+#[path = "../../../../tests/support/property.rs"]
+mod property;
+
 pub(crate) mod congestion;
 pub(crate) mod conn;
 pub(crate) mod endpoint;
