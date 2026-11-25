@@ -63,6 +63,11 @@ use sha2::{Digest, Sha256};
 use crate::crypto::replay::{ReplayCache, ReplayEntry, ReplayInsertOutcome};
 use crate::tls::quic::ZeroRttGuard;
 
+/// Upper bound on accepted tickets waiting for the durable journal. When disk
+/// persistence stalls, new tickets fall back to 1-RTT instead of growing the
+/// queue without limit.
+const MAX_PENDING_PERSISTS: usize = 16_384;
+
 struct ZeroRttGateState {
     mirror: ReplayCache,
     pending: VecDeque<(ReplayEntry, u64)>,
@@ -150,11 +155,12 @@ impl ReplayCacheGuard {
                 if let Some(now) = max_now {
                     cache.prune_expired_at(now);
                 }
+                // Do not prune again at the batch maximum after inserting: after a
+                // clock rollback an entry admitted at a lower `now` would be pruned
+                // before it is journaled, and a restart would then admit its replay
+                // even though the live gate rejected it.
                 for (entry, now) in batch {
                     let _ = cache.insert_new_outcome_deferred(entry, now);
-                }
-                if let Some(now) = max_now {
-                    cache.prune_expired_at(now);
                 }
                 cache.persist_pending()
             };
@@ -198,11 +204,12 @@ impl ReplayCacheGuard {
                 if let Some(now) = max_now {
                     cache.prune_expired_at(now);
                 }
+                // Do not prune again at the batch maximum after inserting: after a
+                // clock rollback an entry admitted at a lower `now` would be pruned
+                // before it is journaled, and a restart would then admit its replay
+                // even though the live gate rejected it.
                 for (entry, now) in batch {
                     let _ = cache.insert_new_outcome_deferred(entry, now);
-                }
-                if let Some(now) = max_now {
-                    cache.prune_expired_at(now);
                 }
                 cache
                     .persist_pending()
@@ -250,6 +257,7 @@ impl ZeroRttGuard for ReplayCacheGuard {
         };
         let mut spawn_worker = false;
         let accepted = match self.gate.try_lock() {
+            Ok(gate) if gate.pending.len() >= MAX_PENDING_PERSISTS => false,
             Ok(mut gate) => {
                 gate.max_observed_now = Some(
                     gate.max_observed_now
@@ -311,6 +319,63 @@ mod tests {
         assert!(g.accept_ticket(b"ticket-three", now));
         // ...and each is single-use.
         assert!(!g.accept_ticket(b"ticket-two", now));
+    }
+
+    #[test]
+    fn ticket_admitted_after_clock_rollback_is_journaled_before_pruning() {
+        // Two tickets land in one persist batch: one at a later time, then one
+        // after the clock stepped back by more than the window. The earlier-time
+        // entry must reach the journal, not be pruned at the batch maximum.
+        const WINDOW_SECS: u64 = 60;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero-rtt-rollback.cache");
+        let key = b"server-host-key-derived-mac-material";
+        let real_now = crate::crypto::replay::current_unix_timestamp().unwrap();
+        let rolled_back = real_now - 30;
+        let later = rolled_back + WINDOW_SECS + 100;
+
+        let cache =
+            ReplayCache::load_or_create_authenticated_with_window(&path, 64, key, WINDOW_SECS)
+                .unwrap();
+        let g = ReplayCacheGuard::new(cache);
+        // Keep both accepts in one batch by holding off the inline worker.
+        g.gate.lock().unwrap().worker_running = true;
+        assert!(g.accept_ticket(b"ticket-at-later-time", later));
+        assert!(g.accept_ticket(b"ticket-after-rollback", rolled_back));
+        g.gate.lock().unwrap().worker_running = false;
+        g.flush_pending_for_test();
+        drop(g);
+
+        let reloaded =
+            ReplayCache::load_or_create_authenticated_with_window(&path, 64, key, WINDOW_SECS)
+                .unwrap();
+        let g2 = ReplayCacheGuard::new(reloaded);
+        assert!(
+            !g2.accept_ticket(b"ticket-after-rollback", rolled_back),
+            "a ticket the live gate accepted must stay single-use across a restart"
+        );
+    }
+
+    #[test]
+    fn stalled_persistence_bounds_the_pending_queue() {
+        let g = guard();
+        g.gate.lock().unwrap().worker_running = true;
+        let now = 4_000_000;
+        for i in 0..MAX_PENDING_PERSISTS {
+            g.gate.lock().unwrap().pending.push_back((
+                ReplayEntry {
+                    timestamp: now,
+                    nonce: (i as u64).to_le_bytes(),
+                    transcript_fingerprint: [0; 32],
+                },
+                now,
+            ));
+        }
+        assert!(
+            !g.accept_ticket(b"ticket-while-persist-stalled", now),
+            "a full pending queue falls back to 1-RTT"
+        );
+        assert_eq!(g.gate.lock().unwrap().pending.len(), MAX_PENDING_PERSISTS);
     }
 
     #[test]
