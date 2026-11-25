@@ -539,6 +539,10 @@ struct MuxPoolState {
     /// Number of session builds currently in flight (bounded by
     /// [`MUX_MAX_CONCURRENT_SESSION_BUILDS`]).
     builds_in_flight: usize,
+    /// Connections parked on `build_notify` waiting for an in-flight build to
+    /// land. Compared against the spare slots those builds will bring so a
+    /// burst starts only as many handshakes as it needs.
+    parked_waiters: usize,
     /// Fired whenever a build finishes (success or failure) so parked waiters
     /// re-check the pool. Lazily created; shared by all current waiters.
     build_notify: Option<Arc<Notify>>,
@@ -983,8 +987,13 @@ impl ClientMuxPool {
         self.last_activity
             .store(relay_now_millis().saturating_add(1), Ordering::Relaxed);
         let mut build_attempts = 0u32;
+        let mut parked = false;
         loop {
             let mut state = self.inner.lock().await;
+            if parked {
+                state.parked_waiters -= 1;
+                parked = false;
+            }
             // Prune dead and surplus-idle sessions, then take a free slot on any
             // live session (reuse before build, so steady-state traffic amortizes
             // onto existing sessions instead of opening new ones).
@@ -1008,7 +1017,14 @@ impl ClientMuxPool {
             } else {
                 MUX_MAX_CONCURRENT_SESSION_BUILDS
             };
-            if state.builds_in_flight < max_builds {
+            // Each in-flight build brings one slot for its builder plus
+            // `max_concurrent_streams - 1` spare ones. Start another handshake
+            // only when the connections already parked (plus this one) exceed
+            // those spare slots; otherwise park and take a slot when it lands.
+            let spare_slots_pending = state.builds_in_flight
+                * (self.traffic.max_concurrent_streams as usize).saturating_sub(1);
+            let needs_build = state.parked_waiters + 1 > spare_slots_pending;
+            if needs_build && state.builds_in_flight < max_builds {
                 state.builds_in_flight += 1;
                 drop(state);
                 // Establish OFF-LOCK, add the new session, take its first substream
@@ -1040,15 +1056,18 @@ impl ClientMuxPool {
                     }
                 }
             }
-            // At the build-concurrency cap: park until an in-flight build lands,
-            // then retry (usually grabbing a slot it freed). The `Notified` future
-            // is created AND enabled WHILE THE LOCK IS STILL HELD, so a
-            // `notify_waiters()` from a build that completes as we unlock cannot be
-            // missed (lost-wakeup safety) — only then is the lock dropped.
+            // In-flight builds already cover this connection, or the pool is at
+            // the build-concurrency cap: park until a build lands, then retry
+            // (usually grabbing a slot it freed). The `Notified` future is created
+            // AND enabled WHILE THE LOCK IS STILL HELD, so a `notify_waiters()` from
+            // a build that completes as we unlock cannot be missed (lost-wakeup
+            // safety) — only then is the lock dropped.
             let notify = state.build_wakeup();
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            state.parked_waiters += 1;
+            parked = true;
             drop(state);
             notified.await;
         }
