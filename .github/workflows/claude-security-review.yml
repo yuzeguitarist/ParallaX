@@ -14,7 +14,7 @@ name: claude-security-review
 
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     # Cost control: run ONCE per PR (on open / ready-for-review / reopen), NOT on
     # every push. `synchronize` (fires on each new commit) was the expensive path
     # — iterating on a PR re-ran the full Claude review on every push. The single

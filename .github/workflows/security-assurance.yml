@@ -2,7 +2,7 @@ name: security-assurance
 
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     paths:
       - 'src/**'
       - 'tests/**'

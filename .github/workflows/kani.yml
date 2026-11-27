@@ -20,7 +20,7 @@ on:
   # keep this tight to avoid long runs on unrelated changes; the weekly schedule
   # covers dependency drift.
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     paths:
       - 'src/crypto/session.rs'
       - 'src/crypto/replay.rs'
