@@ -18,6 +18,7 @@ on:
     branches:
       - main
       - master
+      - 'perf/latency-peak'
     paths:
       # Anything that feeds the fuzz workspace's compile: first-party sources, the
       # fuzz crate itself, the lockfile, and this workflow.

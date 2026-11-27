@@ -20,7 +20,7 @@ name: gitleaks
 
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
   push:
     branches: [main, master]
   schedule:
