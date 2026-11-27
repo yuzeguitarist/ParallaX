@@ -23,7 +23,7 @@ FILTERS = (
 
 def script():
     for block in re.split(r"(?=^      - )", WORKFLOW.read_text(), flags=re.M):
-        if block.startswith("      - name: cargo miri test ("):
+        if block.startswith("      - name: cargo miri test\n"):
             return textwrap.dedent(block.split("        run: |\n", 1)[1])
     raise AssertionError("Missing Miri test step")
 
@@ -66,44 +66,47 @@ class MiriWorkflowTests(unittest.TestCase):
             '''))
         cargo.chmod(0o755)
 
-    def run_workflow(self, **env):
+    def run_workflow(self, test_filter, **env):
         self.log.write_text("")
         result = subprocess.run(
             ["bash", "-e", "-o", "pipefail", "-c", script()],
-            cwd=self.root, env={**self.env, **env},
+            cwd=self.root, env={**self.env, "MIRI_TEST_FILTER": test_filter, **env},
             text=True, capture_output=True,
         )
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         return result, calls
 
     def test_each_module_is_listed_and_run_separately(self):
-        result, calls = self.run_workflow()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        expected = []
+        workflow = WORKFLOW.read_text()
+        matrix_filters = re.findall(r"^            filter: '([^']+)'$", workflow, re.M)
+        self.assertEqual(tuple(matrix_filters), FILTERS)
+        self.assertIn("          MIRI_TEST_FILTER: ${{ matrix.filter }}", workflow)
         for test_filter in FILTERS:
-            command = ["+nightly", "miri", "test", "--locked", "--lib", "--", test_filter]
-            expected.extend([command + ["--list"], command])
-        self.assertEqual(calls, expected)
+            with self.subTest(test_filter=test_filter):
+                result, calls = self.run_workflow(test_filter)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                command = ["+nightly", "miri", "test", "--locked", "--lib", "--", test_filter]
+                self.assertEqual(calls, [command + ["--list"], command])
 
     def test_any_empty_filter_fails_before_running_that_module(self):
-        for index, test_filter in enumerate(FILTERS):
+        for test_filter in FILTERS:
             with self.subTest(test_filter=test_filter):
-                result, calls = self.run_workflow(EMPTY_FILTER=test_filter)
+                result, calls = self.run_workflow(test_filter, EMPTY_FILTER=test_filter)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"::error::Miri filter matched no tests: {test_filter}",
                               result.stdout)
-                self.assertEqual(len(calls), 2 * index + 1)
-                self.assertEqual(calls[-1][-2:], [test_filter, "--list"])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][-2:], [test_filter, "--list"])
 
     def test_list_failures_propagate(self):
-        for index, test_filter in enumerate(FILTERS):
+        for test_filter in FILTERS:
             with self.subTest(test_filter=test_filter):
-                result, calls = self.run_workflow(LIST_FAIL_FILTER=test_filter)
+                result, calls = self.run_workflow(test_filter, LIST_FAIL_FILTER=test_filter)
                 self.assertEqual(result.returncode, 42)
-                self.assertEqual(len(calls), 2 * index + 1)
+                self.assertEqual(len(calls), 1)
 
     def test_miri_failures_propagate(self):
-        result, calls = self.run_workflow(RUN_FAIL_FILTER=FILTERS[0])
+        result, calls = self.run_workflow(FILTERS[0], RUN_FAIL_FILTER=FILTERS[0])
         self.assertEqual(result.returncode, 43)
         self.assertEqual(len(calls), 2)
 

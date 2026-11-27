@@ -18,6 +18,7 @@ on:
     branches:
       - main
       - master
+      - 'perf/latency-peak'
     paths-ignore:
       - '**.md'
       - 'ParallaX-DeepWiki/**'

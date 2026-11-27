@@ -1,0 +1,31 @@
+name: perf-branch-guard
+
+# perf/latency-peak collects speed changes before they reach main. Every pull
+# request into it must keep main's security/camouflage yardstick intact: the
+# same PR gates, unchanged captured-traffic fixtures and censor-model data, and
+# no removed or newly ignored test. See .github/scripts/check_perf_branch_guard.py.
+
+on:
+  pull_request:
+    branches: ['perf/latency-peak']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-branch-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: no regression against main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0          # merge base with main
+          persist-credentials: false
+      - name: Compare against main
+        run: python3 .github/scripts/check_perf_branch_guard.py --base origin/main
