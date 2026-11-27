@@ -47,9 +47,21 @@ env:
 
 jobs:
   miri:
-    name: miri (pure-logic modules)
+    name: miri (${{ matrix.module }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: QUIC varint
+            filter: 'transport::udp::quic::varint::'
+          - module: QUIC frame
+            filter: 'transport::udp::quic::frame::'
+          - module: traffic
+            filter: 'traffic::'
+          - module: protocol command
+            filter: 'protocol::command::'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,24 +80,16 @@ jobs:
 
       # Pure-logic modules only (no crypto FFI or network syscalls on these paths).
       # disable-isolation lets the deterministic StdRng/time helpers run.
-      - name: cargo miri test (varint + frame + padding + command codecs)
+      - name: cargo miri test
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
+          MIRI_TEST_FILTER: ${{ matrix.filter }}
         shell: bash
         run: |
-          for test_filter in \
-            'transport::udp::quic::varint::' \
-            'transport::udp::quic::frame::' \
-            'traffic::' \
-            'protocol::command::'
-          do
-            # libtest ORs multiple filters, so check each module separately:
-            # a stale filter must fail even when the other modules have tests.
-            test_list="$(cargo +nightly miri test --locked --lib -- "$test_filter" --list)"
-            printf '%s\n' "$test_list"
-            if ! grep -q ': test$' <<< "$test_list"; then
-              echo "::error::Miri filter matched no tests: $test_filter"
-              exit 1
-            fi
-            cargo +nightly miri test --locked --lib -- "$test_filter"
-          done
+          test_list="$(cargo +nightly miri test --locked --lib -- "$MIRI_TEST_FILTER" --list)"
+          printf '%s\n' "$test_list"
+          if ! grep -q ': test$' <<< "$test_list"; then
+            echo "::error::Miri filter matched no tests: $MIRI_TEST_FILTER"
+            exit 1
+          fi
+          cargo +nightly miri test --locked --lib -- "$MIRI_TEST_FILTER"

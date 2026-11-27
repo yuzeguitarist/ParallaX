@@ -43,9 +43,11 @@ TARGET = "x86_64-unknown-linux-gnu"
 SOURCE_COMMIT = "ec9ab9d68bf7a0e86b2ddf3c0e6e3c4620e02961"
 PATCH_COMMIT = "09910aa044808dfbfe1e0f96b5e39260789212fb"
 SOURCE_URL = f"https://github.com/rust-lang/llvm-project/archive/{SOURCE_COMMIT}.tar.gz"
-PATCH_URL = f"https://github.com/llvm/llvm-project/commit/{PATCH_COMMIT}.patch"
+# GitHub's default abbreviations can change as the repository grows. Request
+# full blob IDs so the exact patch digest remains stable.
+PATCH_URL = f"https://github.com/llvm/llvm-project/commit/{PATCH_COMMIT}.patch?full_index=1"
 SOURCE_SHA256 = "a2267d295f69a8450cae462158d57f5599bef79b4c2940111c9390d47660d4fd"
-PATCH_SHA256 = "aee1a0a0ab6993ac94fc62a84017d039be56e41b430a2d41ffc91968284e2ac1"
+PATCH_SHA256 = "2faacb3237e2e28f94804dd52cb6b1563d38e9134c4e32b0ea6111df55601e07"
 PATCH_PATHS = (
     "compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp",
     "compiler-rt/test/tsan/Linux/fd_fcntl_dupfd_cloexec_norace.cpp",
