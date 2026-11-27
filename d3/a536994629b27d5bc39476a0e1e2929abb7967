@@ -1,0 +1,19 @@
+.github/scripts/test_miri_workflow.py
+  s_a4b4623abf3887::t_11726398b05f9b 26,69,73,80-83,85-89,92,94,98-99,102,104,106,109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d3a536994629b27d5bc39476a0e1e2929abb7967",
+  "prompts": {},
+  "sessions": {
+    "s_a4b4623abf3887": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21b74-4cf1-73f0-88f3-b6b163f351ba",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
