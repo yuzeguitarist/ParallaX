@@ -33,7 +33,9 @@ use super::params::{
     POLYW1_PACKEDBYTES, PUBLICKEYBYTES, RNDBYTES, SECRETKEYBYTES, SEEDBYTES, SIGNBYTES, TRBYTES,
 };
 use super::poly::Poly;
-use super::polyvec::{matrix_expand, matrix_pointwise_montgomery, Polyveck, Polyvecl};
+use super::polyvec::{
+    matrix_expand, matrix_expand_cached, matrix_pointwise_montgomery, Polyveck, Polyvecl,
+};
 
 /// The single failure mode of [`signature_ctx`]: the FIPS 204 context string
 /// exceeded the 255-byte cap. Modeled as an enum (not a unit `Err(())`) so the
@@ -166,8 +168,7 @@ pub fn signature_ctx(
     fips202::shake256(&mut rhoprime, &[&key, rnd, &mu]);
 
     // Expand matrix and transform secret vectors into the NTT domain.
-    let mut mat = [Polyvecl::zero(); K];
-    matrix_expand(&mut mat, &rho);
+    let mat = matrix_expand_cached(&rho);
     s1.ntt();
     s2.ntt();
     t0.ntt();
@@ -323,8 +324,7 @@ pub fn verify_ctx(
     // Matrix-vector multiplication; compute w' = A*z - c*2^d*t1.
     let mut cp = Poly::zero();
     cp.poly_challenge(&c);
-    let mut mat = [Polyvecl::zero(); K];
-    matrix_expand(&mut mat, &rho);
+    let mat = matrix_expand_cached(&rho);
 
     z.ntt();
     let mut w1 = Polyveck::zero();

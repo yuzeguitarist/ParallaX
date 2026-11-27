@@ -2987,6 +2987,18 @@ fn is_loopback_test_certificate(sni: &str, digest: &[u8]) -> bool {
     sni == "example.com" && digest == LOOPBACK_CAMOUFLAGE_CERT_SHA256
 }
 
+/// Pay the two process-wide one-time costs of the first client handshake ahead
+/// of the first connection: AWS-LC's jitter-entropy seeding (triggered by the
+/// first ML-KEM key share) and the platform trust-store load. Wire-invisible;
+/// a failed root load is not memoized, so the handshake still retries it.
+pub fn prewarm_client_handshake() {
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+
+    let mut byte = [0_u8; 1];
+    let _ = SystemRandom::new().fill(&mut byte);
+    let _ = native_roots();
+}
+
 fn native_roots() -> Result<&'static [CertificateDer<'static>], Safari26TlsError> {
     // Cache only the SUCCESS value: a transient empty/error load (boot-time
     // trust-store rotation, a momentary sandbox denial) must NOT be memoized, or
