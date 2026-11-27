@@ -23,6 +23,8 @@
 //! variable-time exactly as their per-poly kernels are; the arithmetic / rounding
 //! vector ops are straight-line loops safe on the secret `s1`/`s2`/`y` vectors.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use super::params::{CRHBYTES, K, L, SEEDBYTES};
 use super::poly::Poly;
 
@@ -359,6 +361,25 @@ pub fn matrix_expand(mat: &mut [Polyvecl; K], rho: &[u8; SEEDBYTES]) {
             p.poly_uniform(rho, ((i << 8) + j) as u16);
         }
     }
+}
+
+/// [`matrix_expand`] with the result for the most recently used `rho` kept for
+/// reuse. `A` depends only on `rho`, which is part of the public key, so the
+/// cached value is public and identical to a fresh expansion; a process signs
+/// (server) or verifies (client) under the same identity key on every connection.
+pub fn matrix_expand_cached(rho: &[u8; SEEDBYTES]) -> Arc<[Polyvecl; K]> {
+    type Entry = ([u8; SEEDBYTES], Arc<[Polyvecl; K]>);
+    static LAST: Mutex<Option<Entry>> = Mutex::new(None);
+    if let Some((cached_rho, mat)) = LAST.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        if cached_rho == rho {
+            return Arc::clone(mat);
+        }
+    }
+    let mut mat = [Polyvecl::zero(); K];
+    matrix_expand(&mut mat, rho);
+    let mat = Arc::new(mat);
+    *LAST.lock().unwrap_or_else(PoisonError::into_inner) = Some((*rho, Arc::clone(&mat)));
+    mat
 }
 
 /// `polyvec_matrix_pointwise_montgomery`: `t[i] = <mat[i], v>` for each of the `K`
@@ -756,6 +777,18 @@ mod tests {
                 &one[..],
                 "pack_w1 block {i} mismatch"
             );
+        }
+    }
+
+    /// The cached ExpandA must equal a fresh expansion on a miss, on a hit, and
+    /// after the cached `rho` is replaced.
+    #[test]
+    fn matrix_expand_cached_matches_fresh_expansion() {
+        for seed in [0x11u8, 0x11, 0x22, 0x11] {
+            let rho = [seed; SEEDBYTES];
+            let mut fresh = [Polyvecl::zero(); K];
+            matrix_expand(&mut fresh, &rho);
+            assert_eq!(*matrix_expand_cached(&rho), fresh);
         }
     }
 }
