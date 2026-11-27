@@ -4077,9 +4077,9 @@ where
                     batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
                 if should_parallelize_aead(record_count, payload_bytes) {
                     open_from_server
-                        .open_concat_records_parallel(
+                        .open_concat_records_parallel_in_place(
                             parallel::global(),
-                            &batch_records,
+                            &mut batch_records,
                             &mut batch_plaintext,
                         )
                         .map_err(ClientHandshakeError::from)?;
