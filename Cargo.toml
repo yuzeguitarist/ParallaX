@@ -110,12 +110,9 @@ tempfile = "3"
 # speed-test upload throughput floor) can be tested deterministically without
 # real waits. Feature-unified with the runtime tokio dep; adds no runtime code.
 tokio = { version = "1.37", features = ["test-util"] }
-# ML-DSA-87 differential oracle (tests/mldsa_differential.rs only): the PQClean C
-# FFI implementation the hand-rolled `crypto::mldsa` is cross-checked against. The
-# production identity signer is `crypto::mldsa`; these are test-only since the
-# cutover and must not re-enter [dependencies].
-pqcrypto-mldsa = "0.1.2"
-pqcrypto-traits = "0.3"
+# ML-DSA-87 differential oracle. The already resolved AWS-LC library exposes
+# the FIPS 204 context API through its C bindings.
+aws-lc-sys = { version = "0.45", default-features = false }
 # ML-DSA-87 ACVP validation harness (tests/mldsa_acvp.rs): parse NIST ACVP JSON
 # vectors and decode their uppercase-hex fields. Test-only; not runtime deps.
 serde_json = "1"

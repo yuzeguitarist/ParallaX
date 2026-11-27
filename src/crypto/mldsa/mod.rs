@@ -2,9 +2,9 @@
 //! reference for ParallaX server-identity signing.
 //!
 //! A forgery here is a server-identity bypass, so this is a faithful, byte-for-byte
-//! port of the PQClean `ml-dsa-87/clean` C (the same code `pqcrypto-mldsa 0.1.2`
-//! compiles, which is also kept in-tree as the differential oracle). It is
-//! validated against the NIST ACVP KAT vectors; see `tests/mldsa_acvp.rs`.
+//! port of the PQClean `ml-dsa-87/clean` C. It is validated against the NIST
+//! ACVP KAT vectors and tested for interoperability with AWS-LC; see
+//! `tests/mldsa_acvp.rs` and `tests/mldsa_differential.rs`.
 //!
 //! Module layout mirrors the C files 1:1 so each Rust function can be diffed
 //! against exactly one C function (the `PQCLEAN_MLDSA87_CLEAN_` prefix is dropped
