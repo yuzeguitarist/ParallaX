@@ -35,6 +35,14 @@ const SOURCE_IDLE_GRACE: Duration = Duration::from_secs(120);
 const MIN_SOURCE_MAP_ENTRIES: usize = 4096;
 /// Max idle-log entries inspected per admission so the accept path stays cheap.
 const PRUNE_BUDGET: usize = 64;
+/// Connections one source may hold on a small server, capped at three quarters of
+/// the global limit. A phone on a personal 1 GiB VPS opens tens of streams at
+/// once, and the quarter share alone left such a box (global limit 13) admitting
+/// three mux sessions from its only user and cap-shedding the rest of every burst
+/// to the origin. The three-quarter cap keeps the limiter's purpose: one source
+/// pinning fallback slots still leaves a quarter of the pool to everyone else.
+/// From a global limit of `4 * MIN_SOURCE_SHARE` up, the quarter share applies.
+const MIN_SOURCE_SHARE: usize = 16;
 /// IPv6 aggregation prefix. A single routed allocation (commonly a /48 or /56 to
 /// one customer/VPS tenant) contains thousands of /64s, so the per-/64 cap alone
 /// lets one administrative entity rotate /64s to bypass it entirely. A coarser
@@ -169,7 +177,10 @@ impl SourceLimiter {
         let max_entries = connection_limit
             .saturating_mul(4)
             .max(MIN_SOURCE_MAP_ENTRIES);
-        let source_share = u32::try_from((connection_limit / 4).max(1)).unwrap_or(u32::MAX);
+        let source_share = (connection_limit / 4)
+            .max(MIN_SOURCE_SHARE.min(connection_limit * 3 / 4))
+            .max(1);
+        let source_share = u32::try_from(source_share).unwrap_or(u32::MAX);
         let mut limiter = Self::with_params(
             cap_v4.min(source_share),
             cap_v6.min(source_share),
@@ -346,10 +357,10 @@ fn masked_v6(addr: Ipv6Addr, prefix_len: u8) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn low_global_limit_clamps_v4_v6_and_rotating_v6_prefixes() {
-        let limiter = SourceLimiter::new(256, 256, 64, 8);
+    fn global_limit_quarter_clamps_v4_v6_and_rotating_v6_prefixes() {
+        let limiter = SourceLimiter::new(256, 256, 64, 80);
         let mut permits = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..20 {
             permits.push(
                 Arc::clone(&limiter)
                     .try_admit("192.0.2.1".parse().unwrap())
@@ -359,7 +370,7 @@ mod tests {
         assert!(Arc::clone(&limiter)
             .try_admit("192.0.2.1".parse().unwrap())
             .is_none());
-        for subnet in 0..2 {
+        for subnet in 0..20 {
             permits.push(
                 Arc::clone(&limiter)
                     .try_admit(IpAddr::V6(Ipv6Addr::new(
@@ -374,6 +385,40 @@ mod tests {
         assert!(Arc::clone(&limiter)
             .try_admit("2001:db8:2::1".parse().unwrap())
             .is_some());
+    }
+
+    #[test]
+    fn small_global_limit_gives_one_source_three_quarters() {
+        // A 1 GiB VPS computes a global limit of 13; its only user needs several
+        // mux sessions at once (a phone's burst), not 13 / 4 = 3, while a source
+        // pinning fallback slots must still leave a quarter to everyone else.
+        let limiter = SourceLimiter::new(256, 256, 64, 13);
+        let permits: Vec<_> = (0..9)
+            .map(|_| {
+                Arc::clone(&limiter)
+                    .try_admit("192.0.2.1".parse().unwrap())
+                    .expect("a lone source may use three quarters of the pool")
+            })
+            .collect();
+        assert_eq!(permits.len(), 9);
+        assert!(Arc::clone(&limiter)
+            .try_admit("192.0.2.1".parse().unwrap())
+            .is_none());
+        assert!(Arc::clone(&limiter)
+            .try_admit("198.51.100.1".parse().unwrap())
+            .is_some());
+        let tiny = SourceLimiter::new(256, 256, 64, 1);
+        assert!(Arc::clone(&tiny)
+            .try_admit("192.0.2.1".parse().unwrap())
+            .is_some());
+        let wide = SourceLimiter::new(256, 256, 64, 1000);
+        let held: Vec<_> = (0..250)
+            .map(|_| Arc::clone(&wide).try_admit("192.0.2.1".parse().unwrap()))
+            .collect();
+        assert!(held.iter().all(Option::is_some));
+        assert!(Arc::clone(&wide)
+            .try_admit("192.0.2.1".parse().unwrap())
+            .is_none());
     }
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
