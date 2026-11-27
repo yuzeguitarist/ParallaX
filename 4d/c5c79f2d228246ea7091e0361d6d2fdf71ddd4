@@ -1,0 +1,33 @@
+.github/scripts/check_tls_drain.py
+  s_a4b4623abf3887::t_2b3b2958625422 78,174,177
+.github/semgrep/tls_drain.rs
+  s_a4b4623abf3887::t_64f0dc67a81755 41,183,197,202,205,207,230,233-234
+.github/semgrep/tls_drain.yml
+  s_a4b4623abf3887::t_abfa8e43114dde 38,258,270,272,274,276
+.github/workflows/miri.yml
+  s_a4b4623abf3887::t_e681b7434db9c3 50,53-64,83,86,89-95
+SPEC.md
+  s_a4b4623abf3887::t_fdaec1286eaef6 1659-1662
+src/handshake/server.rs
+  s_a4b4623abf3887::t_460cf2319c1052 6332-6333,6397,6451-6457,11825,11829,11902-11907,12849-12894,12913-12914,12916-12918,12923,12929,12939-12940,12942-12944,12948,12958,12969-12970,12972-12973,12993
+src/tls/safari26.rs
+  s_a4b4623abf3887::t_4598503e76ea4f 70-71,258-271,1111-1113,1133,1152,1154,1173,1245,1249,1251,1264,3757,3762,4369,4668,4682,4709,4739,4761,4790,4816,4839,4863,4891,4896-4932,4942,4974,4994,5020,5068,5105,5171,7742,8106
+src/traffic.rs
+  s_a4b4623abf3887::t_ee135c9272714d 149-153,335,381-395
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4dc5c79f2d228246ea7091e0361d6d2fdf71ddd4",
+  "prompts": {},
+  "sessions": {
+    "s_a4b4623abf3887": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21b74-4cf1-73f0-88f3-b6b163f351ba",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
