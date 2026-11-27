@@ -35,7 +35,7 @@ rules:
       - pattern-inside: 'async fn $PHASE(...) { ... }'
       - metavariable-regex:
           metavariable: $PHASE
-          regex: '^(drain_post_handshake|await_http2_settings_ack)$'
+          regex: '^(drain_post_handshake|await_http2_peer_settings)$'
       - pattern: 'keys.server_application.decrypt_record(...)'
       - pattern-not-inside: |
           {
@@ -255,7 +255,7 @@ rules:
                 flight.extend_from_slice(&fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?);
                 self.write_application_data(stream, keys, &flight).await?;
                 let observed = self.drain_post_handshake(stream, keys).await?;
-                self.await_http2_settings_ack(stream, keys).await?;
+                self.await_http2_peer_settings(stream, keys).await?;
                 Ok(observed)
               }
       - patterns:
@@ -267,13 +267,13 @@ rules:
     severity: ERROR
     message: A short optional H2 boundary wait must resume the same partially consumed reader until the original normal record deadline; partial timeout/EOF must fail.
     patterns:
-      - pattern: 'async fn await_http2_settings_ack(...) { ... }'
+      - pattern: 'async fn await_http2_peer_settings(...) { ... }'
       - pattern-not: |
-          async fn await_http2_settings_ack(...) {
+          async fn await_http2_peer_settings(...) {
             ...
-            for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
+            for _ in 0..H2_SETTINGS_RECORD_LIMIT {
               let record_deadline = tokio::time::Instant::now() + TLS_RECORD_COMPLETION_TIMEOUT;
-              match timeout(H2_SETTINGS_ACK_TIMEOUT, reader.read_record_into(&mut record)).await {
+              match timeout(H2_SETTINGS_TIMEOUT, reader.read_record_into(&mut record)).await {
                 Ok(Ok(())) => {},
                 Ok(Err(err)) if is_clean_close(&err) && reader.at_record_boundary() => {
                   return self.ensure_post_handshake_boundary()
