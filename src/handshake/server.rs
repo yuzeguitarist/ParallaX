@@ -2864,6 +2864,7 @@ async fn run_authenticated_data_mode(
                             ),
                         );
                         if !replay_committed? {
+                            drop(pq_response);
                             tracing::warn!(cid, "closing on replayed ClientHello after data proof");
                             // Blur the replay close-time tell (M-5): hold the inert
                             // connection for a WIDE jittered delay before tearing it
