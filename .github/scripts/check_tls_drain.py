@@ -75,7 +75,7 @@ def mutations(semgrep):
     parser = source[parser_start:parser_end]
     ticket_start = source.index("fn validate_new_session_ticket(", parser_start)
     ticket = source[ticket_start:parser_end]
-    h2_start = source.index("    async fn await_http2_settings_ack(")
+    h2_start = source.index("    async fn await_http2_peer_settings(")
     h2_end = source.index("    async fn process_http2_frames(", h2_start)
     h2 = source[h2_start:h2_end]
     opening_start = source.index("    async fn open_http2_connection(")
@@ -171,10 +171,10 @@ def mutations(semgrep):
             "parallax-tls-opening-before-drain"),
         "short_drain_completion.rs": (source[start:handler_start],
             replace_once(source[start:handler_start],
-                "TLS_RECORD_COMPLETION_TIMEOUT", "H2_SETTINGS_ACK_TIMEOUT"),
+                "TLS_RECORD_COMPLETION_TIMEOUT", "H2_SETTINGS_TIMEOUT"),
             "parallax-tls-ready-drain"),
         "short_h2_completion.rs": (h2, replace_once(h2,
-            "TLS_RECORD_COMPLETION_TIMEOUT", "H2_SETTINGS_ACK_TIMEOUT"),
+            "TLS_RECORD_COMPLETION_TIMEOUT", "H2_SETTINGS_TIMEOUT"),
             "parallax-tls-settings-record-completion"),
         "discarded_h2_record_prefix.rs": (h2, replace_once(h2,
             "record_deadline,\n                        reader.read_record_into(&mut record),",

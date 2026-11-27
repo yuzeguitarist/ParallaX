@@ -1656,8 +1656,10 @@ After the TLS handshake, the connection looks like Safari's HTTP/2:
   (m, s, a, p).
 
 When the origin negotiates `h2`, the camouflage handshake sends this opening
-under the origin's TLS application keys and consumes its SETTINGS/ACK before
-handoff. This is still origin-bridged traffic. The first **ParallaX inner**
+under the origin's TLS application keys. Receiving and acknowledging the
+origin's SETTINGS is sufficient for handoff, and a late SETTINGS-ACK is
+handled within the existing residual-origin budget. This is still origin-bridged
+traffic. The first **ParallaX inner**
 record is then `PX1Q` (§7.3), and after takeover subsequent ParallaX records use
 `DataRecordCodec` directly; they are not wrapped in an ongoing HTTP/2 DATA
 stream. HTTP/3 DATA framing on the QUIC plane is a separate, live carrier

@@ -38,7 +38,7 @@ async fn drain_post_handshake(stream: &mut TcpStream) -> Result<usize, Error> {
 }
 
 // ruleid: parallax-tls-settings-record-completion
-async fn await_http2_settings_ack() {
+async fn await_http2_peer_settings() {
     // ruleid: parallax-tls-post-handshake-processing
     let chunk = keys.server_application.decrypt_record(&record)?;
     ignore(chunk);
@@ -180,7 +180,7 @@ async fn open_http2_connection() -> Result<usize, Error> {
     flight.extend_from_slice(&fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?);
     self.write_application_data(stream, keys, &flight).await?;
     let observed = self.drain_post_handshake(stream, keys).await?;
-    self.await_http2_settings_ack(stream, keys).await?;
+    self.await_http2_peer_settings(stream, keys).await?;
     Ok(observed)
 }
 
@@ -194,17 +194,17 @@ async fn open_http2_connection() -> Result<usize, Error> {
     flight.extend_from_slice(&fingerprint.headers_frame_with_language(&self.sni, &self.accept_language)?);
     let observed = self.drain_post_handshake(stream, keys).await?;
     self.write_application_data(stream, keys, &flight).await?;
-    self.await_http2_settings_ack(stream, keys).await?;
+    self.await_http2_peer_settings(stream, keys).await?;
     Ok(observed)
 }
 
 // ok: parallax-tls-settings-record-completion
-async fn await_http2_settings_ack() -> Result<(), Error> {
+async fn await_http2_peer_settings() -> Result<(), Error> {
     let mut reader = TlsRecordReader::new(&mut *stream);
     let mut record = Vec::new();
-    for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
+    for _ in 0..H2_SETTINGS_RECORD_LIMIT {
         let record_deadline = tokio::time::Instant::now() + TLS_RECORD_COMPLETION_TIMEOUT;
-        match timeout(H2_SETTINGS_ACK_TIMEOUT, reader.read_record_into(&mut record)).await {
+        match timeout(H2_SETTINGS_TIMEOUT, reader.read_record_into(&mut record)).await {
             Ok(Ok(())) => {},
             Ok(Err(err)) if is_clean_close(&err) && reader.at_record_boundary() => {
                 return self.ensure_post_handshake_boundary()
@@ -227,11 +227,11 @@ async fn await_http2_settings_ack() -> Result<(), Error> {
 }
 
 // ruleid: parallax-tls-settings-record-completion
-async fn await_http2_settings_ack() -> Result<(), Error> {
+async fn await_http2_peer_settings() -> Result<(), Error> {
     let mut reader = TlsRecordReader::new(&mut *stream);
     let mut record = Vec::new();
-    for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
-        match timeout(H2_SETTINGS_ACK_TIMEOUT, reader.read_record_into(&mut record)).await {
+    for _ in 0..H2_SETTINGS_RECORD_LIMIT {
+        match timeout(H2_SETTINGS_TIMEOUT, reader.read_record_into(&mut record)).await {
             Ok(result) => result?,
             Err(_) => return Err(Error),
         }

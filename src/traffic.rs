@@ -146,17 +146,11 @@ impl PaddingProfile {
 
         if rng.gen_range(0..100) < 55 {
             let target = OBSERVED_PACKET_TARGETS[rng.gen_range(0..OBSERVED_PACKET_TARGETS.len())];
-            let overhead = 2_usize;
-            // Only aim for an observed packet size when it leaves room to pad
-            // above the floor. Full-size relay chunks already have
-            // payload_len + overhead >= every observed target, so the old code
-            // collapsed to `self.min` here, spiking the padding distribution at a
-            // single value. Fall through to the random-span branch in that case.
-            if payload_len + overhead + (self.min as usize) < (target as usize) {
-                let needed = target
-                    .saturating_sub(payload_len as u16)
-                    .saturating_sub(overhead as u16);
-                return needed.clamp(self.min, self.max);
+            let needed = usize::from(target).saturating_sub(payload_len.saturating_add(2));
+            // Unreachable targets fall through to the random draw. Clamping
+            // them would concentrate record sizes at a configured bound.
+            if (usize::from(self.min) + 1..=usize::from(self.max)).contains(&needed) {
+                return needed as u16;
             }
         }
 
@@ -338,7 +332,7 @@ mod tests {
     fn padding_round_trips_for_random_payloads_and_profiles() {
         // remove(apply(x)) == x across random (min,max) profiles and payloads,
         // and the padded length always lands in [payload+min+2, payload+max+2]
-        // (the observed-target branch clamps pad_len into [min,max]).
+        // (the observed-target branch only selects padding within that range).
         let mut rng = StdRng::seed_from_u64(0x5EED_CAFE);
         let iters = if cfg!(miri) { 100 } else { 2000 };
         for _ in 0..iters {
@@ -382,6 +376,21 @@ mod tests {
             let pad_len = u16::from_be_bytes([padded[padded.len() - 2], padded[padded.len() - 1]]);
             assert!((3..=777).contains(&pad_len));
         }
+    }
+
+    #[test]
+    fn unreachable_observed_targets_do_not_concentrate_padding_at_the_maximum() {
+        let profile = PaddingProfile::new(0, 32).unwrap();
+        let mut rng = StdRng::seed_from_u64(17);
+
+        // Even the smallest observed target needs 49 bytes of padding here.
+        let maximum_count = (0..1024)
+            .filter(|_| profile.sample_padding_len(13, &mut rng) == 32)
+            .count();
+        assert!(
+            maximum_count < 100,
+            "maximum selected {maximum_count} times"
+        );
     }
 
     #[test]

@@ -2877,18 +2877,29 @@ async fn read_server_identity_payload(
     }
 }
 
-async fn establish_data_session(
-    server: &mut TcpStream,
+async fn connect_and_establish_data_session(
+    server_addr: &ServerAddrResolver,
     config: &ClientConfig,
     traffic: TrafficConfig,
     psk: &[u8],
     server_public: &[u8; 32],
-) -> Result<ClientDataSession, ClientRuntimeError> {
-    let mut session = Safari26TlsCamouflage.start(config.sni.clone(), psk, server_public)?;
+) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
+    // The first ML-KEM key generation can take tens of milliseconds. Prepare
+    // a fresh key before opening TCP, then build the timestamped ClientHello
+    // after connect so DNS and connect retries do not age its authentication.
+    let key_share = Safari26TlsCamouflage::prepare_key_share()?;
+    let mut server = server_addr.connect().await?;
+    tune_tcp_stream(&server)?;
+    let mut session = Safari26TlsCamouflage.start_with_key_share(
+        config.sni.clone(),
+        psk,
+        server_public,
+        key_share,
+    )?;
     if let Some(al) = &config.accept_language {
         session = session.with_accept_language(al.clone());
     }
-    let completed = session.complete(server).await?;
+    let completed = session.complete(&mut server).await?;
     let session_keys = match &completed.hrr_exchange {
         None => client::derive_session_keys_from_shared(
             psk,
@@ -2905,21 +2916,7 @@ async fn establish_data_session(
             &completed.server_hello_record,
         )?,
     };
-    Ok(ClientDataSession::new(session_keys, traffic)?)
-}
-
-async fn connect_and_establish_data_session(
-    server_addr: &ServerAddrResolver,
-    config: &ClientConfig,
-    traffic: TrafficConfig,
-    psk: &[u8],
-    server_public: &[u8; 32],
-) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
-    let mut server = server_addr.connect().await?;
-    tune_tcp_stream(&server)?;
-    let data_session =
-        establish_data_session(&mut server, config, traffic, psk, server_public).await?;
-    Ok((server, data_session))
+    Ok((server, ClientDataSession::new(session_keys, traffic)?))
 }
 
 struct ClientRelay {
@@ -6283,15 +6280,16 @@ mod tests {
             }
         }
 
+        let traffic = TrafficConfig::default();
         let codec = || {
             DataRecordCodec::new(
                 AeadCodec::new([0x51; 32], [0x62; 12]),
-                PaddingProfile::new(0, 0).unwrap(),
+                PaddingProfile::from_config(traffic).unwrap(),
                 b"mux-idle",
             )
         };
         let idle = Duration::from_millis(100);
-        let cover = CoverTrafficProfile::from_config(TrafficConfig::default());
+        let cover = CoverTrafficProfile::from_config(traffic);
         assert!(!cover.is_enabled());
         for (upload_only, kind) in [
             (true, MuxFrameKind::Data),
@@ -6337,8 +6335,15 @@ mod tests {
                     },
                 };
                 if upload_only {
+                    let plaintext_len = MuxFrame::encoded_len(frame.payload.len()).unwrap();
                     frame_tx.send(frame).await.unwrap();
-                    written_rx.recv().await.unwrap();
+                    let record = written_rx.recv().await.unwrap();
+                    let header = crate::tls::record::parse_header(&record).unwrap();
+                    assert_eq!(
+                        header.payload_len,
+                        plaintext_len + 18,
+                        "default mux padding"
+                    );
                 } else {
                     let record = peer_seal
                         .seal(&frame.encode().unwrap(), &mut OsRng)
@@ -7241,7 +7246,7 @@ mod tests {
     /// Regression (client-side sibling): the camouflage origin ends its side with a
     /// real TLS 1.3 `close_notify` alert (encrypted, level 1 desc 0) before its FIN.
     /// That alert can land while the client is still in `Safari26TlsSession::complete()`
-    /// (drain_post_handshake / await_http2_settings_ack). Those loops must treat a
+    /// (drain_post_handshake / await_http2_peer_settings). Those loops must treat a
     /// warning close_notify as a clean end-of-stream — not abort with Err(Alert) —
     /// so the client finishes its camouflage, writes PX1Q, and the relay completes.
     /// End-to-end guard for the same integration path the server-side eager-close
@@ -9555,7 +9560,7 @@ mod tests {
     /// the client's PX1Q) sees that FIN before the client can emit PX1Q — the exact
     /// pre-PX1Q ordering that the fix must survive. A bare FIN is used deliberately:
     /// a close_notify *alert* would abort the client's still-running `.complete()`
-    /// (`await_http2_settings_ack`), a separate client-side concern out of scope
+    /// (`await_http2_peer_settings`), a separate client-side concern out of scope
     /// here; this test pins the SERVER's pre-PX1Q origin-close handling. The client
     /// tolerates a bare origin FIN during `.complete()` (its post-handshake/H2
     /// waits exit via their record-boundary timeouts), so it still finishes its
@@ -9603,7 +9608,7 @@ mod tests {
     /// before the FIN — what a real served origin actually sends. This exercises
     /// the CLIENT-side tolerance: the close_notify can land while the client is
     /// still in `Safari26TlsSession::complete()` (drain_post_handshake /
-    /// await_http2_settings_ack), which must treat a warning close_notify as a
+    /// await_http2_peer_settings), which must treat a warning close_notify as a
     /// clean end-of-stream rather than aborting the handshake, so the client still
     /// finishes its camouflage and writes PX1Q and the relay completes.
     async fn run_camouflage_tls_server_close_notify(mut stream: TcpStream) {
