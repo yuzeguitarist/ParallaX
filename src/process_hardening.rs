@@ -120,6 +120,14 @@ impl Drop for MaskedSecret {
 /// traced*, so an operator who must run under a debugger or an attaching crash
 /// reporter can set that variable to skip the step and let startup proceed.
 pub fn harden_current_process() {
+    // Read the auxiliary vector (through the page size) while the process is
+    // still dumpable. On kernels without `PR_GET_AUXV` (before Linux 6.4, e.g.
+    // Ubuntu 22.04's 5.15) rustix falls back to `/proc/self/auxv`, which a
+    // non-root process cannot read once `PR_SET_DUMPABLE` is cleared; rustix
+    // then panics on its first auxv-backed call (the first `mlock` of a secret).
+    // rustix caches every auxv value on this first read.
+    #[cfg(unix)]
+    let _ = page_size();
     if let Err(err) = disable_core_dumps() {
         tracing::warn!(error = %err, "failed to disable core dumps for this process");
     }
