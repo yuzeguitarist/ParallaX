@@ -1,0 +1,37 @@
+.github/semgrep-overrides.in
+  s_8a0fd04aa4520f::t_c21c9a905a7e99 1-11
+.github/workflows/cargo-deny.yml
+  s_8a0fd04aa4520f::t_3e12371d0f8121 35
+.github/workflows/ci-pr.yml
+  s_8a0fd04aa4520f::t_c6734b6ec90607 79-80
+.github/workflows/dependency-assurance.yml
+  s_8a0fd04aa4520f::t_5b5be5fb711309 58,87,120
+.github/workflows/release.yml
+  s_8a0fd04aa4520f::t_4e1a91c8b8884d 83,118
+.github/workflows/security-sanitizers.yml
+  s_8a0fd04aa4520f::t_6d00c09ac6419c 54
+.github/workflows/semgrep.yml
+  s_8a0fd04aa4520f::t_8a35cb68fafe0b 9-11,51
+src/config.rs
+  s_8a0fd04aa4520f::t_96a5770c96d8ae 2917,2921,2925
+src/crypto/mldsa/polyvec.rs
+  s_8a0fd04aa4520f::t_bd8cb8703c75f1 680-683
+src/runtime_guard.rs
+  s_8a0fd04aa4520f::t_3b4836dfa312f8 462,504,525-530,533
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9212ed46355cbf037a910b4d3f61f6b37acb9380",
+  "prompts": {},
+  "sessions": {
+    "s_8a0fd04aa4520f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21cda-7ef1-7102-a2c3-b5a53fa4a108",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
