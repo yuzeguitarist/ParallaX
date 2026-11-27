@@ -1,0 +1,35 @@
+Cargo.lock
+  s_a4b4623abf3887::t_cdd330145947ea 714
+Cargo.toml
+  s_a4b4623abf3887::t_8bd56364994a00 113-115
+ParallaX-DeepWiki/Hand-Rolled-ML-DSA-87.md
+  s_a4b4623abf3887::t_534f7094c90798 23-25,88,103
+deny.toml
+  s_a4b4623abf3887::t_96e46bea1306ed 14
+docs/security/threat-model.md
+  s_a4b4623abf3887::t_9096a9888f94a4 57,64
+scripts/security/sanitizers.py
+  s_a4b4623abf3887::t_ee5761da73d62d 301,305
+src/crypto/mldsa/mod.rs
+  s_a4b4623abf3887::t_8bd30a0bb78611 5-7
+tests/mldsa_acvp.rs
+  s_a4b4623abf3887::t_65a9277db47aeb 4-7
+tests/mldsa_differential.rs
+  s_a4b4623abf3887::t_a1c69ae73e7834 2,5-6,10,12,18,20,22,25-26,29-54,56-66,68-157,189,197,209,217,230,237-238,243,245,253,275-276,286,291-292,298,308,319,327,339,355,372,394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6f90dda877e8febbb22af461d5d02930fafc007b",
+  "prompts": {},
+  "sessions": {
+    "s_a4b4623abf3887": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21b74-4cf1-73f0-88f3-b6b163f351ba",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
