@@ -1250,11 +1250,9 @@ impl DataRecordCodec {
     /// callers that own the staged ciphertext: each worker decrypts its record
     /// group directly inside `records` (handed over as disjoint owned views of
     /// the same allocation and rejoined afterwards), so no per-group ciphertext
-    /// copy, plaintext staging buffer or scrub of that staging buffer is
-    /// needed. Same validation, sequence handling and fail-close behaviour;
-    /// plaintext residue matches the serial [`Self::open_concat_records`]: on
-    /// success `records` holds decrypted bytes the caller must not reuse, on
-    /// error `out` keeps only its pre-call contents and `records` is zeroized.
+    /// copy or plaintext staging allocation is needed. On success the staging
+    /// bytes are wiped while the original allocation and length are preserved.
+    /// On error `out` keeps only its pre-call contents and `records` is zeroized.
     pub fn open_concat_records_parallel_in_place(
         &mut self,
         pool: &CryptoPool,
@@ -1269,6 +1267,10 @@ impl DataRecordCodec {
             out.truncate(output_start);
             records.zeroize();
             self.aead.poison();
+        } else {
+            // Compaction can leave plaintext both in the prefix and at its
+            // original offsets. Wipe the full staging slice before reuse.
+            records.as_mut_slice().zeroize();
         }
         result
     }
@@ -2729,6 +2731,10 @@ mod tests {
             dec.open_concat_records_parallel_in_place(&pool, &mut sealed, &mut opened)
                 .unwrap();
             assert_eq!(opened, payload);
+            assert!(
+                sealed.iter().all(|byte| *byte == 0),
+                "reused ciphertext staging must not retain plaintext"
+            );
             assert_eq!(
                 (sealed.as_ptr(), sealed.len(), sealed.capacity()),
                 (ptr, len, capacity)
@@ -2738,17 +2744,21 @@ mod tests {
 
     #[test]
     fn scrub_on_drop_wipes_a_view_lost_to_an_unwinding_job() {
-        let mut whole = BytesMut::from(&[0xA5_u8; 64][..]);
+        let mut backing = Vec::with_capacity(128);
+        backing.resize(64, 0xA5_u8);
+        let view_start = backing.as_mut_ptr();
+        // Spare capacity lets Bytes take ownership of the Vec buffer directly.
+        let mut whole = BytesMut::from(Bytes::from(backing));
+        assert_eq!(whole.as_ptr(), view_start.cast_const());
         let view = ScrubOnDrop(whole.split_to(48));
-        let view_start = view.0.as_ptr();
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _view = view;
             std::panic::resume_unwind(Box::new("job panicked"));
         }));
         assert!(unwound.is_err());
-        // SAFETY: `whole` still owns the allocation both views were split
-        // from, so the dropped view's 48 bytes stay allocated and initialized,
-        // and nothing else references them any more.
+        // SAFETY: `whole` retains ownership of the original allocation. The
+        // pointer came from the Vec, so the drop scrub does not invalidate a
+        // shared borrow of the view. The first 48 bytes remain initialized.
         let wiped = unsafe { std::slice::from_raw_parts(view_start, 48) };
         assert!(wiped.iter().all(|byte| *byte == 0));
         // The neighbouring view is untouched.
