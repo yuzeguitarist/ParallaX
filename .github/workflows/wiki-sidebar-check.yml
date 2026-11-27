@@ -6,7 +6,7 @@ name: Wiki Sidebar Check
 # hand-curated sidebar. Stdlib-only python, no toolchain needed.
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     paths:
       - "ParallaX-DeepWiki/**"
       - "scripts/wiki_sync/check_sidebar.py"

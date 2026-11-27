@@ -4018,7 +4018,7 @@ def correspond(root: Path = ROOT) -> None:
 
     inbound = _extract_fn(server, "handle_connection_inner")
     authenticated = _extract_at(inbound, "ConnectionDecision::Authenticated(authenticated) =>")
-    _order(authenticated, ("cache.try_lock()", "cache.reserve_pending(&entry, now)",
+    _order(authenticated, ("cache.gate.try_lock()", "cache.reserve_pending(&entry, now)",
                             "if !fresh", "return relay_admitted_fallback(",
                             "Some(PendingReplayEntry", "reserved: true", "accept_authenticated_with_origin("),
            "early pending admission refuses through origin splice before authenticated establishment", problems)

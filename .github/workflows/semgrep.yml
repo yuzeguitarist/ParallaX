@@ -13,7 +13,7 @@ name: semgrep
 
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     paths-ignore: ['**.md', 'ParallaX-DeepWiki/**']
   push:
     branches: [main, master]

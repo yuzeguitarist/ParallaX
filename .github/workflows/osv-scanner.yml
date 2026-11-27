@@ -13,7 +13,7 @@ name: osv-scanner
 
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'perf/latency-peak']
     paths: ['**/Cargo.toml', '**/Cargo.lock']
   push:
     branches: [main, master]
