@@ -1,0 +1,19 @@
+verification/proverif/source_contracts.json
+  s_a4b4623abf3887::t_9c8098b6cdc85c 30-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c5aeea169c279fe9531cc128be661ca6ee51caca",
+  "prompts": {},
+  "sessions": {
+    "s_a4b4623abf3887": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21b74-4cf1-73f0-88f3-b6b163f351ba",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
