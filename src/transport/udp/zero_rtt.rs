@@ -62,13 +62,9 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::replay::{
     ReplayCache, ReplayEntry, ReplayInsertOutcome, BACKGROUND_PERSIST_RETRY_BACKOFF,
+    MAX_PENDING_PERSISTS,
 };
 use crate::tls::quic::ZeroRttGuard;
-
-/// Upper bound on accepted tickets waiting for the durable journal. When disk
-/// persistence stalls, new tickets fall back to 1-RTT instead of growing the
-/// queue without limit.
-const MAX_PENDING_PERSISTS: usize = 16_384;
 
 struct ZeroRttGateState {
     mirror: ReplayCache,

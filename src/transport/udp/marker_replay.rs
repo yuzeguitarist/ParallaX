@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::crypto::quic_marker::Marker;
 use crate::crypto::replay::{
     ReplayCache, ReplayEntry, ReplayInsertOutcome, BACKGROUND_PERSIST_RETRY_BACKOFF,
+    MAX_PENDING_PERSISTS,
 };
 
 struct MarkerGateState {
@@ -81,9 +82,9 @@ impl MarkerReplayGuard {
 
     /// Record the marker and report whether this is its FIRST sighting. `true` means
     /// the connection may terminate locally (a real, non-replayed ParallaX client);
-    /// `false` means a replay (or a poisoned/contended lock, or a full or stale
-    /// cache) and the flow must be spliced to the origin. `now_unix` is the current
-    /// Unix time in seconds.
+    /// On replay, lock contention, stale markers or exhausted cache/queue
+    /// capacity this returns `false` and the flow is spliced to the origin.
+    /// `now_unix` is the current Unix time in seconds.
     ///
     /// The dedup decision is made synchronously in memory under the fast `gate`
     /// lock (so a replayed marker is gated the instant its first sighting returns,
@@ -116,6 +117,7 @@ impl MarkerReplayGuard {
         };
         let mut spawn_worker = false;
         let inserted = match self.gate.try_lock() {
+            Ok(gate) if gate.pending.len() >= MAX_PENDING_PERSISTS => false,
             Ok(mut gate) => {
                 gate.max_observed_now = Some(
                     gate.max_observed_now
@@ -320,6 +322,36 @@ mod tests {
         assert!(g.first_sighting(&marker(0x01, now + 1), now + 1));
         // ...but each exact (nonce, timestamp) is single-use.
         assert!(!g.first_sighting(&marker(0x02, now), now));
+    }
+
+    #[test]
+    fn stalled_persistence_bounds_the_marker_queue() {
+        let g = guard();
+        let now = 1_900_000_000;
+        {
+            let mut gate = g.gate.lock().unwrap();
+            gate.worker_running = true;
+            gate.pending.resize_with(MAX_PENDING_PERSISTS, || {
+                (
+                    ReplayEntry {
+                        timestamp: now,
+                        nonce: [0; 8],
+                        transcript_fingerprint: [0; 32],
+                    },
+                    now,
+                )
+            });
+        }
+        let m = marker(0x02, now);
+        assert!(!g.first_sighting(&m, now));
+        {
+            let mut gate = g.gate.lock().unwrap();
+            assert_eq!(gate.pending.len(), MAX_PENDING_PERSISTS);
+            gate.pending.clear();
+            gate.worker_running = false;
+        }
+        assert!(g.first_sighting(&m, now));
+        assert!(!g.first_sighting(&m, now));
     }
 
     #[test]

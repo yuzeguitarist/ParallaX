@@ -166,6 +166,9 @@ pub(crate) const BACKGROUND_PERSIST_RETRY_BACKOFF: [std::time::Duration; 4] = [
     std::time::Duration::from_secs(5),
 ];
 
+/// Bound the admissions waiting behind a QUIC replay journal worker.
+pub(crate) const MAX_PENDING_PERSISTS: usize = 16_384;
+
 /// Test-only fault injection for the header-commit phase of
 /// [`ReplayCache::persist_authenticated_entry`]: deterministically reproduces
 /// the two on-disk outcomes a failed commit can leave behind (no header byte
