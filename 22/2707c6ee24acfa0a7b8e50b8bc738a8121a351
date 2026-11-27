@@ -1,0 +1,19 @@
+src/handshake/server.rs
+  s_a4b4623abf3887::t_a7b55c8701a431 2867
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "222707c6ee24acfa0a7b8e50b8bc738a8121a351",
+  "prompts": {},
+  "sessions": {
+    "s_a4b4623abf3887": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21b74-4cf1-73f0-88f3-b6b163f351ba",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
