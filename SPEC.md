@@ -520,7 +520,9 @@ exchanged and the client is authenticated (§7.2), both peers hold:
   made explicit here.) When the fallback origin answers `ClientHello1` with a
   single TLS 1.3 `HelloRetryRequest` (§12.3), `transcript_hash` is instead
   `SHA-256(b"ParallaX v1 HRR handshake transcript" || u32_be(len(CH1)) || CH1 || u32_be(len(HRR)) || HRR || u32_be(len(CH2)) || CH2 || u32_be(len(SH2)) || SH2)`,
-  binding all four carrier handshake records in wire order.
+  binding all four carrier handshake messages in wire order. Each input
+  includes the raw TLS records carrying that message, with their headers and
+  original fragmentation. Compatibility ChangeCipherSpec records are excluded.
 
 The **initial chain secret** is derived with a standard HKDF
 Extract-then-Expand:
@@ -1629,7 +1631,7 @@ the client, validates and forwards the client's compat `ChangeCipherSpec` +
 `ClientHello2` (requiring matching `client_random`, `session_id`, `sni`, and
 TLS 1.3 support) to the origin, relays the origin's final `ServerHello` back to
 the client (rejecting a second HRR), and both peers derive epoch-0 keys and the
-ML-DSA identity binding over the domain-separated four-record transcript
+ML-DSA identity binding over the domain-separated four-message transcript
 `SHA-256(b"ParallaX v1 HRR handshake transcript" || u32_be(len(CH1)) || CH1 || u32_be(len(HRR)) || HRR || u32_be(len(CH2)) || CH2 || u32_be(len(SH2)) || SH2)`.
 Non-HRR connections continue to use `b"ParallaX v1 handshake transcript"` over
 `(ClientHello1, ServerHello)` unchanged.

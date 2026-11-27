@@ -1695,7 +1695,7 @@ async fn accept_authenticated_with_origin(
     // Run the fallible forward-and-derive body in a closure and close both on Err.
     let forward = async {
         tune_tcp_stream(&fallback)?;
-        let forwarded = read_forwarded_server_hello(&mut fallback, &mut client).await?;
+        let forwarded = read_forwarded_server_hello(&mut fallback, &mut client, false).await?;
         Ok::<_, HandshakeServerError>(forwarded)
     }
     .await;
@@ -1741,7 +1741,7 @@ async fn accept_authenticated_with_origin(
             )
             .await?;
             let next_forwarded =
-                read_forwarded_post_hrr_server_hello(&mut fallback, &mut client).await?;
+                read_forwarded_server_hello(&mut fallback, &mut client, true).await?;
             if config.strict_tls13 && !next_forwarded.parsed.tls13_selected {
                 let _ =
                     write_all_with_handshake_timeout(&mut client, &next_forwarded.raw_record).await;
@@ -2248,12 +2248,17 @@ async fn read_forwarded_server_hello<
 >(
     fallback: &mut R,
     client: &mut W,
+    forward_alerts: bool,
 ) -> Result<ForwardedServerHello, HandshakeServerError> {
     timeout(HANDSHAKE_TIMEOUT, async {
         let mut reassembly = ServerHelloReassembly::default();
         let mut ccs_records = 0;
         loop {
             let record = read_record(fallback).await?;
+            if forward_alerts && record[0] == TLS_CONTENT_ALERT {
+                let _ = client.write_all(&record).await;
+                return Err(ServerHelloError::NotHandshakeRecord.into());
+            }
             if record[0] == 0x14 {
                 if reassembly.started() || !is_compat_change_cipher_spec(&record) {
                     return Err(ServerHelloError::NotHandshakeRecord.into());
@@ -2295,16 +2300,7 @@ async fn read_forwarded_server_hello<
 pub(crate) async fn read_forwarded_server_hello_for_test(
     fallback: &mut TcpStream,
 ) -> Result<ForwardedServerHello, HandshakeServerError> {
-    read_forwarded_server_hello(fallback, &mut tokio::io::sink()).await
-}
-
-/// Reads one TLS record under the per-record handshake bound. The HelloRetryRequest
-/// relay below reads record by record, so each read keeps its own timeout.
-async fn read_first_record(stream: &mut TcpStream) -> Result<Vec<u8>, HandshakeServerError> {
-    timeout(HANDSHAKE_TIMEOUT, read_record(stream))
-        .await
-        .map_err(|_| HandshakeServerError::Timeout)?
-        .map_err(HandshakeServerError::Io)
+    read_forwarded_server_hello(fallback, &mut tokio::io::sink(), false).await
 }
 
 async fn forward_client_hrr_retry(
@@ -2316,7 +2312,9 @@ async fn forward_client_hrr_retry(
     let compat_ccs = change_cipher_spec();
     let mut pending_ccs = false;
     loop {
-        let record = read_first_record(client).await?;
+        let record = timeout(HANDSHAKE_TIMEOUT, read_record(client))
+            .await
+            .map_err(|_| HandshakeServerError::Timeout)??;
         if record.as_slice() == compat_ccs.as_slice() {
             if pending_ccs {
                 return Err(HandshakeServerError::ServerHello(
@@ -2376,37 +2374,6 @@ fn single_handshake_message_fills_record(record: &[u8]) -> bool {
         .checked_add(4)
         .and_then(|n| n.checked_add(body_len))
         == Some(record.len())
-}
-
-async fn read_forwarded_post_hrr_server_hello(
-    fallback: &mut TcpStream,
-    client: &mut TcpStream,
-) -> Result<ForwardedServerHello, HandshakeServerError> {
-    const MAX_POST_HRR_COMPAT_CCS_RECORDS: usize = 2;
-    let compat_ccs = change_cipher_spec();
-    let mut ccs_records = 0_usize;
-    loop {
-        let raw_record = read_first_record(fallback).await?;
-        if raw_record.as_slice() == compat_ccs.as_slice() {
-            ccs_records += 1;
-            if ccs_records > MAX_POST_HRR_COMPAT_CCS_RECORDS {
-                return Err(HandshakeServerError::ServerHello(
-                    ServerHelloError::NotHandshakeRecord,
-                ));
-            }
-            write_all_with_handshake_timeout(client, &raw_record).await?;
-            continue;
-        }
-        let header = parse_header(&raw_record).map_err(ServerHelloError::Record)?;
-        if header.content_type == TLS_CONTENT_ALERT {
-            let _ = write_all_with_handshake_timeout(client, &raw_record).await;
-            return Err(HandshakeServerError::ServerHello(
-                ServerHelloError::NotHandshakeRecord,
-            ));
-        }
-        let parsed = parse_server_hello(&raw_record)?;
-        return Ok(ForwardedServerHello { raw_record, parsed });
-    }
 }
 
 /// Adds a uniform `[0, jitter]` upward grace to `floor`. The floor is never
@@ -8330,7 +8297,7 @@ mod tests {
         let mut writer = writer.unwrap().0;
         writer.write_all(&wire).await.unwrap();
         drop(writer);
-        let forwarded = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink())
+        let forwarded = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink(), false)
             .await
             .unwrap();
         assert_eq!(forwarded.raw_record, wire);
@@ -8346,7 +8313,7 @@ mod tests {
         writer.write_all(&wire[..TLS_HEADER_LEN + 2]).await.unwrap();
         let started = Instant::now();
         let reading = tokio::spawn(async move {
-            read_forwarded_server_hello(&mut reader, &mut tokio::io::sink()).await
+            read_forwarded_server_hello(&mut reader, &mut tokio::io::sink(), false).await
         });
         tokio::task::yield_now().await;
         tokio::time::advance(HANDSHAKE_TIMEOUT - Duration::from_secs(1)).await;
@@ -8372,7 +8339,7 @@ mod tests {
         record[3..5].copy_from_slice(&payload_len.to_be_bytes());
         let (mut writer, mut reader) = tokio::io::duplex(1024);
         writer.write_all(&record).await.unwrap();
-        let result = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink()).await;
+        let result = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink(), false).await;
         assert!(matches!(
             result,
             Err(HandshakeServerError::ServerHello(
@@ -8391,7 +8358,7 @@ mod tests {
         let (mut client_write, mut client_read) = tokio::io::duplex(1);
         let started = Instant::now();
         let reading = tokio::spawn(async move {
-            read_forwarded_server_hello(&mut fallback, &mut client_write).await
+            read_forwarded_server_hello(&mut fallback, &mut client_write, false).await
         });
         tokio::task::yield_now().await;
         tokio::time::advance(HANDSHAKE_TIMEOUT).await;
@@ -16306,7 +16273,10 @@ mod tests {
         let first_ch = parse_client_hello(&first_client_record).unwrap();
         let session_id = first_client_record[first_ch.session_id_range.clone()].to_vec();
         let hrr = hrr_fixture_echoing_session_id(&session_id);
-        let final_sh = server_hello_echoing_session_id(&session_id);
+        let final_sh = crate::tls::server_hello::tests::fragment_handshake_record(
+            &server_hello_echoing_session_id(&session_id),
+            &[2, 41],
+        );
         let mut second_client_record =
             client_hello_fixture_with_key_share("example.com", &[0x33; 32]);
         let second_ch = parse_client_hello(&second_client_record).unwrap();
@@ -16376,7 +16346,11 @@ mod tests {
             read_record(&mut client).await.unwrap(),
             change_cipher_spec()
         );
-        assert_eq!(read_record(&mut client).await.unwrap(), final_sh);
+        let mut forwarded_sh = Vec::new();
+        while forwarded_sh.len() < final_sh.len() {
+            forwarded_sh.extend_from_slice(&read_record(&mut client).await.unwrap());
+        }
+        assert_eq!(forwarded_sh, final_sh);
 
         let handshake = accepted.await.unwrap().unwrap();
         fallback_task.await.unwrap();

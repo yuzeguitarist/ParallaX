@@ -21,10 +21,9 @@ pub fn transcript_hash(client_hello_record: &[u8], server_hello_record: &[u8]) -
 }
 
 /// Domain-separated carrier transcript hash for a TLS 1.3 handshake that went
-/// through a single `HelloRetryRequest`: binds all four carrier handshake
-/// records (`ClientHello1`, `HelloRetryRequest`, `ClientHello2`, and the final
-/// `ServerHello`) with 32-bit big-endian length prefixes so tampering with any
-/// leg or record boundary causes epoch-0 AEAD and ML-DSA identity failure.
+/// through a single `HelloRetryRequest`. Length-prefix the wire bytes of
+/// `ClientHello1`, `HelloRetryRequest`, `ClientHello2` and the final `ServerHello`.
+/// Each input includes the TLS record headers of all its fragments, in order.
 pub fn hrr_transcript_hash(
     client_hello_1: &[u8],
     hello_retry_request: &[u8],

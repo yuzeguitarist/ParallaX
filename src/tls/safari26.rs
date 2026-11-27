@@ -1825,15 +1825,9 @@ fn single_key_share_extension(group: u16, public: &[u8]) -> Result<Vec<u8>, Safa
 /// X25519 `key_share` (see [`Safari26TlsCamouflage::start`]). This rewrite replaces
 /// that extension wholesale, so ClientHello2 does not preserve the auth binding.
 ///
-/// Authenticated TCP proxy sessions through an HRR origin are unsupported: the
-/// server already authenticated ClientHello1 and derives epoch-0 keys from
-/// (ClientHello1, HRR), while this client returns the final ServerHello for its
-/// ParallaX key derivation. The server neither reauthenticates ClientHello2 nor
-/// updates that context. The TLS retry can finish, but the mismatched epoch-0
-/// keys prevent PX1Q takeover, so proxy establishment fails in the bounded
-/// pre-PQ splice. This is not a transparent downgrade to an ordinary origin
-/// session; deployments must verify their fallback origin accepts an initially
-/// offered share without HRR. See SPEC §12.3.
+/// The server authenticates ClientHello1 and the retry preserves its random,
+/// session ID and SNI. Both peers bind the four relayed handshake messages into
+/// the epoch-0 keys after the final ServerHello. See SPEC §12.3.
 fn rewrite_client_hello_for_retry(
     client_hello: &[u8],
     key_share_body: &[u8],
