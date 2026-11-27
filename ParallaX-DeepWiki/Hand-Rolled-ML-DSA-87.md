@@ -20,13 +20,9 @@ The two post-quantum primitives now sit on different backends:
 | ML-KEM-1024 (FIPS 203) | `aws-lc-rs` | `src/crypto/pq.rs` |
 | ML-DSA-87 (FIPS 204) | Hand-rolled, pure Rust | `src/crypto/mldsa/` |
 
-`pqcrypto-mldsa` and `pqcrypto-traits` were removed from the runtime dependency
-tree. They remain in **`[dev-dependencies]` only**, kept deliberately as a
-signature-interoperability oracle (`tests/mldsa_differential.rs`). The oracle
-does not expose seed or signing-randomness injection, so these tests do not
-compare generated keys or signatures byte-for-byte. Byte-exact known-answer
-checks instead use the vendored ACVP vectors (`tests/mldsa_acvp.rs`).
-Do not delete the `pqcrypto` dev-dependency — it is the oracle, not dead weight.
+The differential tests use the AWS-LC ML-DSA-87 context API via a test-only
+direct dependency on the already resolved `aws-lc-sys`. Byte-exact known-answer
+checks use the vendored ACVP vectors (`tests/mldsa_acvp.rs`).
 
 ## Module layout
 
@@ -89,7 +85,7 @@ its own identity-proof error type and calls `keypair`/`sign`/`verify` directly.
 ## Validation
 
 - **Differential oracle:** `tests/mldsa_differential.rs` checks signature
-  verification in both directions against the `pqcrypto` dev-dependency,
+  verification in both directions against AWS-LC,
   including shared-key interoperability, the public hedged signer, and selected
   signature/message tampering.
 - **ACVP KATs:** `tests/mldsa_acvp.rs` compares ML-DSA-87 keyGen and deterministic /
@@ -104,5 +100,4 @@ its own identity-proof error type and calls `keypair`/`sign`/`verify` directly.
 
 The 1:1 mapping to PQClean is intentional — keep it so the differential test stays
 meaningful. If you change a module, re-run `tests/mldsa_differential.rs` and
-`tests/mldsa_acvp.rs`. If the dev-only `pqcrypto` oracle is ever removed, update
-this page and [Cryptographic Subsystems](Cryptographic-Subsystems.md) together.
+`tests/mldsa_acvp.rs`.

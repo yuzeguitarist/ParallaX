@@ -30,7 +30,7 @@ use tokio::{
 use zeroize::{Zeroize, Zeroizing};
 
 use super::source_limit::SourceLimiter;
-use super::transcript::transcript_hash;
+use super::transcript::{hrr_transcript_hash, transcript_hash};
 use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;
 
 use crate::{
@@ -72,8 +72,8 @@ use crate::{
     tls::{
         client_hello::parse_client_hello,
         record::{
-            log_record_read, parse_header, read_record, BufferedTlsRecordReader, TlsRecordReader,
-            TLS_HEADER_LEN,
+            change_cipher_spec, log_record_read, parse_header, read_record,
+            BufferedTlsRecordReader, TlsRecordReader, TLS_CONTENT_ALERT, TLS_HEADER_LEN,
         },
         server_hello::{
             is_compat_change_cipher_spec, parse_server_hello, parse_server_hello_records,
@@ -1695,7 +1695,7 @@ async fn accept_authenticated_with_origin(
     // Run the fallible forward-and-derive body in a closure and close both on Err.
     let forward = async {
         tune_tcp_stream(&fallback)?;
-        let forwarded = read_forwarded_server_hello(&mut fallback, &mut client).await?;
+        let forwarded = read_forwarded_server_hello(&mut fallback, &mut client, false).await?;
         Ok::<_, HandshakeServerError>(forwarded)
     }
     .await;
@@ -1724,17 +1724,54 @@ async fn accept_authenticated_with_origin(
         );
         return Err(HandshakeServerError::Tls13Required);
     }
-    // Mirror the origin ServerHello + derive the epoch-0 keys; on any error FIN
-    // both sockets rather than bare-dropping (post-auth, but still no RST tell).
+    // Mirror the origin ServerHello (completing at most one HelloRetryRequest
+    // round-trip when the origin requests a key-share retry) + derive the epoch-0
+    // keys; on any error FIN both sockets rather than bare-dropping (post-auth,
+    // but still no RST tell).
     let finish = async {
         write_all_with_handshake_timeout(&mut client, &forwarded.raw_record).await?;
-        let context = transcript_hash(&first_client_record, &forwarded.raw_record);
+        let (final_server_hello, context) = if forwarded.parsed.is_hello_retry_request() {
+            let first_ch = parse_client_hello(&first_client_record)
+                .map_err(|_| ServerHelloError::RetryClientHelloInvalid)?;
+            let second_client_hello = forward_client_hrr_retry(
+                &mut client,
+                &mut fallback,
+                &first_ch,
+                &first_client_record,
+            )
+            .await?;
+            let next_forwarded =
+                read_forwarded_server_hello(&mut fallback, &mut client, true).await?;
+            if config.strict_tls13 && !next_forwarded.parsed.tls13_selected {
+                let _ =
+                    write_all_with_handshake_timeout(&mut client, &next_forwarded.raw_record).await;
+                return Err(HandshakeServerError::Tls13Required);
+            }
+            if next_forwarded.parsed.is_hello_retry_request() {
+                let _ =
+                    write_all_with_handshake_timeout(&mut client, &next_forwarded.raw_record).await;
+                return Err(HandshakeServerError::ServerHello(
+                    ServerHelloError::UnexpectedHelloRetryRequest,
+                ));
+            }
+            write_all_with_handshake_timeout(&mut client, &next_forwarded.raw_record).await?;
+            let context = hrr_transcript_hash(
+                &first_client_record,
+                &forwarded.raw_record,
+                &second_client_hello,
+                &next_forwarded.raw_record,
+            );
+            (next_forwarded.parsed, context)
+        } else {
+            let context = transcript_hash(&first_client_record, &forwarded.raw_record);
+            (forwarded.parsed, context)
+        };
         let session_keys = derive_server_keys_from_shared(psk, &x25519_shared_secret, &context)?;
-        Ok::<_, HandshakeServerError>(session_keys)
+        Ok::<_, HandshakeServerError>((final_server_hello, session_keys))
     }
     .await;
-    let session_keys = match finish {
-        Ok(session_keys) => session_keys,
+    let (final_server_hello, session_keys) = match finish {
+        Ok(done) => done,
         Err(err) => {
             tokio::join!(
                 graceful_close_tcp_stream(client),
@@ -1749,7 +1786,7 @@ async fn accept_authenticated_with_origin(
         client,
         fallback,
         client_hello,
-        server_hello: forwarded.parsed,
+        server_hello: final_server_hello,
         session_keys,
         server_public_key,
     })
@@ -2211,12 +2248,17 @@ async fn read_forwarded_server_hello<
 >(
     fallback: &mut R,
     client: &mut W,
+    forward_alerts: bool,
 ) -> Result<ForwardedServerHello, HandshakeServerError> {
     timeout(HANDSHAKE_TIMEOUT, async {
         let mut reassembly = ServerHelloReassembly::default();
         let mut ccs_records = 0;
         loop {
             let record = read_record(fallback).await?;
+            if forward_alerts && record[0] == TLS_CONTENT_ALERT {
+                let _ = client.write_all(&record).await;
+                return Err(ServerHelloError::NotHandshakeRecord.into());
+            }
             if record[0] == 0x14 {
                 if reassembly.started() || !is_compat_change_cipher_spec(&record) {
                     return Err(ServerHelloError::NotHandshakeRecord.into());
@@ -2258,7 +2300,80 @@ async fn read_forwarded_server_hello<
 pub(crate) async fn read_forwarded_server_hello_for_test(
     fallback: &mut TcpStream,
 ) -> Result<ForwardedServerHello, HandshakeServerError> {
-    read_forwarded_server_hello(fallback, &mut tokio::io::sink()).await
+    read_forwarded_server_hello(fallback, &mut tokio::io::sink(), false).await
+}
+
+async fn forward_client_hrr_retry(
+    client: &mut TcpStream,
+    fallback: &mut TcpStream,
+    first_ch: &crate::tls::client_hello::ClientHello,
+    first_client_record: &[u8],
+) -> Result<Vec<u8>, HandshakeServerError> {
+    let compat_ccs = change_cipher_spec();
+    let mut pending_ccs = false;
+    loop {
+        let record = timeout(HANDSHAKE_TIMEOUT, read_record(client))
+            .await
+            .map_err(|_| HandshakeServerError::Timeout)??;
+        if record.as_slice() == compat_ccs.as_slice() {
+            if pending_ccs {
+                return Err(HandshakeServerError::ServerHello(
+                    ServerHelloError::RetryClientHelloInvalid,
+                ));
+            }
+            pending_ccs = true;
+            continue;
+        }
+        let header = parse_header(&record).map_err(ServerHelloError::Record)?;
+        if header.content_type == TLS_CONTENT_ALERT {
+            // Relay ONLY a canonical 2-byte fatal TLS 1.3 alert (`15 03 03 00 02 02 <desc>`)
+            // to the origin before tearing down so an active-probing origin observes
+            // Safari's exact alert response, while rejecting oversized/malformed 0x15
+            // records so an authenticated client cannot smuggle arbitrary bytes.
+            if header.legacy_version == [0x03, 0x03]
+                && header.payload_len == 2
+                && record.len() == TLS_HEADER_LEN + 2
+                && record[TLS_HEADER_LEN] == 0x02
+            {
+                let _ = write_all_with_handshake_timeout(fallback, &record).await;
+            }
+            return Err(HandshakeServerError::ServerHello(
+                ServerHelloError::RetryClientHelloInvalid,
+            ));
+        }
+        let parsed_ch2 =
+            parse_client_hello(&record).map_err(|_| ServerHelloError::RetryClientHelloInvalid)?;
+        if !single_handshake_message_fills_record(&record)
+            || parsed_ch2.record_len != record.len()
+            || !parsed_ch2.tls13_supported
+            || parsed_ch2.client_random != first_ch.client_random
+            || record[parsed_ch2.session_id_range.clone()]
+                != first_client_record[first_ch.session_id_range.clone()]
+            || parsed_ch2.sni != first_ch.sni
+        {
+            return Err(HandshakeServerError::ServerHello(
+                ServerHelloError::RetryClientHelloInvalid,
+            ));
+        }
+        if pending_ccs {
+            write_all_with_handshake_timeout(fallback, &compat_ccs).await?;
+        }
+        write_all_with_handshake_timeout(fallback, &record).await?;
+        return Ok(record);
+    }
+}
+
+fn single_handshake_message_fills_record(record: &[u8]) -> bool {
+    if record.len() < TLS_HEADER_LEN + 4 {
+        return false;
+    }
+    let body_len = ((record[TLS_HEADER_LEN + 1] as usize) << 16)
+        | ((record[TLS_HEADER_LEN + 2] as usize) << 8)
+        | (record[TLS_HEADER_LEN + 3] as usize);
+    TLS_HEADER_LEN
+        .checked_add(4)
+        .and_then(|n| n.checked_add(body_len))
+        == Some(record.len())
 }
 
 /// Adds a uniform `[0, jitter]` upward grace to `floor`. The floor is never
@@ -8188,7 +8303,7 @@ mod tests {
         let mut writer = writer.unwrap().0;
         writer.write_all(&wire).await.unwrap();
         drop(writer);
-        let forwarded = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink())
+        let forwarded = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink(), false)
             .await
             .unwrap();
         assert_eq!(forwarded.raw_record, wire);
@@ -8204,7 +8319,7 @@ mod tests {
         writer.write_all(&wire[..TLS_HEADER_LEN + 2]).await.unwrap();
         let started = Instant::now();
         let reading = tokio::spawn(async move {
-            read_forwarded_server_hello(&mut reader, &mut tokio::io::sink()).await
+            read_forwarded_server_hello(&mut reader, &mut tokio::io::sink(), false).await
         });
         tokio::task::yield_now().await;
         tokio::time::advance(HANDSHAKE_TIMEOUT - Duration::from_secs(1)).await;
@@ -8230,7 +8345,7 @@ mod tests {
         record[3..5].copy_from_slice(&payload_len.to_be_bytes());
         let (mut writer, mut reader) = tokio::io::duplex(1024);
         writer.write_all(&record).await.unwrap();
-        let result = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink()).await;
+        let result = read_forwarded_server_hello(&mut reader, &mut tokio::io::sink(), false).await;
         assert!(matches!(
             result,
             Err(HandshakeServerError::ServerHello(
@@ -8249,7 +8364,7 @@ mod tests {
         let (mut client_write, mut client_read) = tokio::io::duplex(1);
         let started = Instant::now();
         let reading = tokio::spawn(async move {
-            read_forwarded_server_hello(&mut fallback, &mut client_write).await
+            read_forwarded_server_hello(&mut fallback, &mut client_write, false).await
         });
         tokio::task::yield_now().await;
         tokio::time::advance(HANDSHAKE_TIMEOUT).await;
@@ -16193,5 +16308,359 @@ mod tests {
              got {result:?}",
         );
         drop((stream, downlink));
+    }
+
+    fn hrr_fixture_echoing_session_id(session_id: &[u8]) -> Vec<u8> {
+        let mut hrr = vec![
+            0x16, 0x03, 0x03, 0x00, 0x58, 0x02, 0x00, 0x00, 0x54, 0x03, 0x03,
+        ];
+        hrr.extend_from_slice(&crate::tls::server_hello::HELLO_RETRY_REQUEST_RANDOM);
+        hrr.push(session_id.len() as u8);
+        hrr.extend_from_slice(session_id);
+        hrr.extend_from_slice(&[
+            0x13, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00,
+            0x02, 0x00, 0x17,
+        ]);
+        hrr
+    }
+
+    fn server_hello_echoing_session_id(session_id: &[u8]) -> Vec<u8> {
+        let mut sh = server_hello_fixture();
+        let range = parse_server_hello(&sh).unwrap().session_id_range;
+        sh[range].copy_from_slice(session_id);
+        sh
+    }
+
+    #[tokio::test]
+    async fn accept_authenticated_completes_across_origin_hello_retry_request_and_derives_matching_keys(
+    ) {
+        let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let first_ch = parse_client_hello(&first_client_record).unwrap();
+        let session_id = first_client_record[first_ch.session_id_range.clone()].to_vec();
+        let hrr = hrr_fixture_echoing_session_id(&session_id);
+        let final_sh = crate::tls::server_hello::tests::fragment_handshake_record(
+            &server_hello_echoing_session_id(&session_id),
+            &[2, 41],
+        );
+        let mut second_client_record =
+            client_hello_fixture_with_key_share("example.com", &[0x33; 32]);
+        let second_ch = parse_client_hello(&second_client_record).unwrap();
+        // Preserve ClientHello1's random and session_id, matching Safari's HRR rewrite.
+        second_client_record[TLS_HEADER_LEN + 6..TLS_HEADER_LEN + 38]
+            .copy_from_slice(&first_ch.client_random);
+        second_client_record[second_ch.session_id_range].copy_from_slice(&session_id);
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let expected_ch1 = first_client_record.clone();
+        let expected_ch2 = second_client_record.clone();
+        let origin_hrr = hrr.clone();
+        let origin_sh = final_sh.clone();
+        let fallback_task = tokio::spawn(async move {
+            let (mut origin, _) = fallback_listener.accept().await.unwrap();
+            assert_eq!(read_record(&mut origin).await.unwrap(), expected_ch1);
+            origin.write_all(&origin_hrr).await.unwrap();
+            assert_eq!(
+                read_record(&mut origin).await.unwrap(),
+                change_cipher_spec()
+            );
+            assert_eq!(read_record(&mut origin).await.unwrap(), expected_ch2);
+            origin.write_all(&change_cipher_spec()).await.unwrap();
+            origin.write_all(&origin_sh).await.unwrap();
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_dir.path().join("parallax-replay.cache"),
+        );
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let psk = [0x5a_u8; 32];
+        let shared = [0x42_u8; 32];
+        let server_ch1 = first_client_record.clone();
+        let accepted = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            accept_authenticated(
+                server_side,
+                &config,
+                &psk,
+                server_keys.public,
+                zeroize::Zeroizing::new(shared),
+                server_ch1,
+                AuthenticatedHello {
+                    sni: String::from("example.com"),
+                    x25519_key_share: [0x22; 32],
+                    timestamp: 1_700_000_001,
+                    nonce: [7; 8],
+                    transcript_fingerprint: [8; 32],
+                },
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        assert_eq!(read_record(&mut client).await.unwrap(), hrr);
+        client.write_all(&change_cipher_spec()).await.unwrap();
+        client.write_all(&second_client_record).await.unwrap();
+        assert_eq!(
+            read_record(&mut client).await.unwrap(),
+            change_cipher_spec()
+        );
+        let mut forwarded_sh = Vec::new();
+        while forwarded_sh.len() < final_sh.len() {
+            forwarded_sh.extend_from_slice(&read_record(&mut client).await.unwrap());
+        }
+        assert_eq!(forwarded_sh, final_sh);
+
+        let handshake = accepted.await.unwrap().unwrap();
+        fallback_task.await.unwrap();
+
+        let client_keys = crate::handshake::client::derive_hrr_session_keys_from_shared(
+            &psk,
+            &shared,
+            &first_client_record,
+            &hrr,
+            &second_client_record,
+            &final_sh,
+        )
+        .unwrap();
+        assert_eq!(
+            handshake.session_keys.transcript_hash,
+            client_keys.transcript_hash
+        );
+        assert_eq!(handshake.session_keys.client_key, client_keys.client_key);
+        assert_eq!(handshake.session_keys.server_key, client_keys.server_key);
+    }
+
+    #[tokio::test]
+    async fn accept_authenticated_rejects_second_origin_hello_retry_request_after_mirroring() {
+        let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let first_ch = parse_client_hello(&first_client_record).unwrap();
+        let session_id = first_client_record[first_ch.session_id_range.clone()].to_vec();
+        let hrr = hrr_fixture_echoing_session_id(&session_id);
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let origin_hrr = hrr.clone();
+        let fallback_task = tokio::spawn(async move {
+            let (mut origin, _) = fallback_listener.accept().await.unwrap();
+            let _ = read_record(&mut origin).await.unwrap();
+            origin.write_all(&origin_hrr).await.unwrap();
+            let _ = read_record(&mut origin).await.unwrap();
+            origin.write_all(&origin_hrr).await.unwrap();
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_dir.path().join("parallax-replay.cache"),
+        );
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let server_ch1 = first_client_record.clone();
+        let accepted = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            accept_authenticated(
+                server_side,
+                &config,
+                &[0x5a_u8; 32],
+                server_keys.public,
+                zeroize::Zeroizing::new([0x42_u8; 32]),
+                server_ch1,
+                AuthenticatedHello {
+                    sni: String::from("example.com"),
+                    x25519_key_share: [0x22; 32],
+                    timestamp: 1_700_000_001,
+                    nonce: [7; 8],
+                    transcript_fingerprint: [8; 32],
+                },
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        assert_eq!(read_record(&mut client).await.unwrap(), hrr);
+        client.write_all(&first_client_record).await.unwrap();
+        // Second HRR is still mirrored to the client before graceful FIN teardown.
+        assert_eq!(read_record(&mut client).await.unwrap(), hrr);
+
+        let err = accepted.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            HandshakeServerError::ServerHello(ServerHelloError::UnexpectedHelloRetryRequest)
+        ));
+        fallback_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_authenticated_rejects_sni_mutation_in_retry_client_hello() {
+        let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let first_ch = parse_client_hello(&first_client_record).unwrap();
+        let session_id = first_client_record[first_ch.session_id_range.clone()].to_vec();
+        let hrr = hrr_fixture_echoing_session_id(&session_id);
+
+        // Build a ClientHello2 that preserves random + session_id, but switches SNI!
+        let mut mutated_sni_ch2 = client_hello_fixture_with_key_share("evil.example", &[0x33; 32]);
+        let ch2_parsed = parse_client_hello(&mutated_sni_ch2).unwrap();
+        mutated_sni_ch2[TLS_HEADER_LEN + 6..TLS_HEADER_LEN + 38]
+            .copy_from_slice(&first_ch.client_random);
+        mutated_sni_ch2[ch2_parsed.session_id_range].copy_from_slice(&session_id);
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback_listener.local_addr().unwrap();
+        let origin_hrr = hrr.clone();
+        let fallback_task = tokio::spawn(async move {
+            let (mut origin, _) = fallback_listener.accept().await.unwrap();
+            let _ = read_record(&mut origin).await.unwrap();
+            origin.write_all(&origin_hrr).await.unwrap();
+            // Origin MUST NOT receive the SNI-mutated ClientHello2; it must see clean EOF.
+            let mut trailing = Vec::new();
+            origin.read_to_end(&mut trailing).await.unwrap();
+            assert!(
+                trailing.is_empty(),
+                "server must never forward an SNI-mutated ClientHello2 to the origin"
+            );
+        });
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let replay_cache_dir = tempfile::tempdir().unwrap();
+        let config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_dir.path().join("parallax-replay.cache"),
+        );
+        let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let parallax_addr = parallax_listener.local_addr().unwrap();
+        let server_ch1 = first_client_record.clone();
+        let accepted = tokio::spawn(async move {
+            let (server_side, _) = parallax_listener.accept().await.unwrap();
+            accept_authenticated(
+                server_side,
+                &config,
+                &[0x5a_u8; 32],
+                server_keys.public,
+                zeroize::Zeroizing::new([0x42_u8; 32]),
+                server_ch1,
+                AuthenticatedHello {
+                    sni: String::from("example.com"),
+                    x25519_key_share: [0x22; 32],
+                    timestamp: 1_700_000_001,
+                    nonce: [7; 8],
+                    transcript_fingerprint: [8; 32],
+                },
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        assert_eq!(read_record(&mut client).await.unwrap(), hrr);
+        client.write_all(&change_cipher_spec()).await.unwrap();
+        client.write_all(&mutated_sni_ch2).await.unwrap();
+        let _ = client.shutdown().await;
+
+        let err = accepted.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            HandshakeServerError::ServerHello(ServerHelloError::RetryClientHelloInvalid)
+        ));
+        fallback_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_authenticated_relays_only_canonical_fatal_alert_after_hrr() {
+        let first_client_record = client_hello_fixture_with_key_share("example.com", &[0x22; 32]);
+        let first_ch = parse_client_hello(&first_client_record).unwrap();
+        let session_id = first_client_record[first_ch.session_id_range.clone()].to_vec();
+        let hrr = hrr_fixture_echoing_session_id(&session_id);
+        let canonical_illegal_parameter_alert =
+            vec![TLS_CONTENT_ALERT, 0x03, 0x03, 0x00, 0x02, 0x02, 47];
+        let oversized_fake_alert = vec![
+            TLS_CONTENT_ALERT,
+            0x03,
+            0x03,
+            0x00,
+            0x06,
+            b'S',
+            b'M',
+            b'U',
+            b'G',
+            b'G',
+            b'L',
+        ];
+
+        for (alert_to_send, expected_at_origin) in [
+            (
+                canonical_illegal_parameter_alert.clone(),
+                canonical_illegal_parameter_alert,
+            ),
+            (oversized_fake_alert, Vec::new()),
+        ] {
+            let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let fallback_addr = fallback_listener.local_addr().unwrap();
+            let origin_hrr = hrr.clone();
+            let fallback_task = tokio::spawn(async move {
+                let (mut origin, _) = fallback_listener.accept().await.unwrap();
+                let _ = read_record(&mut origin).await.unwrap();
+                origin.write_all(&origin_hrr).await.unwrap();
+                let mut observed = Vec::new();
+                origin.read_to_end(&mut observed).await.unwrap();
+                assert_eq!(observed, expected_at_origin);
+            });
+
+            let server_keys = X25519KeyPair::generate();
+            let server_identity_keys = identity::keypair();
+            let replay_cache_dir = tempfile::tempdir().unwrap();
+            let config = authenticated_server_config(
+                fallback_addr,
+                &server_keys,
+                &server_identity_keys,
+                replay_cache_dir.path().join("parallax-replay.cache"),
+            );
+            let parallax_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let parallax_addr = parallax_listener.local_addr().unwrap();
+            let server_ch1 = first_client_record.clone();
+            let accepted = tokio::spawn(async move {
+                let (server_side, _) = parallax_listener.accept().await.unwrap();
+                accept_authenticated(
+                    server_side,
+                    &config,
+                    &[0x5a_u8; 32],
+                    server_keys.public,
+                    zeroize::Zeroizing::new([0x42_u8; 32]),
+                    server_ch1,
+                    AuthenticatedHello {
+                        sni: String::from("example.com"),
+                        x25519_key_share: [0x22; 32],
+                        timestamp: 1_700_000_001,
+                        nonce: [7; 8],
+                        transcript_fingerprint: [8; 32],
+                    },
+                )
+                .await
+            });
+
+            let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+            assert_eq!(read_record(&mut client).await.unwrap(), hrr);
+            client.write_all(&alert_to_send).await.unwrap();
+            let _ = client.shutdown().await;
+
+            let err = accepted.await.unwrap().unwrap_err();
+            assert!(matches!(
+                err,
+                HandshakeServerError::ServerHello(ServerHelloError::RetryClientHelloInvalid)
+            ));
+            fallback_task.await.unwrap();
+        }
     }
 }

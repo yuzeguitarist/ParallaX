@@ -1,10 +1,10 @@
 //! NIST ACVP known-answer-test (KAT) gate for the hand-rolled `crypto::mldsa`
 //! ML-DSA-87 (FIPS 204) implementation. This is the decisive correctness gate
 //! (plan §4): byte-for-byte agreement with the official ACVP vectors proves the
-//! port reproduces the reference exactly, which the differential-vs-pqcrypto
-//! tests (`tests/mldsa_differential.rs`) cannot — the C oracle is hedged-only and
-//! offers no seed-injection / deterministic API, so byte-equality must come from
-//! these vectors.
+//! port reproduces the reference exactly. The AWS-LC differential tests
+//! (`tests/mldsa_differential.rs`) check interoperability with randomized
+//! signatures. The vectors separately pin the exact bytes for a supplied seed
+//! and signing randomness.
 //!
 //! Vectors are read at runtime from the on-disk ACVP `internalProjection.json`
 //! files (which hold inputs AND answers in one file, so no `tcId` join is needed);

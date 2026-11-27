@@ -63,7 +63,6 @@ rcgen = "0.13"
 # `unsafe { libc::* }` blocks. The handful rustix does not cover stay on libc
 # (mlock/madvise, macOS PT_DENY_ATTACH, FreeBSD procctl, SO_PREFER_BUSY_POLL).
 rustix = { version = "1", features = ["event", "fs", "net", "param", "pipe", "process", "thread"] }
-rustls = { version = "=0.23.46", features = ["std", "aws_lc_rs"] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "aws-lc-rs"] }
@@ -102,18 +101,18 @@ zeroize = { version = "1.7", features = ["derive"] }
 seccompiler = "=0.5.0"
 
 [dev-dependencies]
+# Test-only TLS 1.3 / QUIC server oracle (loopback camouflage origins and HRR/retry
+# conformance fixtures). Production TLS and QUIC engines are clean-room in `src/tls/`.
+rustls = { version = "=0.23.46", features = ["std", "aws_lc_rs"] }
 tempfile = "3"
 # Test-only: enables tokio's paused-clock controls (`time::pause`/`advance`,
 # `#[tokio::test(start_paused = true)]`) so time-dependent paths (e.g. the
 # speed-test upload throughput floor) can be tested deterministically without
 # real waits. Feature-unified with the runtime tokio dep; adds no runtime code.
 tokio = { version = "1.37", features = ["test-util"] }
-# ML-DSA-87 differential oracle (tests/mldsa_differential.rs only): the PQClean C
-# FFI implementation the hand-rolled `crypto::mldsa` is cross-checked against. The
-# production identity signer is `crypto::mldsa`; these are test-only since the
-# cutover and must not re-enter [dependencies].
-pqcrypto-mldsa = "0.1.2"
-pqcrypto-traits = "0.3"
+# ML-DSA-87 differential oracle. The already resolved AWS-LC library exposes
+# the FIPS 204 context API through its C bindings.
+aws-lc-sys = { version = "0.45", default-features = false }
 # ML-DSA-87 ACVP validation harness (tests/mldsa_acvp.rs): parse NIST ACVP JSON
 # vectors and decode their uppercase-hex fields. Test-only; not runtime deps.
 serde_json = "1"

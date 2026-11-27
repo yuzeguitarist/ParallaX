@@ -298,6 +298,7 @@ strings below or it will not interoperate.
 
 **Handshake / transcript / auth:**
 - `b"ParallaX v1 handshake transcript"`
+- `b"ParallaX v1 HRR handshake transcript"`
 - `b"ParallaX v1 ClientHello authentication"`
 - `b"ParallaX v4 ClientHello carrier mask key"`
 - `b"ParallaX v4 ClientHello.random mask"`
@@ -516,7 +517,12 @@ exchanged and the client is authenticated (§7.2), both peers hold:
   between the two records into the hash. (Elsewhere this spec writes the inputs
   as `client_hello_record || server_hello_record` for brevity; that shorthand
   names the two participating records and omits the per-record length prefixes
-  made explicit here.)
+  made explicit here.) When the fallback origin answers `ClientHello1` with a
+  single TLS 1.3 `HelloRetryRequest` (§12.3), `transcript_hash` is instead
+  `SHA-256(b"ParallaX v1 HRR handshake transcript" || u32_be(len(CH1)) || CH1 || u32_be(len(HRR)) || HRR || u32_be(len(CH2)) || CH2 || u32_be(len(SH2)) || SH2)`,
+  binding all four carrier handshake messages in wire order. Each input
+  includes the raw TLS records carrying that message, with their headers and
+  original fragmentation. Compatibility ChangeCipherSpec records are excluded.
 
 The **initial chain secret** is derived with a standard HKDF
 Extract-then-Expand:
@@ -1618,25 +1624,17 @@ Safari/BoringSSL does (RFC 8446 §4.1.2 / §4.4.1):
 5. The next ServerHello MUST NOT be another HRR, MUST keep the cipher suite the
    HRR selected, and its `key_share` group MUST equal the retried group.
 
-**Authenticated-proxy limitation.** The TLS camouflage client handles this retry,
-but the reference TCP proxy does **not** support an authenticated session when
-the configured fallback origin returns an HRR. The server has already
-authenticated ClientHello1 before reading the origin's response. It derives the
-ParallaX epoch-0 keys from `(ClientHello1, HRR)`, while the client uses
-`(ClientHello1, final ServerHello)`. These are the ParallaX transcript inputs
-(§5.3), separate from the correctly collapsed TLS transcript above.
-
-ClientHello2 replaces the original TLS `key_share`, whose standalone X25519
-public key (`tls_ephemeral_pub`) is used to derive the carrier mask (§7.2).
-The distinct ParallaX authentication public key (`parallax_x25519_pub`) remains
-masked in `ClientHello.random`, which the retry copies unchanged. The server
-does not reauthenticate that retry or update its saved transcript.
-Consequently the epoch-0 keys differ: the camouflage TLS handshake may finish,
-but the server cannot recognize the client's encrypted `PX1Q`, and proxy
-establishment fails in the bounded pre-`PX1Q` origin-splice phase (§7.1). This is
-not a transparent downgrade to an ordinary origin session. Deployments SHOULD
-select and verify a fallback origin that accepts an initial `X25519` or
-`X25519MLKEM768` share without an HRR for the configured SNI.
+**Authenticated-proxy binding across HRR.** When the fallback origin answers
+`ClientHello1` with a single valid HRR, the ParallaX server (which already
+authenticated `ClientHello1` and recovered `x25519_shared`) relays the HRR to
+the client, validates and forwards the client's compat `ChangeCipherSpec` +
+`ClientHello2` (requiring matching `client_random`, `session_id`, `sni`, and
+TLS 1.3 support) to the origin, relays the origin's final `ServerHello` back to
+the client (rejecting a second HRR), and both peers derive epoch-0 keys and the
+ML-DSA identity binding over the domain-separated four-message transcript
+`SHA-256(b"ParallaX v1 HRR handshake transcript" || u32_be(len(CH1)) || CH1 || u32_be(len(HRR)) || HRR || u32_be(len(CH2)) || CH2 || u32_be(len(SH2)) || SH2)`.
+Non-HRR connections continue to use `b"ParallaX v1 handshake transcript"` over
+`(ClientHello1, ServerHello)` unchanged.
 
 ### 12.4 HTTP/2 fingerprint (TCP plane)
 

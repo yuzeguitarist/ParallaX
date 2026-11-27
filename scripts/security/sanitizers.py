@@ -298,10 +298,11 @@ class Runner:
             raise RuntimeError("No target native archives; application was not built")
         seen: set[str] = set()
         instrumented: set[str] = set()
+        expected = {"aws-lc-sys", "ring"}
         symbol = {"address": "__asan_", "thread": "__tsan_", "leak": "__lsan_"}[self.kind]
         for archive in archives:
             parent = archive.relative_to(native_build).parts[0]
-            dependency = next((name for name in ("aws-lc-sys", "ring", "pqcrypto-mldsa")
+            dependency = next((name for name in expected
                                if parent.startswith(name + "-")), None)
             if dependency is None:
                 continue
@@ -319,7 +320,6 @@ class Runner:
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "sanitizer_symbol_references": references,
             })
-        expected = {"aws-lc-sys", "ring", "pqcrypto-mldsa"}
         if expected - seen:
             raise RuntimeError(f"Missing native build evidence: {sorted(expected - seen)}")
         # LSan uses allocation interception, not per-access compiler probes.

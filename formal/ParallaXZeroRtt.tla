@@ -35,8 +35,6 @@ Init ==
   \/ (guard = "free" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
   \/ (guard = "busy" /\ binder = "ok" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
   \/ (guard = "busy" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
-  \/ (guard = "out" /\ binder = "ok" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
-  \/ (guard = "out" /\ binder = "bad" /\ offered = FALSE /\ decided = FALSE /\ early = FALSE /\ burned = FALSE /\ durable = FALSE /\ journal = "idle" /\ restarted = FALSE /\ reject = "none" /\ hs = FALSE /\ probe = "none" /\ settings = "none" /\ relay = FALSE /\ retained = FALSE /\ stored = FALSE /\ accepts = 0 /\ replay_offered = FALSE /\ replay_decided = FALSE /\ replay_rejected = FALSE /\ dead = FALSE)
 
 Offer ==
   /\ (~offered /\ ~dead)
@@ -156,13 +154,7 @@ ReplayOffer ==
   /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_decided, replay_rejected, dead >>
 
 ReplayReject ==
-  /\ (replay_offered /\ ~replay_decided /\ journal # "out")
-  /\ replay_decided' = TRUE
-  /\ replay_rejected' = TRUE
-  /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, dead >>
-
-CheckoutReject ==
-  /\ (replay_offered /\ ~replay_decided /\ journal = "out")
+  /\ (replay_offered /\ ~replay_decided)
   /\ replay_decided' = TRUE
   /\ replay_rejected' = TRUE
   /\ UNCHANGED << guard, binder, offered, decided, early, burned, durable, journal, restarted, reject, hs, probe, settings, relay, retained, stored, accepts, replay_offered, dead >>
@@ -189,7 +181,6 @@ Next ==
   \/ StoreTicket
   \/ ReplayOffer
   \/ ReplayReject
-  \/ CheckoutReject
 
 Spec == Init /\ [][Next]_vars
 

@@ -14,6 +14,13 @@ pub(crate) const MAX_CHANGE_CIPHER_SPEC_RECORDS: usize = 2;
 const MAX_SERVER_HELLO_MESSAGE: usize = 4 + 2 + 32 + 1 + 32 + 2 + 1 + 2 + u16::MAX as usize;
 const MAX_SERVER_HELLO_RECORDS: usize = 256;
 
+/// RFC 8446 §4.1.3 SHA-256("HelloRetryRequest") sentinel placed in
+/// `ServerHello.random` to encode a TLS 1.3 `HelloRetryRequest`.
+pub const HELLO_RETRY_REQUEST_RANDOM: [u8; RANDOM_LEN] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerHello {
     /// Bytes consumed on the wire, including all fragment record headers.
@@ -23,6 +30,12 @@ pub struct ServerHello {
     /// handshake). For fragmented input this is not a range into raw wire bytes.
     pub session_id_range: Range<usize>,
     pub tls13_selected: bool,
+}
+
+impl ServerHello {
+    pub fn is_hello_retry_request(&self) -> bool {
+        self.random == HELLO_RETRY_REQUEST_RANDOM
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -37,6 +50,10 @@ pub enum ServerHelloError {
     Truncated,
     #[error("ServerHello length is invalid")]
     InvalidLength,
+    #[error("origin sent a second HelloRetryRequest")]
+    UnexpectedHelloRetryRequest,
+    #[error("client retry flight after HelloRetryRequest is invalid")]
+    RetryClientHelloInvalid,
 }
 
 pub(crate) fn is_compat_change_cipher_spec(record: &[u8]) -> bool {

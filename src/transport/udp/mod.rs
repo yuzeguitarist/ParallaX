@@ -49,7 +49,7 @@ pub use quic::frame_fuzz as quic_frame_fuzz;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -198,7 +198,7 @@ pub fn client_config(
 pub(crate) mod test_support {
     use std::sync::Arc;
 
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     use super::quic::endpoint::{Connection, Endpoint};
     use super::server_config;

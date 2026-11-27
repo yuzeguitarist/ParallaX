@@ -446,10 +446,14 @@ impl Safari26TlsSession {
             stream.write_all(&self.client_hello).await?;
 
             let mut server_hello_record = self.read_server_hello_record(stream).await?;
+            let mut hrr_exchange = None;
             if is_hello_retry_request(&server_hello_record) {
-                server_hello_record = self
-                    .retry_after_hello_retry_request(stream, &mut transcript, &server_hello_record)
+                let hrr_record = server_hello_record;
+                let (second_client_hello, next_server_hello) = self
+                    .retry_after_hello_retry_request(stream, &mut transcript, &hrr_record)
                     .await?;
+                hrr_exchange = Some((hrr_record, second_client_hello));
+                server_hello_record = next_server_hello;
             }
             transcript.push_handshake_record(&server_hello_record)?;
             let server_hello =
@@ -482,31 +486,34 @@ impl Safari26TlsSession {
             self.ensure_post_handshake_boundary()?;
             Ok::<_, Safari26TlsError>((
                 server_hello_record,
+                hrr_exchange,
                 negotiated_alpn,
                 post_handshake_records,
             ))
         }
         .await;
-        let (server_hello_record, negotiated_alpn, post_handshake_records) = match result {
-            Ok(completed) => completed,
-            Err(error) => {
-                let cipher = traffic_keys.as_mut().map(|keys| {
-                    if client_finished_sent {
-                        &mut keys.client_application
-                    } else {
-                        &mut keys.client_handshake
-                    }
-                });
-                self.send_fatal_alert(stream, cipher, &error).await;
-                return Err(error);
-            }
-        };
+        let (server_hello_record, hrr_exchange, negotiated_alpn, post_handshake_records) =
+            match result {
+                Ok(completed) => completed,
+                Err(error) => {
+                    let cipher = traffic_keys.as_mut().map(|keys| {
+                        if client_finished_sent {
+                            &mut keys.client_application
+                        } else {
+                            &mut keys.client_handshake
+                        }
+                    });
+                    self.send_fatal_alert(stream, cipher, &error).await;
+                    return Err(error);
+                }
+            };
 
         Ok(CompletedSafari26Handshake {
             client_hello: self.client_hello,
             client_x25519: self.parallax_x25519,
             x25519_shared_secret: self.parallax_x25519_shared_secret,
             server_hello_record,
+            hrr_exchange,
             record_events: self.tap.events,
             negotiated_alpn,
             post_handshake_records,
@@ -583,7 +590,7 @@ impl Safari26TlsSession {
         stream: &mut TcpStream,
         transcript: &mut HandshakeTranscript,
         hrr_record: &[u8],
-    ) -> Result<Vec<u8>, Safari26TlsError> {
+    ) -> Result<(Vec<u8>, Vec<u8>), Safari26TlsError> {
         let hrr = parse_hello_retry_request(hrr_record, &self.sent_session_id)?;
 
         // RFC 8446 §4.1.4: abort if the server asks for a group we already sent a
@@ -636,7 +643,7 @@ impl Safari26TlsSession {
                 "ServerHello cipher_suite does not match the HelloRetryRequest",
             ));
         }
-        Ok(next)
+        Ok((second_client_hello, next))
     }
 
     async fn read_server_hello_record(
@@ -1279,6 +1286,9 @@ pub struct CompletedSafari26Handshake {
     pub client_hello: Vec<u8>,
     pub client_x25519: X25519KeyPair,
     pub server_hello_record: Vec<u8>,
+    /// Present iff the fallback origin sent a TLS 1.3 `HelloRetryRequest`:
+    /// `(hello_retry_request_record, second_client_hello_record)`.
+    pub hrr_exchange: Option<(Vec<u8>, Vec<u8>)>,
     pub record_events: Vec<RecordEvent>,
     pub negotiated_alpn: Option<Vec<u8>>,
     pub post_handshake_records: usize,
@@ -1825,15 +1835,9 @@ fn single_key_share_extension(group: u16, public: &[u8]) -> Result<Vec<u8>, Safa
 /// X25519 `key_share` (see [`Safari26TlsCamouflage::start`]). This rewrite replaces
 /// that extension wholesale, so ClientHello2 does not preserve the auth binding.
 ///
-/// Authenticated TCP proxy sessions through an HRR origin are unsupported: the
-/// server already authenticated ClientHello1 and derives epoch-0 keys from
-/// (ClientHello1, HRR), while this client returns the final ServerHello for its
-/// ParallaX key derivation. The server neither reauthenticates ClientHello2 nor
-/// updates that context. The TLS retry can finish, but the mismatched epoch-0
-/// keys prevent PX1Q takeover, so proxy establishment fails in the bounded
-/// pre-PQ splice. This is not a transparent downgrade to an ordinary origin
-/// session; deployments must verify their fallback origin accepts an initially
-/// offered share without HRR. See SPEC §12.3.
+/// The server authenticates ClientHello1 and the retry preserves its random,
+/// session ID and SNI. Both peers bind the four relayed handshake messages into
+/// the epoch-0 keys after the final ServerHello. See SPEC §12.3.
 fn rewrite_client_hello_for_retry(
     client_hello: &[u8],
     key_share_body: &[u8],
@@ -3633,6 +3637,7 @@ mod tests {
                 public: [1_u8; 32],
             },
             server_hello_record: vec![4, 5, 6],
+            hrr_exchange: None,
             record_events: Vec::new(),
             negotiated_alpn: Some(b"h2".to_vec()),
             post_handshake_records: 2,
@@ -7056,6 +7061,7 @@ mod tests {
         session
             .retry_after_hello_retry_request(&mut client, &mut transcript, &hrr)
             .await
+            .map(|(_second_ch, next_sh)| next_sh)
     }
 
     #[tokio::test]
@@ -7194,7 +7200,7 @@ mod tests {
         transcript
             .push_handshake_record(&session.client_hello)
             .unwrap();
-        let received_final = session
+        let (_second_client_hello, received_final) = session
             .retry_after_hello_retry_request(&mut client, &mut transcript, &received_hrr)
             .await
             .unwrap();

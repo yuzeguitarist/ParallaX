@@ -2900,12 +2900,22 @@ async fn connect_and_establish_data_session(
         session = session.with_accept_language(al.clone());
     }
     let completed = session.complete(&mut server).await?;
-    let session_keys = client::derive_session_keys_from_shared(
-        psk,
-        completed.x25519_shared_secret(),
-        &completed.client_hello,
-        &completed.server_hello_record,
-    )?;
+    let session_keys = match &completed.hrr_exchange {
+        None => client::derive_session_keys_from_shared(
+            psk,
+            completed.x25519_shared_secret(),
+            &completed.client_hello,
+            &completed.server_hello_record,
+        )?,
+        Some((hrr_record, second_client_hello)) => client::derive_hrr_session_keys_from_shared(
+            psk,
+            completed.x25519_shared_secret(),
+            &completed.client_hello,
+            hrr_record,
+            second_client_hello,
+            &completed.server_hello_record,
+        )?,
+    };
     Ok((server, ClientDataSession::new(session_keys, traffic)?))
 }
 
@@ -7284,6 +7294,44 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
+    async fn socks_relay_succeeds_across_origin_hello_retry_request_without_leaking_pq_flight() {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback_hrr_strict_decrypt().await;
+        let (target_addr, target_task) = spawn_eof_response_target().await;
+
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let _replay_cache_dir = tempfile::tempdir().unwrap();
+        let replay_cache_path = _replay_cache_dir.path().join("parallax-replay.cache");
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_cache_path,
+        );
+        let (parallax_addr, server_task) = spawn_parallax_server(server_config).await;
+        let (local_addr, client_task) =
+            spawn_local_client(parallax_addr, &server_keys, &server_identity_keys).await;
+
+        let mut app = connect_socks_target(local_addr, target_addr).await;
+        app.write_all(b"request-before-half-close").await.unwrap();
+        app.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), app.read_to_end(&mut response))
+            .await
+            .expect("authenticated relay across HRR fallback origin timed out")
+            .unwrap();
+        assert_eq!(response, b"response-after-half-close");
+
+        wait_for_task("client", client_task).await;
+        wait_for_task("server", server_task).await;
+        wait_for_task("target", target_task).await;
+        wait_for_task("fallback", fallback_task).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
     async fn socks_relay_succeeds_with_client_udp_negotiation_enabled() {
         // Turn on client-initiated UDP negotiation for this test's client only;
         // the server stays default (declines with PX1N). The relay must still
@@ -9592,6 +9640,73 @@ mod tests {
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             run_camouflage_tls_server_close_notify(stream).await;
+        });
+        (addr, task)
+    }
+
+    async fn spawn_camouflage_fallback_hrr_strict_decrypt(
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let cert_der = CertificateDer::from(STANDARD.decode(CAMOUFLAGE_CERT_DER_B64).unwrap());
+            let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                STANDARD.decode(CAMOUFLAGE_KEY_DER_B64).unwrap(),
+            ));
+            let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+            // Offer ONLY SECP256R1 so Safari 26's X25519 + X25519MLKEM768 initial
+            // key_share forces a genuine TLS 1.3 HelloRetryRequest.
+            provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::SECP256R1];
+            let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap();
+            cfg.alpn_protocols = vec![b"h2".to_vec()];
+
+            let mut server = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
+            let mut buf = [0_u8; 4096];
+            let mut client_flights = 0_usize;
+            while server.is_handshaking() {
+                flush_rustls_server(&mut server, &mut stream).await;
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "origin saw premature EOF during HRR handshake");
+                client_flights += 1;
+                let mut cursor = Cursor::new(&buf[..n]);
+                server.read_tls(&mut cursor).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            assert!(
+                client_flights >= 2,
+                "SECP256R1-only origin must force a multi-flight HRR handshake"
+            );
+            flush_rustls_server(&mut server, &mut stream).await;
+
+            // Decrypt EVERY post-handshake byte forwarded to the origin until EOF:
+            // if the ParallaX server leaks the client's ParallaX-encrypted PX1Q
+            // flight to the origin, rustls fails TLS AEAD decryption here.
+            loop {
+                match timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        let mut pos = 0;
+                        while pos < n {
+                            let mut cursor = Cursor::new(&buf[pos..n]);
+                            let consumed = server.read_tls(&mut cursor).unwrap();
+                            assert!(consumed > 0);
+                            pos += consumed;
+                            server
+                                .process_new_packets()
+                                .expect("fallback origin received undecryptable post-handshake record (leaked PX1Q)");
+                            flush_rustls_server(&mut server, &mut stream).await;
+                        }
+                    }
+                    Ok(Err(err)) => panic!("fallback origin read error: {err}"),
+                    Err(_) => break,
+                }
+            }
         });
         (addr, task)
     }

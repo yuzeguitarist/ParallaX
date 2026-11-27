@@ -4070,4 +4070,22 @@ server_identity_public_key = "{identity}"
         let prefixes: Prefixes = toml::from_str("nat64_prefixes = ['2606:4700::/96']").unwrap();
         assert_eq!(prefixes.nat64_prefixes.len(), 1);
     }
+
+    #[test]
+    fn cargo_manifest_excludes_rustls_from_production_dependencies() {
+        let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let raw = fs::read_to_string(&manifest_path).unwrap();
+        let doc: toml::Value = toml::from_str(&raw).unwrap();
+
+        let deps = doc["dependencies"].as_table().unwrap();
+        assert!(
+            !deps.contains_key("rustls"),
+            "production [dependencies] must stay rustls-free (rustls belongs in [dev-dependencies] only)"
+        );
+        let dev_deps = doc["dev-dependencies"].as_table().unwrap();
+        assert!(
+            dev_deps.contains_key("rustls"),
+            "rustls must remain in [dev-dependencies] for loopback/HRR server oracles"
+        );
+    }
 }
