@@ -4,6 +4,7 @@ pub mod client;
 pub(crate) mod concurrency;
 pub mod config;
 pub mod crypto;
+pub mod embed;
 pub mod fingerprint;
 pub mod handshake;
 pub mod netmatrix;

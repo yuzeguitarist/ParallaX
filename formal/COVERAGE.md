@@ -28,6 +28,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/bin/plx.rs` | not-exhaustive | process entrypoint |
 | `src/cli.rs` | not-exhaustive | argv parsing and filesystem paths |
 | `src/client/initial_payload.rs` | not-exhaustive | first-record bytes and socket deadlines |
+| `src/client/local.rs` | not-exhaustive | application-side stream adapters over sockets and embedder byte streams |
 | `src/client/mod.rs` | not-exhaustive | module wiring |
 | `src/client/runtime.rs` | bounded-elsewhere | Kani checks mux activation and bounded tail append arithmetic. ParallaXSession and ParallaXZeroRtt cover control order; ParallaXIdentityChunks covers bounded PX1I caller metadata, completion/verification/CONNECT gates, and establishment failure outcomes. TCP and QUIC I/O are not proved |
 | `src/client/socks.rs` | not-exhaustive | SOCKS byte parser and sockets |
@@ -52,6 +53,7 @@ A new `src/**/*.rs` file fails `check` until it is added here.
 | `src/crypto/pool.rs` | not-exhaustive | production worker queue and lifecycle are exercised under bounded Loom/Shuttle schedules; arbitrary closures, OS threads and all schedules are not proved |
 | `src/crypto/replay.rs` | bounded-elsewhere | Kani checks post-HMAC digest copying and wiping. ParallaXReplay is the in-memory stage_insert order for one slot; ParallaXSession separates early pending admission refusal/splice from the late data-proof commit refusal/close. The journal MAC and disk are not proved |
 | `src/crypto/session.rs` | bounded-elsewhere | Kani proves nonce injectivity in the sequence and substream HKDF-info injectivity in the stream id. AEAD and HKDF bytes are not enumerated. ParallaXSession anchors the degenerate-secret check; ParallaXRecords covers a three-sequence reservation window and permanent poison across fresh-key rekey |
+| `src/embed.rs` | not-exhaustive | embedding API over the client runtime: in-memory profiles, byte counting, and sockets the host owns |
 | `src/fingerprint/http2.rs` | not-exhaustive | HTTP/2 frame bytes |
 | `src/fingerprint/http3.rs` | not-exhaustive | HTTP/3 and QPACK bytes |
 | `src/fingerprint/mod.rs` | not-exhaustive | module wiring |

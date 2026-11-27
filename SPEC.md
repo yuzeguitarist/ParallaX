@@ -167,6 +167,7 @@ encrypted records.
 | `PX1I` | `50 58 31 49` | SERVER_IDENTITY_CHUNK | S→C | 5.6 |
 | `PX1F` | `50 58 31 46` | FRAMED_CHUNK (generic chunk reassembly) | both | 5.8 |
 | `PX1M` | `50 58 31 4D` | MUX_FRAME | both | 7 |
+| `PX1A` | `50 58 31 41` | UDP_ASSOCIATE (MUX OPEN payload; status reply) | both | 6.7 |
 | `PX1G` | `50 58 31 47` | UDP_REQUEST (negotiate QUIC plane) | C→S | 9.1 |
 | `PX1O` | `50 58 31 4F` | UDP_OFFER | S→C | 9.1 |
 | `PX1P` | `50 58 31 50` | UDP_PROBE_ACK | C→S | 9.1 |
@@ -201,7 +202,7 @@ from an error.
 
 | Value | Kind | Meaning | stream_id rule |
 |-------|------|---------|----------------|
-| `1` | OPEN | Open a new logical stream; payload is a `CONNECT` message. | non-zero |
+| `1` | OPEN | Open a new logical stream; payload is a `CONNECT` message, or a `UDP_ASSOCIATE` message for a datagram stream (§6.7). | non-zero |
 | `2` | DATA | Stream payload bytes. | non-zero |
 | `3` | FIN | Graceful half-close (no more data this direction). | non-zero |
 | `4` | RESET | Abort the stream. | non-zero |
@@ -881,7 +882,53 @@ offset  size         field
 `MUX_FRAME_FIXED_LEN = 13`. Stream-id rules: `kind ∈ {OPEN,DATA,FIN,RESET}`
 requires `stream_id != 0`; `kind == COVER` requires `stream_id == 0`. A
 violation is `InvalidStreamId`. `kind` outside 1..=5 is `InvalidKind`. For an
-`OPEN` frame, the `payload` is a complete `CONNECT` (`PX1C`) message.
+`OPEN` frame, the `payload` is a complete `CONNECT` (`PX1C`) message, or a
+complete `UDP_ASSOCIATE` (`PX1A`) message that opens a datagram stream (§6.7).
+
+### 6.7 UDP_ASSOCIATE (`PX1A`) — datagram streams over MUX
+
+A client relays one UDP flow (one local socket to one target) as a TCP-plane
+MUX stream. No new frame kind exists: the stream is an ordinary `OPEN` whose
+payload is a `PX1A` request, so a peer that predates `PX1A` resets only that
+stream (an unknown OPEN payload) and never the session.
+
+**Request (C→S, the OPEN payload, exact length):**
+
+```
+offset  size      field
+0       4         magic = "PX1A"
+4       2         host_len (u16 BE, 1..=255)
+6       host_len  host (UTF-8; IPv4 dotted quad, bracketless IPv6, or a name)
+6+n     2         port (u16 BE, non-zero)
+```
+
+**Status (S→C, the first non-empty DATA payload on the stream, 5 bytes):**
+`magic "PX1A" || status(u8)`, `status ∈ {0 accepted, 1 refused}`. A refused
+association is followed by `RESET`. Any other byte is `InvalidStatus`.
+
+**Datagrams.** After `accepted`, every non-empty DATA frame carries exactly one
+datagram, in either direction; frame boundaries are datagram boundaries. Empty
+DATA stays control (the OPEN receipt of §9.1) and is never a datagram, so a
+zero-length datagram cannot be carried. A datagram larger than the stream's
+maximum DATA payload is dropped (and counted) by its sender. Either side drops
+rather than blocks when its queue for the stream is full: a datagram stream never
+back-pressures the shared session. `FIN` from the client ends the association;
+the server answers with `FIN`. `RESET` aborts it.
+
+**Server behavior.** Target resolution and the egress policy are exactly those
+of `CONNECT` (§13, private/NAT64 screening of every resolved address); the
+server relays through one connected UDP socket per stream toward the first
+permitted address and counts the stream against `max_concurrent_streams`. An
+association ends after 60 s without a datagram in either direction (30 s for
+port 53). A server whose `data_target` is set relays only to that operator-fixed
+TCP target and answers every `PX1A` OPEN with `RESET` and no status; it never
+forwards a `PX1A` payload as raw bytes.
+
+**Client behavior.** A `RESET` that arrives before any status means the server
+does not offer UDP: the client records that for the session and fails later
+associations on it without another round trip. `PX1A` is not defined on the
+QUIC plane (§9.2); a QUIC-plane server resets a substream whose first record is
+`PX1A`.
 
 ### 6.6 UDP negotiation messages (optional, QUIC plane)
 
@@ -1266,7 +1313,8 @@ Each logical stream is identified by a `u32` `stream_id`.
   for `COVER` frames. (A server-initiated stream scheme is not used in the TCP
   plane; the client always initiates.)
 - **OPEN (kind 1).** Carries a complete `CONNECT` (`PX1C`) as its payload,
-  telling the server the target for this stream. After OPEN the server dials and
+  telling the server the target for this stream (or a `UDP_ASSOCIATE` (`PX1A`)
+  for a datagram stream, §6.7). After OPEN the server dials and
   the stream is established. The first DATA, FIN or RESET implicitly acknowledges
   receipt. Otherwise the TCP-plane server queues one empty DATA receipt by an
   absolute deadline of half the shared 5 s client suspect budget, measured before

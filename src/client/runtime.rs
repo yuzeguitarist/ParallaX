@@ -22,13 +22,14 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
+    sync::{mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
     time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
 
 use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;
 use crate::{
     client::initial_payload,
+    client::local::{LocalReader, LocalWriter},
     client::socks::{self, SocksError},
     config::{
         decode_base64_bytes, decode_key32, decode_psk, ClientConfig, Config, ConfigError, Mode,
@@ -39,7 +40,7 @@ use crate::{
     protocol::command::{
         ConnectRequest, ConnectRequestError, FramedReassembler, MuxFrame, MuxFrameError,
         MuxFrameKind, MuxFrameRef, MuxPayloadPool, ServerIdentityChunk, ServerIdentityProof,
-        ServerKeyExchange, MAX_PQ_HANDSHAKE_FRAME,
+        ServerKeyExchange, UdpAssociateRequest, UdpAssociateStatus, MAX_PQ_HANDSHAKE_FRAME,
     },
     protocol::data::{
         max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
@@ -47,7 +48,7 @@ use crate::{
     },
     tls::{
         record::{log_record_read, TlsRecordError, TlsRecordReader},
-        safari26::{Safari26TlsCamouflage, Safari26TlsError},
+        safari26::{Safari26TlsCamouflage, Safari26TlsError, ServerCertVerifier},
     },
     traffic::CoverTrafficProfile,
     transport::{
@@ -56,8 +57,8 @@ use crate::{
             LegWriter, TcpLegReader, TcpLegWriter,
         },
         tcp::{
-            connect_tuned_tcp_any, drain_ready_tcp_read, is_fd_exhaustion_error,
-            is_transient_accept_error, relay_connection_limit, resolve_tcp_host, tune_tcp_stream,
+            connect_tuned_tcp_any, is_fd_exhaustion_error, is_transient_accept_error,
+            needs_nat64_synthesis, relay_connection_limit, resolve_tcp_host, tune_tcp_stream,
         },
     },
 };
@@ -194,6 +195,78 @@ const MUX_CARRIER_DEFERRED_RECHECK: Duration = Duration::from_secs(1);
 /// that cannot drain for this long means the carrier is dead, and the session is
 /// torn down instead of pinning every substream queued behind it.
 const CLIENT_MUX_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Buffer and batching bounds of the client data path.
+///
+/// [`ClientRelayLimits::STANDARD`] is the CLI's tuning, value for value the
+/// constants above. [`ClientRelayLimits::CONSTRAINED`] bounds per-stream and
+/// per-session memory for hosts with a hard memory ceiling (an iOS packet tunnel
+/// extension) and keeps all AEAD work on the calling task. Neither changes a byte
+/// on the wire: records stay capped at the codec's plaintext limit and frames
+/// never span records; only how much is read, queued, or sealed per cycle moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClientRelayLimits {
+    /// Target size of one local read; never below one record's plaintext.
+    pub(crate) read_buffer_target: usize,
+    /// Depth of one stream's download channel, in frames.
+    pub(crate) stream_channel: usize,
+    /// Upload frame-channel slots per stream; a session's channel holds
+    /// `max_concurrent_streams` times this.
+    pub(crate) frame_channel_per_stream: usize,
+    /// Frames the mux writer drains behind the first one into a single batch.
+    pub(crate) frame_batch_limit: usize,
+    /// Ciphertext bytes a reader gathers into one open batch.
+    pub(crate) open_batch_bytes: usize,
+    /// Capacity of a session's buffered record reader.
+    pub(crate) record_read_buffer: usize,
+    /// Recycled payload buffers a session keeps.
+    pub(crate) payload_pool_buffers: usize,
+    /// Fully idle sessions the pool keeps for reuse.
+    pub(crate) max_idle_sessions: usize,
+    /// Whether bulk AEAD work may fan out to the process-wide crypto pool.
+    pub(crate) parallel_aead: bool,
+}
+
+impl ClientRelayLimits {
+    pub(crate) const STANDARD: Self = Self {
+        read_buffer_target: crate::protocol::data::RELAY_READ_BUFFER_TARGET,
+        stream_channel: CLIENT_MUX_STREAM_CHANNEL,
+        frame_channel_per_stream: MUX_FRAME_CHANNEL_PER_STREAM,
+        frame_batch_limit: MUX_FRAME_BATCH_LIMIT,
+        open_batch_bytes: MUX_OPEN_BATCH_BYTES,
+        record_read_buffer: crate::tls::record::BUFFERED_READ_CAPACITY,
+        payload_pool_buffers: crate::protocol::command::MUX_PAYLOAD_POOL_DEFAULT_MAX,
+        max_idle_sessions: MUX_POOL_MAX_IDLE_SESSIONS,
+        parallel_aead: true,
+    };
+
+    pub(crate) const CONSTRAINED: Self = Self {
+        read_buffer_target: 16 * 1024,
+        stream_channel: 4,
+        frame_channel_per_stream: 2,
+        frame_batch_limit: 3,
+        open_batch_bytes: 64 * 1024,
+        record_read_buffer: 32 * 1024,
+        payload_pool_buffers: 8,
+        max_idle_sessions: 1,
+        parallel_aead: false,
+    };
+
+    /// One local read buffer for records of at most `max_payload_chunk_len`
+    /// plaintext bytes (the [`relay_read_buffer_len`] rule with this target).
+    pub(crate) fn read_buffer_len(&self, max_payload_chunk_len: usize) -> usize {
+        if max_payload_chunk_len == 0 {
+            0
+        } else {
+            self.read_buffer_target.max(max_payload_chunk_len)
+        }
+    }
+
+    /// [`should_parallelize_aead`] gated on this profile allowing fan-out.
+    fn parallel(&self, record_count: usize, total_bytes: usize) -> bool {
+        self.parallel_aead && should_parallelize_aead(record_count, total_bytes)
+    }
+}
 
 static NEXT_CLIENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -538,6 +611,10 @@ struct MuxPoolState {
     build_notify: Option<Arc<Notify>>,
     consecutive_failures: u32,
     retry_at: Option<Instant>,
+    /// Network epoch whose build failures set `retry_at`; a cooldown earned on
+    /// a network the host has since left does not delay the first build on the
+    /// new one.
+    retry_epoch: u64,
 }
 
 impl MuxPoolState {
@@ -563,7 +640,7 @@ impl MuxPoolState {
 }
 
 #[derive(Clone)]
-struct ClientMuxPool {
+pub(crate) struct ClientMuxPool {
     inner: Arc<Mutex<MuxPoolState>>,
     /// Monotonic ms + 1 of the last validated local connection. Zero means the
     /// client has never served one, including at clock epoch zero. The warm-
@@ -578,6 +655,72 @@ struct ClientMuxPool {
     psk: Arc<Zeroizing<Vec<u8>>>,
     server_public: [u8; 32],
     server_identity_public: Arc<[u8]>,
+    limits: ClientRelayLimits,
+    cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    signals: Arc<MuxPoolSignals>,
+}
+
+/// Network epoch value that marks a pool as shut down for good.
+const MUX_POOL_SHUT_DOWN: u64 = u64::MAX;
+
+/// Lifecycle signals shared by a pool, its sessions, its builds and its keeper.
+struct MuxPoolSignals {
+    /// The host's network epoch. A session belongs to the epoch it was built in;
+    /// bumping the epoch (a network path change) retires every older session, and
+    /// [`MUX_POOL_SHUT_DOWN`] retires everything and stops the pool.
+    epoch: watch::Sender<u64>,
+    /// Wakes a parked warm-keeper when local activity resumes.
+    keeper_wake: Notify,
+}
+
+impl MuxPoolSignals {
+    fn new() -> Self {
+        Self {
+            epoch: watch::channel(0).0,
+            keeper_wake: Notify::new(),
+        }
+    }
+
+    fn current_epoch(&self) -> u64 {
+        *self.epoch.borrow()
+    }
+
+    fn is_shut_down(&self) -> bool {
+        self.current_epoch() == MUX_POOL_SHUT_DOWN
+    }
+}
+
+/// Resolves once `epoch` no longer holds `birth`: the owner's network epoch
+/// ended (path change) or the pool shut down.
+async fn epoch_left(epoch: &mut watch::Receiver<u64>, birth: u64) {
+    loop {
+        if *epoch.borrow_and_update() != birth {
+            return;
+        }
+        if epoch.changed().await.is_err() {
+            // The pool is gone; its owner ends through its channels instead.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Resolves once the pool behind `epoch` is shut down (or gone).
+async fn epoch_reaches_shut_down(epoch: &mut watch::Receiver<u64>) {
+    loop {
+        if *epoch.borrow_and_update() == MUX_POOL_SHUT_DOWN {
+            return;
+        }
+        if epoch.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn shut_down_error() -> ClientRuntimeError {
+    ClientRuntimeError::Io(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "ParallaX client is shut down",
+    ))
 }
 
 fn mux_activity_is_recent(last_activity: u64, now: u64) -> bool {
@@ -615,6 +758,11 @@ struct ClientMuxHandle {
     chunk_size: usize,
     carrier: MuxCarrier,
     health: Arc<MuxCarrierHealth>,
+    /// Network epoch this session was built in (see [`MuxPoolSignals`]).
+    epoch: u64,
+    /// Set once the server refused a UDP association on this session without a
+    /// PX1A status, i.e. it predates PX1A: later associations fail fast.
+    udp_unsupported: Arc<AtomicBool>,
 }
 
 /// Liveness of a TCP mux session's carrier, shared by its reader, writer, and
@@ -799,6 +947,15 @@ impl ClientMuxHandle {
             MuxCarrier::Quic { conn, .. } => !conn.is_closed(),
         }
     }
+
+    /// Ends a session whose network epoch is over. A TCP session's supervisor
+    /// already watches the epoch and aborts its tasks; a QUIC session has no
+    /// supervisor, so close its connection here (ending every substream on it).
+    fn retire(&self) {
+        if let MuxCarrier::Quic { conn, .. } = &self.carrier {
+            conn.close(0u32.into(), b"client-retire");
+        }
+    }
 }
 
 /// Hands a freshly opened stream's local write half + completion one-shot to the
@@ -808,14 +965,26 @@ impl ClientMuxHandle {
 /// per-connection task that holds the slot permit.
 struct ClientStreamRegistration {
     stream_id: u32,
-    local_write: OwnedWriteHalf,
+    local_write: Box<dyn LocalWriter>,
     outcome_tx: oneshot::Sender<DownloadOutcome>,
+}
+
+/// A datagram stream's receive side, handed to the reader. Unlike a byte
+/// stream there is no download task: the association owns the receiving end of
+/// `events` itself, and each Data frame is one datagram.
+struct ClientDatagramRegistration {
+    stream_id: u32,
+    events: mpsc::Sender<DownloadEvent>,
+    terminal: StreamTerminal,
+    dropped: Arc<AtomicU64>,
 }
 
 /// Control messages a per-connection task sends to the single mux reader loop.
 enum ClientStreamControl {
     /// Hand a newly opened stream's download half to the reader.
     Register(ClientStreamRegistration),
+    /// Route a newly opened datagram stream's Data frames to its association.
+    RegisterDatagrams(ClientDatagramRegistration),
     /// Drop a stream's download half because its per-connection task has exited.
     /// Sent after the per-connection `try_join!` returns so the reader-owned
     /// `OwnedWriteHalf` cannot leak when the stream ends without a server
@@ -881,6 +1050,11 @@ impl StreamTerminal {
         let _ = self
             .0
             .compare_exchange(Self::NONE, value, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// Whether a terminal outcome has been stamped.
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire) != Self::NONE
     }
 
     /// Read the outcome after the data channel has closed. An unset flag means the
@@ -953,7 +1127,65 @@ impl ClientMuxPool {
             psk,
             server_public,
             server_identity_public,
+            limits: ClientRelayLimits::STANDARD,
+            cert_verifier: None,
+            signals: Arc::new(MuxPoolSignals::new()),
         }
+    }
+
+    /// Embedding configuration: buffer limits and an optional origin-chain
+    /// verifier (see [`ServerCertVerifier`]). The CLI keeps the defaults.
+    pub(crate) fn with_embedding(
+        mut self,
+        limits: ClientRelayLimits,
+        cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    ) -> Self {
+        self.limits = limits;
+        self.cert_verifier = cert_verifier;
+        self
+    }
+
+    /// Retires every session built on the previous network and makes the next
+    /// build re-resolve the server and re-probe UDP. Synchronous so a host can
+    /// call it from its path-monitor thread; the retired TCP sessions' supervisors
+    /// observe the epoch and stop their tasks, and the next `acquire` (or the
+    /// returned reap future) drops their handles and closes QUIC carriers.
+    pub(crate) fn network_changed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.signals.epoch.send_modify(|epoch| {
+            if *epoch != MUX_POOL_SHUT_DOWN {
+                *epoch += 1;
+            }
+        });
+        self.server_addr.mark_stale();
+        self.reachability.record_usable();
+        let pool = self.clone();
+        async move {
+            let mut state = pool.inner.lock().await;
+            pool.reap_sessions(&mut state);
+        }
+    }
+
+    /// Stops the pool for good: retires every session, cancels in-flight builds
+    /// and the warm-keeper, and fails every later `acquire`. The returned future
+    /// closes the remaining carriers; the tasks the epoch already ended need no
+    /// further help.
+    pub(crate) fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.signals.epoch.send_replace(MUX_POOL_SHUT_DOWN);
+        self.signals.keeper_wake.notify_one();
+        let pool = self.clone();
+        async move {
+            let mut state = pool.inner.lock().await;
+            pool.reap_sessions(&mut state);
+            let notify = state.build_notify.clone();
+            drop(state);
+            if let Some(notify) = notify {
+                notify.notify_waiters();
+            }
+        }
+    }
+
+    pub(crate) fn is_shut_down(&self) -> bool {
+        self.signals.is_shut_down()
     }
 
     /// Records activity (so the warm-keeper keeps a tunnel ready during active
@@ -966,18 +1198,22 @@ impl ClientMuxPool {
     /// (the single-session starvation bug); it is bounded only by the fd-based
     /// connection limit, like the `max_concurrent_streams=1` path.
     ///
-    /// Cancellation note: in production this future always runs to completion — a
-    /// per-connection task spawns it and is never aborted, and it is never wrapped
-    /// in `timeout`/`select!`. That guarantees every `builds_in_flight` increment
-    /// below is paired with the decrement in `build_and_reserve`. Do NOT wrap
-    /// `acquire` in a cancelling combinator without making that accounting
-    /// cancel-safe first (a leaked count would, in the empty-pool single-flight
-    /// case, wedge the pool).
+    /// Cancellation: safe to drop at any await. Every `builds_in_flight` increment
+    /// below happens in the same poll that spawns the detached task owning the
+    /// matching decrement (see [`Self::build_and_reserve`]), so a dropped caller
+    /// (an embedder cancelling a flow) can never strand the count and wedge the
+    /// empty-pool single-flight case; the session it was building still joins the
+    /// pool for the next caller.
     async fn acquire(&self) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
         self.last_activity
             .store(relay_now_millis().saturating_add(1), Ordering::Relaxed);
+        // A keeper parked through an idle stretch resumes its watch now.
+        self.signals.keeper_wake.notify_one();
         let mut build_attempts = 0u32;
         loop {
+            if self.is_shut_down() {
+                return Err(shut_down_error());
+            }
             let mut state = self.inner.lock().await;
             // Prune dead and surplus-idle sessions, then take a free slot on any
             // live session (reuse before build, so steady-state traffic amortizes
@@ -986,7 +1222,11 @@ impl ClientMuxPool {
             if let Some(reserved) = reserve_slot(&state.sessions) {
                 return Ok(reserved);
             }
-            if let Some(retry_at) = state.retry_at.filter(|until| *until > Instant::now()) {
+            let epoch = self.signals.current_epoch();
+            if let Some(retry_at) = state
+                .retry_at
+                .filter(|until| *until > Instant::now() && state.retry_epoch == epoch)
+            {
                 drop(state);
                 sleep_until(retry_at).await;
                 continue;
@@ -1056,38 +1296,69 @@ impl ClientMuxPool {
     async fn build_and_reserve(
         &self,
     ) -> Result<(ClientMuxHandle, OwnedSemaphorePermit), ClientRuntimeError> {
-        let result = self.spawn_build().await;
-        let mut state = self.inner.lock().await;
-        state.builds_in_flight -= 1;
-        state.record_build_result(result.is_ok());
-        let outcome = match result {
-            Ok(handle) => {
-                // A fresh session always has free slots, so this cannot fail.
-                let permit = Arc::clone(&handle.stream_slots)
-                    .try_acquire_owned()
-                    .expect("a freshly built mux session has free substream slots");
-                state.sessions.push(handle.clone());
-                Ok((handle, permit))
+        // The build, its accounting, and the first-slot reservation run in ONE
+        // detached task, spawned in the same poll as the caller's increment. A
+        // caller dropped mid-build therefore never strands `builds_in_flight`;
+        // its session still joins the pool, and the reserved slot is released
+        // with the task's unclaimed output.
+        let pool = self.clone();
+        let accounted = tokio::spawn(async move {
+            let result = pool.spawn_build().await;
+            let mut state = pool.inner.lock().await;
+            state.builds_in_flight -= 1;
+            state.record_build_result(result.is_ok());
+            state.retry_epoch = pool.signals.current_epoch();
+            let outcome = match result {
+                Ok(handle) if handle.epoch != pool.signals.current_epoch() => {
+                    // Built on a network the host has since left (or after
+                    // shutdown): never hand it out.
+                    handle.retire();
+                    Err(if pool.is_shut_down() {
+                        shut_down_error()
+                    } else {
+                        ClientRuntimeError::Io(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "client mux session outlived its network",
+                        ))
+                    })
+                }
+                Ok(handle) => {
+                    // A fresh session always has free slots, so this cannot fail.
+                    let permit = Arc::clone(&handle.stream_slots)
+                        .try_acquire_owned()
+                        .expect("a freshly built mux session has free substream slots");
+                    state.sessions.push(handle.clone());
+                    Ok((handle, permit))
+                }
+                // Leave the pool without this session so a waiter re-loops and one
+                // becomes the next builder (preserves retry-on-failure).
+                Err(err) => Err(err),
+            };
+            let notify = state.build_notify.clone();
+            drop(state);
+            if let Some(notify) = notify {
+                notify.notify_waiters();
             }
-            // Leave the pool without this session so a waiter re-loops and one
-            // becomes the next builder (preserves retry-on-failure).
-            Err(err) => Err(err),
-        };
-        let notify = state.build_notify.clone();
-        drop(state);
-        if let Some(notify) = notify {
-            notify.notify_waiters();
+            outcome
+        });
+        match accounted.await {
+            Ok(outcome) => outcome,
+            Err(join_err) => Err(ClientRuntimeError::Io(io::Error::other(format!(
+                "client mux build accounting task failed: {join_err}"
+            )))),
         }
-        outcome
     }
 
     /// Ensures at least one reusable session exists WITHOUT reserving a slot, for
     /// the warm-keeper. Only builds when the pool is empty AND no build is already
     /// in flight, so a warm rebuild never races a connection into an extra session.
-    /// Like `acquire`, it always runs to completion (the warm-keeper task never
-    /// cancels it), so its `builds_in_flight` increment/decrement stay paired.
+    /// Cancel-safe like `acquire`: the build and its `builds_in_flight` decrement
+    /// run in one detached task spawned in the same poll as the increment.
     async fn ensure_warm(&self) -> Result<(), ClientRuntimeError> {
         loop {
+            if self.is_shut_down() {
+                return Err(shut_down_error());
+            }
             if !mux_activity_is_recent(
                 self.last_activity.load(Ordering::Relaxed),
                 relay_now_millis(),
@@ -1099,7 +1370,11 @@ impl ClientMuxPool {
             if !state.sessions.is_empty() {
                 return Ok(());
             }
-            if let Some(retry_at) = state.retry_at.filter(|until| *until > Instant::now()) {
+            let epoch = self.signals.current_epoch();
+            if let Some(retry_at) = state
+                .retry_at
+                .filter(|until| *until > Instant::now() && state.retry_epoch == epoch)
+            {
                 drop(state);
                 sleep_until(retry_at).await;
                 continue;
@@ -1107,23 +1382,37 @@ impl ClientMuxPool {
             if state.builds_in_flight == 0 {
                 state.builds_in_flight += 1;
                 drop(state);
-                let result = self.spawn_build().await;
-                let mut state = self.inner.lock().await;
-                state.builds_in_flight -= 1;
-                state.record_build_result(result.is_ok());
-                let outcome = match result {
-                    Ok(handle) => {
-                        state.sessions.push(handle);
-                        Ok(())
+                let pool = self.clone();
+                let accounted = tokio::spawn(async move {
+                    let result = pool.spawn_build().await;
+                    let mut state = pool.inner.lock().await;
+                    state.builds_in_flight -= 1;
+                    state.record_build_result(result.is_ok());
+                    state.retry_epoch = pool.signals.current_epoch();
+                    let outcome = match result {
+                        Ok(handle) if handle.epoch != pool.signals.current_epoch() => {
+                            handle.retire();
+                            Ok(())
+                        }
+                        Ok(handle) => {
+                            state.sessions.push(handle);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    };
+                    let notify = state.build_notify.clone();
+                    drop(state);
+                    if let Some(notify) = notify {
+                        notify.notify_waiters();
                     }
-                    Err(err) => Err(err),
+                    outcome
+                });
+                return match accounted.await {
+                    Ok(outcome) => outcome,
+                    Err(join_err) => Err(ClientRuntimeError::Io(io::Error::other(format!(
+                        "client mux warm build accounting task failed: {join_err}"
+                    )))),
                 };
-                let notify = state.build_notify.clone();
-                drop(state);
-                if let Some(notify) = notify {
-                    notify.notify_waiters();
-                }
-                return outcome;
             }
             // A build is already in flight. Enable the wakeup under the lock (as in
             // `acquire`) so the completing build's notify is never missed, then
@@ -1145,7 +1434,20 @@ impl ClientMuxPool {
     /// stalling server never blocks other local connections behind the pool mutex.
     async fn spawn_build(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
         let pool = self.clone();
-        match tokio::spawn(async move { pool.start_session().await }).await {
+        let mut epoch = self.signals.epoch.subscribe();
+        let birth = *epoch.borrow_and_update();
+        let build = async move {
+            // A network change or shutdown abandons the handshake at once instead
+            // of finishing a session that would be retired on arrival.
+            tokio::select! {
+                result = pool.start_session(birth) => result,
+                _ = epoch_left(&mut epoch, birth) => Err(ClientRuntimeError::Io(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "client mux build abandoned: network changed or client shut down",
+                ))),
+            }
+        };
+        match tokio::spawn(build).await {
             Ok(result) => result,
             Err(join_err) => {
                 tracing::warn!(
@@ -1160,19 +1462,26 @@ impl ClientMuxPool {
     }
 
     /// Drops sessions that are no longer reusable (both carrier tasks/conn must be
-    /// live — see [`ClientMuxHandle::is_reusable`]) and fully-idle sessions beyond
-    /// [`MUX_POOL_MAX_IDLE_SESSIONS`], so the pool does not hoard idle carriers
-    /// after a burst. A session with any substream slot in use is always kept.
+    /// live — see [`ClientMuxHandle::is_reusable`]), sessions from an earlier
+    /// network epoch (retired, see [`ClientMuxHandle::retire`]), and fully-idle
+    /// sessions beyond the profile's idle cap ([`MUX_POOL_MAX_IDLE_SESSIONS`] by
+    /// default), so the pool does not hoard idle carriers after a burst. A current
+    /// session with any substream slot in use is always kept.
     fn reap_sessions(&self, state: &mut MuxPoolState) {
         let full_slots = self.traffic.max_concurrent_streams as usize;
+        let epoch = self.signals.current_epoch();
         let mut idle_kept = 0;
         state.sessions.retain(|handle| {
+            if handle.epoch != epoch {
+                handle.retire();
+                return false;
+            }
             if !handle.is_reusable() {
                 return false;
             }
             // Fully idle == every substream slot free (no active connection).
             if handle.stream_slots.available_permits() >= full_slots {
-                if idle_kept < MUX_POOL_MAX_IDLE_SESSIONS {
+                if idle_kept < self.limits.max_idle_sessions {
                     idle_kept += 1;
                     true
                 } else {
@@ -1184,8 +1493,9 @@ impl ClientMuxPool {
         });
     }
 
-    fn start_keeper(&self) {
+    pub(crate) fn start_keeper(&self) {
         let pool = self.clone();
+        let mut epoch = self.signals.epoch.subscribe();
         tokio::spawn(async move {
             // Warm-keeper: during active-use windows, proactively rebuild a dead
             // shared tunnel so the next local connection finds it warm (resilience
@@ -1199,12 +1509,28 @@ impl ClientMuxPool {
             // blackholed) use exponential backoff + jitter and a hard attempt cap,
             // after which the keeper goes dormant until fresh local activity — a
             // clock-locked retry burst to a dead endpoint is itself a covert tell.
+            //
+            // The poll runs only inside an active-use window. Outside it there is
+            // nothing to keep warm, so the keeper parks on `keeper_wake` (fired by
+            // `acquire`) with no timer armed: a long-idle client, such as a mobile
+            // tunnel with no new flows, gets no wakeups from it at all.
             let mut failures: u32 = 0;
             let mut next_rebuild_at: u64 = 0;
             // last_activity value at which we gave up; stay dormant until it advances.
             let mut dormant_after: Option<u64> = None;
             loop {
-                sleep(MUX_WARM_KEEPER_INTERVAL).await;
+                let active = mux_activity_is_recent(
+                    pool.last_activity.load(Ordering::Relaxed),
+                    relay_now_millis(),
+                );
+                tokio::select! {
+                    _ = sleep(MUX_WARM_KEEPER_INTERVAL), if active => {}
+                    _ = pool.signals.keeper_wake.notified(), if !active => {}
+                    _ = epoch_reaches_shut_down(&mut epoch) => return,
+                }
+                if pool.is_shut_down() {
+                    return;
+                }
                 let alive = {
                     let mut state = pool.inner.lock().await;
                     pool.reap_sessions(&mut state);
@@ -1240,7 +1566,12 @@ impl ClientMuxPool {
                 if now < next_rebuild_at {
                     continue;
                 }
-                match pool.ensure_warm().await {
+                // `ensure_warm` is cancel-safe, so shutdown may cut it short.
+                let warmed = tokio::select! {
+                    warmed = pool.ensure_warm() => warmed,
+                    _ = epoch_reaches_shut_down(&mut epoch) => return,
+                };
+                match warmed {
                     Ok(_) => {
                         failures = 0;
                         next_rebuild_at = 0;
@@ -1272,7 +1603,7 @@ impl ClientMuxPool {
         });
     }
 
-    async fn start_session(&self) -> Result<ClientMuxHandle, ClientRuntimeError> {
+    async fn start_session(&self, birth: u64) -> Result<ClientMuxHandle, ClientRuntimeError> {
         let (server, data_session, retained_quic) =
             establish_authenticated_data_session_with_resolver(
                 &self.server_addr,
@@ -1283,6 +1614,7 @@ impl ClientMuxPool {
                 self.psk.as_ref().as_slice(),
                 &self.server_public,
                 Arc::clone(&self.server_identity_public),
+                self.cert_verifier.as_ref(),
             )
             .await?;
         // `TrafficConfig::validate` rejects 0, but clamp anyway: a programmatically
@@ -1355,29 +1687,36 @@ impl ClientMuxPool {
                 },
                 // QUIC carries its own liveness (idle timeout); never marked.
                 health: Arc::new(MuxCarrierHealth::new()),
+                epoch: birth,
+                udp_unsupported: Arc::new(AtomicBool::new(false)),
             });
         }
 
         // No Verified UDP path: the mux stays on TCP, byte-identical to before.
+        let limits = self.limits;
         let (server_read, server_write) = server.into_split();
         let (seal_to_server, open_from_server) = data_session.into_data_codecs();
         let channel_capacity = stream_limit
-            .saturating_mul(MUX_FRAME_CHANNEL_PER_STREAM)
+            .saturating_mul(limits.frame_channel_per_stream)
             .max(1);
         let (frame_tx, frame_rx) = mpsc::channel(channel_capacity);
         let (register_tx, register_rx) = mpsc::channel(stream_limit.max(1));
         let session_cid = NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-        let payload_pool = MuxPayloadPool::with_capacity(MuxFrame::max_payload_len(chunk_size));
+        let payload_pool = MuxPayloadPool::new(
+            MuxFrame::max_payload_len(chunk_size),
+            limits.payload_pool_buffers,
+        );
         let health = Arc::new(MuxCarrierHealth::new());
         let cover = CoverTrafficProfile::from_config(self.traffic);
         let reader = client_mux_reader_loop(
-            TcpLegReader::buffered(server_read),
+            TcpLegReader::buffered_with_capacity(server_read, limits.record_read_buffer),
             open_from_server,
             register_rx,
             session_cid,
             client_relay_idle_timeout(),
             Arc::clone(&health),
             MUX_CARRIER_WATCHDOG,
+            limits,
         );
         let writer = client_mux_writer_loop(
             TcpLegWriter(server_write),
@@ -1388,14 +1727,25 @@ impl ClientMuxPool {
             payload_pool.clone(),
             Arc::clone(&health),
             CLIENT_MUX_WRITE_STALL_TIMEOUT,
+            limits,
         );
         // Separate tasks so the two directions run in parallel, supervised so
-        // that either one ending ends the session.
-        tokio::spawn(supervise_client_mux_session(
-            tokio::spawn(reader),
-            tokio::spawn(writer),
-            session_cid,
-        ));
+        // that either one ending ends the session — or the session's network
+        // epoch ending (path change, shutdown), which aborts both.
+        let reader = tokio::spawn(reader);
+        let writer = tokio::spawn(writer);
+        let (reader_abort, writer_abort) = (reader.abort_handle(), writer.abort_handle());
+        let mut epoch = self.signals.epoch.subscribe();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = supervise_client_mux_session(reader, writer, session_cid) => {}
+                () = epoch_left(&mut epoch, birth) => {
+                    tracing::debug!(cid = session_cid, "client mux session retired by its network epoch");
+                    reader_abort.abort();
+                    writer_abort.abort();
+                }
+            }
+        });
 
         Ok(ClientMuxHandle {
             next_stream_id: Arc::new(AtomicU32::new(1)),
@@ -1407,6 +1757,8 @@ impl ClientMuxPool {
                 payload_pool,
             },
             health,
+            epoch: birth,
+            udp_unsupported: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -1463,19 +1815,46 @@ async fn handle_local_mux_connection_with_cid(
         task_name = "client-mux-connection",
         "accepted SOCKS connection for mux session"
     );
+    let (local_read, local_write) = local.into_split();
+    relay_mux_stream(
+        request.host,
+        request.port,
+        local_read,
+        local_write,
+        &mux_pool,
+        cid,
+    )
+    .await
+}
 
+/// Relays one already-accepted local stream to `host:port` over a pooled mux
+/// session. The SOCKS5 adapter above and the embedding API share this code, so
+/// both produce the same frames and records for the same application bytes.
+pub(crate) async fn relay_mux_stream<L, W>(
+    host: String,
+    port: u16,
+    mut local_read: L,
+    local_write: W,
+    mux_pool: &ClientMuxPool,
+    cid: u64,
+) -> Result<(), ClientRuntimeError>
+where
+    L: LocalReader,
+    W: LocalWriter,
+{
     // Reserve a substream slot on a session that has one free, opening a new
     // session if every existing session is saturated. The permit is held for the
     // whole connection: it bounds each session to `max_concurrent_streams`
     // substreams WITHOUT capping the client's total concurrent connections.
     let (mux, _stream_permit) = mux_pool.acquire().await?;
-    let initial_payload_cap = MuxFrame::max_open_initial_payload_len(&request.host, mux.chunk_size);
-    let initial_payload = initial_payload::read_initial_payload(&mut local, initial_payload_cap)
-        .await
-        .map_err(ClientRuntimeError::Io)?;
+    let initial_payload_cap = MuxFrame::max_open_initial_payload_len(&host, mux.chunk_size);
+    let initial_payload =
+        initial_payload::read_initial_payload(&mut local_read, initial_payload_cap)
+            .await
+            .map_err(ClientRuntimeError::Io)?;
     let connect_request = ConnectRequest {
-        host: request.host,
-        port: request.port,
+        host,
+        port,
         initial_payload,
     };
 
@@ -1491,7 +1870,8 @@ async fn handle_local_mux_connection_with_cid(
     } = &mux.carrier
     {
         return client_mux_quic_substream(
-            local,
+            local_read,
+            local_write,
             conn.clone(),
             session_keys,
             *traffic,
@@ -1499,6 +1879,7 @@ async fn handle_local_mux_connection_with_cid(
             authority,
             accept_language.as_deref(),
             cid,
+            mux_pool.limits,
         )
         .await;
     }
@@ -1528,14 +1909,13 @@ async fn handle_local_mux_connection_with_cid(
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
 
-    let (local_read, local_write) = local.into_split();
     let (outcome_tx, outcome_rx) = oneshot::channel();
     // Register the download half with the reader before announcing the stream,
     // so an immediate server response can never race ahead of the write half.
     if register_tx
         .send(ClientStreamControl::Register(ClientStreamRegistration {
             stream_id,
-            local_write,
+            local_write: Box::new(local_write),
             outcome_tx,
         }))
         .await
@@ -1544,7 +1924,13 @@ async fn handle_local_mux_connection_with_cid(
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client mux reader is gone").into());
     }
     open_slot.send(open_frame);
+    // From here the stream exists on both ends. If the caller drops this future
+    // (an embedder cancelling a flow), the guard still resets the server side and
+    // releases the reader's download half instead of leaking both until the
+    // session ends.
+    let mut teardown = MuxStreamTeardown::armed(frame_tx.clone(), register_tx.clone(), stream_id);
     if frame_tx.is_closed() {
+        teardown.disarm();
         let _ = register_tx
             .send(ClientStreamControl::Deregister(stream_id))
             .await;
@@ -1563,6 +1949,9 @@ async fn handle_local_mux_connection_with_cid(
         } else {
             Duration::ZERO
         },
+        mux_pool
+            .limits
+            .read_buffer_len(MuxFrame::max_payload_len(mux.chunk_size)),
     );
     let download = client_mux_await_download(outcome_rx, cid);
     // Wait for BOTH halves. A clean server Fin (DownloadOutcome::Fin -> Ok)
@@ -1574,6 +1963,7 @@ async fn handle_local_mux_connection_with_cid(
     // below turns into an upstream Reset. Cancelling the upload here would
     // silently drop in-flight client->server bytes and break half-close.
     let result = tokio::try_join!(upload, download).map(|_| ());
+    teardown.disarm();
 
     // Tear the stream down on both ends so it cannot leak when it ended without a
     // server Fin/Reset (e.g. the local upload half errored before a clean Fin).
@@ -1602,6 +1992,330 @@ fn next_mux_stream_id(next: &AtomicU32) -> u32 {
     next.fetch_add(2, Ordering::Relaxed) | 1
 }
 
+/// Resets and deregisters an announced TCP-mux stream whose owning future was
+/// dropped before its own teardown ran. Disarmed on every path that tears the
+/// stream down itself, so the CLI (which never cancels a stream) is unaffected.
+struct MuxStreamTeardown {
+    channels: Option<(
+        mpsc::Sender<MuxFrame>,
+        mpsc::Sender<ClientStreamControl>,
+        u32,
+    )>,
+}
+
+impl MuxStreamTeardown {
+    fn armed(
+        frame_tx: mpsc::Sender<MuxFrame>,
+        register_tx: mpsc::Sender<ClientStreamControl>,
+        stream_id: u32,
+    ) -> Self {
+        Self {
+            channels: Some((frame_tx, register_tx, stream_id)),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.channels = None;
+    }
+}
+
+impl Drop for MuxStreamTeardown {
+    fn drop(&mut self) {
+        let Some((frame_tx, register_tx, stream_id)) = self.channels.take() else {
+            return;
+        };
+        let reset = MuxFrame {
+            stream_id,
+            kind: MuxFrameKind::Reset,
+            payload: Vec::new(),
+        };
+        match tokio::runtime::Handle::try_current() {
+            // Bounded: both sends end when the session's channels close.
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = frame_tx.send(reset).await;
+                    let _ = register_tx
+                        .send(ClientStreamControl::Deregister(stream_id))
+                        .await;
+                });
+            }
+            Err(_) => {
+                let _ = frame_tx.try_send(reset);
+                let _ = register_tx.try_send(ClientStreamControl::Deregister(stream_id));
+            }
+        }
+    }
+}
+
+/// Builds the mux pool behind [`crate::embed::Client`]: no listener and no I/O
+/// until the first stream (the server address resolves on first use).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn embedded_mux_pool(
+    config: ClientConfig,
+    traffic: TrafficConfig,
+    udp: UdpConfig,
+    psk: Zeroizing<Vec<u8>>,
+    server_public: [u8; 32],
+    server_identity_public: Arc<[u8]>,
+    limits: ClientRelayLimits,
+    cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+) -> ClientMuxPool {
+    let server_addr = ServerAddrResolver::deferred(&config.server_addr);
+    ClientMuxPool::new(
+        Arc::new(config),
+        server_addr,
+        traffic,
+        Arc::new(udp),
+        Arc::new(UdpReachability::new(UDP_BLACKHOLE_TTL)),
+        Arc::new(psk),
+        server_public,
+        server_identity_public,
+    )
+    .with_embedding(limits, cert_verifier)
+}
+
+/// Next connection id for log correlation, shared with the SOCKS listener.
+pub(crate) fn next_client_connection_id() -> u64 {
+    NEXT_CLIENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Why a UDP association could not be opened.
+#[derive(Debug)]
+pub(crate) enum UdpOpenError {
+    /// The server does not relay UDP: it predates `PX1A`, relays only to an
+    /// operator-fixed target, or the session runs on the QUIC plane.
+    Unsupported,
+    /// The server refused this target (resolution, egress policy, socket).
+    Refused,
+    Runtime(ClientRuntimeError),
+}
+
+impl From<ClientRuntimeError> for UdpOpenError {
+    fn from(err: ClientRuntimeError) -> Self {
+        Self::Runtime(err)
+    }
+}
+
+/// Why a datagram was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UdpSendError {
+    /// Larger than one DATA frame can carry on this session.
+    TooLarge(usize),
+    /// The association or its session has ended.
+    Closed,
+}
+
+/// Client side of one `PX1A` datagram stream (SPEC §6.7) on a TCP-mux session.
+pub(crate) struct ClientUdpAssociation {
+    stream_id: u32,
+    frame_tx: mpsc::Sender<MuxFrame>,
+    register_tx: mpsc::Sender<ClientStreamControl>,
+    events: mpsc::Receiver<DownloadEvent>,
+    terminal: StreamTerminal,
+    payload_pool: MuxPayloadPool,
+    max_datagram: usize,
+    dropped_inbound: Arc<AtomicU64>,
+    dropped_outbound: AtomicU64,
+    /// Bounds the session's streams like any CONNECT stream.
+    _slot: OwnedSemaphorePermit,
+    finished: bool,
+}
+
+impl ClientMuxPool {
+    /// Opens a UDP association toward `host:port` (SPEC §6.7) on a pooled
+    /// session. `queue` bounds the datagrams buffered toward the caller; beyond
+    /// it the shared reader drops instead of waiting.
+    pub(crate) async fn open_udp(
+        &self,
+        host: String,
+        port: u16,
+        queue: usize,
+    ) -> Result<ClientUdpAssociation, UdpOpenError> {
+        let request = UdpAssociateRequest { host, port }
+            .encode()
+            .map_err(|err| ClientRuntimeError::Io(io::Error::other(err.to_string())))?;
+        let (mux, slot) = self.acquire().await?;
+        if mux.udp_unsupported.load(Ordering::Relaxed) {
+            return Err(UdpOpenError::Unsupported);
+        }
+        let MuxCarrier::Tcp {
+            frame_tx,
+            register_tx,
+            payload_pool,
+        } = &mux.carrier
+        else {
+            // PX1A is a TCP-plane construct; the QUIC plane resets it.
+            return Err(UdpOpenError::Unsupported);
+        };
+        let stream_id = next_mux_stream_id(&mux.next_stream_id);
+        let open_slot = frame_tx
+            .reserve()
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
+            .map_err(ClientRuntimeError::Io)?;
+        let (events_tx, events) = mpsc::channel(queue.max(1));
+        let terminal = StreamTerminal::new();
+        let dropped_inbound = Arc::new(AtomicU64::new(0));
+        if register_tx
+            .send(ClientStreamControl::RegisterDatagrams(
+                ClientDatagramRegistration {
+                    stream_id,
+                    events: events_tx,
+                    terminal: terminal.clone(),
+                    dropped: Arc::clone(&dropped_inbound),
+                },
+            ))
+            .await
+            .is_err()
+        {
+            return Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "client mux reader is gone",
+            ))
+            .into());
+        }
+        open_slot.send(MuxFrame {
+            stream_id,
+            kind: MuxFrameKind::Open,
+            payload: request,
+        });
+        let mut association = ClientUdpAssociation {
+            stream_id,
+            frame_tx: frame_tx.clone(),
+            register_tx: register_tx.clone(),
+            events,
+            terminal,
+            payload_pool: payload_pool.clone(),
+            max_datagram: MuxFrame::max_payload_len(mux.chunk_size),
+            dropped_inbound,
+            dropped_outbound: AtomicU64::new(0),
+            _slot: slot,
+            finished: false,
+        };
+        match timeout(CLIENT_ESTABLISH_TIMEOUT, association.events.recv()).await {
+            Ok(Some(DownloadEvent(status))) => match UdpAssociateStatus::decode(&status) {
+                Ok(UdpAssociateStatus::Accepted) => Ok(association),
+                Ok(UdpAssociateStatus::Refused) => Err(UdpOpenError::Refused),
+                Err(_) => {
+                    // Bytes that are not a PX1A status: not a PX1A server.
+                    mux.udp_unsupported.store(true, Ordering::Relaxed);
+                    Err(UdpOpenError::Unsupported)
+                }
+            },
+            // The stream ended before any status.
+            Ok(None) if !mux.is_reusable() => Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "client mux session ended",
+            ))
+            .into()),
+            Ok(None) => {
+                // A RESET with no PX1A status: this server does not relay UDP.
+                association.finished = true;
+                let _ = association
+                    .register_tx
+                    .try_send(ClientStreamControl::Deregister(stream_id));
+                mux.udp_unsupported.store(true, Ordering::Relaxed);
+                Err(UdpOpenError::Unsupported)
+            }
+            Err(_) => Err(ClientRuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "server did not answer the UDP association in time",
+            ))
+            .into()),
+        }
+    }
+}
+
+impl ClientUdpAssociation {
+    /// Largest datagram this association can carry (one DATA frame payload).
+    pub(crate) fn max_datagram_len(&self) -> usize {
+        self.max_datagram
+    }
+
+    /// Queues one datagram without waiting. `Ok(false)` when it was dropped
+    /// because the session's send queue is full (UDP semantics) or it is empty
+    /// (a zero-length datagram cannot be framed).
+    pub(crate) fn send(&self, datagram: &[u8]) -> Result<bool, UdpSendError> {
+        if datagram.len() > self.max_datagram {
+            self.dropped_outbound.fetch_add(1, Ordering::Relaxed);
+            return Err(UdpSendError::TooLarge(self.max_datagram));
+        }
+        if self.finished || self.terminal.is_set() {
+            return Err(UdpSendError::Closed);
+        }
+        if datagram.is_empty() {
+            self.dropped_outbound.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        match self.frame_tx.try_reserve() {
+            Ok(permit) => {
+                permit.send(MuxFrame {
+                    stream_id: self.stream_id,
+                    kind: MuxFrameKind::Data,
+                    payload: self.payload_pool.take_filled(datagram),
+                });
+                Ok(true)
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                self.dropped_outbound.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => Err(UdpSendError::Closed),
+        }
+    }
+
+    /// Waits for the next datagram and copies it into `buf`, returning its full
+    /// length; a longer datagram is truncated to `buf` (as `recv(2)` does).
+    /// `Ok(None)` once the association has ended.
+    pub(crate) async fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let DownloadEvent(datagram) = self.events.recv().await?;
+        let copied = datagram.len().min(buf.len());
+        buf[..copied].copy_from_slice(&datagram[..copied]);
+        Some(datagram.len())
+    }
+
+    /// Datagrams dropped toward the caller (queue full) and toward the server
+    /// (send queue full, oversize, or empty).
+    pub(crate) fn dropped(&self) -> (u64, u64) {
+        (
+            self.dropped_inbound.load(Ordering::Relaxed),
+            self.dropped_outbound.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Ends the association cleanly: `FIN` to the server, which answers `FIN`.
+    pub(crate) async fn close(mut self) {
+        self.finished = true;
+        let _ = self
+            .frame_tx
+            .send(MuxFrame {
+                stream_id: self.stream_id,
+                kind: MuxFrameKind::Fin,
+                payload: Vec::new(),
+            })
+            .await;
+        let _ = self
+            .register_tx
+            .send(ClientStreamControl::Deregister(self.stream_id))
+            .await;
+    }
+}
+
+impl Drop for ClientUdpAssociation {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Dropped without `close`: reset the server side and release the reader's
+        // route, exactly like an abandoned TCP stream.
+        drop(MuxStreamTeardown::armed(
+            self.frame_tx.clone(),
+            self.register_tx.clone(),
+            self.stream_id,
+        ));
+    }
+}
+
 /// Relays one mux substream over its OWN QUIC bidi (native multiplexing). Opens a
 /// fresh bidi on the shared connection, derives a per-substream record codec keyed
 /// by the bidi's wire stream id (so the server derives the matching codec from the
@@ -1610,8 +2324,9 @@ fn next_mux_stream_id(next: &AtomicU32) -> u32 {
 /// carrier to the single-Connect QUIC relay, just one per substream. Teardown is
 /// per-stream: a clean finish on the send half, a `RESET_STREAM` on error.
 #[allow(clippy::too_many_arguments)]
-async fn client_mux_quic_substream(
-    local: TcpStream,
+async fn client_mux_quic_substream<L, W>(
+    local_read: L,
+    local_write: W,
     conn: crate::transport::udp::quic::endpoint::Connection,
     session_keys: &SessionKeys,
     traffic: TrafficConfig,
@@ -1619,7 +2334,12 @@ async fn client_mux_quic_substream(
     authority: &str,
     accept_language: Option<&str>,
     cid: u64,
-) -> Result<(), ClientRuntimeError> {
+    limits: ClientRelayLimits,
+) -> Result<(), ClientRuntimeError>
+where
+    L: LocalReader,
+    W: LocalWriter,
+{
     use crate::transport::udp::h3::{
         read_business_response_headers, write_business_request_headers,
     };
@@ -1723,8 +2443,7 @@ async fn client_mux_quic_substream(
         }
     }
 
-    let (local_read, local_write) = local.into_split();
-    let local_buf = vec![0_u8; relay_read_buffer_len(chunk_size)];
+    let local_buf = vec![0_u8; limits.read_buffer_len(chunk_size)];
     let activity: ClientRelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
     // Cover profile from config, exactly like the single-Connect QUIC path: when
     // cover is disabled (the default) the upload loop is a plain copy; when enabled
@@ -1739,6 +2458,7 @@ async fn client_mux_quic_substream(
         cover,
         activity.clone(),
         cid,
+        limits,
     );
     let download = client_download_loop(
         H3DataFrameLegReader::buffered(recv),
@@ -1746,6 +2466,7 @@ async fn client_mux_quic_substream(
         open_from_server,
         activity.clone(),
         cid,
+        limits,
     );
     let relay = async { tokio::try_join!(upload, download) };
     let outcome = tokio::select! {
@@ -1824,6 +2545,7 @@ async fn handle_local_connection_with_cid(
                 speculative_psk.as_slice(),
                 &speculative_server_public,
                 speculative_server_identity_public,
+                None,
             )
             .await
         })
@@ -1917,6 +2639,7 @@ pub(crate) async fn establish_authenticated_data_session(
         psk,
         server_public,
         server_identity_public,
+        None,
     )
     .await?;
     // The speed test measures TCP always (over `server`), and QUIC additionally
@@ -2378,6 +3101,7 @@ async fn establish_authenticated_data_session_with_resolver(
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: Arc<[u8]>,
+    cert_verifier: Option<&Arc<dyn ServerCertVerifier>>,
 ) -> Result<(TcpStream, ClientDataSession, Option<RetainedClientQuic>), ClientRuntimeError> {
     // Bound the entire post-connect establishment (camouflage TLS .complete(),
     // PQ-rekey read, server-identity read/verify, AND the fail-soft UDP
@@ -2401,6 +3125,7 @@ async fn establish_authenticated_data_session_with_resolver(
             psk,
             server_public,
             server_identity_public,
+            cert_verifier,
         ),
     )
     .await
@@ -2423,10 +3148,17 @@ async fn establish_authenticated_data_session_inner(
     psk: &[u8],
     server_public: &[u8; 32],
     server_identity_public: Arc<[u8]>,
+    cert_verifier: Option<&Arc<dyn ServerCertVerifier>>,
 ) -> Result<(TcpStream, ClientDataSession, Option<RetainedClientQuic>), ClientRuntimeError> {
-    let (mut server, mut data_session) =
-        connect_and_establish_data_session(server_addr, config, traffic, psk, server_public)
-            .await?;
+    let (mut server, mut data_session) = connect_and_establish_data_session(
+        server_addr,
+        config,
+        traffic,
+        psk,
+        server_public,
+        cert_verifier,
+    )
+    .await?;
     let (pq_record, pending_rekey) = data_session.build_pq_rekey_record(&mut OsRng)?;
     server.write_all(&pq_record).await?;
     apply_server_key_exchange_after_residuals(&mut server, &mut data_session, &pending_rekey, psk)
@@ -2568,6 +3300,10 @@ struct ServerAddrResolver {
     original: Arc<str>,
     cached: Arc<Mutex<Vec<SocketAddr>>>,
     literal: bool,
+    /// Set when the host's network changed: the cached answers may belong to the
+    /// old network (another resolver, NAT64 prefix, or address family), so the
+    /// next connect resolves afresh before trying them.
+    stale: Arc<AtomicBool>,
 }
 
 // Leave room for the authenticated handshake inside CLIENT_ESTABLISH_TIMEOUT.
@@ -2577,18 +3313,47 @@ const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 impl ServerAddrResolver {
     async fn new(server_addr: &str) -> Result<Self, ClientRuntimeError> {
         let parsed = server_addr.parse::<SocketAddr>().ok();
+        let literal = parsed.is_some_and(|addr| !needs_nat64_synthesis(&addr));
         let initial = match parsed {
-            Some(addr) => vec![addr],
-            None => resolve_client_server_addr(server_addr).await?,
+            Some(addr) if literal => vec![addr],
+            _ => resolve_client_server_addr(server_addr).await?,
         };
         Ok(Self {
             original: Arc::<str>::from(server_addr),
             cached: Arc::new(Mutex::new(initial)),
-            literal: parsed.is_some(),
+            literal,
+            stale: Arc::new(AtomicBool::new(false)),
         })
     }
 
+    /// A resolver that performs no I/O until its first connect, so a client can
+    /// be created synchronously (embedding) and resolve on first use.
+    fn deferred(server_addr: &str) -> Self {
+        let parsed = server_addr.parse::<SocketAddr>().ok();
+        let literal = parsed.is_some_and(|addr| !needs_nat64_synthesis(&addr));
+        Self {
+            original: Arc::<str>::from(server_addr),
+            cached: Arc::new(Mutex::new(parsed.into_iter().collect())),
+            literal,
+            stale: Arc::new(AtomicBool::new(!literal)),
+        }
+    }
+
+    fn mark_stale(&self) {
+        if !self.literal {
+            self.stale.store(true, Ordering::Relaxed);
+        }
+    }
+
     async fn connect(&self) -> Result<TcpStream, ClientRuntimeError> {
+        if self.stale.swap(false, Ordering::Relaxed) {
+            // Refresh first; on failure keep the previous answers and let the
+            // normal path below retry resolution once they fail too.
+            match resolve_client_server_addr(self.original.as_ref()).await {
+                Ok(refreshed) => *self.cached.lock().await = refreshed,
+                Err(_) => self.stale.store(true, Ordering::Relaxed),
+            }
+        }
         self.connect_with_resolver(|| resolve_client_server_addr(self.original.as_ref()))
             .await
     }
@@ -2650,7 +3415,9 @@ async fn resolve_client_server_addr(
     server_addr: &str,
 ) -> Result<Vec<SocketAddr>, ClientRuntimeError> {
     if let Ok(addr) = server_addr.parse::<SocketAddr>() {
-        return Ok(vec![addr]);
+        if !needs_nat64_synthesis(&addr) {
+            return Ok(vec![addr]);
+        }
     }
 
     let mut addrs = Vec::new();
@@ -2883,6 +3650,7 @@ async fn connect_and_establish_data_session(
     traffic: TrafficConfig,
     psk: &[u8],
     server_public: &[u8; 32],
+    cert_verifier: Option<&Arc<dyn ServerCertVerifier>>,
 ) -> Result<(TcpStream, ClientDataSession), ClientRuntimeError> {
     // The first ML-KEM key generation can take tens of milliseconds. Prepare
     // a fresh key before opening TCP, then build the timestamped ClientHello
@@ -2898,6 +3666,9 @@ async fn connect_and_establish_data_session(
     )?;
     if let Some(al) = &config.accept_language {
         session = session.with_accept_language(al.clone());
+    }
+    if let Some(verifier) = cert_verifier {
+        session = session.with_cert_verifier(Some(Arc::clone(verifier)));
     }
     let completed = session.complete(&mut server).await?;
     let session_keys = match &completed.hrr_exchange {
@@ -3024,6 +3795,7 @@ impl ClientRelay {
                 cover,
                 activity.clone(),
                 cid,
+                ClientRelayLimits::STANDARD,
             );
             // The download loop shuts the local write half down on the server's
             // clean EOF (the app sees its response EOF immediately, decoupled from
@@ -3034,6 +3806,7 @@ impl ClientRelay {
                 open_from_server,
                 activity.clone(),
                 cid,
+                ClientRelayLimits::STANDARD,
             );
             // Application-level DONE handshake over the reliable TCP control stream.
             // quinn 0.11.9's Connection::close ABANDONS undelivered stream data, so
@@ -3114,6 +3887,7 @@ impl ClientRelay {
                 cover,
                 activity.clone(),
                 cid,
+                ClientRelayLimits::STANDARD,
             );
             let download = client_download_loop(
                 TcpLegReader::buffered(server_read),
@@ -3121,6 +3895,7 @@ impl ClientRelay {
                 open_from_server,
                 activity.clone(),
                 cid,
+                ClientRelayLimits::STANDARD,
             );
             tokio::select! {
                 result = async {
@@ -3300,16 +4075,19 @@ async fn client_exchange_quic_done(
 /// codec on a clean finish so the QUIC fast-plane teardown can seal the local
 /// DONE marker on the SAME send-direction codec (sequence continues
 /// uninterrupted). TCP-path callers discard the returned codec.
-async fn client_upload_loop<W>(
-    mut local_read: OwnedReadHalf,
+#[allow(clippy::too_many_arguments)]
+async fn client_upload_loop<L, W>(
+    mut local_read: L,
     mut server_write: W,
     mut seal_to_server: DataRecordCodec,
     mut local_buf: Vec<u8>,
     cover: CoverTrafficProfile,
     activity: ClientRelayActivity,
     cid: u64,
+    limits: ClientRelayLimits,
 ) -> Result<DataRecordCodec, ClientRuntimeError>
 where
+    L: LocalReader,
     W: LegWriter,
 {
     let mut seal_scratch = RelaySealScratch::with_payload_capacity(local_buf.len());
@@ -3345,7 +4123,7 @@ where
             return Ok(seal_to_server);
         }
         bump_client_relay_activity(&activity);
-        n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+        n = local_read.drain_ready(&mut local_buf, n)?;
 
         loop {
             // Seal the current burst (sequential; codec state advances here, never
@@ -3356,6 +4134,7 @@ where
                 &mut rng,
                 &mut seal_scratch,
                 RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
+                limits.parallel_aead,
             )?;
 
             if n == cap {
@@ -3379,7 +4158,7 @@ where
                     return Ok(seal_to_server);
                 }
                 bump_client_relay_activity(&activity);
-                let next_n = drain_ready_tcp_read(&local_read, spare, next_n)?;
+                let next_n = local_read.drain_ready(spare, next_n)?;
 
                 // Swap: the just-read spare becomes the current burst; the
                 // just-written scratch becomes the spare seal buffer.
@@ -3401,7 +4180,7 @@ where
                     return Ok(seal_to_server);
                 }
                 bump_client_relay_activity(&activity);
-                n = drain_ready_tcp_read(&local_read, &mut local_buf, next_n)?;
+                n = local_read.drain_ready(&mut local_buf, next_n)?;
             }
         }
     }
@@ -3418,6 +4197,7 @@ where
                     &mut rng,
                     &mut seal_scratch,
                     RelayWriteLog::new(cid, "client->server", "client-cover-writer"),
+                    limits.parallel_aead,
                 )
                 .await?;
                 cover_sleep.as_mut().reset(Instant::now() + cover.sample_interval(&mut rng));
@@ -3429,7 +4209,7 @@ where
                     return Ok(seal_to_server);
                 }
                 bump_client_relay_activity(&activity);
-                let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+                let n = local_read.drain_ready(&mut local_buf, n)?;
                 write_client_data_records_chunked(
                     &mut server_write,
                     &mut seal_to_server,
@@ -3437,6 +4217,7 @@ where
                     &mut rng,
                     &mut seal_scratch,
                     RelayWriteLog::new(cid, "client->server", "client-upload-writer"),
+                    limits.parallel_aead,
                 )
                 .await?;
             }
@@ -3470,6 +4251,7 @@ async fn drain_buffered_download_batch<R>(
     batch_records: &mut Vec<u8>,
     task_name: &'static str,
     cid: u64,
+    max_batch_bytes: usize,
 ) -> (usize, Option<io::Error>)
 where
     R: LegReader,
@@ -3478,7 +4260,7 @@ where
     batch_records.clear();
     let mut batch_bytes = first_record.len();
     let mut deferred_read_error = None;
-    while batch_bytes < MUX_OPEN_BATCH_BYTES {
+    while batch_bytes < max_batch_bytes {
         match server_records.try_read_record_into(extra_record).await {
             None => break,
             Some(Ok(())) => {
@@ -3499,15 +4281,17 @@ where
     (record_count, deferred_read_error)
 }
 
-async fn client_download_loop<R>(
+async fn client_download_loop<R, W>(
     mut server_records: R,
-    mut local_write: OwnedWriteHalf,
+    mut local_write: W,
     mut open_from_server: DataRecordCodec,
     activity: ClientRelayActivity,
     cid: u64,
+    limits: ClientRelayLimits,
 ) -> Result<DataRecordCodec, ClientRuntimeError>
 where
     R: LegReader,
+    W: LocalWriter,
 {
     let mut server_record = Vec::new();
     // Scratch reused across iterations for the opportunistic batch-open path
@@ -3525,7 +4309,7 @@ where
                 return Ok(open_from_server);
             }
             Some(err) => {
-                abort_client_download(local_write);
+                Box::new(local_write).abort();
                 return Err(ClientRuntimeError::Io(err));
             }
             None => match server_records.read_record_into(&mut server_record).await {
@@ -3535,7 +4319,7 @@ where
                     return Ok(open_from_server);
                 }
                 Err(err) => {
-                    abort_client_download(local_write);
+                    Box::new(local_write).abort();
                     return Err(ClientRuntimeError::Io(err));
                 }
             },
@@ -3551,6 +4335,7 @@ where
             &mut batch_records,
             "client-outer-reader",
             cid,
+            limits.open_batch_bytes,
         )
         .await;
         deferred_read_error = deferred;
@@ -3571,7 +4356,7 @@ where
             batch_plaintext.clear();
             let payload_bytes =
                 batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
-            let opened = if should_parallelize_aead(record_count, payload_bytes) {
+            let opened = if limits.parallel(record_count, payload_bytes) {
                 open_from_server.open_concat_records_parallel(
                     parallel::global(),
                     &batch_records,
@@ -3660,16 +4445,21 @@ mod client_mux_tail_proofs {
     }
 }
 
-async fn client_mux_upload_loop(
-    mut local_read: OwnedReadHalf,
+#[allow(clippy::too_many_arguments)]
+async fn client_mux_upload_loop<L>(
+    mut local_read: L,
     frame_tx: mpsc::Sender<MuxFrame>,
     stream_id: u32,
     chunk_size: usize,
     cid: u64,
     payload_pool: MuxPayloadPool,
     hold: Duration,
-) -> Result<(), ClientRuntimeError> {
-    let mut local_buf = vec![0_u8; relay_read_buffer_len(MuxFrame::max_payload_len(chunk_size))];
+    read_buffer_len: usize,
+) -> Result<(), ClientRuntimeError>
+where
+    L: LocalReader,
+{
+    let mut local_buf = vec![0_u8; read_buffer_len];
     let max_payload_len = MuxFrame::max_payload_len(chunk_size);
     if max_payload_len == 0 {
         return Err(ClientRuntimeError::TlsRecord(
@@ -3735,7 +4525,7 @@ async fn client_mux_upload_loop(
         // cannot report a successfully consumed partial prefix. The zero-hold
         // path keeps its original opportunistic-drain behavior.
         if hold.is_zero() {
-            n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+            n = local_read.drain_ready(&mut local_buf, n)?;
             for chunk in local_buf[..n].chunks(max_payload_len) {
                 send_mux_frame(
                     &frame_tx,
@@ -3786,6 +4576,9 @@ async fn client_mux_upload_loop(
 struct ClientDownloadStream {
     events: mpsc::Sender<DownloadEvent>,
     terminal: StreamTerminal,
+    /// `Some` for a datagram stream: a full channel drops the datagram (counted
+    /// here) instead of back-pressuring the shared reader, as UDP would.
+    datagram_drops: Option<Arc<AtomicU64>>,
 }
 
 /// Resolves once the reader loop reports the download direction is done: a
@@ -3816,7 +4609,7 @@ async fn client_mux_await_download(
 /// the outcome defaults to `Reset` so a truncated download surfaces as a
 /// connection error rather than a clean, complete-looking EOF.
 async fn client_mux_download_loop(
-    mut local_write: OwnedWriteHalf,
+    mut local_write: Box<dyn LocalWriter>,
     mut events: mpsc::Receiver<DownloadEvent>,
     terminal: StreamTerminal,
     outcome_tx: oneshot::Sender<DownloadOutcome>,
@@ -3858,16 +4651,10 @@ async fn client_mux_download_loop(
     if matches!(outcome, DownloadOutcome::Fin) {
         let _ = local_write.shutdown().await;
     } else {
-        abort_client_download(local_write);
+        // For a socket: SO_LINGER(0) + no FIN, i.e. an abortive close (RST).
+        local_write.abort();
     }
     let _ = outcome_tx.send(outcome);
-}
-
-fn abort_client_download(local_write: OwnedWriteHalf) {
-    let _ = socket2::SockRef::from(local_write.as_ref()).set_linger(Some(Duration::ZERO));
-    // OwnedWriteHalf's ordinary drop shuts down the write direction, emitting
-    // FIN before the upload half closes. Leave it open for the abortive close.
-    local_write.forget();
 }
 
 /// Keeps the reader's unanswered-Open set (stream id -> `relay_now_millis()` when
@@ -3876,6 +4663,9 @@ fn abort_client_download(local_write: OwnedWriteHalf) {
 fn track_unanswered_open(unanswered: &mut HashMap<u32, u64>, control: &ClientStreamControl) {
     match control {
         ClientStreamControl::Register(reg) => {
+            unanswered.insert(reg.stream_id, relay_now_millis());
+        }
+        ClientStreamControl::RegisterDatagrams(reg) => {
             unanswered.insert(reg.stream_id, relay_now_millis());
         }
         ClientStreamControl::Deregister(stream_id) => {
@@ -3893,10 +4683,11 @@ fn apply_client_stream_control(
     local_writes: &mut HashMap<u32, ClientDownloadStream>,
     control: ClientStreamControl,
     idle: Duration,
+    stream_channel: usize,
 ) {
     match control {
         ClientStreamControl::Register(reg) => {
-            let (events_tx, events_rx) = mpsc::channel(CLIENT_MUX_STREAM_CHANNEL);
+            let (events_tx, events_rx) = mpsc::channel(stream_channel.max(1));
             let terminal = StreamTerminal::new();
             tokio::spawn(client_mux_download_loop(
                 reg.local_write,
@@ -3910,6 +4701,17 @@ fn apply_client_stream_control(
                 ClientDownloadStream {
                     events: events_tx,
                     terminal,
+                    datagram_drops: None,
+                },
+            );
+        }
+        ClientStreamControl::RegisterDatagrams(reg) => {
+            local_writes.insert(
+                reg.stream_id,
+                ClientDownloadStream {
+                    events: reg.events,
+                    terminal: reg.terminal,
+                    datagram_drops: Some(reg.dropped),
                 },
             );
         }
@@ -3923,6 +4725,7 @@ fn apply_client_stream_control(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn client_mux_reader_loop<R>(
     mut server_records: R,
     mut open_from_server: DataRecordCodec,
@@ -3931,6 +4734,7 @@ async fn client_mux_reader_loop<R>(
     idle: Duration,
     health: Arc<MuxCarrierHealth>,
     watchdog: MuxCarrierWatchdog,
+    limits: ClientRelayLimits,
 ) -> Result<(), ClientRuntimeError>
 where
     R: LegReader,
@@ -3961,7 +4765,12 @@ where
                     match registration {
                         Some(control) => {
                             track_unanswered_open(&mut unanswered_opens, &control);
-                            apply_client_stream_control(&mut local_writes, control, idle);
+                            apply_client_stream_control(
+                                &mut local_writes,
+                                control,
+                                idle,
+                                limits.stream_channel,
+                            );
                         }
                         None => register_open = false,
                     }
@@ -4026,6 +4835,7 @@ where
             &mut batch_records,
             "client-mux-outer-reader",
             cid,
+            limits.open_batch_bytes,
         )
         .await;
         deferred_read_error = deferred;
@@ -4035,7 +4845,7 @@ where
         // deregister from an exited per-connection task is applied promptly.
         while let Ok(control) = register_rx.try_recv() {
             track_unanswered_open(&mut unanswered_opens, &control);
-            apply_client_stream_control(&mut local_writes, control, idle);
+            apply_client_stream_control(&mut local_writes, control, idle, limits.stream_channel);
         }
 
         // Open + dispatch the batch. Any AEAD-open, decode, or dispatch error
@@ -4057,7 +4867,7 @@ where
                 batch_plaintext.clear();
                 let payload_bytes =
                     batch_records.len() - record_count * crate::tls::record::TLS_HEADER_LEN;
-                if should_parallelize_aead(record_count, payload_bytes) {
+                if limits.parallel(record_count, payload_bytes) {
                     open_from_server
                         .open_concat_records_parallel(
                             parallel::global(),
@@ -4135,6 +4945,13 @@ async fn dispatch_client_mux_frame(
                             // The stream's download task is gone (local app
                             // closed): stop trying to feed it.
                             local_writes.remove(&frame.stream_id);
+                        }
+                        Err(TrySendError::Full(_)) if stream.datagram_drops.is_some() => {
+                            // A datagram stream never back-pressures the shared
+                            // reader: like a full socket buffer, drop and count.
+                            if let Some(dropped) = &stream.datagram_drops {
+                                dropped.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(TrySendError::Full(event)) => {
                             // Channel full: the app is draining slower than this
@@ -4232,6 +5049,7 @@ async fn client_mux_writer_loop<W>(
     payload_pool: MuxPayloadPool,
     health: Arc<MuxCarrierHealth>,
     stall: Duration,
+    limits: ClientRelayLimits,
 ) -> Result<(), ClientRuntimeError>
 where
     W: LegWriter,
@@ -4252,6 +5070,7 @@ where
                     frame,
                     ClientMuxBatchState {
                         frame_rx: &mut frame_rx,
+                        limits,
                     },
                     &mut rng,
                     &mut seal_scratch,
@@ -4281,6 +5100,7 @@ where
                         &mut seal_scratch,
                         cid,
                         "client-mux-cover-writer",
+                        limits.parallel_aead,
                     ),
                     stall,
                     &health,
@@ -4301,6 +5121,7 @@ where
                         frame,
                         ClientMuxBatchState {
                             frame_rx: &mut frame_rx,
+                            limits,
                         },
                         &mut rng,
                         &mut seal_scratch,
@@ -4365,6 +5186,7 @@ impl Drop for WriteInFlight<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_client_mux_frame<W, R>(
     writer: &mut W,
     codec: &mut DataRecordCodec,
@@ -4373,6 +5195,7 @@ async fn write_client_mux_frame<W, R>(
     scratch: &mut RelaySealScratch,
     cid: u64,
     task_name: &'static str,
+    parallel_aead: bool,
 ) -> Result<(), ClientRuntimeError>
 where
     W: LegWriter,
@@ -4386,12 +5209,14 @@ where
         rng,
         scratch,
         RelayWriteLog::new(cid, "client->server", task_name),
+        parallel_aead,
     )
     .await
 }
 
 struct ClientMuxBatchState<'a> {
     frame_rx: &'a mut mpsc::Receiver<MuxFrame>,
+    limits: ClientRelayLimits,
 }
 
 /// Encodes the first frame plus any immediately available frames into
@@ -4433,7 +5258,7 @@ where
     )?;
 
     let mut drained = 0;
-    while drained < MUX_FRAME_BATCH_LIMIT {
+    while drained < batch.limits.frame_batch_limit {
         let frame = match batch.frame_rx.try_recv() {
             Ok(frame) => frame,
             Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
@@ -4458,7 +5283,10 @@ where
     // Phase B: seal every record with unchanged boundaries and sequence
     // order; only the bulk path pays the crypto-pool dispatch cost.
     scratch.records_buf.clear();
-    if should_parallelize_aead(scratch.record_lens.len(), scratch.plaintext_buf.len()) {
+    if batch
+        .limits
+        .parallel(scratch.record_lens.len(), scratch.plaintext_buf.len())
+    {
         codec
             .seal_records_into_parallel(
                 parallel::global(),
@@ -4546,12 +5374,13 @@ async fn write_client_data_records_chunked<W, R>(
     rng: &mut R,
     scratch: &mut RelaySealScratch,
     log: RelayWriteLog,
+    parallel_aead: bool,
 ) -> Result<(), ClientRuntimeError>
 where
     W: LegWriter,
     R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
 {
-    seal_client_data_records_chunked(codec, payload, rng, scratch, log)?;
+    seal_client_data_records_chunked(codec, payload, rng, scratch, log, parallel_aead)?;
     writer.write_records(scratch.records_buf.as_slice()).await?;
     Ok(())
 }
@@ -4570,6 +5399,7 @@ fn seal_client_data_records_chunked<R>(
     rng: &mut R,
     scratch: &mut RelaySealScratch,
     log: RelayWriteLog,
+    parallel_aead: bool,
 ) -> Result<(), ClientRuntimeError>
 where
     R: rand::Rng + rand::RngCore + rand::CryptoRng + ?Sized,
@@ -4609,7 +5439,7 @@ where
         // written exactly once (no re-seal/resume relies on byte-identity). Small
         // batches stay on the low-latency serial path.
         let record_count = payload.len().div_ceil(max_chunk_len).max(1);
-        if should_parallelize_aead(record_count, payload.len()) {
+        if parallel_aead && should_parallelize_aead(record_count, payload.len()) {
             codec
                 .seal_chunks_into_parallel(
                     parallel::global(),
@@ -4765,6 +5595,7 @@ mod tests {
             1,
             pool.clone(),
             hold,
+            relay_read_buffer_len(capacity),
         ));
         (peer, receiver, task, pool)
     }
@@ -4960,6 +5791,7 @@ mod tests {
                 1,
                 pool.clone(),
                 Duration::from_millis(1),
+                relay_read_buffer_len(MuxFrame::max_payload_len(1037)),
             ));
             tokio::time::pause();
             peer.write_all(b"uncommitted").await.unwrap();
@@ -5047,6 +5879,7 @@ mod tests {
                 original: Arc::from("127.0.0.1:9"),
                 cached: Arc::new(Mutex::new(vec!["127.0.0.1:9".parse().unwrap()])),
                 literal: true,
+                stale: Arc::new(AtomicBool::new(false)),
             },
             TrafficConfig::default(),
             Arc::new(UdpConfig::default()),
@@ -5158,6 +5991,7 @@ mod tests {
             original: Arc::from("server.invalid:443"),
             cached: Arc::new(Mutex::new(addrs)),
             literal: false,
+            stale: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -5260,7 +6094,14 @@ mod tests {
 
     #[tokio::test]
     async fn server_addr_resolver_literal_skips_dns_refresh() {
-        let available = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // On Apple platforms IPv4 literals go through the system resolver for NAT64
+        // synthesis (see `needs_nat64_synthesis`); IPv6 literals never do.
+        let bind = if cfg!(target_vendor = "apple") {
+            "[::1]:0"
+        } else {
+            "127.0.0.1:0"
+        };
+        let available = TcpListener::bind(bind).await.unwrap();
         let addr = available.local_addr().unwrap();
         let resolver = ServerAddrResolver::new(&addr.to_string()).await.unwrap();
         assert_eq!(*resolver.cached.lock().await, vec![addr]);
@@ -5277,6 +6118,16 @@ mod tests {
             })
             .await
             .is_err());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn server_addr_resolver_resynthesizes_ipv4_literals_on_apple() {
+        let resolver = ServerAddrResolver::deferred("192.0.2.1:443");
+        assert!(!resolver.literal);
+        assert!(resolver.stale.load(Ordering::Relaxed));
+        resolver.mark_stale();
+        assert!(resolver.stale.load(Ordering::Relaxed));
     }
 
     #[tokio::test(start_paused = true)]
@@ -6137,6 +6988,8 @@ mod tests {
                 payload_pool: MuxPayloadPool::with_capacity(1024),
             },
             health: Arc::new(MuxCarrierHealth::new()),
+            epoch: 0,
+            udp_unsupported: Arc::new(AtomicBool::new(false)),
         };
         (handle, frame_rx, register_rx)
     }
@@ -6307,6 +7160,7 @@ mod tests {
                 idle,
                 health.clone(),
                 MUX_CARRIER_WATCHDOG,
+                ClientRelayLimits::STANDARD,
             ));
             let (frame_tx, frame_rx) = mpsc::channel(4);
             let (written_tx, mut written_rx) = mpsc::channel(4);
@@ -6319,6 +7173,7 @@ mod tests {
                 MuxPayloadPool::with_capacity(1024),
                 health,
                 idle,
+                ClientRelayLimits::STANDARD,
             ));
             let mut peer_seal = codec();
             tokio::task::yield_now().await;
@@ -6387,7 +7242,7 @@ mod tests {
         register_tx
             .send(ClientStreamControl::Register(ClientStreamRegistration {
                 stream_id: 1,
-                local_write,
+                local_write: Box::new(local_write),
                 outcome_tx,
             }))
             .await
@@ -6419,6 +7274,7 @@ mod tests {
                 Duration::from_millis(80),
                 Arc::new(MuxCarrierHealth::new()),
                 MUX_CARRIER_WATCHDOG,
+                ClientRelayLimits::STANDARD,
             ),
         )
         .await
@@ -6456,7 +7312,7 @@ mod tests {
         register_tx
             .send(ClientStreamControl::Register(ClientStreamRegistration {
                 stream_id: 1,
-                local_write,
+                local_write: Box::new(local_write),
                 outcome_tx,
             }))
             .await
@@ -6510,6 +7366,7 @@ mod tests {
                 Duration::from_secs(600),
                 health.clone(),
                 MUX_CARRIER_WATCHDOG,
+                ClientRelayLimits::STANDARD,
             ));
             sender
                 .write_all(if complete { &wire } else { &wire[..128] })
@@ -6561,7 +7418,7 @@ mod tests {
             register_tx
                 .send(ClientStreamControl::Register(ClientStreamRegistration {
                     stream_id,
-                    local_write,
+                    local_write: Box::new(local_write),
                     outcome_tx,
                 }))
                 .await
@@ -6605,6 +7462,7 @@ mod tests {
             Duration::from_secs(600),
             Arc::clone(&health),
             MUX_CARRIER_WATCHDOG,
+            ClientRelayLimits::STANDARD,
         ));
         tokio::task::yield_now().await;
         tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER + Duration::from_millis(1)).await;
@@ -6688,6 +7546,7 @@ mod tests {
             Duration::from_secs(60),
             Arc::clone(&health),
             TEST_WATCHDOG,
+            ClientRelayLimits::STANDARD,
         ));
         tokio::time::sleep(Duration::from_millis(130)).await;
         assert!(
@@ -6726,6 +7585,7 @@ mod tests {
             Duration::from_secs(600),
             Arc::clone(&health),
             MUX_CARRIER_WATCHDOG,
+            ClientRelayLimits::STANDARD,
         ));
         tokio::task::yield_now().await;
         tokio::time::advance(MUX_CARRIER_SUSPECT_AFTER + Duration::from_millis(1)).await;
@@ -6775,6 +7635,7 @@ mod tests {
                 Duration::from_millis(600),
                 Arc::clone(&health),
                 TEST_WATCHDOG,
+                ClientRelayLimits::STANDARD,
             ),
         )
         .await
@@ -6805,6 +7666,7 @@ mod tests {
             Duration::from_secs(60),
             Arc::clone(&health),
             TEST_WATCHDOG,
+            ClientRelayLimits::STANDARD,
         ));
         tokio::time::sleep(TEST_WATCHDOG.dead_after * 2).await;
         assert!(
@@ -6903,6 +7765,7 @@ mod tests {
                 MuxPayloadPool::with_capacity(1024),
                 Arc::new(MuxCarrierHealth::new()),
                 Duration::from_millis(50),
+                ClientRelayLimits::STANDARD,
             ),
         )
         .await
@@ -6938,7 +7801,7 @@ mod tests {
         // A short injected idle so the write bound fires in real time.
         let idle = Duration::from_millis(200);
         let task = tokio::spawn(client_mux_download_loop(
-            parallax_write,
+            Box::new(parallax_write),
             events_rx,
             terminal,
             outcome_tx,
@@ -6984,7 +7847,7 @@ mod tests {
             let terminal = StreamTerminal::new();
             let (outcome_tx, outcome_rx) = oneshot::channel();
             let task = tokio::spawn(client_mux_download_loop(
-                proxy_write,
+                Box::new(proxy_write),
                 events_rx,
                 terminal.clone(),
                 outcome_tx,
@@ -8220,6 +9083,200 @@ mod tests {
         wait_for_task("server", server_task).await;
         wait_for_task("target", target_task).await;
         wait_for_task("fallback", fallback_task).await;
+    }
+
+    fn embedded_test_pool(
+        parallax_addr: SocketAddr,
+        server_keys: &X25519KeyPair,
+        server_identity_keys: &identity::MlDsaKeyPair,
+        traffic: TrafficConfig,
+        limits: ClientRelayLimits,
+    ) -> ClientMuxPool {
+        let pool = embedded_mux_pool(
+            ClientConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server_addr: parallax_addr.to_string(),
+                sni: "example.com".to_owned(),
+                server_public_key: STANDARD.encode(server_keys.public),
+                server_identity_public_key: STANDARD.encode(&server_identity_keys.public),
+                accept_language: None,
+            },
+            traffic,
+            UdpConfig::default(),
+            Zeroizing::new(PSK.to_vec()),
+            server_keys.public,
+            Arc::from(server_identity_keys.public.clone().into_boxed_slice()),
+            limits,
+            None,
+        );
+        pool.start_keeper();
+        pool
+    }
+
+    async fn spawn_allowed_udp_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        server::allow_udp_test_target(addr);
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0_u8; 65_536];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&buf[..n], peer).await;
+            }
+        });
+        (addr, task)
+    }
+
+    /// PX1A end to end (SPEC §6.7): real client pool, real server, real UDP
+    /// target. Every datagram keeps its boundaries and comes back intact.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP and UDP sockets"]
+    async fn embedded_udp_association_round_trips_datagrams_through_px1a() {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback_multi().await;
+        let (echo, echo_task) = spawn_allowed_udp_echo().await;
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let replay_dir = tempfile::tempdir().unwrap();
+        let mut server_config = large_payload_server_config(
+            fallback_addr,
+            echo,
+            &server_keys,
+            &server_identity_keys,
+            replay_dir.path().join("parallax-replay.cache"),
+        );
+        server_config.data_target = None;
+        let traffic = TrafficConfig {
+            max_concurrent_streams: 4,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_multi(server_config, traffic).await;
+        let pool = embedded_test_pool(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys,
+            traffic,
+            ClientRelayLimits::CONSTRAINED,
+        );
+
+        let mut association = pool
+            .open_udp(echo.ip().to_string(), echo.port(), 16)
+            .await
+            .expect("a PX1A server accepts a permitted UDP target");
+        let mut buf = vec![0_u8; 2048];
+        for datagram in [&b"a"[..], &[0x5A; 1350][..], &b"third"[..]] {
+            assert_eq!(association.send(datagram), Ok(true));
+            let len = timeout(Duration::from_secs(5), association.recv(&mut buf))
+                .await
+                .expect("echoed datagram")
+                .expect("association open");
+            assert_eq!(&buf[..len], datagram, "datagram boundaries survive the mux");
+        }
+        let max = association.max_datagram_len();
+        assert_eq!(
+            association.send(&vec![0_u8; max + 1]),
+            Err(UdpSendError::TooLarge(max))
+        );
+        assert_eq!(
+            association.send(&[]),
+            Ok(false),
+            "empty datagrams are not framed"
+        );
+        assert_eq!(association.dropped(), (0, 2));
+        association.close().await;
+
+        pool.shutdown().await;
+        for task in [server_task, fallback_task, echo_task] {
+            task.abort();
+        }
+    }
+
+    /// A server that relays only to an operator-fixed target answers PX1A with a
+    /// statusless Reset — what a pre-PX1A server does too. The client reports
+    /// Unsupported, remembers it for the session (the next attempt needs no round
+    /// trip), and the session itself keeps relaying TCP streams.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn embedded_udp_association_is_unsupported_after_a_statusless_reset() {
+        let (fallback_addr, fallback_task) = spawn_camouflage_fallback_multi().await;
+        let (target_addr, target_task) = spawn_multi_echo_target(1).await;
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = crate::crypto::identity::keypair();
+        let replay_dir = tempfile::tempdir().unwrap();
+        let server_config = large_payload_server_config(
+            fallback_addr,
+            target_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_dir.path().join("parallax-replay.cache"),
+        );
+        let traffic = TrafficConfig {
+            max_concurrent_streams: 4,
+            ..TrafficConfig::default()
+        };
+        let (parallax_addr, server_task) =
+            spawn_parallax_server_multi(server_config, traffic).await;
+        let pool = embedded_test_pool(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys,
+            traffic,
+            ClientRelayLimits::STANDARD,
+        );
+
+        let first = pool.open_udp("192.0.2.1".to_owned(), 53, 4).await;
+        assert!(
+            matches!(first, Err(UdpOpenError::Unsupported)),
+            "{:?}",
+            first.err()
+        );
+        let started = Instant::now();
+        let second = pool.open_udp("192.0.2.1".to_owned(), 53, 4).await;
+        assert!(
+            matches!(second, Err(UdpOpenError::Unsupported)),
+            "{:?}",
+            second.err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a cached Unsupported must not wait for another server round trip"
+        );
+
+        // The statusless Reset cost one stream, not the session.
+        let (app, relay_side) = tokio::io::duplex(64 * 1024);
+        let (relay_read, relay_write) = tokio::io::split(relay_side);
+        let relay = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                relay_mux_stream(
+                    "ignored.invalid".to_owned(),
+                    443,
+                    relay_read,
+                    relay_write,
+                    &pool,
+                    1,
+                )
+                .await
+            }
+        });
+        let (mut app_read, mut app_write) = tokio::io::split(app);
+        app_write.write_all(b"after-px1a-reset").await.unwrap();
+        app_write.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        timeout(Duration::from_secs(10), app_read.read_to_end(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, b"after-px1a-reset");
+        timeout(Duration::from_secs(10), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        pool.shutdown().await;
+        for task in [server_task, fallback_task, target_task] {
+            task.abort();
+        }
     }
 
     /// Regression cover for the mux concurrency-starvation bug.
@@ -9928,6 +10985,7 @@ mod tests {
             CoverTrafficProfile::from_config(TrafficConfig::default()),
             activity,
             7,
+            ClientRelayLimits::STANDARD,
         );
 
         let (loop_res, feeder_res, collected) = timeout(Duration::from_secs(30), async {

@@ -129,6 +129,12 @@ pub enum ConfigError {
     InvalidCongestionControl,
     #[error("client.accept_language must be a non-empty, single-line ASCII header value (no control characters), e.g. \"en-US,en;q=0.9\"")]
     InvalidAcceptLanguage,
+    #[error("an embedded profile must be a client-mode config (mode = \"client\")")]
+    EmbeddedRequiresClientMode,
+    #[error("{field}: an embedded profile must carry this secret inline; file, env, and sealed references would read the host's filesystem or environment")]
+    EmbeddedSecretReference { field: &'static str },
+    #[error("invalid embedded profile: {0}")]
+    EmbeddedProfileShape(String),
     #[cfg(unix)]
     #[error(
         "config file permissions are insecure for {path:?}: mode {mode:o}, owner uid {uid}, \
@@ -973,6 +979,36 @@ impl Config {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Parses and validates a client-mode config held in memory, for an embedder
+    /// (see `parallax::embed`). It never touches the filesystem or the
+    /// environment: every secret must be inline (a `file`/`env`/`sealed`
+    /// reference is rejected), and no permission checks apply because there is no
+    /// file. `client.listen` names the CLI's SOCKS5 listener, which an embedded
+    /// client does not have, so it may be omitted; a `plx init` client config
+    /// imports unchanged. Otherwise validation is exactly [`Config::validate`].
+    pub(crate) fn from_embedded_client_toml(raw: &str) -> Result<Self, ConfigError> {
+        let mut table: toml::Table = toml::from_str(raw).map_err(|e| toml_error(raw, e))?;
+        if let Some(toml::Value::Table(client)) = table.get_mut("client") {
+            client
+                .entry("listen")
+                .or_insert_with(|| toml::Value::String("127.0.0.1:0".to_owned()));
+        }
+        let mut cfg = Self::deserialize(toml::Value::Table(table))
+            .map_err(|err| ConfigError::EmbeddedProfileShape(err.message().to_owned()))?;
+        if cfg.mode != Mode::Client || cfg.server.is_some() {
+            return Err(ConfigError::EmbeddedRequiresClientMode);
+        }
+        for (field, source) in cfg.secret_sources_mut() {
+            if !source.is_inline_secret() {
+                return Err(ConfigError::EmbeddedSecretReference { field });
+            }
+            // Inline sources resolve without I/O: the text moves into `Zeroizing`.
+            source.resolve_in_place(field, Path::new("."))?;
+        }
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// True when the resolved PSK looks low-entropy (guessable).

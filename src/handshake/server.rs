@@ -61,7 +61,8 @@ use crate::{
             MuxFrame, MuxFrameError, MuxFrameKind, MuxFrameRef, MuxPayloadPool, PqRekeyError,
             PqRekeyRequest, ServerIdentityChunk, ServerIdentityChunkError, ServerIdentityProof,
             ServerIdentityProofError, ServerKeyExchange, ServerKeyExchangeError, SpeedTestAck,
-            SpeedTestRequest, SpeedTestRequestError, MAX_PQ_HANDSHAKE_FRAME,
+            SpeedTestRequest, SpeedTestRequestError, UdpAssociateRequest, UdpAssociateStatus,
+            MAX_PQ_HANDSHAKE_FRAME,
         },
         data::{
             max_plaintext_len, relay_read_buffer_len, should_parallelize_aead, DataRecordCodec,
@@ -4723,6 +4724,9 @@ struct ServerMuxStreams {
     /// the reader's own `Zeroizing` plaintext buffers.
     uploads: HashMap<u32, mpsc::Sender<Zeroizing<Vec<u8>>>>,
     tasks: HashMap<u32, tokio::task::JoinHandle<()>>,
+    /// `PX1A` datagram streams: a full upload channel drops the datagram instead
+    /// of waiting (and never sheds the stream), as a full UDP socket buffer would.
+    datagrams: std::collections::HashSet<u32>,
 }
 
 impl ServerMuxStreams {
@@ -4730,6 +4734,7 @@ impl ServerMuxStreams {
         Self {
             uploads: HashMap::new(),
             tasks: HashMap::new(),
+            datagrams: std::collections::HashSet::new(),
         }
     }
 
@@ -4738,6 +4743,7 @@ impl ServerMuxStreams {
     fn prune_finished(&mut self) {
         self.tasks.retain(|_, h| !h.is_finished());
         self.uploads.retain(|id, _| self.tasks.contains_key(id));
+        self.datagrams.retain(|id| self.tasks.contains_key(id));
     }
 
     /// Number of substreams still holding a target fd (the `max_streams` admission
@@ -4753,6 +4759,7 @@ impl ServerMuxStreams {
     /// Tear down every substream and wait until aborted tasks close their targets.
     async fn teardown(&mut self) {
         self.uploads.clear();
+        self.datagrams.clear();
         for handle in self.tasks.values() {
             handle.abort();
         }
@@ -4925,6 +4932,23 @@ impl ServerMuxStreamTx {
     /// Resets this substream (empty-payload Reset, queued after its data).
     async fn reset(&self) -> Result<(), HandshakeServerError> {
         self.send(MuxFrameKind::Reset, Vec::new()).await
+    }
+
+    /// Queues one datagram as a Data frame without waiting. `false` when the
+    /// stream's queue is full (or gone): a datagram stream drops instead of
+    /// back-pressuring, and the payload buffer is only taken once a slot is held.
+    fn try_send_datagram(&self, datagram: &[u8], payload_pool: &MuxPayloadPool) -> bool {
+        let Ok(permit) = self.frames.try_reserve() else {
+            return false;
+        };
+        claim_mux_publication(&self.first_publication);
+        permit.send(MuxFrame {
+            stream_id: self.stream_id,
+            kind: MuxFrameKind::Data,
+            payload: payload_pool.take_filled(datagram),
+        });
+        self.wake.notify_one();
+        true
     }
 }
 
@@ -5938,6 +5962,14 @@ async fn serve_mux_quic_substream_inner(
         }
     }
     let first_range = client_open.open_in_place_payload_range(&mut first_record)?;
+    // PX1A datagram streams exist only on the TCP plane (SPEC §6.7); reset one
+    // here rather than letting a fixed `data_target` treat it as raw bytes.
+    if UdpAssociateRequest::has_magic(&first_record[first_range.clone()]) {
+        return Err(HandshakeServerError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "UDP association is not defined on the QUIC plane",
+        )));
+    }
     let (target_addr, target_source, initial_payload) =
         resolve_connect_target(&mut first_record[first_range], fixed_data_target)?;
     let mut target = connect_outbound_target(&target_addr, target_source, nat64_prefixes).await?;
@@ -6184,6 +6216,41 @@ async fn process_server_mux_frame(
                 downlink.reset_unregistered(frame.stream_id).await?;
                 return Ok(());
             }
+            // A PX1A Open is a datagram stream (SPEC §6.7): same slot accounting and
+            // admission as a CONNECT stream, its own relay task and drop-not-wait
+            // upload policy.
+            if UdpAssociateRequest::has_magic(frame.payload) {
+                let (upload_tx, upload_rx) =
+                    mpsc::channel::<Zeroizing<Vec<u8>>>(SERVER_MUX_UDP_UPLOAD_CHANNEL);
+                let stream_id = frame.stream_id;
+                let stream_downlink = downlink.register(stream_id).await?;
+                let admission = context.admission.cloned();
+                let request = Zeroizing::new(frame.payload.to_vec());
+                let udp_ctx = ServerMuxUdpContext {
+                    fixed_data_target: context.fixed_data_target.is_some(),
+                    nat64_prefixes: context.nat64_prefixes.to_vec(),
+                    max_datagram: MuxFrame::max_payload_len(context.chunk_size),
+                    cid: context.cid,
+                    idle: UDP_ASSOCIATION_IDLE,
+                };
+                let stream_payload_pool = payload_pool.clone();
+                let handle = tokio::spawn(async move {
+                    let _admission = admission;
+                    server_mux_udp_task(
+                        stream_id,
+                        request,
+                        upload_rx,
+                        stream_downlink,
+                        udp_ctx,
+                        stream_payload_pool,
+                    )
+                    .await;
+                });
+                streams.uploads.insert(stream_id, upload_tx);
+                streams.datagrams.insert(stream_id);
+                streams.tasks.insert(stream_id, handle);
+                return Ok(());
+            }
             // Route this substream's client->target uploads over a BOUNDED channel to
             // its own supervisor task, which performs ALL per-destination blocking
             // work (resolve / connect / initial-payload write / relay) OFF this shared
@@ -6236,11 +6303,15 @@ async fn process_server_mux_frame(
                     Shed,
                     Grace(mpsc::Sender<Zeroizing<Vec<u8>>>, Zeroizing<Vec<u8>>),
                 }
+                let datagram = streams.datagrams.contains(&frame.stream_id);
                 let outcome = match streams.uploads.get(&frame.stream_id) {
                     Some(sender) => match sender.try_send(Zeroizing::new(frame.payload.to_vec())) {
                         Ok(()) => UploadOutcome::Delivered,
                         // Task gone (setup failed / relay ended): shed this stream.
                         Err(TrySendError::Closed(_)) => UploadOutcome::Shed,
+                        // A datagram stream drops on a full queue, like a full UDP
+                        // socket buffer; it never holds the shared reader.
+                        Err(TrySendError::Full(_)) if datagram => UploadOutcome::Delivered,
                         // Full: the target is draining slower than this burst (or has not
                         // finished connecting). Wait UP TO the SHORT grace for a slot
                         // instead of shedding at once — but never longer, so one substream
@@ -6323,6 +6394,240 @@ async fn shed_server_mux_substream(
     }
     downlink.purge(stream_id).await?;
     downlink.reset_unregistered(stream_id).await
+}
+
+/// Depth of a `PX1A` stream's client->target datagram queue. Datagrams beyond it
+/// are dropped (UDP semantics), never waited for.
+const SERVER_MUX_UDP_UPLOAD_CHANNEL: usize = 64;
+
+/// Largest datagram a UDP association reads from its target socket (the IPv4/IPv6
+/// UDP payload ceiling); anything larger than the stream's DATA payload limit is
+/// dropped and counted.
+const UDP_ASSOCIATION_RECV_BUFFER: usize = 65_536;
+
+/// Longest a datagram waits for its target socket to accept it before it is
+/// dropped (UDP semantics; normally the send completes at once).
+const UDP_ASSOCIATION_SEND_WAIT: Duration = Duration::from_millis(50);
+
+/// Silence bounds of a `PX1A` association (SPEC §6.7): no datagram in either
+/// direction for this long ends it.
+#[derive(Debug, Clone, Copy)]
+struct UdpAssociationIdle {
+    default: Duration,
+    dns: Duration,
+}
+
+const UDP_ASSOCIATION_IDLE: UdpAssociationIdle = UdpAssociationIdle {
+    default: Duration::from_secs(60),
+    dns: Duration::from_secs(30),
+};
+
+impl UdpAssociationIdle {
+    fn for_port(&self, port: u16) -> Duration {
+        if port == 53 {
+            self.dns
+        } else {
+            self.default
+        }
+    }
+}
+
+/// Owned per-association settings handed to [`server_mux_udp_task`].
+struct ServerMuxUdpContext {
+    /// An operator-fixed `data_target` is a TCP service: UDP is refused outright.
+    fixed_data_target: bool,
+    nat64_prefixes: Vec<Nat64Prefix>,
+    /// Largest datagram one DATA frame can carry on this session.
+    max_datagram: usize,
+    cid: u64,
+    idle: UdpAssociationIdle,
+}
+
+/// Loopback targets a test may reach through `PX1A` (the egress policy otherwise
+/// denies them). Per-address, so concurrent tests cannot widen each other's policy.
+#[cfg(test)]
+static UDP_TEST_ALLOWED_TARGETS: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
+
+/// Lets this crate's tests reach one loopback UDP fixture through `PX1A`.
+#[cfg(test)]
+pub(crate) fn allow_udp_test_target(addr: SocketAddr) {
+    UDP_TEST_ALLOWED_TARGETS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(addr);
+}
+
+/// Resolves a client-chosen UDP target under the same egress policy as a
+/// `CONNECT` target and opens one connected UDP socket toward the first permitted
+/// address.
+async fn connect_udp_association_target(
+    target_addr: &str,
+    nat64_prefixes: &[Nat64Prefix],
+) -> Result<(tokio::net::UdpSocket, SocketAddr), HandshakeServerError> {
+    #[cfg(test)]
+    let test_allowed = target_addr
+        .parse::<SocketAddr>()
+        .ok()
+        .filter(|addr| {
+            UDP_TEST_ALLOWED_TARGETS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(addr)
+        })
+        .map(|addr| vec![addr]);
+    #[cfg(not(test))]
+    let test_allowed: Option<Vec<SocketAddr>> = None;
+    let addrs = match test_allowed {
+        Some(addrs) => addrs,
+        None => timeout(
+            HANDSHAKE_TIMEOUT,
+            resolve_public_target_addrs(target_addr, nat64_prefixes),
+        )
+        .await
+        .map_err(|_| {
+            HandshakeServerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "UDP target DNS resolve timed out",
+            ))
+        })??,
+    };
+    let target = *addrs.first().ok_or_else(|| {
+        HandshakeServerError::Io(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "client-selected UDP target did not resolve",
+        ))
+    })?;
+    // A loopback target needs a loopback-bound socket: macOS refuses to send
+    // (EADDRNOTAVAIL) from a wildcard-bound socket connected to 127.0.0.1.
+    let local: SocketAddr = match target {
+        SocketAddr::V4(v4) if v4.ip().is_loopback() => (Ipv4Addr::LOCALHOST, 0).into(),
+        SocketAddr::V6(v6) if v6.ip().is_loopback() => (Ipv6Addr::LOCALHOST, 0).into(),
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = tokio::net::UdpSocket::bind(local).await?;
+    socket.connect(target).await?;
+    Ok((socket, target))
+}
+
+/// One `PX1A` datagram stream (SPEC §6.7), spawned by the shared mux reader like
+/// [`server_mux_upstream_task`]: resolves and screens the target off the reader,
+/// answers with a status, then relays datagrams both ways through one connected
+/// UDP socket until the client's `FIN`, a `RESET` (task abort), or idle expiry.
+/// Neither direction ever waits on a full queue: datagrams are dropped and
+/// counted instead, so a busy association cannot stall the session.
+async fn server_mux_udp_task(
+    stream_id: u32,
+    request: Zeroizing<Vec<u8>>,
+    mut upload_rx: mpsc::Receiver<Zeroizing<Vec<u8>>>,
+    downlink: ServerMuxStreamTx,
+    ctx: ServerMuxUdpContext,
+    payload_pool: MuxPayloadPool,
+) {
+    let association = async {
+        if ctx.fixed_data_target {
+            // An operator-fixed target is a TCP service. Reset with no status so
+            // the client marks UDP unsupported on this server; never forward the
+            // request bytes anywhere.
+            tracing::debug!(
+                cid = ctx.cid,
+                stream_id,
+                "UDP association refused: data_target is set"
+            );
+            let _ = downlink.reset().await;
+            return;
+        }
+        let (target_addr, port) = match UdpAssociateRequest::decode_ref(&request) {
+            Ok(parsed) => (parsed.target(), parsed.port),
+            Err(_) => {
+                tracing::debug!(cid = ctx.cid, stream_id, "malformed UDP associate request");
+                let _ = downlink.reset().await;
+                return;
+            }
+        };
+        drop(request);
+        let socket = match connect_udp_association_target(&target_addr, &ctx.nat64_prefixes).await {
+            Ok((socket, _)) => socket,
+            Err(_) => {
+                tracing::debug!(cid = ctx.cid, stream_id, "UDP associate target refused");
+                let _ = downlink
+                    .send(
+                        MuxFrameKind::Data,
+                        UdpAssociateStatus::Refused.encode().to_vec(),
+                    )
+                    .await;
+                let _ = downlink.reset().await;
+                return;
+            }
+        };
+        if downlink
+            .send(
+                MuxFrameKind::Data,
+                UdpAssociateStatus::Accepted.encode().to_vec(),
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let idle = ctx.idle.for_port(port);
+        let activity: RelayActivity = Arc::new(AtomicU64::new(relay_now_millis()));
+        let mut datagram = Zeroizing::new(vec![0_u8; UDP_ASSOCIATION_RECV_BUFFER]);
+        let mut dropped: u64 = 0;
+        loop {
+            tokio::select! {
+                upload = upload_rx.recv() => match upload {
+                    Some(payload) => {
+                        if payload.is_empty() {
+                            continue;
+                        }
+                        // A UDP send waits only for socket readiness (a fresh socket
+                        // is not marked writable until the reactor's first turn); a
+                        // send buffer that stays full drops the datagram, as the
+                        // kernel would, instead of holding this loop.
+                        match timeout(UDP_ASSOCIATION_SEND_WAIT, socket.send(&payload)).await {
+                            Ok(Ok(_)) => bump_relay_activity(&activity),
+                            _ => dropped = dropped.saturating_add(1),
+                        }
+                    }
+                    // Client FIN: the association is over.
+                    None => break,
+                },
+                received = socket.recv(datagram.as_mut_slice()) => match received {
+                    Ok(len) if len == 0 || len > ctx.max_datagram => {
+                        // A zero-length datagram cannot be framed (empty DATA is
+                        // control); an oversize one does not fit one DATA frame.
+                        dropped = dropped.saturating_add(1);
+                    }
+                    Ok(len) => {
+                        if downlink.try_send_datagram(&datagram[..len], &payload_pool) {
+                            bump_relay_activity(&activity);
+                        } else {
+                            dropped = dropped.saturating_add(1);
+                        }
+                    }
+                    // A connected UDP socket surfaces an ICMP error (e.g. port
+                    // unreachable) once on the next receive: transient, keep going.
+                    Err(_) => dropped = dropped.saturating_add(1),
+                },
+                _ = relay_idle_watchdog(activity.clone(), idle) => {
+                    tracing::debug!(cid = ctx.cid, stream_id, "UDP association idle expiry");
+                    break;
+                }
+            }
+        }
+        if dropped > 0 {
+            tracing::debug!(
+                cid = ctx.cid,
+                stream_id,
+                dropped,
+                "UDP association dropped datagrams"
+            );
+        }
+        let _ = downlink.send(MuxFrameKind::Fin, Vec::new()).await;
+    };
+    with_mux_open_receipt(&downlink, association).await;
 }
 
 /// Nominal deadline for retaining an incomplete TCP mux payload. Full payloads
@@ -12012,6 +12317,226 @@ mod tests {
         scheduler.drain_control();
         let (_, frames) = scheduler.queues.pop_front().unwrap();
         (stream, frames)
+    }
+
+    /// A loopback UDP echo the PX1A egress policy is told to allow.
+    async fn spawn_udp_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        allow_udp_test_target(addr);
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0_u8; 65_536];
+            loop {
+                let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                let _ = socket.send_to(&buf[..n], peer).await;
+            }
+        });
+        (addr, task)
+    }
+
+    fn udp_request(target: SocketAddr) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(
+            UdpAssociateRequest {
+                host: target.ip().to_string(),
+                port: target.port(),
+            }
+            .encode()
+            .unwrap(),
+        )
+    }
+
+    fn udp_ctx(max_datagram: usize, idle: Duration) -> ServerMuxUdpContext {
+        ServerMuxUdpContext {
+            fixed_data_target: false,
+            nat64_prefixes: Vec::new(),
+            max_datagram,
+            cid: 1,
+            idle: UdpAssociationIdle {
+                default: idle,
+                dns: idle,
+            },
+        }
+    }
+
+    async fn next_frame(frames: &mut mpsc::Receiver<MuxFrame>) -> MuxFrame {
+        timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .expect("the association produced no frame in time")
+            .expect("the association's queue closed early")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback UDP sockets"]
+    async fn udp_association_relays_both_ways_and_answers_client_fin_with_fin() {
+        let (echo, echo_task) = spawn_udp_echo().await;
+        let (stream, mut frames) = mux_receipt_channel(16).await;
+        let (upload_tx, upload_rx) = mpsc::channel(8);
+        let task = tokio::spawn(server_mux_udp_task(
+            1,
+            udp_request(echo),
+            upload_rx,
+            stream,
+            udp_ctx(16_370, Duration::from_secs(60)),
+            MuxPayloadPool::with_capacity(16_370),
+        ));
+        let status = next_frame(&mut frames).await;
+        assert_eq!(status.kind, MuxFrameKind::Data);
+        assert_eq!(
+            UdpAssociateStatus::decode(&status.payload),
+            Ok(UdpAssociateStatus::Accepted)
+        );
+        for datagram in [&b"one"[..], &[0xAB; 1200][..], &b"three"[..]] {
+            upload_tx
+                .send(Zeroizing::new(datagram.to_vec()))
+                .await
+                .unwrap();
+            let echoed = next_frame(&mut frames).await;
+            assert_eq!(echoed.kind, MuxFrameKind::Data);
+            assert_eq!(echoed.payload, datagram, "one DATA frame per datagram");
+        }
+        drop(upload_tx);
+        assert_eq!(next_frame(&mut frames).await.kind, MuxFrameKind::Fin);
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_association_with_a_fixed_data_target_resets_without_a_status() {
+        let (stream, mut frames) = mux_receipt_channel(4).await;
+        let (_upload_tx, upload_rx) = mpsc::channel(1);
+        let mut ctx = udp_ctx(16_370, Duration::from_secs(60));
+        ctx.fixed_data_target = true;
+        server_mux_udp_task(
+            1,
+            udp_request("192.0.2.1:53".parse().unwrap()),
+            upload_rx,
+            stream,
+            ctx,
+            MuxPayloadPool::with_capacity(16),
+        )
+        .await;
+        let frame = next_frame(&mut frames).await;
+        assert_eq!(frame.kind, MuxFrameKind::Reset);
+        assert!(frame.payload.is_empty());
+        assert!(frames.try_recv().is_err(), "no status, no raw forwarding");
+    }
+
+    #[tokio::test]
+    async fn udp_association_refuses_a_private_target_with_a_status_then_reset() {
+        let (stream, mut frames) = mux_receipt_channel(4).await;
+        let (_upload_tx, upload_rx) = mpsc::channel(1);
+        server_mux_udp_task(
+            1,
+            udp_request("10.0.0.1:53".parse().unwrap()),
+            upload_rx,
+            stream,
+            udp_ctx(16_370, Duration::from_secs(60)),
+            MuxPayloadPool::with_capacity(16),
+        )
+        .await;
+        let status = next_frame(&mut frames).await;
+        assert_eq!(
+            UdpAssociateStatus::decode(&status.payload),
+            Ok(UdpAssociateStatus::Refused)
+        );
+        assert_eq!(next_frame(&mut frames).await.kind, MuxFrameKind::Reset);
+    }
+
+    #[tokio::test]
+    async fn udp_association_resets_a_malformed_request() {
+        let (stream, mut frames) = mux_receipt_channel(4).await;
+        let (_upload_tx, upload_rx) = mpsc::channel(1);
+        server_mux_udp_task(
+            1,
+            Zeroizing::new(b"PX1A\x00\x00".to_vec()),
+            upload_rx,
+            stream,
+            udp_ctx(16_370, Duration::from_secs(60)),
+            MuxPayloadPool::with_capacity(16),
+        )
+        .await;
+        assert_eq!(next_frame(&mut frames).await.kind, MuxFrameKind::Reset);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback UDP sockets"]
+    async fn udp_association_ends_after_its_idle_bound() {
+        let (echo, echo_task) = spawn_udp_echo().await;
+        let (stream, mut frames) = mux_receipt_channel(4).await;
+        let (_upload_tx, upload_rx) = mpsc::channel(1);
+        let started = Instant::now();
+        let task = tokio::spawn(server_mux_udp_task(
+            1,
+            udp_request(echo),
+            upload_rx,
+            stream,
+            udp_ctx(16_370, Duration::from_millis(200)),
+            MuxPayloadPool::with_capacity(16),
+        ));
+        assert_eq!(
+            UdpAssociateStatus::decode(&next_frame(&mut frames).await.payload),
+            Ok(UdpAssociateStatus::Accepted)
+        );
+        assert_eq!(next_frame(&mut frames).await.kind, MuxFrameKind::Fin);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(3),
+            "idle expiry after {elapsed:?}"
+        );
+        task.await.unwrap();
+        echo_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback UDP sockets"]
+    async fn udp_association_drops_a_reply_larger_than_one_frame() {
+        let (echo, echo_task) = spawn_udp_echo().await;
+        let (stream, mut frames) = mux_receipt_channel(8).await;
+        let (upload_tx, upload_rx) = mpsc::channel(8);
+        let task = tokio::spawn(server_mux_udp_task(
+            1,
+            udp_request(echo),
+            upload_rx,
+            stream,
+            udp_ctx(8, Duration::from_secs(60)),
+            MuxPayloadPool::with_capacity(8),
+        ));
+        assert_eq!(
+            UdpAssociateStatus::decode(&next_frame(&mut frames).await.payload),
+            Ok(UdpAssociateStatus::Accepted)
+        );
+        // The echo of a 20-byte datagram cannot fit an 8-byte frame: dropped.
+        upload_tx.send(Zeroizing::new(vec![7; 20])).await.unwrap();
+        upload_tx
+            .send(Zeroizing::new(b"tiny".to_vec()))
+            .await
+            .unwrap();
+        let frame = next_frame(&mut frames).await;
+        assert_eq!(frame.payload, b"tiny", "only the fitting datagram arrives");
+        drop(upload_tx);
+        assert_eq!(next_frame(&mut frames).await.kind, MuxFrameKind::Fin);
+        task.await.unwrap();
+        echo_task.abort();
+    }
+
+    /// A PX1A Open must never reach the CONNECT path: with a fixed data_target
+    /// that path would forward the request bytes raw to the operator's target.
+    #[test]
+    fn udp_associate_payload_is_classified_before_connect_resolution() {
+        let request = udp_request("192.0.2.1:53".parse().unwrap());
+        assert!(UdpAssociateRequest::has_magic(&request));
+        let mut raw = request.to_vec();
+        let (target, source, payload) =
+            resolve_connect_target(&mut raw, Some("127.0.0.1:9")).unwrap();
+        // This is exactly the raw-forward hazard the PX1A branch preempts.
+        assert_eq!(target, "127.0.0.1:9");
+        assert_eq!(source, TargetSource::OperatorFixed);
+        assert_eq!(payload, request.as_slice());
     }
 
     #[tokio::test(start_paused = true)]

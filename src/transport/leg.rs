@@ -143,6 +143,14 @@ where
     pub(crate) fn buffered(reader: R) -> Self {
         Self(TlsRecordReader::buffered(reader))
     }
+
+    /// Like [`Self::buffered`] with an explicit read-buffer capacity (the
+    /// constrained memory profile uses a smaller one).
+    pub(crate) fn buffered_with_capacity(reader: R, capacity: usize) -> Self {
+        Self(TlsRecordReader::new(tokio::io::BufReader::with_capacity(
+            capacity, reader,
+        )))
+    }
 }
 
 /// TCP record-writer leg: writes sealed record bytes straight to the

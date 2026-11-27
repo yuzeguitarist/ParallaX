@@ -22,6 +22,9 @@ const SPEED_WARMUP_UPLOAD_DONE_MAGIC: &[u8; 4] = b"PX1V";
 const SPEED_DOWNLOAD_DONE_MAGIC: &[u8; 4] = b"PX1D";
 const SPEED_UPLOAD_DONE_MAGIC: &[u8; 4] = b"PX1U";
 const MUX_FRAME_MAGIC: &[u8; 4] = b"PX1M";
+/// UDP association over a mux stream: the `Open` payload, and the prefix of the
+/// server's status reply (see [`UdpAssociateRequest`]).
+const UDP_ASSOCIATE_MAGIC: &[u8; 4] = b"PX1A";
 const MAX_HOST_LEN: usize = 255;
 const CONNECT_FIXED_LEN: usize = 4 + 2 + 2 + 4;
 const MUX_FRAME_FIXED_LEN: usize = 4 + 4 + 1 + 4;
@@ -751,6 +754,157 @@ fn connect_target(host: &str, port: u16) -> String {
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(_)) => format!("[{host}]:{port}"),
         _ => format!("{host}:{port}"),
+    }
+}
+
+/// Fixed part of a `PX1A` request: magic + host length + port.
+const UDP_ASSOCIATE_FIXED_LEN: usize = 4 + 2 + 2;
+/// `PX1A` status reply: magic + one status byte.
+pub const UDP_ASSOCIATE_STATUS_LEN: usize = 4 + 1;
+
+/// `PX1A` UDP association request, the payload of a mux `Open` (SPEC §6.7):
+/// `"PX1A" | host_len u16 (1..=255) | host UTF-8 | port u16 (≠0)`, exact length.
+///
+/// After the server answers with a [`UdpAssociateStatus`] Data frame, every
+/// further non-empty `Data` frame on the stream carries exactly one datagram in
+/// each direction. Empty `Data` frames stay control (receipts) and are never
+/// datagrams, so a zero-length datagram cannot be carried.
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct UdpAssociateRequest {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpAssociateRequestRef<'a> {
+    pub host: &'a str,
+    pub port: u16,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum UdpAssociateError {
+    #[error("UDP associate message is truncated")]
+    Truncated,
+    #[error("UDP associate magic mismatch")]
+    BadMagic,
+    #[error("UDP associate host is empty")]
+    EmptyHost,
+    #[error("UDP associate host is too long")]
+    HostTooLong,
+    #[error("UDP associate host is not valid UTF-8")]
+    InvalidHost,
+    #[error("UDP associate port must not be zero")]
+    ZeroPort,
+    #[error("UDP associate message has trailing bytes")]
+    TrailingBytes,
+    #[error("UDP associate status is unknown")]
+    InvalidStatus,
+}
+
+impl UdpAssociateRequest {
+    pub fn has_magic(input: &[u8]) -> bool {
+        input.len() >= 4 && &input[..4] == UDP_ASSOCIATE_MAGIC
+    }
+
+    pub fn target(&self) -> String {
+        connect_target(&self.host, self.port)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, UdpAssociateError> {
+        let host = self.host.as_bytes();
+        if host.is_empty() {
+            return Err(UdpAssociateError::EmptyHost);
+        }
+        if host.len() > MAX_HOST_LEN {
+            return Err(UdpAssociateError::HostTooLong);
+        }
+        if self.port == 0 {
+            return Err(UdpAssociateError::ZeroPort);
+        }
+        let mut out = Vec::with_capacity(UDP_ASSOCIATE_FIXED_LEN + host.len());
+        out.extend_from_slice(UDP_ASSOCIATE_MAGIC);
+        out.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        out.extend_from_slice(host);
+        out.extend_from_slice(&self.port.to_be_bytes());
+        crate::process_hardening::exclude_from_core_dump("udp_associate.encoded", &out);
+        Ok(out)
+    }
+
+    pub fn decode_ref(input: &[u8]) -> Result<UdpAssociateRequestRef<'_>, UdpAssociateError> {
+        if input.len() < 4 {
+            return Err(UdpAssociateError::Truncated);
+        }
+        if !Self::has_magic(input) {
+            return Err(UdpAssociateError::BadMagic);
+        }
+        let truncated = |_| UdpAssociateError::Truncated;
+        let mut cursor = Cursor::new(input, 4);
+        let host_len = cursor.u16().map_err(truncated)? as usize;
+        if host_len == 0 {
+            return Err(UdpAssociateError::EmptyHost);
+        }
+        if host_len > MAX_HOST_LEN {
+            return Err(UdpAssociateError::HostTooLong);
+        }
+        let host = cursor.bytes(host_len).map_err(truncated)?;
+        let host = std::str::from_utf8(host).map_err(|_| UdpAssociateError::InvalidHost)?;
+        let port = cursor.u16().map_err(truncated)?;
+        if port == 0 {
+            return Err(UdpAssociateError::ZeroPort);
+        }
+        if cursor.remaining() != 0 {
+            return Err(UdpAssociateError::TrailingBytes);
+        }
+        crate::process_hardening::exclude_from_core_dump("udp_associate.host", host.as_bytes());
+        Ok(UdpAssociateRequestRef { host, port })
+    }
+}
+
+impl UdpAssociateRequestRef<'_> {
+    pub fn target(&self) -> String {
+        connect_target(self.host, self.port)
+    }
+}
+
+/// The server's first non-empty `Data` frame on a `PX1A` stream:
+/// `"PX1A" | status u8`. A server that predates `PX1A`, or that relays only to an
+/// operator-fixed target, answers the `Open` with a plain `Reset` instead, which
+/// the client reads as "UDP unsupported on this server".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpAssociateStatus {
+    /// A UDP socket toward the target is open; datagrams may flow.
+    Accepted,
+    /// The target was refused (resolution failed, egress policy, or socket
+    /// error). A `Reset` follows.
+    Refused,
+}
+
+impl UdpAssociateStatus {
+    pub fn encode(self) -> [u8; UDP_ASSOCIATE_STATUS_LEN] {
+        let status = match self {
+            Self::Accepted => 0,
+            Self::Refused => 1,
+        };
+        let mut out = [0_u8; UDP_ASSOCIATE_STATUS_LEN];
+        out[..4].copy_from_slice(UDP_ASSOCIATE_MAGIC);
+        out[4] = status;
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, UdpAssociateError> {
+        if input.len() < 4 {
+            return Err(UdpAssociateError::Truncated);
+        }
+        if &input[..4] != UDP_ASSOCIATE_MAGIC {
+            return Err(UdpAssociateError::BadMagic);
+        }
+        match input {
+            [_, _, _, _, 0] => Ok(Self::Accepted),
+            [_, _, _, _, 1] => Ok(Self::Refused),
+            [_, _, _, _] => Err(UdpAssociateError::Truncated),
+            [_, _, _, _, _] => Err(UdpAssociateError::InvalidStatus),
+            _ => Err(UdpAssociateError::TrailingBytes),
+        }
     }
 }
 
@@ -3121,6 +3275,123 @@ mod tests {
         };
 
         assert_eq!(request.target(), "[::1]:443");
+    }
+
+    /// PX1A (SPEC §6.7): exact layout, exact consumption, and the same field
+    /// limits as PX1C, checked against a hand-built wire image.
+    #[test]
+    fn udp_associate_request_matches_the_spec_layout_and_rejects_malformed_input() {
+        let request = UdpAssociateRequest {
+            host: "dns.example".to_owned(),
+            port: 53,
+        };
+        let wire = request.encode().unwrap();
+        let mut expected = b"PX1A".to_vec();
+        expected.extend_from_slice(&11_u16.to_be_bytes());
+        expected.extend_from_slice(b"dns.example");
+        expected.extend_from_slice(&53_u16.to_be_bytes());
+        assert_eq!(wire, expected);
+        let decoded = UdpAssociateRequest::decode_ref(&wire).unwrap();
+        assert_eq!((decoded.host, decoded.port), ("dns.example", 53));
+        assert_eq!(decoded.target(), "dns.example:53");
+        assert!(UdpAssociateRequest::has_magic(&wire));
+        assert!(!UdpAssociateRequest::has_magic(b"PX1C"));
+
+        for cut in 0..wire.len() {
+            assert!(
+                UdpAssociateRequest::decode_ref(&wire[..cut]).is_err(),
+                "a {cut}-byte prefix must not decode"
+            );
+        }
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert_eq!(
+            UdpAssociateRequest::decode_ref(&trailing),
+            Err(UdpAssociateError::TrailingBytes)
+        );
+        let mut zero_port = wire.clone();
+        let len = zero_port.len();
+        zero_port[len - 2..].copy_from_slice(&[0, 0]);
+        assert_eq!(
+            UdpAssociateRequest::decode_ref(&zero_port),
+            Err(UdpAssociateError::ZeroPort)
+        );
+        assert_eq!(
+            UdpAssociateRequest::decode_ref(b"PX1A\x00\x00\x00\x35"),
+            Err(UdpAssociateError::EmptyHost)
+        );
+        assert_eq!(
+            UdpAssociateRequest::decode_ref(b"PX1A\x01\x00"),
+            Err(UdpAssociateError::HostTooLong)
+        );
+        assert_eq!(
+            UdpAssociateRequest::decode_ref(b"PX1A\x00\x01\xff\x00\x35"),
+            Err(UdpAssociateError::InvalidHost)
+        );
+        assert_eq!(
+            UdpAssociateRequest::decode_ref(b"PX1C\x00\x01x\x00\x35"),
+            Err(UdpAssociateError::BadMagic)
+        );
+        assert_eq!(
+            UdpAssociateRequest {
+                host: "x".repeat(256),
+                port: 1
+            }
+            .encode(),
+            Err(UdpAssociateError::HostTooLong)
+        );
+        let v6 = UdpAssociateRequest {
+            host: "2001:db8::1".to_owned(),
+            port: 443,
+        };
+        assert_eq!(v6.target(), "[2001:db8::1]:443");
+    }
+
+    #[test]
+    fn udp_associate_status_is_magic_plus_one_known_byte() {
+        assert_eq!(&UdpAssociateStatus::Accepted.encode(), b"PX1A\x00");
+        assert_eq!(&UdpAssociateStatus::Refused.encode(), b"PX1A\x01");
+        for status in [UdpAssociateStatus::Accepted, UdpAssociateStatus::Refused] {
+            assert_eq!(UdpAssociateStatus::decode(&status.encode()), Ok(status));
+        }
+        assert_eq!(
+            UdpAssociateStatus::decode(b"PX1A\x02"),
+            Err(UdpAssociateError::InvalidStatus)
+        );
+        assert_eq!(
+            UdpAssociateStatus::decode(b"PX1A"),
+            Err(UdpAssociateError::Truncated)
+        );
+        assert_eq!(
+            UdpAssociateStatus::decode(b"PX1A\x00\x00"),
+            Err(UdpAssociateError::TrailingBytes)
+        );
+        assert_eq!(
+            UdpAssociateStatus::decode(b"PX1M\x00"),
+            Err(UdpAssociateError::BadMagic)
+        );
+        // An empty DATA receipt is control, never a status.
+        assert_eq!(
+            UdpAssociateStatus::decode(b""),
+            Err(UdpAssociateError::Truncated)
+        );
+    }
+
+    /// A server that predates PX1A routes an OPEN payload through the PX1C
+    /// decoder; it must fail there (BadMagic), which that server answers with a
+    /// stream Reset and no status — the signal the client reads as "unsupported".
+    #[test]
+    fn udp_associate_request_is_not_a_connect_request() {
+        let wire = UdpAssociateRequest {
+            host: "example.com".to_owned(),
+            port: 443,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            ConnectRequest::decode_ref(&wire),
+            Err(ConnectRequestError::BadMagic)
+        );
     }
 
     #[test]

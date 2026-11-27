@@ -8,7 +8,7 @@
 
 use std::{
     fmt, io,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -246,6 +246,26 @@ impl RecordEventTap for VecRecordTap {
     }
 }
 
+/// Pluggable trust decision for the camouflage origin's certificate chain.
+///
+/// By default the client validates the chain with webpki against the platform
+/// root store loaded through `rustls-native-certs`. A host that cannot load a
+/// root store that way (an iOS app extension cannot enumerate the system roots)
+/// injects its platform verifier here instead, for example one backed by
+/// `SecTrustEvaluateWithError`. Either way the client still checks the server's
+/// CertificateVerify signature against the leaf's public key itself.
+pub trait ServerCertVerifier: Send + Sync + fmt::Debug {
+    /// Verify that `end_entity` chains through `intermediates` to a trusted root
+    /// and is valid for `server_name` at `now_unix_secs`. Every certificate is DER.
+    fn verify(
+        &self,
+        end_entity: &[u8],
+        intermediates: &[&[u8]],
+        server_name: &str,
+        now_unix_secs: u64,
+    ) -> Result<(), String>;
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Safari26TlsCamouflage;
 
@@ -363,6 +383,7 @@ impl Safari26TlsCamouflage {
             pending_http2_plaintext: Vec::new(),
             pending_post_handshake: Vec::new(),
             tap: VecRecordTap::default(),
+            cert_verifier: None,
         })
     }
 }
@@ -412,6 +433,9 @@ pub struct Safari26TlsSession {
     /// A fragmented ticket/KeyUpdate cannot be silently dropped at handoff.
     pending_post_handshake: Vec<u8>,
     tap: VecRecordTap,
+    /// Injected origin-chain trust decision; `None` keeps the webpki + native
+    /// roots path (see [`ServerCertVerifier`]).
+    cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
 }
 
 impl Safari26TlsSession {
@@ -426,6 +450,13 @@ impl Safari26TlsSession {
     /// the fleet is not a single fixed `accept-language` cross-connection tell.
     pub fn with_accept_language(mut self, accept_language: String) -> Self {
         self.accept_language = accept_language;
+        self
+    }
+
+    /// Validate the origin's certificate chain with `verifier` instead of webpki
+    /// and the native root store. `None` keeps the default path unchanged.
+    pub fn with_cert_verifier(mut self, verifier: Option<Arc<dyn ServerCertVerifier>>) -> Self {
+        self.cert_verifier = verifier;
         self
     }
 
@@ -857,7 +888,12 @@ impl Safari26TlsSession {
                             keys,
                         )?;
                         if !certificate_verified && !flight.certificates.is_empty() {
-                            verify_server_certificate(&self.sni, &flight, transcript)?;
+                            match self.cert_verifier.as_deref() {
+                                Some(verifier) => {
+                                    verify_server_certificate_with(verifier, &self.sni, &flight)?
+                                }
+                                None => verify_server_certificate(&self.sni, &flight, transcript)?,
+                            }
                             certificate_verified = true;
                         }
                         if flight.finished || handshake_buf.len() == buffered {
@@ -2991,6 +3027,33 @@ fn verify_server_certificate(
     )
     .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?;
     Ok(())
+}
+
+/// Chain validation through an injected [`ServerCertVerifier`]. Runs at the same
+/// point as [`verify_server_certificate`] (on Certificate, before CertificateVerify
+/// or Finished is parsed); there is deliberately no test-only bypass here.
+fn verify_server_certificate_with(
+    verifier: &dyn ServerCertVerifier,
+    sni: &str,
+    flight: &ServerFlight,
+) -> Result<(), Safari26TlsError> {
+    let leaf = flight
+        .certificates
+        .first()
+        .ok_or_else(|| Safari26TlsError::Certificate("missing server certificate".to_owned()))?;
+    let intermediates = flight
+        .certificates
+        .iter()
+        .skip(1)
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| Safari26TlsError::Certificate(err.to_string()))?
+        .as_secs();
+    verifier
+        .verify(leaf, &intermediates, sni, now)
+        .map_err(Safari26TlsError::Certificate)
 }
 
 /// The certificate pin is a test-only bypass. Keep BOTH conditions independently

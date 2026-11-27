@@ -161,6 +161,7 @@ jobs:
             --test deploy_seal_interruption \
             --test distinguisher_battery \
             --test e2e_tunnel_roundtrip \
+            --test embed_contract \
             --test gfw_live_replay \
             --test gfw_sim_provenance \
             --test ja4_census_oracle \

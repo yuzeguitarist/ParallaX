@@ -172,13 +172,94 @@ pub async fn connect_tuned_tcp_host(addr: &str, deadline: Instant) -> io::Result
 /// Keep uncancellable getaddrinfo calls bounded even after their async callers
 /// time out. The blocking job owns the permit until the resolver actually exits.
 pub(crate) async fn resolve_tcp_host(addr: &str) -> io::Result<Vec<SocketAddr>> {
-    if let Ok(addr) = addr.parse::<SocketAddr>() {
-        return Ok(vec![addr]);
-    }
     static DNS_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    if let Ok(parsed) = addr.parse::<SocketAddr>() {
+        if !needs_nat64_synthesis(&parsed) {
+            return Ok(vec![parsed]);
+        }
+        let slots = Arc::clone(DNS_SLOTS.get_or_init(|| Arc::new(Semaphore::new(32))));
+        return bounded_dns_lookup(slots, move || synthesize_ipv4_literal(parsed)).await;
+    }
     let slots = Arc::clone(DNS_SLOTS.get_or_init(|| Arc::new(Semaphore::new(32))));
     let addr = addr.to_owned();
     bounded_dns_lookup(slots, move || addr.to_socket_addrs().map(Iterator::collect)).await
+}
+
+/// Whether an address literal must go through the system resolver before use.
+///
+/// On Apple platforms an IPv6-only network reaches IPv4 hosts through NAT64,
+/// and only the system resolver knows the network's NAT64 prefix: `connect` to
+/// a bare IPv4 address fails there. `getaddrinfo` on an IPv4 literal returns
+/// the synthesized IPv6 address on such a network and the literal itself
+/// everywhere else. Elsewhere, and for IPv6 literals, the literal is used as is.
+pub(crate) fn needs_nat64_synthesis(addr: &SocketAddr) -> bool {
+    cfg!(target_vendor = "apple") && addr.is_ipv4()
+}
+
+#[cfg(target_vendor = "apple")]
+fn synthesize_ipv4_literal(addr: SocketAddr) -> io::Result<Vec<SocketAddr>> {
+    use std::{
+        ffi::CString,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+    };
+
+    let host = CString::new(addr.ip().to_string()).map_err(io::Error::other)?;
+    // SAFETY: an all-zero addrinfo is a valid "no hints" value; the fields set
+    // below are plain integers.
+    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_flags = libc::AI_DEFAULT;
+    hints.ai_family = libc::AF_UNSPEC;
+    hints.ai_socktype = libc::SOCK_STREAM;
+    let mut list: *mut libc::addrinfo = std::ptr::null_mut();
+    // SAFETY: host is NUL-terminated, hints is initialized, and list receives a
+    // resolver-owned list that is freed below exactly once.
+    let rc = unsafe { libc::getaddrinfo(host.as_ptr(), std::ptr::null(), &hints, &mut list) };
+    if rc != 0 || list.is_null() {
+        return Ok(vec![addr]);
+    }
+    let mut out = Vec::new();
+    let mut cursor = list;
+    while !cursor.is_null() {
+        // SAFETY: cursor walks the list getaddrinfo returned; each node is valid
+        // until freeaddrinfo, and ai_addr matches ai_family's sockaddr layout.
+        let info = unsafe { &*cursor };
+        if !info.ai_addr.is_null() {
+            match info.ai_family {
+                libc::AF_INET6 => {
+                    // SAFETY: AF_INET6 entries point at a sockaddr_in6.
+                    let sa = unsafe { &*(info.ai_addr as *const libc::sockaddr_in6) };
+                    out.push(SocketAddr::V6(SocketAddrV6::new(
+                        Ipv6Addr::from(sa.sin6_addr.s6_addr),
+                        addr.port(),
+                        0,
+                        sa.sin6_scope_id,
+                    )));
+                }
+                libc::AF_INET => {
+                    // SAFETY: AF_INET entries point at a sockaddr_in.
+                    let sa = unsafe { &*(info.ai_addr as *const libc::sockaddr_in) };
+                    out.push(SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr)),
+                        addr.port(),
+                    )));
+                }
+                _ => {}
+            }
+        }
+        cursor = info.ai_next;
+    }
+    // SAFETY: list came from the successful getaddrinfo above and is freed once.
+    unsafe { libc::freeaddrinfo(list) };
+    if out.is_empty() {
+        out.push(addr);
+    }
+    out.dedup();
+    Ok(out)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn synthesize_ipv4_literal(addr: SocketAddr) -> io::Result<Vec<SocketAddr>> {
+    Ok(vec![addr])
 }
 
 async fn bounded_dns_lookup<F>(slots: Arc<Semaphore>, lookup: F) -> io::Result<Vec<SocketAddr>>
@@ -1304,6 +1385,21 @@ mod kernel_splice {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ipv4_literals_resolve_through_the_system_on_apple() {
+        let literal: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        assert_eq!(
+            needs_nat64_synthesis(&literal),
+            cfg!(target_vendor = "apple")
+        );
+        assert!(!needs_nat64_synthesis(&"[::1]:8443".parse().unwrap()));
+        let resolved = resolve_tcp_host("127.0.0.1:8443").await.unwrap();
+        assert!(!resolved.is_empty());
+        assert!(resolved.iter().all(|addr| addr.port() == 8443));
+        // Without NAT64 the system hands the literal back unchanged.
+        assert!(resolved.contains(&literal) || resolved.iter().any(SocketAddr::is_ipv6));
+    }
+
     #[test]
     fn heap_admission_rejects_an_oversized_session_and_accounts_mux_queues() {
         const MIB: usize = 1024 * 1024;

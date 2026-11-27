@@ -77,6 +77,23 @@ When the user says not to keep doing something, not to continue optimizing, or n
 
 When changing source code, configuration, documentation, or any repository file content, use the dedicated patch/edit tool instead of writing file changes through shell scripts, inline Python, sed/perl replacement commands, heredocs, or shell redirection. Terminal commands are acceptable for inspection, tests, benchmarks, formatting checks, and git operations, but content edits must go through the patch/edit tool unless the user explicitly authorizes another method.
 
+## 7. Apple embedding contract
+
+The iOS/macOS client embeds this crate through `parallax::embed` (no SOCKS5, no
+CLI). Its contract is [`EMBEDDING.md`](./EMBEDDING.md): API, runtime rules,
+memory profiles, the process-global effects the embedding path must never have,
+and the `API_VERSION` bump policy.
+
+- After changing `src/client/`, `src/embed.rs`, `src/tls/safari26.rs`,
+  `src/protocol/`, `src/handshake/server.rs`, or `Cargo.toml`, run
+  `scripts/check-apple.sh` (Apple target builds, embedding guard, embed contract
+  tests including loopback).
+- An observable change to `parallax::embed` bumps `embed::API_VERSION`, adds a
+  changelog row in `EMBEDDING.md`, and updates the pin in
+  `tests/embed_contract.rs`.
+- The CLI's SOCKS5 mux path is an adapter over the same relay
+  (`relay_mux_stream`); keep it that way rather than forking the relay.
+
 ## Cursor Cloud specific instructions
 
 Single-binary Rust proxy (`parallax` / `plx` alias). No databases or external services to run.

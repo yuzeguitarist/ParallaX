@@ -499,10 +499,18 @@ pub fn exclude_transient_from_core_dump(label: &'static str, bytes: &[u8]) {
     }
 }
 
+static TRANSIENT_PLAINTEXT_HARDENING: OnceLock<bool> = OnceLock::new();
+
 fn transient_plaintext_hardening_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
+    *TRANSIENT_PLAINTEXT_HARDENING
         .get_or_init(|| transient_plaintext_setting_from_env(std::env::var(HARDEN_TRANSIENT_ENV)))
+}
+
+/// Fixes the transient-plaintext toggle without consulting the environment, for
+/// an embedder (`parallax::embed`), which must not read the host's environment.
+/// First decision wins, as with the environment path.
+pub(crate) fn set_transient_plaintext_hardening(enabled: bool) {
+    let _ = TRANSIENT_PLAINTEXT_HARDENING.set(enabled);
 }
 
 /// Pure decision for the transient-hardening toggle: an absent var is off, a
