@@ -67,8 +67,8 @@ const POST_HANDSHAKE_DRAIN_LIMIT: usize = 4;
 // post-handshake record during the ready-only drain.
 const TLS_RECORD_COMPLETION_TIMEOUT: Duration = Duration::from_secs(20);
 const FATAL_ALERT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
-const H2_SETTINGS_ACK_RECORD_LIMIT: usize = 8;
-const H2_SETTINGS_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+const H2_SETTINGS_RECORD_LIMIT: usize = 8;
+const H2_SETTINGS_TIMEOUT: Duration = Duration::from_millis(250);
 const H2_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
 const MAX_POST_HANDSHAKE_MESSAGE: usize = 64 * 1024;
 const POST_HANDSHAKE_BUFFER_LIMIT: usize =
@@ -256,6 +256,20 @@ impl Safari26TlsCamouflage {
         psk: &[u8],
         server_public_key: &[u8; 32],
     ) -> Result<Safari26TlsSession, Safari26TlsError> {
+        self.start_with_key_share(sni, psk, server_public_key, Self::prepare_key_share()?)
+    }
+
+    pub(crate) fn prepare_key_share() -> Result<DecapsulationKey, Safari26TlsError> {
+        DecapsulationKey::generate(&ML_KEM_768).map_err(|_| Safari26TlsError::MlKem)
+    }
+
+    pub(crate) fn start_with_key_share(
+        &self,
+        sni: String,
+        psk: &[u8],
+        server_public_key: &[u8; 32],
+        mlkem_dk: DecapsulationKey,
+    ) -> Result<Safari26TlsSession, Safari26TlsError> {
         ServerName::try_from(sni.as_str())
             .map_err(|_| Safari26TlsError::InvalidServerName(sni.clone()))?;
 
@@ -294,8 +308,6 @@ impl Safari26TlsCamouflage {
             &tail,
         )?;
 
-        let mlkem_dk =
-            DecapsulationKey::generate(&ML_KEM_768).map_err(|_| Safari26TlsError::MlKem)?;
         let mlkem_public = mlkem_dk
             .encapsulation_key()
             .and_then(|ek| ek.key_bytes())
@@ -1089,7 +1101,9 @@ impl Safari26TlsSession {
         // A fragmented ticket must not delay the browser's opening request.
         // Process any available post-handshake records only after writing it.
         let observed = self.drain_post_handshake(stream, keys).await?;
-        self.await_http2_settings_ack(stream, keys).await?;
+        // ACK the origin's SETTINGS once received. The opening request is
+        // already in flight, so the origin's ACK can arrive after handoff.
+        self.await_http2_peer_settings(stream, keys).await?;
         Ok(observed)
     }
 
@@ -1109,7 +1123,7 @@ impl Safari26TlsSession {
         Ok(())
     }
 
-    async fn await_http2_settings_ack(
+    async fn await_http2_peer_settings(
         &mut self,
         stream: &mut TcpStream,
         keys: &mut Tls13Keys,
@@ -1128,14 +1142,9 @@ impl Safari26TlsSession {
         // holds the stream borrow for the loop's lifetime.
         let mut reader = TlsRecordReader::new(&mut *stream);
         let mut record = Vec::new();
-        for _ in 0..H2_SETTINGS_ACK_RECORD_LIMIT {
+        for _ in 0..H2_SETTINGS_RECORD_LIMIT {
             let record_deadline = tokio::time::Instant::now() + TLS_RECORD_COMPLETION_TIMEOUT;
-            match timeout(
-                H2_SETTINGS_ACK_TIMEOUT,
-                reader.read_record_into(&mut record),
-            )
-            .await
-            {
+            match timeout(H2_SETTINGS_TIMEOUT, reader.read_record_into(&mut record)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) if is_clean_close(&err) && reader.at_record_boundary() => {
                     return self.ensure_post_handshake_boundary()
@@ -1154,7 +1163,7 @@ impl Safari26TlsSession {
                         Ok(result) => result?,
                         Err(_) => {
                             return Err(Safari26TlsError::Handshake(
-                                "http/2 settings ack timed out mid-record".to_owned(),
+                                "http/2 settings timed out mid-record".to_owned(),
                             ))
                         }
                     }
@@ -1226,12 +1235,13 @@ impl Safari26TlsSession {
         keys: &mut Tls13Keys,
     ) -> Result<bool, Safari26TlsError> {
         let mut offset = 0;
-        let mut saw_settings_ack = false;
+        let mut saw_settings = false;
 
         while let Some((header, total)) = Http2FrameHeader::parse_complete(&plaintext[offset..]) {
             if header.is_settings_ack() {
-                saw_settings_ack = true;
+                saw_settings = true;
             } else if header.is_settings() {
+                saw_settings = true;
                 // RFC 9113 §6.5.3 requires one ACK per SETTINGS, in receipt order;
                 // a batch containing multiple frames must not collapse their ACKs.
                 let ack = Http2Fingerprint::settings_ack_frame()?;
@@ -1244,7 +1254,7 @@ impl Safari26TlsSession {
         // (offset > 0 versus offset >= 0) that adds no parsing protection.
         plaintext.drain(..offset);
 
-        Ok(saw_settings_ack)
+        Ok(saw_settings)
     }
 
     fn tap_records(&mut self, direction: RecordDirection, records: &[u8]) {
@@ -3739,12 +3749,12 @@ mod tests {
         // arm and the `should_ack_peer_settings` write block: the session must
         // encrypt and send a SETTINGS-ACK back to the peer.
         let mut plaintext = h2_frame(0x4, 0x0, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x64]);
-        let saw_ack = session
+        let saw_settings = session
             .process_http2_frames(&mut plaintext, &mut stream, &mut session_keys)
             .await
             .unwrap();
 
-        assert!(!saw_ack); // a peer SETTINGS frame is not itself our ack signal
+        assert!(saw_settings);
         assert!(plaintext.is_empty()); // the complete frame was drained
 
         // The reply is written via client_application.encrypt_record, so decrypt it
@@ -4351,7 +4361,7 @@ mod tests {
                 .unwrap();
             peer.write_all(&next).await.unwrap();
             assert!(session
-                .await_http2_settings_ack(&mut stream, &mut keys)
+                .await_http2_peer_settings(&mut stream, &mut keys)
                 .await
                 .is_err());
         }
@@ -4650,7 +4660,7 @@ mod tests {
         assert!(matches!(err, Safari26TlsError::Alert { .. }));
     }
 
-    // ---- await_http2_settings_ack ----
+    // ---- await_http2_peer_settings ----
 
     #[tokio::test]
     async fn await_http2_settings_ack_propagates_outer_alert() {
@@ -4664,7 +4674,7 @@ mod tests {
         drop(peer);
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut keys)
+            .await_http2_peer_settings(&mut stream, &mut keys)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4691,7 +4701,7 @@ mod tests {
         drop(peer);
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4721,7 +4731,7 @@ mod tests {
         drop(peer);
 
         session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap();
     }
@@ -4743,7 +4753,7 @@ mod tests {
         drop(peer);
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4772,7 +4782,7 @@ mod tests {
         drop(peer);
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4798,7 +4808,7 @@ mod tests {
         drop(peer);
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut keys)
+            .await_http2_peer_settings(&mut stream, &mut keys)
             .await
             .unwrap_err();
         assert!(matches!(err, Safari26TlsError::Alert { .. }));
@@ -4821,7 +4831,7 @@ mod tests {
         drop(peer);
 
         let error = session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap_err();
         assert!(matches!(error, Safari26TlsError::Handshake(_)));
@@ -4845,7 +4855,7 @@ mod tests {
         drop(peer);
 
         session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap();
     }
@@ -4873,9 +4883,46 @@ mod tests {
         drop(peer);
 
         session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http2_bootstrap_hands_off_after_acknowledging_origin_settings() {
+        let mut session = test_session();
+        let (mut stream, mut peer) = loopback().await;
+        let mut keys = app_keys();
+        let mut peer_keys = app_keys();
+        let settings = h2_frame(0x4, 0x0, &[]);
+        let record = peer_keys
+            .server_application
+            .encrypt_record(TLS_RECORD_APPLICATION_DATA, &settings)
+            .unwrap();
+        peer.write_all(&record).await.unwrap();
+
+        // The origin keeps its connection open. It has sent its SETTINGS and
+        // can accept the request, but has not ACKed the client's SETTINGS.
+        let mut ack = Vec::new();
+        let mut reader = TlsRecordReader::new(&mut peer);
+        let (open, read) = tokio::join!(
+            timeout(
+                H2_SETTINGS_TIMEOUT / 2,
+                session.await_http2_peer_settings(&mut stream, &mut keys),
+            ),
+            reader.read_record_into(&mut ack),
+        );
+        open.expect("origin SETTINGS should suffice for handoff")
+            .unwrap();
+        read.unwrap();
+        assert_eq!(
+            peer_keys
+                .client_application
+                .decrypt_record(&ack)
+                .unwrap()
+                .plaintext,
+            Http2Fingerprint::settings_ack_frame().unwrap(),
+        );
     }
 
     #[tokio::test]
@@ -4887,7 +4934,7 @@ mod tests {
         // Nothing is ever sent: the read times out at a clean record boundary and
         // must resolve to Ok rather than a mid-record error.
         session
-            .await_http2_settings_ack(&mut stream, &mut keys)
+            .await_http2_peer_settings(&mut stream, &mut keys)
             .await
             .unwrap();
     }
@@ -4919,7 +4966,7 @@ mod tests {
         stream.readable().await.unwrap();
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut keys)
+            .await_http2_peer_settings(&mut stream, &mut keys)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4939,7 +4986,7 @@ mod tests {
             peer.write_all(&record[..split]).await.unwrap();
             peer.shutdown().await.unwrap();
             let err = session
-                .await_http2_settings_ack(&mut stream, &mut keys)
+                .await_http2_peer_settings(&mut stream, &mut keys)
                 .await
                 .unwrap_err();
             assert!(matches!(err, Safari26TlsError::Io(ref err)
@@ -4965,7 +5012,7 @@ mod tests {
         drop(peer);
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut keys)
+            .await_http2_peer_settings(&mut stream, &mut keys)
             .await
             .unwrap_err();
         assert!(
@@ -5013,7 +5060,7 @@ mod tests {
         drop(peer);
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5050,7 +5097,7 @@ mod tests {
         drop(peer);
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5116,7 +5163,7 @@ mod tests {
         });
 
         let err = session
-            .await_http2_settings_ack(&mut stream, &mut session_keys)
+            .await_http2_peer_settings(&mut stream, &mut session_keys)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -7686,7 +7733,7 @@ mod tests {
                 peer.write_all(&record[split..]).await.unwrap();
             };
             let (result, ()) = tokio::join!(
-                session.await_http2_settings_ack(&mut stream, &mut keys),
+                session.await_http2_peer_settings(&mut stream, &mut keys),
                 tail
             );
             result.unwrap();
@@ -8050,7 +8097,7 @@ mod tests {
                     } else {
                         keys.negotiated_alpn = Some(b"h2".to_vec());
                         session
-                            .await_http2_settings_ack(&mut stream, &mut keys)
+                            .await_http2_peer_settings(&mut stream, &mut keys)
                             .await
                             .err()
                     }

@@ -6214,6 +6214,8 @@ async fn shed_server_mux_substream(
 /// bypass this timer. Timer resolution/scheduling, queue backpressure and
 /// explicitly configured jitter are separate from this intentional hold.
 const SERVER_MUX_TAIL_HOLD: Duration = Duration::from_millis(5);
+/// An isolated short reply can be a flow-control update that unblocks upload.
+const SERVER_MUX_SHORT_REPLY_MAX: usize = 64;
 
 fn mux_tail_append_len(buffered: usize, available: usize, capacity: usize) -> usize {
     available.min(capacity - buffered)
@@ -6277,6 +6279,7 @@ async fn server_mux_target_reader_loop(
     let mut rng = StdRng::from_entropy();
     let mut tail = payload_pool.take();
     let mut tail_deadline = None;
+    let mut first_reply = true;
     loop {
         // The supervisor bounds silence across BOTH target directions. A
         // per-read timeout would truncate a sustained upload-only stream.
@@ -6330,10 +6333,13 @@ async fn server_mux_target_reader_loop(
         if !delay.is_zero() {
             sleep(delay).await;
         }
-        // Explicit jitter retains its original per-read send behavior. The
-        // default zero-timing path coalesces only an incomplete payload, without
-        // delaying full records or adding padding.
-        if timing.is_enabled() {
+        // Let an opening reply or an isolated control-sized reply advance the
+        // other direction promptly. Ready bytes still drain into one buffer.
+        let flush_short_reply = tail.is_empty()
+            && n < max_payload_len
+            && (first_reply || n <= SERVER_MUX_SHORT_REPLY_MAX);
+        first_reply = false;
+        if timing.is_enabled() || flush_short_reply {
             for chunk in target_buf[..n].chunks(max_payload_len) {
                 downlink
                     .send(MuxFrameKind::Data, payload_pool.take_filled(chunk))
@@ -11701,14 +11707,14 @@ mod tests {
                 Ok(())
             }
         }
+        let traffic = TrafficConfig::default();
         let codec = || {
             DataRecordCodec::new(
                 AeadCodec::new([0x51; 32], [0x62; 12]),
-                PaddingProfile::new(0, 0).unwrap(),
+                PaddingProfile::from_config(traffic).unwrap(),
                 b"mux-idle",
             )
         };
-        let traffic = TrafficConfig::default();
         let idle = Duration::from_millis(100);
         let context = ServerMuxContext {
             fixed_data_target: None,
@@ -11778,7 +11784,12 @@ mod tests {
                         .send(MuxFrameKind::Data, b"payload".to_vec())
                         .await
                         .unwrap();
-                    written_rx.recv().await.unwrap();
+                    let plaintext_len = MuxFrame::encoded_len(b"payload".len()).unwrap();
+                    assert_eq!(
+                        written_rx.recv().await.unwrap(),
+                        TLS_HEADER_LEN + plaintext_len + 18,
+                        "default mux padding"
+                    );
                 }
                 tokio::task::yield_now().await;
                 assert!(
@@ -12720,6 +12731,52 @@ mod tests {
         panic!("loopback target read was not observed");
     }
 
+    async fn send_mux_target_full_first_reply(
+        peer: &mut TcpStream,
+        frames: &mut mpsc::Receiver<MuxFrame>,
+        activity: &RelayActivity,
+        capacity: usize,
+    ) {
+        let first = vec![0x7f; capacity];
+        peer.write_all(&first).await.unwrap();
+        assert_eq!(frames.recv().await.unwrap().payload, first);
+        activity.store(u64::MAX, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_first_short_reply_sends_without_waiting_for_deadline() {
+        let (mut peer, mut frames, task, activity) =
+            mux_tail_test_reader(16, TimingProfile::from_config(TrafficConfig::default())).await;
+        tokio::time::pause();
+        peer.write_all(b"greeting").await.unwrap();
+        wait_for_mux_target_read(&activity).await;
+        let frame = frames
+            .try_recv()
+            .expect("short first reply must be sent immediately");
+        assert_eq!(frame.kind, MuxFrameKind::Data);
+        assert_eq!(frame.payload, b"greeting");
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn mux_tail_isolated_control_sized_reply_does_not_wait_after_bulk() {
+        let (mut peer, mut frames, task, activity) =
+            mux_tail_test_reader(128, TimingProfile::from_config(TrafficConfig::default())).await;
+        send_mux_target_full_first_reply(&mut peer, &mut frames, &activity, 128).await;
+        tokio::time::pause();
+        let reply = [0x42; 48];
+        peer.write_all(&reply).await.unwrap();
+        wait_for_mux_target_read(&activity).await;
+        let frame = frames.try_recv().expect("an isolated short reply is ready");
+        assert_eq!(frame.kind, MuxFrameKind::Data);
+        assert_eq!(frame.payload, reply);
+        task.abort();
+        let _ = task.await;
+    }
+
     #[test]
     fn mux_tail_append_plan_bounds_every_split() {
         for capacity in [1, 16, 16370] {
@@ -12738,20 +12795,23 @@ mod tests {
     #[ignore = "requires loopback TCP sockets"]
     async fn mux_tail_full_payload_sends_without_waiting_for_deadline() {
         let (mut peer, mut frames, task, activity) =
-            mux_tail_test_reader(16, TimingProfile::from_config(TrafficConfig::default())).await;
+            mux_tail_test_reader(128, TimingProfile::from_config(TrafficConfig::default())).await;
+        send_mux_target_full_first_reply(&mut peer, &mut frames, &activity, 128).await;
         tokio::time::pause();
-        peer.write_all(b"abcdefgh").await.unwrap();
+        let first = [0x41; 80];
+        let second = [0x42; 48];
+        peer.write_all(&first).await.unwrap();
         wait_for_mux_target_read(&activity).await;
         assert!(frames.try_recv().is_err());
         tokio::time::advance(Duration::from_millis(2)).await;
         activity.store(u64::MAX, Ordering::Relaxed);
-        peer.write_all(b"ijklmnop").await.unwrap();
+        peer.write_all(&second).await.unwrap();
         wait_for_mux_target_read(&activity).await;
         let frame = frames
             .try_recv()
             .expect("full payload must not await the timer");
         assert_eq!(frame.kind, MuxFrameKind::Data);
-        assert_eq!(frame.payload, b"abcdefghijklmnop");
+        assert_eq!(frame.payload, [first.as_slice(), &second].concat());
         assert!(frames.try_recv().is_err());
         task.abort();
         let _ = task.await;
@@ -12761,13 +12821,16 @@ mod tests {
     #[ignore = "requires loopback TCP sockets"]
     async fn mux_tail_deadline_is_not_extended_by_another_read() {
         let (mut peer, mut frames, task, activity) =
-            mux_tail_test_reader(16, TimingProfile::from_config(TrafficConfig::default())).await;
+            mux_tail_test_reader(128, TimingProfile::from_config(TrafficConfig::default())).await;
+        send_mux_target_full_first_reply(&mut peer, &mut frames, &activity, 128).await;
         tokio::time::pause();
-        peer.write_all(b"first").await.unwrap();
+        let first = [0x41; 80];
+        let second = [0x42; 8];
+        peer.write_all(&first).await.unwrap();
         wait_for_mux_target_read(&activity).await;
         tokio::time::advance(Duration::from_millis(3)).await;
         activity.store(u64::MAX, Ordering::Relaxed);
-        peer.write_all(b"second").await.unwrap();
+        peer.write_all(&second).await.unwrap();
         wait_for_mux_target_read(&activity).await;
         assert!(frames.try_recv().is_err());
         // Tokio's timer wheel rounds a deadline up to the next millisecond.
@@ -12777,7 +12840,7 @@ mod tests {
         let frame = frames
             .try_recv()
             .expect("oldest byte's deadline must flush");
-        assert_eq!(frame.payload, b"firstsecond");
+        assert_eq!(frame.payload, [first.as_slice(), &second].concat());
         assert_eq!(frame.kind, MuxFrameKind::Data);
         assert!(frames.try_recv().is_err());
         task.abort();
@@ -12788,9 +12851,11 @@ mod tests {
     #[ignore = "requires loopback TCP sockets"]
     async fn mux_tail_eof_flushes_data_before_fin_without_waiting() {
         let (mut peer, mut frames, task, activity) =
-            mux_tail_test_reader(16, TimingProfile::from_config(TrafficConfig::default())).await;
+            mux_tail_test_reader(128, TimingProfile::from_config(TrafficConfig::default())).await;
+        send_mux_target_full_first_reply(&mut peer, &mut frames, &activity, 128).await;
         tokio::time::pause();
-        peer.write_all(b"short tail").await.unwrap();
+        let tail = [0x41; 80];
+        peer.write_all(&tail).await.unwrap();
         wait_for_mux_target_read(&activity).await;
         assert!(frames.try_recv().is_err());
         let before_eof = Instant::now();
@@ -12810,7 +12875,7 @@ mod tests {
         assert_eq!(Instant::now(), before_eof, "EOF must bypass the tail timer");
         assert_eq!(
             (data.kind, data.payload),
-            (MuxFrameKind::Data, b"short tail".to_vec())
+            (MuxFrameKind::Data, tail.to_vec())
         );
         assert_eq!(fin.kind, MuxFrameKind::Fin);
         assert!(fin.payload.is_empty());
