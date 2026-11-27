@@ -1,0 +1,25 @@
+SPEC.md
+  s_a4b4623abf3887::t_b9160a0fecdd75 523-525,1634
+src/handshake/server.rs
+  s_a4b4623abf3887::t_4cc360effdb4ce 1698,1744,2251,2258-2261,2303,2315-2317,8300,8316,8342,8361,16276-16279,16349-16353
+src/handshake/transcript.rs
+  s_a4b4623abf3887::t_5fbe94a1ac5f72 24-26
+src/tls/safari26.rs
+  s_a4b4623abf3887::t_cd4105919cdca9 1828-1830
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "748e20396c1b2f5f5b3deb6b53dba160126dfedb",
+  "prompts": {},
+  "sessions": {
+    "s_a4b4623abf3887": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21b74-4cf1-73f0-88f3-b6b163f351ba",
+        "model": "unknown"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
