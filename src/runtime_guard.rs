@@ -459,7 +459,7 @@ fn default_state_dir() -> io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        Ok(std::env::temp_dir().join("parallax").join("runtime"))
+        Err(runtime_guard_unsupported())
     }
 }
 
@@ -501,10 +501,7 @@ fn try_lock_file(file: &File) -> io::Result<bool> {
 
 #[cfg(not(unix))]
 fn try_lock_file(_file: &File) -> io::Result<bool> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "runtime guard requires Unix file locking",
-    ))
+    Err(runtime_guard_unsupported())
 }
 
 /// Blocking exclusive flock for the registry mutex: callers WAIT for the short
@@ -525,10 +522,15 @@ fn lock_file_blocking(file: &File) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn lock_file_blocking(_file: &File) -> io::Result<()> {
-    Err(io::Error::new(
+    Err(runtime_guard_unsupported())
+}
+
+#[cfg(not(unix))]
+fn runtime_guard_unsupported() -> io::Error {
+    io::Error::new(
         io::ErrorKind::Unsupported,
         "runtime guard requires Unix file locking",
-    ))
+    )
 }
 
 #[cfg(unix)]

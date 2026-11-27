@@ -2914,15 +2914,15 @@ authorized_sni = ["example.com"]
             for text in [&rendered, &debugged] {
                 assert!(
                     !text.contains('!') && !text.contains("33"),
-                    "secret base64 error must not echo the offending byte: {text:?}"
+                    "secret base64 error must not echo the offending byte"
                 );
                 assert!(
                     !text.contains("secret") && !text.contains("AAAA"),
-                    "secret base64 error must not echo the input: {text:?}"
+                    "secret base64 error must not echo the input"
                 );
             }
             // Position info is retained so the operator can still find the typo.
-            assert!(rendered.contains("offset 4"), "{rendered:?}");
+            assert!(rendered.contains("offset 4"), "missing error position");
         }
     }
 

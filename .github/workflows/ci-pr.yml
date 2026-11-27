@@ -76,7 +76,8 @@ jobs:
       - name: Blocking project security rules (AST fixtures and production mutations)
         run: |
           python3 -m venv /tmp/parallax-security-rules
-          /tmp/parallax-security-rules/bin/pip install --quiet --require-hashes \
+          # The full lockfile includes security overrides for Semgrep's pins.
+          /tmp/parallax-security-rules/bin/pip install --quiet --require-hashes --no-deps \
             -r .github/semgrep-requirements.txt
           python3 .github/scripts/check_crypto_rules.py \
             --semgrep /tmp/parallax-security-rules/bin/semgrep

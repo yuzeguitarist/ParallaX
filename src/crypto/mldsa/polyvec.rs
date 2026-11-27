@@ -677,6 +677,10 @@ mod tests {
 
         for (i, row) in mat.iter().enumerate() {
             for (j, p) in row.vec.iter().enumerate() {
+                // Cross-check the matrix expansion's index encoding.
+                let mut direct = Poly::zero();
+                direct.poly_uniform(&rho, u16::from_be_bytes([i as u8, j as u8]));
+                assert_eq!(*p, direct, "matrix_expand entry ({i},{j})");
                 for (c, &coeff) in p.coeffs.iter().enumerate() {
                     assert!(
                         (0..Q).contains(&coeff),
@@ -688,14 +692,6 @@ mod tests {
         // Distinctness: A[0][0] != A[0][1] != A[1][0] (different nonces).
         assert_ne!(mat[0].vec[0], mat[0].vec[1], "A[0][0] == A[0][1]");
         assert_ne!(mat[0].vec[0], mat[1].vec[0], "A[0][0] == A[1][0]");
-
-        // Cross-check one entry against poly_uniform directly with its nonce.
-        let mut direct = Poly::zero();
-        direct.poly_uniform(&rho, (1 << 8) + 3); // i=1, j=3
-        assert_eq!(
-            mat[1].vec[3], direct,
-            "matrix_expand entry (1,3) must equal poly_uniform with nonce (1<<8)+3"
-        );
     }
 
     /// `uniform_eta` over a `Polyvecl`/`Polyveck` draws each element with the

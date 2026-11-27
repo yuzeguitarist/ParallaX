@@ -14,10 +14,10 @@ name: osv-scanner
 on:
   pull_request:
     branches: [main, master]
-    paths: ['**/Cargo.toml', '**/Cargo.lock']
+    paths: ['**/Cargo.toml', '**/Cargo.lock', '.github/semgrep-requirements.txt']
   push:
     branches: [main, master]
-    paths: ['**/Cargo.toml', '**/Cargo.lock']
+    paths: ['**/Cargo.toml', '**/Cargo.lock', '.github/semgrep-requirements.txt']
   schedule:
     - cron: '37 5 * * 1'   # weekly: catch new advisories against unchanged deps
   workflow_dispatch:
