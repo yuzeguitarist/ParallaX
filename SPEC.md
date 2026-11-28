@@ -2050,8 +2050,12 @@ SHOULD apply an equivalent policy:
 - A global connection limit as the real backstop. The effective per-source cap
   is also bounded by a quarter of the global limit, but never below
   `min(16, ¾ × global limit)`, so the only user of a small server (a 1 GiB VPS
-  has a global limit near 13) can still open the several mux sessions a phone
-  needs, while one source never holds more than three quarters of the pool.
+  has a global limit near 13) can still build the several mux sessions a phone
+  needs at once, while one source never holds more than three quarters of the
+  pool.
+- A connection counts against its source only until its ClientHello passes PSK
+  authentication and the replay check; authenticated sessions are bounded by the
+  global limit alone. Fallback splices keep their source slot until they end.
 - The per-source cap is checked read-only **before** a tracking entry is created,
   so a rejected source leaves no permanent state (a cap of 0, "reject everything",
   therefore cannot grow the table).

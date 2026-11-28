@@ -19,6 +19,11 @@
 //! the TCP handshake completes, so `peer.ip()` is return-routable. The bounded,
 //! self-expiring map defends against *many distinct real sources* (a botnet),
 //! not spoofing.
+//!
+//! A connection holds its slot only while it is unauthenticated: the server drops
+//! the permit once a ClientHello passes PSK authentication and the replay check.
+//! The operator's own client is no slot-pinning threat, and a phone keeps many
+//! mux sessions open from one address; the global limit still bounds them.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -35,13 +40,14 @@ const SOURCE_IDLE_GRACE: Duration = Duration::from_secs(120);
 const MIN_SOURCE_MAP_ENTRIES: usize = 4096;
 /// Max idle-log entries inspected per admission so the accept path stays cheap.
 const PRUNE_BUDGET: usize = 64;
-/// Connections one source may hold on a small server, capped at three quarters of
-/// the global limit. A phone on a personal 1 GiB VPS opens tens of streams at
-/// once, and the quarter share alone left such a box (global limit 13) admitting
-/// three mux sessions from its only user and cap-shedding the rest of every burst
-/// to the origin. The three-quarter cap keeps the limiter's purpose: one source
-/// pinning fallback slots still leaves a quarter of the pool to everyone else.
-/// From a global limit of `4 * MIN_SOURCE_SHARE` up, the quarter share applies.
+/// Unauthenticated connections one source may hold on a small server, capped at
+/// three quarters of the global limit. A phone on a personal 1 GiB VPS builds up
+/// to eight mux sessions at once, each counted until it authenticates, and the
+/// quarter share alone left such a box (global limit 13) admitting three of them
+/// and cap-shedding the rest to the origin. The three-quarter cap keeps the
+/// limiter's purpose: one source pinning fallback slots still leaves a quarter of
+/// the pool to everyone else. From a global limit of `4 * MIN_SOURCE_SHARE` up,
+/// the quarter share applies.
 const MIN_SOURCE_SHARE: usize = 16;
 /// IPv6 aggregation prefix. A single routed allocation (commonly a /48 or /56 to
 /// one customer/VPS tenant) contains thousands of /64s, so the per-/64 cap alone

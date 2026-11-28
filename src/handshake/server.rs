@@ -29,7 +29,7 @@ use tokio::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use super::source_limit::SourceLimiter;
+use super::source_limit::{SourceLimiter, SourcePermit};
 use super::transcript::{hrr_transcript_hash, transcript_hash};
 use crate::protocol::command::MUX_CARRIER_SUSPECT_AFTER;
 
@@ -1106,7 +1106,6 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
         let secrets = secrets.clone();
         tokio::spawn(async move {
             let connection_permit = Arc::new(connection_permit);
-            let _source_permit = source_permit;
             if let Err(err) = handle_connection_with_replay(
                 client,
                 &server,
@@ -1117,6 +1116,7 @@ pub async fn run(config: Config) -> Result<(), HandshakeServerError> {
                 &secrets,
                 cid,
                 connection_permit,
+                source_permit,
             )
             .await
             {
@@ -1153,6 +1153,7 @@ pub async fn handle_connection(
         Some(replay_cache),
         &secrets,
         cid,
+        None,
         None,
     )
     .await
@@ -1232,6 +1233,7 @@ async fn handle_connection_with_replay(
     secrets: &ServerRuntimeSecrets,
     cid: u64,
     admission: Arc<OwnedSemaphorePermit>,
+    source: SourcePermit,
 ) -> Result<(), HandshakeServerError> {
     handle_connection_inner(
         client,
@@ -1243,6 +1245,7 @@ async fn handle_connection_with_replay(
         secrets,
         cid,
         Some(admission),
+        Some(source),
     )
     .await
 }
@@ -1258,6 +1261,7 @@ async fn handle_connection_inner(
     secrets: &ServerRuntimeSecrets,
     cid: u64,
     mut admission: Option<Arc<OwnedSemaphorePermit>>,
+    mut source_slot: Option<SourcePermit>,
 ) -> Result<(), HandshakeServerError> {
     tune_tcp_stream(&client)?;
     tracing::info!(
@@ -1335,6 +1339,11 @@ async fn handle_connection_inner(
                     )
                     .await;
                 }
+                // A PSK-authenticated, never-seen ClientHello is the operator's own
+                // client, not a prober pinning slots: the per-source cap bounds only
+                // unauthenticated connections, so a phone can hold every session the
+                // global limit allows. A replayed hello took the fallback above.
+                drop(source_slot.take());
                 Some(PendingReplayEntry {
                     cache,
                     entry,
@@ -15547,6 +15556,124 @@ mod tests {
         server_task.await.unwrap();
         target_task.await.unwrap();
         fallback_task.await.unwrap();
+    }
+
+    /// A phone opens many mux sessions at once from one address; once a session is
+    /// authenticated it must stop counting against the per-source cap, which
+    /// exists to bound unauthenticated slot pinning.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn authenticated_session_releases_its_source_slot() {
+        let (fallback_addr, fallback_task) = spawn_server_hello_fallback().await;
+        let (target_addr, target_task) = spawn_ping_pong_target().await;
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let client_keys = X25519KeyPair::generate();
+        let replay_dir = tempfile::tempdir().unwrap();
+        let traffic = TrafficConfig::default();
+        let mut config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_dir.path().join("parallax-replay.cache"),
+        );
+        config.data_target = Some(target_addr.to_string());
+        let limiter = SourceLimiter::new(1, 1, 64, 4);
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let slot = Arc::clone(&limiter).try_admit(loopback).unwrap();
+        assert!(Arc::clone(&limiter).try_admit(loopback).is_none());
+        let (parallax_addr, server_task) = spawn_admitted_server(config, traffic, slot).await;
+        let (mut client, mut data_session, mut rng) = open_authenticated_data_session(
+            parallax_addr,
+            &server_keys,
+            &server_identity_keys.public,
+            &client_keys,
+            traffic,
+        )
+        .await;
+
+        assert!(
+            Arc::clone(&limiter).try_admit(loopback).is_some(),
+            "a live authenticated session must not hold its source slot"
+        );
+        send_ping_connect(&mut client, &mut data_session, &mut rng, target_addr).await;
+
+        drop(client);
+        server_task.await.unwrap();
+        target_task.await.unwrap();
+        fallback_task.await.unwrap();
+    }
+
+    /// The other side of the exemption: a splice to the origin (a prober, or any
+    /// ClientHello that fails authentication) keeps its source slot until it ends.
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn fallback_connection_keeps_its_source_slot() {
+        let (fallback_addr, fallback_task) = spawn_server_hello_fallback().await;
+        let server_keys = X25519KeyPair::generate();
+        let server_identity_keys = identity::keypair();
+        let replay_dir = tempfile::tempdir().unwrap();
+        let config = authenticated_server_config(
+            fallback_addr,
+            &server_keys,
+            &server_identity_keys,
+            replay_dir.path().join("parallax-replay.cache"),
+        );
+        let limiter = SourceLimiter::new(1, 1, 64, 4);
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let slot = Arc::clone(&limiter).try_admit(loopback).unwrap();
+        let (parallax_addr, server_task) =
+            spawn_admitted_server(config, TrafficConfig::default(), slot).await;
+        let mut client = TcpStream::connect(parallax_addr).await.unwrap();
+        client
+            .write_all(&client_hello_fixture_with_key_share(
+                "example.com",
+                &[0x22; 32],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_record(&mut client).await.unwrap(),
+            server_hello_fixture()
+        );
+
+        assert!(
+            Arc::clone(&limiter).try_admit(loopback).is_none(),
+            "an unauthenticated splice must keep its source slot"
+        );
+        drop(client);
+        server_task.await.unwrap();
+        fallback_task.await.unwrap();
+        assert!(Arc::clone(&limiter).try_admit(loopback).is_some());
+    }
+
+    async fn spawn_admitted_server(
+        config: ServerConfig,
+        traffic: TrafficConfig,
+        slot: SourcePermit,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let secrets = ServerRuntimeSecrets::decode(&config).unwrap();
+            let replay_cache = shared_replay_cache(&config, PSK).await.unwrap();
+            handle_connection_inner(
+                stream,
+                &config,
+                traffic,
+                &UdpConfig::default(),
+                PSK,
+                Some(replay_cache),
+                &secrets,
+                1,
+                None,
+                Some(slot),
+            )
+            .await
+            .unwrap();
+        });
+        (addr, task)
     }
 
     async fn spawn_server_hello_fallback() -> (SocketAddr, tokio::task::JoinHandle<()>) {
