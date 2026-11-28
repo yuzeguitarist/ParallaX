@@ -1,0 +1,32 @@
+SPEC.md
+  s_c702d8bb7b3811::t_a1181b53064a90 2053-2058
+src/handshake/server.rs
+  s_c702d8bb7b3811::t_89cd7e79904542 1119
+  s_c702d8bb7b3811::t_a839faaff22597 15561-15628,15633-15634,15639-15678
+  s_c702d8bb7b3811::t_3c3fbe2f9240f5 15629-15632,15635-15638
+  s_c702d8bb7b3811::t_a861088e47fde8 32
+  s_c702d8bb7b3811::t_110467869277df 1346
+  s_c702d8bb7b3811::t_e68f087cd28011 1157
+  s_c702d8bb7b3811::t_df67c76dd7b350 1342-1345
+  s_c702d8bb7b3811::t_24077ec6985a69 1236,1248
+  s_c702d8bb7b3811::t_12db06b1d7793f 1264
+src/handshake/source_limit.rs
+  s_c702d8bb7b3811::t_1f058d10072d3e 22-26
+  s_c702d8bb7b3811::t_3a0b578bcf60eb 43-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "80b3bdbffa3ff05db9e1f73e2607d6021603d56f",
+  "prompts": {},
+  "sessions": {
+    "s_c702d8bb7b3811": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0dccf876-bffe-40ca-9941-2e55cf284a27",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
