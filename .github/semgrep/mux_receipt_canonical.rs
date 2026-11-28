@@ -85,6 +85,23 @@ impl ServerMuxStreamTx {
     async fn reset(&self) -> Result<(), HandshakeServerError> {
         self.send(MuxFrameKind::Reset, Vec::new()).await
     }
+
+    /// Queues one datagram as a Data frame without waiting. `false` when the
+    /// stream's queue is full (or gone): a datagram stream drops instead of
+    /// back-pressuring, and the payload buffer is only taken once a slot is held.
+    fn try_send_datagram(&self, datagram: &[u8], payload_pool: &MuxPayloadPool) -> bool {
+        let Ok(permit) = self.frames.try_reserve() else {
+            return false;
+        };
+        claim_mux_publication(&self.first_publication);
+        permit.send(MuxFrame {
+            stream_id: self.stream_id,
+            kind: MuxFrameKind::Data,
+            payload: payload_pool.take_filled(datagram),
+        });
+        self.wake.notify_one();
+        true
+    }
 }
 
 impl Drop for ServerMuxStreamTx {

@@ -85,17 +85,27 @@ impl ClientMuxPool {
 
     async fn ensure_warm(&self) -> Result<(), Error> {
         loop {
+            if self.is_shut_down() {
+                return Err(shut_down_error());
+            }
             if !mux_activity_is_recent(self.last_activity.load(Ordering::Relaxed), relay_now_millis()) {
                 return Ok(());
             }
+            let pool = self.clone();
             // ok: parallax-mux-warm-activation-guard
-            self.spawn_build().await;
+            tokio::spawn(async move { pool.spawn_build().await });
         }
     }
 
     async fn ensure_warm(&self) -> Result<(), Error> {
         // ruleid: parallax-mux-warm-activation-guard
         self.spawn_build().await;
+    }
+
+    async fn ensure_warm(&self) -> Result<(), Error> {
+        let pool = self.clone();
+        // ruleid: parallax-mux-warm-activation-guard
+        tokio::spawn(async move { pool.spawn_build().await });
     }
 
     fn start_keeper(&self) {

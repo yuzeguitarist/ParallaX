@@ -46,7 +46,7 @@ def mutations(semgrep):
     demand_task = single[task_start:task_end]
     extra_dial = """    let _spare = establish_authenticated_data_session_with_resolver(
         &server_addr, config, traffic, udp, &reachability, psk,
-        server_public, server_identity_public.clone(),
+        server_public, server_identity_public.clone(), None,
     ).await?;
 """
     late_single = replace_once(single, guard, "")

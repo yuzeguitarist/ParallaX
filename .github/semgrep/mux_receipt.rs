@@ -44,3 +44,9 @@ async fn handle_local_mux_connection_with_cid() {
     // ruleid: parallax-mux-receipt-no-client-upload-gate
     time::sleep_until(deadline).await;
 }
+async fn relay_mux_stream() {
+    // ruleid: parallax-mux-receipt-no-client-upload-gate
+    sleep(MUX_CARRIER_SUSPECT_AFTER).await;
+    // ruleid: parallax-mux-receipt-no-client-upload-gate
+    tokio::time::sleep_until(deadline).await;
+}

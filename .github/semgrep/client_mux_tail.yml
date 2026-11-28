@@ -57,13 +57,15 @@ rules:
       - pattern: 'client_mux_upload_loop(...)'
       - pattern-not-inside: 'mod tests { ... }'
       - pattern-not: |
-          client_mux_upload_loop(local_read, frame_tx.clone(), stream_id, mux.chunk_size, cid, payload_pool.clone(), if mux_pool.traffic.max_delay_ms == 0 { CLIENT_TCP_MUX_TAIL_HOLD } else { Duration::ZERO })
+          client_mux_upload_loop(local_read, frame_tx.clone(), stream_id, mux.chunk_size, cid, payload_pool.clone(), if mux_pool.traffic.max_delay_ms == 0 { CLIENT_TCP_MUX_TAIL_HOLD } else { Duration::ZERO }, mux_pool.limits.read_buffer_len(MuxFrame::max_payload_len(mux.chunk_size)))
   - id: parallax-client-mux-tail-gate-immutable
     languages: [rust]
     severity: ERROR
     message: Preserve the caller's actual traffic policy; canonical gate text does not excuse pool shadows, traffic writes or mutable aliases beside it.
+    # The TCP/QUIC dispatcher is the relay shared by the SOCKS5 adapter and
+    # parallax::embed; the adapter itself is pinned whole by socks-boundary.
     patterns:
-      - pattern-inside: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
+      - pattern-inside: 'async fn relay_mux_stream(...) { ... }'
       - pattern-either:
           - patterns:
               - pattern: 'let $BINDING = $VALUE;'
@@ -96,16 +98,15 @@ rules:
   - id: parallax-client-mux-tail-tcp-boundary
     languages: [rust]
     severity: ERROR
-    message: Valid SOCKS and the returning QUIC branch precede the sole TCP mux producer call; Open registration remains ahead of upload.
+    message: The returning QUIC branch precedes the sole TCP mux producer call; Open registration remains ahead of upload.
     patterns:
-      - pattern: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
+      - pattern: 'async fn relay_mux_stream(...) { ... }'
       - pattern-not: |
-          async fn handle_local_mux_connection_with_cid(...) {
-            tune_tcp_stream(&local)?;
-            let request = accept_local_socks_connect(&mut local).await?;
+          async fn relay_mux_stream(...) {
+            let (mux, _stream_permit) = mux_pool.acquire().await?;
             ...
             if let MuxCarrier::Quic { conn, session_keys, traffic, authority, accept_language, .. } = &mux.carrier {
-              return client_mux_quic_substream(local, conn.clone(), session_keys, *traffic, connect_request, authority, accept_language.as_deref(), cid).await;
+              return client_mux_quic_substream(local_read, local_write, conn.clone(), session_keys, *traffic, connect_request, authority, accept_language.as_deref(), cid, mux_pool.limits).await;
             }
             let MuxCarrier::Tcp { frame_tx, register_tx, payload_pool } = &mux.carrier else { unreachable!("QUIC carrier handled above"); };
             ...
@@ -114,6 +115,22 @@ rules:
             let upload = client_mux_upload_loop(...);
             let download = client_mux_await_download(outcome_rx, cid);
             ...
+          }
+  - id: parallax-client-mux-tail-socks-boundary
+    languages: [rust]
+    severity: ERROR
+    message: The SOCKS5 adapter validates SOCKS before it hands the stream to the shared relay, and does nothing else.
+    # No body ellipses: a pool shadow, traffic write or second relay call beside
+    # the reviewed sequence is rejected along with a reordered validation.
+    patterns:
+      - pattern: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
+      - pattern-not: |
+          async fn handle_local_mux_connection_with_cid(...) {
+            tune_tcp_stream(&local)?;
+            let request = accept_local_socks_connect(&mut local).await?;
+            tracing::debug!(cid, task_name = "client-mux-connection", "accepted SOCKS connection for mux session");
+            let (local_read, local_write) = local.into_split();
+            relay_mux_stream(request.host, request.port, local_read, local_write, &mux_pool, cid).await
           }
   - id: parallax-client-mux-tail-producer
     languages: [rust]
@@ -125,7 +142,7 @@ rules:
       - pattern: 'async fn client_mux_upload_loop(...) { ... }'
       - pattern-not: |
           async fn client_mux_upload_loop(...) {
-            let mut local_buf = vec![0_u8; relay_read_buffer_len(MuxFrame::max_payload_len(chunk_size))];
+            let mut local_buf = vec![0_u8; read_buffer_len];
             let max_payload_len = MuxFrame::max_payload_len(chunk_size);
             if max_payload_len == 0 {
               return Err(ClientRuntimeError::TlsRecord(crate::tls::record::TlsRecordError::PayloadTooLarge(0)));
@@ -166,7 +183,7 @@ rules:
               let received_at = Instant::now();
               if !hold.is_zero() && tail.bytes.is_empty() { tail_deadline = Some(received_at + hold); }
               if hold.is_zero() {
-                n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+                n = local_read.drain_ready(&mut local_buf, n)?;
                 for chunk in local_buf[..n].chunks(max_payload_len) {
                   send_mux_frame(&frame_tx, stream_id, MuxFrameKind::Data, payload_pool.take_filled(chunk)).await?;
                 }

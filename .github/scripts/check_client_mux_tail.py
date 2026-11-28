@@ -63,8 +63,11 @@ def cardinality(semgrep, target, require_complete=False):
 
 def mutations(semgrep):
     source = (ROOT / "src/client/runtime.rs").read_text()
-    producer = fragment(source, "async fn client_mux_upload_loop(")
-    owner = fragment(source, "async fn handle_local_mux_connection_with_cid(")
+    producer = fragment(source, "async fn client_mux_upload_loop<")
+    # The TCP/QUIC dispatcher is the relay the SOCKS5 adapter shares with
+    # parallax::embed; the adapter is pinned separately (socks-boundary).
+    owner = fragment(source, "async fn relay_mux_stream<")
+    socks_owner = fragment(source, "async fn handle_local_mux_connection_with_cid(")
     flush = fragment(source, "async fn flush_client_mux_upload_tail(")
     cleanup = fragment(source, "impl Drop for ClientMuxUploadTail {")
     append = fragment(source, "fn client_mux_tail_append_len(")
@@ -86,7 +89,9 @@ def mutations(semgrep):
     add("configured_delay_used_as_hold", owner, "CLIENT_TCP_MUX_TAIL_HOLD", "Duration::from_millis(mux_pool.traffic.max_delay_ms)", "callsite")
     add("jitter_gets_added_hold", owner, "Duration::ZERO", "CLIENT_TCP_MUX_TAIL_HOLD", "callsite")
     add("quic_return_removed", owner, "return client_mux_quic_substream(", "let _ = client_mux_quic_substream(", "tcp-boundary")
-    add("socks_validation_moved", owner, "let request = accept_local_socks_connect(&mut local).await?;", "let request = unreachable!();", "tcp-boundary")
+    add("socks_validation_moved", socks_owner, "let request = accept_local_socks_connect(&mut local).await?;", "let request = unreachable!();", "socks-boundary")
+    add("socks_adapter_zeroes_gate", socks_owner, "    let (local_read, local_write)", "    let mut mux_pool = mux_pool;\n    mux_pool.traffic.max_delay_ms = 0;\n    let (local_read, local_write)", "socks-boundary")
+    add("socks_adapter_second_relay", socks_owner, "    .await\n}", "    .await?;\n    relay_mux_stream(String::new(), 0, local_read, local_write, &mux_pool, cid).await\n}", "socks-boundary")
     call_start = owner.index("    let upload = client_mux_upload_loop(")
     call_end = owner.index("    let download", call_start)
     call = owner[call_start:call_end]
@@ -94,11 +99,11 @@ def mutations(semgrep):
         replace_once(source, call, "    let mut mux_pool = mux_pool;\n    mux_pool.traffic.max_delay_ms = 0;\n" + call),
         "parallax-client-mux-tail-gate-immutable",
     )
-    # Whole-source, canonical-retaining variants. The real dispatcher owns its
-    # ClientMuxPool argument and TrafficConfig is Copy with a u16 delay field.
-    # Rebindings below can mutate that owned value. Direct-write variants also
-    # make the parameter mutable; a bare write to the original immutable
-    # parameter would be compiler-rejected and is not claimed as a bypass.
+    # Whole-source, canonical-retaining variants. The real dispatcher borrows the
+    # pool (&ClientMuxPool) and TrafficConfig is Copy with a u16 delay field, so
+    # a rebinding clones and mutates its own copy. Direct-write variants make the
+    # borrow mutable; a bare write through the original shared reference would
+    # be compiler-rejected and is not claimed as a bypass.
     # This runner checks AST rejection; the type assessment is by inspection,
     # not a separate compile of these mutation files.
     gate_variants = {
@@ -112,7 +117,7 @@ def mutations(semgrep):
             replace_once(source, call, "    " + prefix + "\n" + call),
             "parallax-client-mux-tail-gate-immutable",
         )
-    mutable_owner = replace_once(owner, "    mux_pool: ClientMuxPool,", "    mut mux_pool: ClientMuxPool,")
+    mutable_owner = replace_once(owner, "    mux_pool: &ClientMuxPool,", "    mux_pool: &mut ClientMuxPool,")
     for name, prefix in {
         "mutable_parameter_zero_gate": "mux_pool.traffic.max_delay_ms = 0;",
         "mutable_parameter_zero_traffic": "mux_pool.traffic = TrafficConfig { max_delay_ms: 0, ..mux_pool.traffic };",
@@ -167,8 +172,9 @@ def mutations(semgrep):
     mutate_producer("unbounded_tail_append", "tail.bytes.extend_from_slice(&input[..take]);", "tail.bytes.extend_from_slice(input);")
     mutate_producer("lost_input_suffix", "input = &input[take..];", "input = &[];")
     mutate_producer("full_tail_waits_for_timer", "if tail.bytes.len() == max_payload_len", "if false")
-    mutate_producer("hold_zero_does_not_drain", "n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;", "")
-    mutate_producer("held_reads_use_lossy_drain", "let received_at = Instant::now();", "let n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;\nlet received_at = Instant::now();")
+    mutate_producer("hold_zero_does_not_drain", "n = local_read.drain_ready(&mut local_buf, n)?;", "")
+    mutate_producer("held_reads_use_lossy_drain", "let received_at = Instant::now();", "let n = local_read.drain_ready(&mut local_buf, n)?;\nlet received_at = Instant::now();")
+    mutate_producer("unbounded_read_buffer", "let mut local_buf = vec![0_u8; read_buffer_len];", "let mut local_buf = vec![0_u8; 1 << 20];")
     mutate_producer("extra_append_before_canonical", "                let take =", "                tail.bytes.extend_from_slice(input);\n                let take =")
     mutate_producer("nested_extra_append_after_canonical", "input = &input[take..];", "input = &input[take..];\nif true { tail.bytes.extend_from_slice(input); }")
     mutate_producer("extra_deadline_with_canonical_retained", "                let take =", "                tail_deadline = Some(Instant::now() + hold);\n                let take =")

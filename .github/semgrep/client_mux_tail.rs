@@ -48,16 +48,20 @@ async fn flush_client_mux_upload_tail(
 }
 
 // ok: parallax-client-mux-tail-producer
-async fn client_mux_upload_loop(
-    mut local_read: OwnedReadHalf,
+async fn client_mux_upload_loop<L>(
+    mut local_read: L,
     frame_tx: mpsc::Sender<MuxFrame>,
     stream_id: u32,
     chunk_size: usize,
     cid: u64,
     payload_pool: MuxPayloadPool,
     hold: Duration,
-) -> Result<(), ClientRuntimeError> {
-    let mut local_buf = vec![0_u8; relay_read_buffer_len(MuxFrame::max_payload_len(chunk_size))];
+    read_buffer_len: usize,
+) -> Result<(), ClientRuntimeError>
+where
+    L: LocalReader,
+{
+    let mut local_buf = vec![0_u8; read_buffer_len];
     let max_payload_len = MuxFrame::max_payload_len(chunk_size);
     if max_payload_len == 0 {
         return Err(ClientRuntimeError::TlsRecord(
@@ -123,7 +127,7 @@ async fn client_mux_upload_loop(
         // cannot report a successfully consumed partial prefix. The zero-hold
         // path keeps its original opportunistic-drain behavior.
         if hold.is_zero() {
-            n = drain_ready_tcp_read(&local_read, &mut local_buf, n)?;
+            n = local_read.drain_ready(&mut local_buf, n)?;
             for chunk in local_buf[..n].chunks(max_payload_len) {
                 send_mux_frame(
                     &frame_tx,
@@ -165,7 +169,7 @@ async fn client_mux_upload_loop(
     }
 }
 
-// ok: parallax-client-mux-tail-tcp-boundary
+// ok: parallax-client-mux-tail-socks-boundary
 async fn handle_local_mux_connection_with_cid(
     mut local: TcpStream,
     mux_pool: ClientMuxPool,
@@ -178,19 +182,44 @@ async fn handle_local_mux_connection_with_cid(
         task_name = "client-mux-connection",
         "accepted SOCKS connection for mux session"
     );
+    let (local_read, local_write) = local.into_split();
+    relay_mux_stream(
+        request.host,
+        request.port,
+        local_read,
+        local_write,
+        &mux_pool,
+        cid,
+    )
+    .await
+}
 
+// ok: parallax-client-mux-tail-tcp-boundary
+pub(crate) async fn relay_mux_stream<L, W>(
+    host: String,
+    port: u16,
+    mut local_read: L,
+    local_write: W,
+    mux_pool: &ClientMuxPool,
+    cid: u64,
+) -> Result<(), ClientRuntimeError>
+where
+    L: LocalReader,
+    W: LocalWriter,
+{
     // Reserve a substream slot on a session that has one free, opening a new
     // session if every existing session is saturated. The permit is held for the
     // whole connection: it bounds each session to `max_concurrent_streams`
     // substreams WITHOUT capping the client's total concurrent connections.
     let (mux, _stream_permit) = mux_pool.acquire().await?;
-    let initial_payload_cap = MuxFrame::max_open_initial_payload_len(&request.host, mux.chunk_size);
-    let initial_payload = initial_payload::read_initial_payload(&mut local, initial_payload_cap)
-        .await
-        .map_err(ClientRuntimeError::Io)?;
+    let initial_payload_cap = MuxFrame::max_open_initial_payload_len(&host, mux.chunk_size);
+    let initial_payload =
+        initial_payload::read_initial_payload(&mut local_read, initial_payload_cap)
+            .await
+            .map_err(ClientRuntimeError::Io)?;
     let connect_request = ConnectRequest {
-        host: request.host,
-        port: request.port,
+        host,
+        port,
         initial_payload,
     };
 
@@ -206,7 +235,8 @@ async fn handle_local_mux_connection_with_cid(
     } = &mux.carrier
     {
         return client_mux_quic_substream(
-            local,
+            local_read,
+            local_write,
             conn.clone(),
             session_keys,
             *traffic,
@@ -214,6 +244,7 @@ async fn handle_local_mux_connection_with_cid(
             authority,
             accept_language.as_deref(),
             cid,
+            mux_pool.limits,
         )
         .await;
     }
@@ -243,14 +274,13 @@ async fn handle_local_mux_connection_with_cid(
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
 
-    let (local_read, local_write) = local.into_split();
     let (outcome_tx, outcome_rx) = oneshot::channel();
     // Register the download half with the reader before announcing the stream,
     // so an immediate server response can never race ahead of the write half.
     if register_tx
         .send(ClientStreamControl::Register(ClientStreamRegistration {
             stream_id,
-            local_write,
+            local_write: Box::new(local_write),
             outcome_tx,
         }))
         .await
@@ -267,7 +297,7 @@ async fn handle_local_mux_connection_with_cid(
     }
 
     // ruleid: parallax-client-mux-tail-gate-immutable
-    let mut mux_pool = mux_pool;
+    let mut mux_pool = mux_pool.clone();
     // ruleid: parallax-client-mux-tail-gate-immutable
     mux_pool.traffic.max_delay_ms = 0;
     {
@@ -292,6 +322,9 @@ async fn handle_local_mux_connection_with_cid(
         } else {
             Duration::ZERO
         },
+        mux_pool
+            .limits
+            .read_buffer_len(MuxFrame::max_payload_len(mux.chunk_size)),
     );
     let download = client_mux_await_download(outcome_rx, cid);
     // Wait for BOTH halves. A clean server Fin (DownloadOutcome::Fin -> Ok)
@@ -333,7 +366,15 @@ async fn flush_client_mux_upload_tail() { Ok(()) }
 // ruleid: parallax-client-mux-tail-producer
 async fn client_mux_upload_loop() { Ok(()) }
 // ruleid: parallax-client-mux-tail-tcp-boundary
+async fn relay_mux_stream() { Ok(()) }
+// ruleid: parallax-client-mux-tail-socks-boundary
 async fn handle_local_mux_connection_with_cid() { Ok(()) }
+// ruleid: parallax-client-mux-tail-socks-boundary
+async fn handle_local_mux_connection_with_cid(mut local: TcpStream, mux_pool: ClientMuxPool, cid: u64) {
+    tune_tcp_stream(&local)?;
+    let (local_read, local_write) = local.into_split();
+    relay_mux_stream(String::new(), 0, local_read, local_write, &mux_pool, cid).await
+}
 fn bad_caller() {
   // ruleid: parallax-client-mux-tail-callsite
   client_mux_upload_loop(local_read, frame_tx.clone(), stream_id, mux.chunk_size, cid, payload_pool.clone(), Duration::from_millis(mux_pool.traffic.max_delay_ms));

@@ -57,8 +57,12 @@ rules:
     languages: [rust]
     severity: ERROR
     message: The local TCP mux producer must not sleep waiting for an Open receipt before starting upload.
+    # The producer lives in the relay the SOCKS5 adapter shares with
+    # parallax::embed; the adapter is covered too.
     patterns:
-      - pattern-inside: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
+      - pattern-either:
+          - pattern-inside: 'async fn relay_mux_stream(...) { ... }'
+          - pattern-inside: 'async fn handle_local_mux_connection_with_cid(...) { ... }'
       - pattern-either:
           - pattern: 'sleep(...)'
           - pattern: 'sleep_until(...)'

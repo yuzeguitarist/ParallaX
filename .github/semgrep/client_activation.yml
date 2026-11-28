@@ -28,6 +28,9 @@ rules:
           - pattern: '$POOL.take_or_start(...)'
           - pattern: '$POOL.acquire(...)'
           - pattern: 'establish_authenticated_data_session_with_resolver(...)'
+          # The mux handler reaches its carrier through the relay it shares with
+          # parallax::embed, which acquires a pooled session first.
+          - pattern: 'relay_mux_stream(...)'
       - pattern-not-inside: |
           async fn $HANDLER(...) {
             tune_tcp_stream(&$LOCAL)?;
@@ -76,7 +79,7 @@ rules:
                 &speculative_server_addr, &speculative_config, traffic,
                 &speculative_udp, &speculative_reachability,
                 speculative_psk.as_slice(), &speculative_server_public,
-                speculative_server_identity_public,
+                speculative_server_identity_public, None,
               ).await
             })
           };
@@ -103,13 +106,18 @@ rules:
     patterns:
       - pattern-inside: 'impl ClientMuxPool { ... }'
       - pattern-inside: 'async fn ensure_warm(...) { ... }'
+      # Any receiver: the build runs on a clone moved into a detached
+      # accounting task (cancel safety), not on `self` directly.
       - pattern-either:
-          - pattern: 'self.spawn_build(...)'
-          - pattern: 'self.start_session(...)'
+          - pattern: '$POOL.spawn_build(...)'
+          - pattern: '$POOL.start_session(...)'
           - pattern: 'establish_authenticated_data_session_with_resolver(...)'
       - pattern-not-inside: |
           async fn ensure_warm(...) {
             loop {
+              if self.is_shut_down() {
+                return Err(shut_down_error());
+              }
               if !mux_activity_is_recent(self.last_activity.load(Ordering::Relaxed), relay_now_millis()) {
                 return Ok(());
               }
