@@ -1,0 +1,56 @@
+.github/semgrep/client_mux_tail_observe.yml
+  s_c702d8bb7b3811::t_cbd4f1b461df29 11-12
+.github/semgrep/mux_receipt.yml
+  s_c702d8bb7b3811::t_42457e73036850 60-61,63-65
+.github/semgrep/mux_receipt.rs
+  s_c702d8bb7b3811::t_5876b56e3f6e39 47-52
+.github/scripts/check_client_activation.py
+  s_c702d8bb7b3811::t_080243cc010a5f 49
+.github/semgrep/mux_receipt_canonical.rs
+  s_c702d8bb7b3811::t_293647ee2cd28e 88-104
+.github/semgrep/client_activation.rs
+  s_c702d8bb7b3811::t_2a7a85f41fa054 88-90,94,96,105-108
+  s_c702d8bb7b3811::t_bab8f6bf392919 109-110
+.github/semgrep/client_mux_tail.yml
+  s_c702d8bb7b3811::t_4e13535e5b8aba 186
+  s_c702d8bb7b3811::t_cb1a2492a3071b 60
+  s_c702d8bb7b3811::t_e176ad12ba9365 65-66,68
+  s_c702d8bb7b3811::t_73bf58ea5eb4da 101,103,105-106,109,119-133
+  s_c702d8bb7b3811::t_5bb3e02b37d722 145
+  s_c702d8bb7b3811::t_644b1b6c61c369 134
+.github/semgrep/client_mux_tail.rs
+  s_c702d8bb7b3811::t_544003dbf06fb2 300
+  s_c702d8bb7b3811::t_5f9d2350ddfdd5 283
+  s_c702d8bb7b3811::t_7737436aa0f40e 172,185-195,197-209,215-219,221-222
+  s_c702d8bb7b3811::t_4cb6adaef0256c 325-327
+  s_c702d8bb7b3811::t_5a1363162e4bdb 130
+  s_c702d8bb7b3811::t_f3c89a907d463f 238-239,247
+  s_c702d8bb7b3811::t_e6442c7cfb7850 369-370,372-377
+  s_c702d8bb7b3811::t_134e9c558b065f 51-52,59-64
+.github/scripts/check_client_mux_tail.py
+  s_c702d8bb7b3811::t_4da5f360909dab 66-70
+  s_c702d8bb7b3811::t_ef7de91733803b 175-177
+  s_c702d8bb7b3811::t_88374a59d179b9 92-94
+  s_c702d8bb7b3811::t_4b5408e5133c4e 120
+  s_c702d8bb7b3811::t_39bf4ba7423025 102-106
+.github/semgrep/client_activation.yml
+  s_c702d8bb7b3811::t_4f01878a436959 109-110,112-113,118-120
+  s_c702d8bb7b3811::t_af3d0bca42fe49 82
+  s_c702d8bb7b3811::t_1e5b934628611d 31-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b464f7fec24a2825837e1b20e1e11867f0b566cc",
+  "prompts": {},
+  "sessions": {
+    "s_c702d8bb7b3811": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0dccf876-bffe-40ca-9941-2e55cf284a27",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
