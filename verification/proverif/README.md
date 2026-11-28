@@ -102,7 +102,7 @@ behavior.
 | `checked_identity(signature, identity_public, context)` | `verify_server_identity_payload_blocking` pins the configured identity key, reconstructs the message from the session context and stored binding, then calls `identity::verify_server_identity` with the fixed ML-DSA context. |
 | `sandwich_chain(old, dh, pq, psk)` | `crypto::pq::hybrid_sandwich_rekey` uses the old chain as HKDF-Extract salt; its input writer domain-separates X25519, ML-KEM-1024 and the length-prefixed PSK. |
 | `client_key(chain, epoch, transcript)` | `crypto::session::expand_epoch_keys` applies the client-direction label, epoch and transcript. The suite selects the record cipher; it is authenticated in the response but is not added to this KDF in the model or production. |
-| Client acceptance and secret release | `establish_authenticated_data_session_inner` finishes PQ application and verifies the identity before returning the usable session. The model's application ciphertext abstracts later data records, not their sizes, counters or framing. |
+| Client acceptance and secret release | `establish_authenticated_data_session_inner` finishes PQ application and verifies the identity before returning the usable session. The model's application ciphertext abstracts later data records, not their sizes, counters or framing. The embedder's optional certificate verifier reaches only the outer camouflage TLS connect; it does not touch the PQ rekey or the identity check. |
 
 Relevant sources are [identity.rs](../../src/crypto/identity.rs),
 [pq.rs](../../src/crypto/pq.rs), [session.rs](../../src/crypto/session.rs),

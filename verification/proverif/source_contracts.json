@@ -26,7 +26,7 @@
     {"id": "decode_ref_with_suite", "path": "src/protocol/command.rs", "function": "decode_ref_with_suite", "sha256": "72af50bf169fe0b22bcbb01a4b0e8e916cb947b8d4f4a08bf67aea815e11d951"},
     {"id": "apply_server_key_exchange_record_blocking", "path": "src/client/runtime.rs", "function": "apply_server_key_exchange_record_blocking", "sha256": "14b59b35182721f89adc72ca0ac969252b048ea1069f3d1e828083211ef26e5b"},
     {"id": "verify_server_identity_payload_blocking", "path": "src/client/runtime.rs", "function": "verify_server_identity_payload_blocking", "sha256": "ffc39dd87611d1ccbb3424ad171c5746aeb28d5e4cd154fb7c4c3b53491424ad"},
-    {"id": "establish_authenticated_data_session_inner", "path": "src/client/runtime.rs", "function": "establish_authenticated_data_session_inner", "sha256": "cc7220ba821f081ce91193a64cfe1ee46e57f587ea0bf05e2d81d0bd35501436"},
+    {"id": "establish_authenticated_data_session_inner", "path": "src/client/runtime.rs", "function": "establish_authenticated_data_session_inner", "sha256": "552e9720c06d5017179d449acc453b29712b2663e1b47321e3ce8e69e5cf8779"},
     {"id": "server_pq_wire_binding", "path": "src/handshake/server.rs", "start": "let key_exchange_payload = ServerKeyExchange {", "end": "crate::process_hardening::protect_secret_bytes(\n                            \"pq_rekey.mlkem_shared_secret\",", "sha256": "eebb9e8e305d5e53ec6bcd55385361039efd726f895d2e8cf62f0144676890b1"},
     {"id": "server_identity_call_fields", "path": "src/handshake/server.rs", "start": "let identity_signature = sign_server_identity_blocking(", "end": "let identity_payload = ServerIdentityProof {", "sha256": "599c6b64ae0c8bdaf27adebea44e7ddb8a22e41db77591cc412ba9574b95004f"}
   ]
