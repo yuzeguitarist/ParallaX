@@ -20,10 +20,11 @@
 //! self-expiring map defends against *many distinct real sources* (a botnet),
 //! not spoofing.
 //!
-//! A connection holds its slot only while it is unauthenticated: the server drops
-//! the permit once a ClientHello passes PSK authentication and the replay check.
-//! The operator's own client is no slot-pinning threat, and a phone keeps many
-//! mux sessions open from one address; the global limit still bounds them.
+//! A connection holds its slot until it proves its session keys: the server drops
+//! the permit once the first data-mode record opens under them. Only the
+//! operator's own client gets that far (a replayed or stalled hello never does),
+//! and a phone keeps many mux sessions open from one address; the global limit
+//! still bounds them.
 
 use std::{
     collections::{HashMap, VecDeque},

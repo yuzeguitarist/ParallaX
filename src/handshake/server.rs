@@ -1339,11 +1339,6 @@ async fn handle_connection_inner(
                     )
                     .await;
                 }
-                // A PSK-authenticated, never-seen ClientHello is the operator's own
-                // client, not a prober pinning slots: the per-source cap bounds only
-                // unauthenticated connections, so a phone can hold every session the
-                // global limit allows. A replayed hello took the fallback above.
-                drop(source_slot.take());
                 Some(PendingReplayEntry {
                     cache,
                     entry,
@@ -1382,6 +1377,7 @@ async fn handle_connection_inner(
                 pending_replay,
                 cid,
                 admission.take(),
+                source_slot.take(),
             )
             .await?;
         }
@@ -2771,6 +2767,7 @@ async fn run_authenticated_data_mode(
     mut pending_replay: Option<PendingReplayEntry>,
     cid: u64,
     mut admission: Option<Arc<OwnedSemaphorePermit>>,
+    mut source_slot: Option<SourcePermit>,
 ) -> Result<(), HandshakeServerError> {
     handshake.session_keys.protect_secret_memory();
     let padding = PaddingProfile::from_config(traffic)?;
@@ -3192,6 +3189,12 @@ async fn run_authenticated_data_mode(
                             fallback_bytes_before_pq,
                             "ParallaX data mode switch confirmed"
                         );
+                        // The first data record opened under the session keys:
+                        // only the operator's own client gets here (a replayed or
+                        // stalled hello never does), so the per-source cap, which
+                        // bounds unauthenticated slot pinning, stops counting it.
+                        // The global limit still bounds every session.
+                        drop(source_slot.take());
 
                         // Set on the Verified+enabled path only: the retained
                         // ephemeral QUIC endpoint and the accepted connection,
@@ -9891,6 +9894,7 @@ mod tests {
                 Some(pending),
                 1,
                 Some(admission),
+                None,
             )
             .await
             .unwrap();
@@ -10009,6 +10013,7 @@ mod tests {
                     Some(pending),
                     1,
                     Some(admission),
+                    None,
                 )
                 .await
             });
@@ -15558,9 +15563,10 @@ mod tests {
         fallback_task.await.unwrap();
     }
 
-    /// A phone opens many mux sessions at once from one address; once a session is
-    /// authenticated it must stop counting against the per-source cap, which
-    /// exists to bound unauthenticated slot pinning.
+    /// A phone opens many mux sessions at once from one address; once a session
+    /// proves its keys with a first data record it must stop counting against the
+    /// per-source cap, which exists to bound unauthenticated slot pinning. A
+    /// handshake that authenticates but never sends data keeps its slot.
     #[tokio::test]
     #[ignore = "requires loopback TCP sockets"]
     async fn authenticated_session_releases_its_source_slot() {
@@ -15593,10 +15599,14 @@ mod tests {
         .await;
 
         assert!(
-            Arc::clone(&limiter).try_admit(loopback).is_some(),
-            "a live authenticated session must not hold its source slot"
+            Arc::clone(&limiter).try_admit(loopback).is_none(),
+            "an authenticated handshake without a data record keeps its source slot"
         );
         send_ping_connect(&mut client, &mut data_session, &mut rng, target_addr).await;
+        assert!(
+            Arc::clone(&limiter).try_admit(loopback).is_some(),
+            "a live data-mode session must not hold its source slot"
+        );
 
         drop(client);
         server_task.await.unwrap();
